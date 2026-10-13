@@ -1,0 +1,5 @@
+/target
+/aars.toml
+/var
+*.wav
+/.cargo/config.toml
