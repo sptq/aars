@@ -44,4 +44,39 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Operacje na kolejce nadań.
+    Queue {
+        #[command(subcommand)]
+        action: QueueAction,
+    },
+    /// Uruchamia stację: dyspozytor przetwarza kolejkę aż do przerwania.
+    Run,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum QueueAction {
+    /// Dodaje komunikat do kolejki.
+    Add {
+        text: String,
+        #[arg(long, default_value = "normal")]
+        priority: String,
+        /// Przerywa trwające nadanie o niższym priorytecie.
+        #[arg(long)]
+        interrupting: bool,
+        /// Ile razy nadać.
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
+        /// Odstęp między powtórzeniami w sekundach.
+        #[arg(long, default_value_t = 600)]
+        every: u64,
+    },
+    /// Wypisuje zadania czekające w kolejce.
+    List,
+    /// Anuluje zadanie albo całą grupę powtórzeń.
+    Cancel {
+        #[arg(long, group = "target")]
+        id: Option<i64>,
+        #[arg(long, group = "target")]
+        group: Option<String>,
+    },
 }
