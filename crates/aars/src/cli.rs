@@ -49,8 +49,46 @@ pub enum Command {
         #[command(subcommand)]
         action: QueueAction,
     },
-    /// Uruchamia stację: dyspozytor przetwarza kolejkę aż do przerwania.
+    /// Definicje komunikatów i ich harmonogram.
+    Message {
+        #[command(subcommand)]
+        action: MessageAction,
+    },
+    /// Uruchamia stację: harmonogram i dyspozytor pracują aż do przerwania.
     Run,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MessageAction {
+    /// Dodaje definicję komunikatu.
+    Add {
+        /// Treść komunikatu.
+        text: String,
+        #[arg(long)]
+        title: String,
+        /// Wzorzec cron, np. "0 18 * * *".
+        #[arg(long, group = "schedule")]
+        cron: Option<String>,
+        /// Jednorazowo o zadanej chwili (RFC 3339).
+        #[arg(long, group = "schedule")]
+        at: Option<String>,
+        #[arg(long, default_value = "normal")]
+        priority: String,
+        #[arg(long)]
+        interrupting: bool,
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
+        #[arg(long, default_value_t = 600)]
+        every: u64,
+    },
+    /// Wypisuje definicje komunikatów.
+    List,
+    /// Włącza definicję.
+    Enable { id: i64 },
+    /// Wyłącza definicję.
+    Disable { id: i64 },
+    /// Usuwa definicję.
+    Remove { id: i64 },
 }
 
 #[derive(Debug, Subcommand)]

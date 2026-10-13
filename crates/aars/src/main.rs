@@ -260,22 +260,133 @@ async fn main() -> Result<()> {
                 config.audio.sample_rate,
             ));
 
+            let misfire_grace_s: u64 = sqlx::query_scalar::<_, String>(
+                "SELECT value FROM settings WHERE key = 'misfire_grace_s'",
+            )
+            .fetch_one(&pool)
+            .await
+            .context("odczyt misfire_grace_s")?
+            .parse()
+            .unwrap_or(600);
+
+            // Jedno repozytorium kolejki dla obu zadań: harmonogram wstawia,
+            // dyspozytor bierze.
+            let queue = Arc::new(QueueRepo::new(pool.clone()));
+
             let shutdown = CancelToken::new();
             let dispatcher = Dispatcher::new(
-                Arc::new(QueueRepo::new(pool)),
+                queue.clone(),
                 renderer,
                 stack.sequencer,
                 DispatcherConfig { tick: std::time::Duration::from_millis(500) },
             );
+            let scheduler = aars_core::scheduler::Scheduler::new(
+                aars_core::message::MessageRepo::new(pool.clone()),
+                queue,
+                aars_core::scheduler::SchedulerConfig {
+                    misfire_grace: std::time::Duration::from_secs(misfire_grace_s),
+                    tick: std::time::Duration::from_secs(1),
+                },
+            );
 
-            let task = tokio::spawn(dispatcher.run(shutdown.clone()));
-            tracing::info!("stacja uruchomiona, Ctrl-C kończy");
+            let dispatcher_task = tokio::spawn(dispatcher.run(shutdown.clone()));
+            let scheduler_task = tokio::spawn(scheduler.run(shutdown.clone()));
+            tracing::info!(misfire_grace_s, "stacja uruchomiona, Ctrl-C kończy");
 
             tokio::signal::ctrl_c().await.context("oczekiwanie na sygnał")?;
             tracing::info!("zatrzymuję stację");
             shutdown.cancel();
-            let _ = task.await;
+            let _ = dispatcher_task.await;
+            let _ = scheduler_task.await;
             stack.watchdog.stop();
+        }
+        cli::Command::Message { action } => {
+            use aars_core::message::{MessageRepo, NewMessage, ScheduleKind};
+
+            let pool = db::connect(&config.storage.db_path).await.context("otwieranie bazy")?;
+            db::migrate(&pool).await.context("nakładanie migracji")?;
+            let repo = MessageRepo::new(pool);
+
+            match action {
+                cli::MessageAction::Add {
+                    text,
+                    title,
+                    cron,
+                    at,
+                    priority,
+                    interrupting,
+                    repeat,
+                    every,
+                } => {
+                    let schedule = match (cron, at) {
+                        (Some(expr), _) => {
+                            // Zepsuty wzorzec odrzucamy tutaj, nie w nocy przy
+                            // pierwszym przebiegu harmonogramu.
+                            <croner::Cron as std::str::FromStr>::from_str(&expr)
+                                .with_context(|| format!("niepoprawny wzorzec cron: {expr}"))?;
+                            ScheduleKind::Cron(expr)
+                        }
+                        (_, Some(when)) => {
+                            let parsed = chrono::DateTime::parse_from_rfc3339(&when)
+                                .with_context(|| format!("niepoprawna data: {when}"))?;
+                            ScheduleKind::At(parsed.with_timezone(&chrono::Utc))
+                        }
+                        (None, None) => ScheduleKind::Immediate,
+                    };
+
+                    let id = repo
+                        .create(NewMessage {
+                            title,
+                            body_template: text,
+                            priority: parse_priority(&priority)?,
+                            interrupting,
+                            repeat_count: repeat,
+                            repeat_interval: std::time::Duration::from_secs(every),
+                            schedule,
+                            valid_from: None,
+                            valid_until: None,
+                            source_id: None,
+                            created_by: None,
+                        })
+                        .await
+                        .context("zapis definicji komunikatu")?;
+                    println!("dodano definicję {id}");
+                }
+                cli::MessageAction::List => {
+                    let messages = repo.list().await.context("odczyt definicji")?;
+                    if messages.is_empty() {
+                        println!("brak definicji");
+                    }
+                    for message in messages {
+                        let schedule = match &message.schedule {
+                            ScheduleKind::Immediate => "na żądanie".to_owned(),
+                            ScheduleKind::At(at) => at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                            ScheduleKind::Cron(expr) => expr.clone(),
+                        };
+                        println!(
+                            "{:>4}  {:<9} {:<20} {:<16} {}{}",
+                            message.id,
+                            format!("{:?}", message.priority),
+                            schedule,
+                            message.title,
+                            if message.enabled { "" } else { "[wyłączony] " },
+                            message.body_template
+                        );
+                    }
+                }
+                cli::MessageAction::Enable { id } => {
+                    repo.set_enabled(id, true).await.context("włączanie definicji")?;
+                    println!("włączono {id}");
+                }
+                cli::MessageAction::Disable { id } => {
+                    repo.set_enabled(id, false).await.context("wyłączanie definicji")?;
+                    println!("wyłączono {id}");
+                }
+                cli::MessageAction::Remove { id } => {
+                    let count = repo.delete(id).await.context("usuwanie definicji")?;
+                    println!("usunięto {count}");
+                }
+            }
         }
     }
 

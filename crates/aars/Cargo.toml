@@ -15,7 +15,9 @@ aars-audio = { path = "../aars-audio" }
 aars-ptt = { path = "../aars-ptt" }
 sqlx.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
+croner.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
