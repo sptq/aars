@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/aars-core", "crates/aars-audio", "crates/aars"]
+members = ["crates/aars-core", "crates/aars-audio", "crates/aars-ptt", "crates/aars"]
 
 [workspace.package]
 edition = "2024"
