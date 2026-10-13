@@ -11,5 +11,7 @@ thiserror.workspace = true
 tracing.workspace = true
 hound = "3.5"
 rubato = "5"
+audioadapter = "5"
+audioadapter-buffers = "5"
 sha2 = "0.10"
 hex = "0.4"
