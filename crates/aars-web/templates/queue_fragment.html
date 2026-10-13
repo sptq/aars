@@ -1,0 +1,28 @@
+{% if pending.is_empty() %}
+<p style="color:var(--muted)">Kolejka pusta.</p>
+{% else %}
+<table>
+  <thead>
+    <tr>
+      <th>#</th><th>Priorytet</th><th>Od</th><th>Treść</th>
+      {% if can_operate %}<th></th>{% endif %}
+    </tr>
+  </thead>
+  <tbody>
+    {% for item in pending %}
+    <tr>
+      <td>{{ item.id }}</td>
+      <td>{{ item.priority }}{% if item.interrupting %} ·
+          <span class="badge warn">przerywa</span>{% endif %}</td>
+      <td>{{ item.not_before }}</td>
+      <td>{{ item.text }}</td>
+      {% if can_operate %}
+      <td><button class="ghost" hx-post="/queue/{{ item.id }}/cancel"
+                  hx-headers='{"x-csrf-token": "{{ csrf }}"}'
+                  hx-target="#queue" hx-swap="innerHTML">Anuluj</button></td>
+      {% endif %}
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}

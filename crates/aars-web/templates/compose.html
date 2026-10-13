@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}AARS — nadaj komunikat{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Nadaj komunikat</h2>
+  <form method="post" action="/compose">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div style="margin-bottom:0.9rem">
+      <label for="text">Treść</label>
+      <textarea id="text" name="text" required
+                placeholder="Uwaga, ostrzeżenie meteorologiczne..."></textarea>
+    </div>
+    <div class="row">
+      <div>
+        <label for="priority">Priorytet</label>
+        <select id="priority" name="priority">
+          <option value="normal" selected>Zwykły</option>
+          <option value="low">Niski</option>
+          <option value="high">Wysoki</option>
+          <option value="emergency">Alarmowy</option>
+        </select>
+      </div>
+      <div>
+        <label for="repeat">Powtórzeń</label>
+        <input id="repeat" name="repeat" type="number" value="1" min="1" max="20">
+      </div>
+      <div>
+        <label for="every">Odstęp (s)</label>
+        <input id="every" name="every" type="number" value="600" min="0">
+      </div>
+    </div>
+    <label style="display:flex;gap:0.5rem;align-items:center;margin-bottom:1rem">
+      <input type="checkbox" name="interrupting" value="1" style="width:auto">
+      Przerwij trwające nadanie o niższym priorytecie
+    </label>
+    <button type="submit">Do kolejki</button>
+  </form>
+</div>
+{% endblock %}

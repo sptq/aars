@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/aars-core", "crates/aars-audio", "crates/aars-ptt", "crates/aars"]
+members = ["crates/aars-core", "crates/aars-audio", "crates/aars-ptt", "crates/aars-web", "crates/aars"]
 
 [workspace.package]
 edition = "2024"
@@ -21,3 +21,8 @@ clap = { version = "4", features = ["derive"] }
 croner = "4"
 argon2 = "0.6"
 rand = "0.9"
+axum = "0.8"
+askama = "0.16"
+rust-embed = "8"
+tower = "0.5"
+mime_guess = "2"
