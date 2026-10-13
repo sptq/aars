@@ -63,10 +63,15 @@ impl Default for FakeSink {
 }
 
 impl AudioSink for FakeSink {
+    /// Odtwarza w czasie rzeczywistym: sypia tyle, ile trwa bufor. Sink
+    /// zwracający natychmiast nie modelowałby nadawania — nadanie kończyłoby
+    /// się przed tym, jak cokolwiek zdąży je przerwać, i test przerywania nie
+    /// testowałby niczego.
     fn play(&self, pcm: &Pcm, cancel: &CancelToken) -> Result<PlayReport, SinkError> {
         // Bufor 1024 próbek, tak jak realne wyjście — anulowanie ma tę samą
         // ziarnistość w teście i na sprzęcie.
         const CHUNK: usize = 1024;
+        let chunk_time = Duration::from_secs_f64(CHUNK as f64 / pcm.sample_rate as f64);
         let mut played = 0usize;
 
         for _ in pcm.samples.chunks(CHUNK) {
@@ -79,6 +84,7 @@ impl AudioSink for FakeSink {
             let step = CHUNK.min(pcm.samples.len() - played);
             played += step;
             self.played.fetch_add(step, Ordering::SeqCst);
+            std::thread::sleep(chunk_time);
         }
 
         Ok(PlayReport {
