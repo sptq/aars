@@ -19,6 +19,8 @@ name = "aars-audio"
 version = "0.1.0"
 dependencies = [
  "aars-core",
+ "audioadapter",
+ "audioadapter-buffers",
  "hex",
  "hound",
  "rubato",
