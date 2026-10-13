@@ -169,3 +169,62 @@ fn queue_add_with_repeats_creates_a_cancellable_group() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn message_add_then_list_shows_the_schedule() {
+    let dir = std::env::temp_dir().join(format!("aars-msg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("msg.db");
+
+    assert!(
+        aars().env("AARS_STORAGE__DB_PATH", &db).arg("migrate").output().unwrap().status.success()
+    );
+
+    let out = aars()
+        .env("AARS_STORAGE__DB_PATH", &db)
+        .args([
+            "message", "add", "--title", "biuletyn", "--cron", "0 18 * * *", "--priority", "high",
+            "prognoza na dziś",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let out = aars()
+        .env("AARS_STORAGE__DB_PATH", &db)
+        .args(["message", "list"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("biuletyn"), "{stdout}");
+    assert!(stdout.contains("0 18 * * *"), "{stdout}");
+    assert!(stdout.contains("High"), "{stdout}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn message_add_rejects_a_broken_cron_expression_up_front() {
+    let dir = std::env::temp_dir().join(format!("aars-badcron-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("bad.db");
+
+    assert!(
+        aars().env("AARS_STORAGE__DB_PATH", &db).arg("migrate").output().unwrap().status.success()
+    );
+
+    let out = aars()
+        .env("AARS_STORAGE__DB_PATH", &db)
+        .args(["message", "add", "--title", "zly", "--cron", "to nie cron", "treść"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "zepsuty wzorzec nie może wejść do bazy");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cron"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
