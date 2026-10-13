@@ -30,4 +30,18 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Nadaje komunikat natychmiast.
+    Tx {
+        /// Treść komunikatu.
+        text: String,
+        /// Priorytet: emergency | high | normal | low.
+        #[arg(long, default_value = "normal")]
+        priority: String,
+        /// Pomiń identyfikację stacji (tylko do testów warsztatowych).
+        #[arg(long)]
+        no_id: bool,
+        /// Sprawdź interlocki i złóż audio, ale nie wchodź na pasmo.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }

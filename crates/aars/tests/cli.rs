@@ -55,3 +55,39 @@ fn say_dry_run_prints_the_normalized_text_without_synthesizing() {
         "stdout: {stdout}"
     );
 }
+
+#[test]
+fn tx_refuses_when_the_kill_switch_is_off() {
+    let dir = std::env::temp_dir().join(format!("aars-tx-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("tx.db");
+
+    // Stacja z wyłączonym nadawaniem musi odmówić, nie nadać.
+    let migrate = aars().env("AARS_STORAGE__DB_PATH", &db).arg("migrate").output().unwrap();
+    assert!(migrate.status.success(), "{}", String::from_utf8_lossy(&migrate.stderr));
+
+    let set = std::process::Command::new("sqlite3")
+        .arg(&db)
+        .arg("UPDATE settings SET value = 'false' WHERE key = 'tx_enabled';")
+        .status()
+        .unwrap();
+    assert!(set.success());
+
+    let out = aars()
+        .env("AARS_STORAGE__DB_PATH", &db)
+        .args(["tx", "--dry-run", "test"])
+        .output()
+        .unwrap();
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("TxDisabled") || combined.contains("nadawanie wyłączone"),
+        "{combined}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

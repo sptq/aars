@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 aars-core = { path = "../aars-core" }
 aars-audio = { path = "../aars-audio" }
+aars-ptt = { path = "../aars-ptt" }
+sqlx.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

@@ -1,4 +1,5 @@
 mod cli;
+mod radio;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -68,6 +69,93 @@ async fn main() -> Result<()> {
             }
 
             cache.prune().await.context("czyszczenie cache")?;
+        }
+        cli::Command::Tx { text, priority, no_id, dry_run } => {
+            use aars_core::interlock::Interlocks;
+            use aars_core::priority::Priority;
+
+            let priority = match priority.as_str() {
+                "emergency" => Priority::Emergency,
+                "high" => Priority::High,
+                "normal" => Priority::Normal,
+                "low" => Priority::Low,
+                other => anyhow::bail!("nieznany priorytet: {other}"),
+            };
+
+            let pool = db::connect(&config.storage.db_path).await.context("otwieranie bazy")?;
+            db::migrate(&pool).await.context("nakładanie migracji")?;
+
+            let mut stack = radio::build_stack(&config, &pool).await?;
+
+            // Interlocki sprawdzamy tu, zanim wydamy czas na syntezę: odmowa
+            // ma być szybka i czytelna, a sekwencer sprawdzi je i tak.
+            if let Err(reason) = stack.interlocks.check(priority) {
+                println!("odmowa nadania: {reason:?}");
+                return Ok(());
+            }
+
+            let synth = aars_audio::piper::PiperSynth::new(
+                &config.tts.piper_bin,
+                &config.tts.model,
+                config.audio.sample_rate,
+            );
+            let cache = aars_audio::cache::AudioCache::new(
+                pool.clone(),
+                config.storage.cache_dir.clone(),
+                config.storage.cache_max_bytes,
+            );
+            let voice = aars_core::synth::VoiceParams::default();
+            let (_, body) = cache.render(&synth, &text, &voice).await.context("synteza treści")?;
+
+            let callsign: String =
+                sqlx::query_scalar("SELECT value FROM settings WHERE key = 'callsign'")
+                    .fetch_one(&pool)
+                    .await
+                    .context("odczyt znaku wywoławczego")?;
+
+            let id_audio = if no_id || callsign.is_empty() {
+                if !no_id {
+                    tracing::warn!("znak wywoławczy nieustawiony — nadanie bez identyfikacji");
+                }
+                None
+            } else {
+                Some(aars_core::ident::morse_pcm(
+                    &callsign,
+                    &aars_core::ident::MorseParams::default(),
+                    config.audio.sample_rate,
+                ))
+            };
+
+            if dry_run {
+                println!("gotowe do nadania: {:?} treści, priorytet {priority:?}", body.duration());
+                return Ok(());
+            }
+
+            stack
+                .sequencer
+                .transmit(aars_core::sequencer::TransmitRequest {
+                    id: 0,
+                    priority,
+                    interrupting: false,
+                    body,
+                    id_audio,
+                })
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            while let Some(event) = stack.sequencer.next_event().await {
+                println!("{event:?}");
+                if matches!(
+                    event,
+                    aars_core::sequencer::SeqEvent::Finished { .. }
+                        | aars_core::sequencer::SeqEvent::Refused { .. }
+                ) {
+                    break;
+                }
+            }
+
+            stack.sequencer.shutdown();
+            stack.watchdog.stop();
         }
     }
 
