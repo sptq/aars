@@ -5,6 +5,7 @@ pub mod ident;
 pub mod interlock;
 pub mod priority;
 pub mod ptt;
+pub mod queue;
 pub mod sequencer;
 pub mod sink;
 pub mod synth;
