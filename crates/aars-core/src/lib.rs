@@ -1,5 +1,6 @@
 pub mod config;
 pub mod db;
+pub mod dispatcher;
 pub mod error;
 pub mod ident;
 pub mod interlock;
