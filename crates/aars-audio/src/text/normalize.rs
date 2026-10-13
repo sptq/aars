@@ -40,64 +40,90 @@ const ABBREVIATIONS: &[(&str, &str)] = &[
     ("KSE", "K S E"),
 ];
 
+/// Interpunkcja, która może poprzedzać słowo.
+const LEADING_PUNCT: &[char] = &['(', '[', '"', '„', '“', '\''];
+
+/// Interpunkcja, która może zamykać słowo. Zostaje w wyniku, bo przecinek i
+/// kropka kształtują intonację syntezatora.
+const TRAILING_PUNCT: &[char] = &[',', '.', ';', ':', '!', '?', ')', ']', '"', '”', '…'];
+
+/// Rozkłada token na interpunkcję wiodącą, rdzeń i interpunkcję końcową.
+///
+/// Bez tego „22 m/s," nie dopasowałoby się do jednostki, a w biuletynie
+/// każdy człon kończy się przecinkiem.
+fn split_punct(token: &str) -> (&str, &str, &str) {
+    let after_lead = token.trim_start_matches(|c| LEADING_PUNCT.contains(&c));
+    let lead = &token[..token.len() - after_lead.len()];
+    let core = after_lead.trim_end_matches(|c| TRAILING_PUNCT.contains(&c));
+    let trail = &after_lead[core.len()..];
+    (lead, core, trail)
+}
+
+fn push_word(out: &mut Vec<String>, lead: &str, word: &str, trail: &str) {
+    out.push(format!("{lead}{word}{trail}"));
+}
+
 /// Zamienia tekst w formę nadającą się do syntezy: liczby i jednostki na
 /// słowa, godziny na mowę, skróty rozwinięte, białe znaki zwinięte.
 ///
 /// Wejście, którego nie rozumie, zostawia w spokoju — lepiej nadać surowy
 /// token niż zgubić treść ostrzeżenia.
 pub fn normalize(input: &str) -> String {
-    let tokens: Vec<&str> = input.split_whitespace().collect();
-    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let raw: Vec<&str> = input.split_whitespace().collect();
+    let parts: Vec<(&str, &str, &str)> = raw.iter().map(|token| split_punct(token)).collect();
+
+    let mut out: Vec<String> = Vec::with_capacity(parts.len());
     let mut idx = 0usize;
 
-    while idx < tokens.len() {
-        let token = tokens[idx];
+    while idx < parts.len() {
+        let (lead, core, trail) = parts[idx];
 
-        if let Some(spoken) = spoken_time(token) {
-            out.push(spoken);
+        if let Some(spoken) = spoken_time(core) {
+            push_word(&mut out, lead, &spoken, trail);
             idx += 1;
             continue;
         }
 
-        if let Some((value, rest)) = number_prefix(token) {
-            // Liczba + jednostka jako dwa tokeny: „12 m/s"
+        if let Some((value, rest)) = number_prefix(core) {
+            // Liczba + jednostka jako dwa tokeny: „12 m/s,"
             if rest.is_empty()
-                && let Some(next) = tokens.get(idx + 1)
-                && let Some(unit) = match_unit(next)
-                && unit.len() == next.len()
+                && let Some(&(next_lead, next_core, next_trail)) = parts.get(idx + 1)
+                && next_lead.is_empty()
+                && let Some(unit) = match_unit(next_core)
+                && unit.len() == next_core.len()
             {
-                out.push(spoken_number(&value));
-                out.push(unit_form(next, &value).to_owned());
+                push_word(&mut out, lead, &spoken_number(&value), "");
+                push_word(&mut out, "", unit_form(next_core, &value), next_trail);
                 idx += 2;
                 continue;
             }
 
-            // Liczba zlepiona z jednostką jako jeden token: „12m/s"
+            // Liczba zlepiona z jednostką jako jeden token: „12m/s,"
             if !rest.is_empty()
                 && let Some(unit) = match_unit(rest)
                 && unit.len() == rest.len()
             {
-                out.push(spoken_number(&value));
-                out.push(unit_form(rest, &value).to_owned());
+                push_word(&mut out, lead, &spoken_number(&value), "");
+                push_word(&mut out, "", unit_form(rest, &value), trail);
                 idx += 1;
                 continue;
             }
 
             // Sama liczba
             if rest.is_empty() {
-                out.push(spoken_number(&value));
+                push_word(&mut out, lead, &spoken_number(&value), trail);
                 idx += 1;
                 continue;
             }
         }
 
-        if let Some(expanded) = ABBREVIATIONS.iter().find(|(abbr, _)| *abbr == token) {
-            out.push(expanded.1.to_owned());
+        if let Some((_, expanded)) = ABBREVIATIONS.iter().find(|(abbr, _)| *abbr == core) {
+            push_word(&mut out, lead, expanded, trail);
             idx += 1;
             continue;
         }
 
-        out.push(token.to_owned());
+        out.push(raw[idx].to_owned());
         idx += 1;
     }
 
@@ -266,6 +292,21 @@ mod tests {
         assert_eq!(n("kierunek N"), "kierunek północny");
         assert_eq!(n("kierunek SW"), "kierunek południowo-zachodni");
         assert_eq!(n("IMGW ostrzega"), "I M G W ostrzega");
+    }
+
+    #[test]
+    fn punctuation_glued_to_a_token_does_not_block_normalization() {
+        // W biuletynie każdy człon kończy się przecinkiem — to norma, nie
+        // przypadek skrajny.
+        assert_eq!(
+            n("wiatr 22 m/s, temperatura -5 °C, ciśnienie 1013 hPa."),
+            "wiatr dwadzieścia dwa metry na sekundę, temperatura minus pięć stopni Celsjusza, \
+             ciśnienie tysiąc trzynaście hektopaskali."
+        );
+        assert_eq!(n("od 18:00 do 06:30,"), "od godzina osiemnasta do godzina szósta trzydzieści,");
+        assert_eq!(n("kierunek SW,"), "kierunek południowo-zachodni,");
+        assert_eq!(n("stopień 2."), "stopień dwa.");
+        assert_eq!(n("(12 m/s)"), "(dwanaście metrów na sekundę)");
     }
 
     #[test]

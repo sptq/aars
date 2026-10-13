@@ -34,6 +34,41 @@ async fn main() -> Result<()> {
             println!("PTT:         {:?}", config.ptt.backend);
             println!("model głosu: {}", config.tts.model);
         }
+        cli::Command::Say { text, out, dry_run } => {
+            let spoken = aars_audio::text::normalize(&text);
+            println!("{spoken}");
+
+            if dry_run {
+                return Ok(());
+            }
+
+            let pool = db::connect(&config.storage.db_path).await.context("otwieranie bazy")?;
+            db::migrate(&pool).await.context("nakładanie migracji")?;
+
+            let synth = aars_audio::piper::PiperSynth::new(
+                &config.tts.piper_bin,
+                &config.tts.model,
+                config.audio.sample_rate,
+            );
+            let cache = aars_audio::cache::AudioCache::new(
+                pool,
+                config.storage.cache_dir.clone(),
+                config.storage.cache_max_bytes,
+            );
+
+            let voice = aars_core::synth::VoiceParams::default();
+            let (path, pcm) =
+                cache.render(&synth, &text, &voice).await.context("synteza komunikatu")?;
+
+            if let Some(out) = out {
+                std::fs::copy(&path, &out).context("zapis pliku wyjściowego")?;
+                println!("zapisano {} ({:?})", out.display(), pcm.duration());
+            } else {
+                println!("cache {} ({:?})", path.display(), pcm.duration());
+            }
+
+            cache.prune().await.context("czyszczenie cache")?;
+        }
     }
 
     Ok(())

@@ -19,4 +19,15 @@ pub enum Command {
     Migrate,
     /// Wypisuje efektywną konfigurację.
     Info,
+    /// Syntezuje tekst i zapisuje do pliku WAV.
+    Say {
+        /// Treść komunikatu.
+        text: String,
+        /// Plik wyjściowy. Pominięty — audio ląduje w cache.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Tylko wypisz znormalizowany tekst, bez syntezy.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
