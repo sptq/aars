@@ -11,6 +11,7 @@ thiserror.workspace = true
 figment.workspace = true
 sqlx.workspace = true
 chrono.workspace = true
+croner.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 
