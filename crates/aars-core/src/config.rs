@@ -157,7 +157,7 @@ impl Config {
         figment
             .merge(Env::prefixed("AARS_").split("__"))
             .extract()
-            .map_err(ConfigError::Invalid)
+            .map_err(|e| ConfigError::Invalid(Box::new(e)))
     }
 }
 
