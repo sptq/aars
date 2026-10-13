@@ -21,11 +21,14 @@ dependencies = [
  "aars-core",
  "audioadapter",
  "audioadapter-buffers",
+ "chrono",
  "hex",
  "hound",
  "rubato",
  "sha2",
+ "sqlx",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 
