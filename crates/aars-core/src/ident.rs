@@ -124,7 +124,7 @@ mod tests {
     fn morse_contains_both_tone_and_silence() {
         let pcm = morse_pcm("A", &MorseParams::default(), 48_000);
         assert!(pcm.samples.iter().any(|s| s.unsigned_abs() > 1000), "brak tonu");
-        assert!(pcm.samples.iter().any(|s| *s == 0), "brak przerw między elementami");
+        assert!(pcm.samples.contains(&0), "brak przerw między elementami");
     }
 
     #[test]
