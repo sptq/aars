@@ -508,7 +508,11 @@ use crate::ptt::PttBackend;
 const TICK: Duration = Duration::from_millis(50);
 
 struct Shared {
-    /// Milisekundy od startu watchdoga do podniesienia PTT; 0 znaczy „nie nadaje".
+    /// Punkt odniesienia dla wszystkich pomiarów — zegar monotoniczny.
+    started: Instant,
+    /// Milisekundy od `started` do podniesienia PTT, plus jeden.
+    /// Zero znaczy „nie nadaje", dlatego przesunięcie o jeden: nadanie
+    /// rozpoczęte w pierwszej milisekundzie też musi być widoczne.
     keyed_at_ms: AtomicU64,
     poisoned: AtomicBool,
     stop: AtomicBool,
@@ -526,21 +530,21 @@ pub struct WatchdogHandle {
 impl Watchdog {
     pub fn spawn(ptt: Arc<dyn PttBackend>, limit: Duration) -> WatchdogHandle {
         let shared = Arc::new(Shared {
+            started: Instant::now(),
             keyed_at_ms: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         });
 
         let worker = shared.clone();
-        let started = Instant::now();
         let thread = std::thread::Builder::new()
             .name("aars-watchdog".to_owned())
             .spawn(move || {
                 while !worker.stop.load(Ordering::SeqCst) {
                     let keyed_at = worker.keyed_at_ms.load(Ordering::SeqCst);
                     if keyed_at > 0 {
-                        let elapsed =
-                            started.elapsed().as_millis() as u64.saturating_sub(keyed_at);
+                        let now_ms = worker.started.elapsed().as_millis() as u64;
+                        let elapsed = now_ms.saturating_sub(keyed_at - 1);
                         if Duration::from_millis(elapsed) > limit {
                             ptt.force_unkey();
                             worker.keyed_at_ms.store(0, Ordering::SeqCst);
@@ -564,13 +568,8 @@ impl Watchdog {
 impl WatchdogHandle {
     /// Wołane przez sekwencer bezpośrednio po `key()`.
     pub fn mark_keyed(&self) {
-        // Wartość musi być niezerowa, bo 0 znaczy „nie nadaje".
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(1);
-        let _ = now;
-        self.shared.keyed_at_ms.store(elapsed_marker(), Ordering::SeqCst);
+        let marker = self.shared.started.elapsed().as_millis() as u64 + 1;
+        self.shared.keyed_at_ms.store(marker, Ordering::SeqCst);
     }
 
     /// Wołane przez sekwencer bezpośrednio po `unkey()`.
@@ -602,15 +601,6 @@ impl Drop for WatchdogHandle {
     }
 }
 ```
-
-**Uwaga dla wykonawcy:** powyższy `mark_keyed` i pętla wątku muszą mierzyć
-czas tym samym `Instant`. Zamiast funkcji `elapsed_marker()` przechowaj
-`Arc<Instant>` w `Shared` i w `mark_keyed` zapisz
-`started.elapsed().as_millis() as u64 + 1` (plus jeden, żeby wartość nigdy
-nie była zerowa w pierwszej milisekundzie). W pętli policz
-`started.elapsed().as_millis() as u64 - (keyed_at - 1)`. Napisz to tak, żeby
-kompilowało się bez `as u64.saturating_sub` — ten zapis w szkicu jest
-niepoprawny składniowo i trzeba go rozpisać na dwie linie.
 
 `crates/aars-core/src/lib.rs` — dopisz `pub mod watchdog;`
 
