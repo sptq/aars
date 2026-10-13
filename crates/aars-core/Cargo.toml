@@ -16,3 +16,6 @@ tokio.workspace = true
 
 [features]
 testing = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
