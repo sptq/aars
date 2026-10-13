@@ -282,22 +282,60 @@ async fn main() -> Result<()> {
             );
             let scheduler = aars_core::scheduler::Scheduler::new(
                 aars_core::message::MessageRepo::new(pool.clone()),
-                queue,
+                queue.clone(),
                 aars_core::scheduler::SchedulerConfig {
                     misfire_grace: std::time::Duration::from_secs(misfire_grace_s),
                     tick: std::time::Duration::from_secs(1),
                 },
             );
 
+            let users = aars_core::user::UserRepo::new(pool.clone());
+            if let Some(password) = users.ensure_bootstrap_admin().await.context("konto startowe")? {
+                // Jedyny moment, w którym to hasło jest widoczne.
+                println!("== konto startowe: admin / {password}");
+                println!("== zmień je po pierwszym logowaniu");
+            }
+            if let Err(err) = users.purge_expired_sessions().await {
+                tracing::error!(%err, "czyszczenie wygasłych sesji zawiodło");
+            }
+
+            let app = aars_web::router(aars_web::AppState::new(
+                pool.clone(),
+                queue.clone(),
+                stack.interlocks.clone(),
+                false,
+            ));
+            let listener = tokio::net::TcpListener::bind(&config.server.bind)
+                .await
+                .with_context(|| format!("nasłuch na {}", config.server.bind))?;
+
             let dispatcher_task = tokio::spawn(dispatcher.run(shutdown.clone()));
             let scheduler_task = tokio::spawn(scheduler.run(shutdown.clone()));
-            tracing::info!(misfire_grace_s, "stacja uruchomiona, Ctrl-C kończy");
+
+            let server_shutdown = shutdown.clone();
+            let server_task = tokio::spawn(async move {
+                let graceful = axum::serve(listener, app).with_graceful_shutdown(async move {
+                    while !server_shutdown.is_cancelled() {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                });
+                if let Err(err) = graceful.await {
+                    tracing::error!(%err, "serwer panelu zakończył się błędem");
+                }
+            });
+
+            tracing::info!(
+                bind = %config.server.bind,
+                misfire_grace_s,
+                "stacja uruchomiona, Ctrl-C kończy"
+            );
 
             tokio::signal::ctrl_c().await.context("oczekiwanie na sygnał")?;
             tracing::info!("zatrzymuję stację");
             shutdown.cancel();
             let _ = dispatcher_task.await;
             let _ = scheduler_task.await;
+            let _ = server_task.await;
             stack.watchdog.stop();
         }
         cli::Command::Message { action } => {
