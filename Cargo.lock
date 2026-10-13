@@ -6,6 +6,7 @@ version = 4
 name = "aars"
 version = "0.1.0"
 dependencies = [
+ "aars-audio",
  "aars-core",
  "anyhow",
  "clap",

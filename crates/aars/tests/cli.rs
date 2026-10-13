@@ -40,3 +40,18 @@ fn a_missing_explicit_config_file_fails_loudly() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("nie istnieje"), "stderr: {stderr}");
 }
+
+#[test]
+fn say_dry_run_prints_the_normalized_text_without_synthesizing() {
+    let out = aars()
+        .args(["say", "--dry-run", "wiatr 12 m/s o 18:00"])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("wiatr dwanaście metrów na sekundę o godzina osiemnasta"),
+        "stdout: {stdout}"
+    );
+}
