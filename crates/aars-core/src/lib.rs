@@ -13,3 +13,4 @@ pub mod sequencer;
 pub mod sink;
 pub mod synth;
 pub mod watchdog;
+pub mod user;

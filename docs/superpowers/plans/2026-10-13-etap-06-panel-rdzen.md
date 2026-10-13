@@ -15,7 +15,7 @@
 - Role: **viewer** czyta; **operator** nadaje, planuje i anuluje; **admin** dodatkowo zmienia konfigurację sprzętu i użytkowników (spec §8).
 - Kill switch jest dostępny operatorowi — zatrzymanie nadawania nie może wymagać admina (spec §8).
 - Hasła Argon2id; sesja w cookie `HttpOnly` + `SameSite=Lax`, `Secure` gdy skonfigurowany HTTPS; sesje w bazie, by wylogowanie działało natychmiast (spec §5, §8).
-- Ochrona CSRF tokenem per sesja na każdym formularzu zmieniającym stan; rate limiting na `/login` (spec §8).
+- Ochrona CSRF tokenem per sesja na każdym formularzu zmieniającym stan; rate limiting na `/login` (spec §8). Token żyje w nowej kolumnie `sessions.csrf_token` (migracja `0002_session_csrf.sql`) — dopisane po napisaniu planu, bo pierwotne zadania wymieniały ten wymóg w ograniczeniach, a nie realizowały go w krokach.
 - Pierwszy start bez użytkowników tworzy konto admina z hasłem wypisanym na konsolę i wymusza zmianę przy pierwszym logowaniu (spec §8).
 - Podgląd audio przechodzi tym samym pipeline'em co nadanie, włącznie z normalizacją (spec §8).
 - Assety i szablony wkompilowane przez `rust-embed`; zero zależności sieciowych w czasie pracy (spec §8, §12).
