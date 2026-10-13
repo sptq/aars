@@ -8,8 +8,10 @@ version = "0.1.0"
 dependencies = [
  "aars-audio",
  "aars-core",
+ "aars-ptt",
  "anyhow",
  "clap",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
