@@ -1,6 +1,7 @@
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod ident;
 pub mod priority;
 pub mod ptt;
 pub mod sink;
