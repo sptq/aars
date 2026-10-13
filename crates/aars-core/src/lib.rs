@@ -5,3 +5,4 @@ pub mod priority;
 pub mod ptt;
 pub mod sink;
 pub mod synth;
+pub mod watchdog;
