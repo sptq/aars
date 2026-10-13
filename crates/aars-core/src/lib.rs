@@ -4,6 +4,7 @@ pub mod dispatcher;
 pub mod error;
 pub mod ident;
 pub mod interlock;
+pub mod message;
 pub mod priority;
 pub mod ptt;
 pub mod queue;
