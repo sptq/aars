@@ -4,8 +4,10 @@ use std::path::PathBuf;
 pub enum ConfigError {
     #[error("plik konfiguracyjny nie istnieje: {path}")]
     NotFound { path: PathBuf },
+    // `figment::Error` ma 208 bajtów; w pudełku, żeby `Result` z tej
+    // funkcji nie puchł na każdej ścieżce sukcesu.
     #[error("niepoprawna konfiguracja: {0}")]
-    Invalid(#[from] figment::Error),
+    Invalid(#[from] Box<figment::Error>),
 }
 
 #[derive(Debug, thiserror::Error)]
