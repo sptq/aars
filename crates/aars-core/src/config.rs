@@ -165,13 +165,19 @@ impl Config {
 mod tests {
     use super::*;
 
+    // Każdy test dotykający konfiguracji pracuje w `figment::Jail`, który
+    // trzyma globalny zamek. Bez tego zmienne `AARS_*` z jednego testu
+    // wyciekają do równolegle biegnącego drugiego.
     #[test]
     fn defaults_are_usable_without_any_file() {
-        let cfg = Config::load(None).expect("domyślna konfiguracja musi się wczytać");
-        assert_eq!(cfg.server.bind, "0.0.0.0:8080");
-        assert_eq!(cfg.audio.sample_rate, 48_000);
-        assert_eq!(cfg.ptt.backend, PttBackendKind::Vox);
-        assert_eq!(cfg.ptt.channel_busy, ChannelBusyKind::None);
+        figment::Jail::expect_with(|_jail| {
+            let cfg = Config::load(None).expect("domyślna konfiguracja musi się wczytać");
+            assert_eq!(cfg.server.bind, "0.0.0.0:8080");
+            assert_eq!(cfg.audio.sample_rate, 48_000);
+            assert_eq!(cfg.ptt.backend, PttBackendKind::Vox);
+            assert_eq!(cfg.ptt.channel_busy, ChannelBusyKind::None);
+            Ok(())
+        });
     }
 
     #[test]
