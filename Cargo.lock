@@ -9,6 +9,7 @@ dependencies = [
  "aars-audio",
  "aars-core",
  "aars-ptt",
+ "aars-sources",
  "aars-web",
  "anyhow",
  "axum",

@@ -32,3 +32,8 @@ model = "/var/lib/aars/voices/pl_PL-darkman-medium.onnx"
 db_path = "var/aars.db"
 cache_dir = "var/cache"
 cache_max_bytes = 536870912
+
+[sources]
+# Adres API ostrzeżeń meteo IMGW. Włączanie źródła, obszar i interwał ustawia
+# się w panelu (/sources); źródło po instalacji jest wyłączone.
+imgw_meteo_url = "https://danepubliczne.imgw.pl/api/data/warningsmeteo"

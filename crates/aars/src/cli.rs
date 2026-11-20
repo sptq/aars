@@ -54,8 +54,19 @@ pub enum Command {
         #[command(subcommand)]
         action: MessageAction,
     },
+    /// Źródła danych (ostrzeżenia IMGW).
+    Source {
+        #[command(subcommand)]
+        action: SourceAction,
+    },
     /// Uruchamia stację: harmonogram i dyspozytor pracują aż do przerwania.
     Run,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SourceAction {
+    /// Jedno pobranie z obszarem z bazy; nic nie zapisuje ani nie nadaje.
+    Preview,
 }
 
 #[derive(Debug, Subcommand)]
