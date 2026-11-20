@@ -6,6 +6,13 @@ use sqlx::{Row, SqlitePool};
 use crate::error::DbError;
 use crate::priority::Priority;
 
+/// Najdłuższy odstęp między powtórzeniami (doba). Panel i CLI odrzucają
+/// większe wartości, zanim dotrą do kolejki.
+pub const MAX_REPEAT_INTERVAL_S: u64 = 86_400;
+
+/// Komunikat dla operatora, gdy odstęp wychodzi poza zakres.
+pub const REPEAT_INTERVAL_ERROR: &str = "odstęp powtórzeń musi mieścić się w 0–86400 s";
+
 /// Kiedy komunikat ma być nadany.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduleKind {

@@ -4,7 +4,9 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use aars_core::message::{Message, MessageRepo, NewMessage, ScheduleKind};
+use aars_core::message::{
+    MAX_REPEAT_INTERVAL_S, Message, MessageRepo, NewMessage, REPEAT_INTERVAL_ERROR, ScheduleKind,
+};
 use aars_core::queue::EnqueueRequest;
 use aars_core::user::Role;
 use askama::Template;
@@ -214,6 +216,9 @@ fn build_message(form: &MessageForm, user_id: i64) -> Result<NewMessage, String>
         return Err("treść komunikatu nie może być pusta".to_owned());
     }
     let priority = parse_priority(&form.priority).ok_or("nieznany priorytet")?;
+    if form.every > MAX_REPEAT_INTERVAL_S {
+        return Err(REPEAT_INTERVAL_ERROR.to_owned());
+    }
     let schedule = parse_schedule(
         &form.schedule_kind,
         &form.at,

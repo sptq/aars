@@ -236,6 +236,11 @@ async fn compose_submit(
         return Ok((StatusCode::BAD_REQUEST, "nieznany priorytet").into_response());
     };
 
+    if form.every > aars_core::message::MAX_REPEAT_INTERVAL_S {
+        return Ok((StatusCode::BAD_REQUEST, aars_core::message::REPEAT_INTERVAL_ERROR)
+            .into_response());
+    }
+
     let request = EnqueueRequest {
         message_id: None,
         rendered_text: text,
@@ -1088,6 +1093,46 @@ pub(crate) mod tests {
         assert!(html.contains("biuletyn"), "{html}");
         assert!(html.contains("0 18 * * *"), "{html}");
         assert!(html.contains("Wysoki"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn a_huge_repeat_interval_is_refused_in_compose_and_in_definitions() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+
+        let response = post_form(
+            &app,
+            &cookie,
+            "/compose",
+            format!("csrf={csrf}&text=uwaga&priority=normal&repeat=3&every=18446744073709551615"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("86400"));
+        assert!(state.queue.pending(10).await.unwrap().is_empty());
+
+        let response = post_form(
+            &app,
+            &cookie,
+            "/messages",
+            message_form(&csrf, "biuletyn", "tresc", "0 18 * * *")
+                .replace("every=60", "every=86401"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let saved = aars_core::message::MessageRepo::new(state.pool.clone()).list().await.unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+
+        // Granica jest włącznie.
+        let response = post_form(
+            &app,
+            &cookie,
+            "/messages",
+            message_form(&csrf, "biuletyn", "tresc", "0 18 * * *")
+                .replace("every=60", "every=86400"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
     }
 
     #[tokio::test]
