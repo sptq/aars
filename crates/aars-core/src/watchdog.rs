@@ -20,17 +20,25 @@ struct Shared {
     stop: AtomicBool,
 }
 
-/// Niezależny strażnik czasu nadawania. Osobny wątek OS i monotoniczny
-/// zegar, bo musi opuścić PTT nawet gdy runtime tokio stanie (spec D7).
 /// Treść błędu, którym kończy się nadanie ucięte twardym limitem czasu.
 /// Dyspozytor rozpoznaje po niej wynik `timeout` w `tx_log`.
 pub const TX_TIMEOUT_ERROR: &str = "przekroczony twardy limit czasu nadawania";
 
+/// Niezależny strażnik czasu nadawania. Osobny wątek OS i monotoniczny
+/// zegar, bo musi opuścić PTT nawet gdy runtime tokio stanie (spec D7).
 pub struct Watchdog;
 
 pub struct WatchdogHandle {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// Lekki uchwyt do stanu strażnika, bez jego wątku. Sekwencer znaczy nim
+/// podniesienie i opuszczenie PTT, binarka i panel czytają i zdejmują nim
+/// flagę `poisoned`. Klony współdzielą stan z `WatchdogHandle`.
+#[derive(Clone)]
+pub struct WatchdogMarker {
+    shared: Arc<Shared>,
 }
 
 impl Watchdog {
@@ -71,7 +79,7 @@ impl Watchdog {
     }
 }
 
-impl WatchdogHandle {
+impl WatchdogMarker {
     /// Wołane przez sekwencer bezpośrednio po `key()`.
     pub fn mark_keyed(&self) {
         let marker = self.shared.started.elapsed().as_millis() as u64 + 1;
@@ -83,6 +91,11 @@ impl WatchdogHandle {
         self.shared.keyed_at_ms.store(0, Ordering::SeqCst);
     }
 
+    /// Czy strażnik uważa, że nadajnik jest na antenie.
+    pub fn is_keyed(&self) -> bool {
+        self.shared.keyed_at_ms.load(Ordering::SeqCst) > 0
+    }
+
     pub fn is_poisoned(&self) -> bool {
         self.shared.poisoned.load(Ordering::SeqCst)
     }
@@ -91,6 +104,29 @@ impl WatchdogHandle {
     pub fn clear_poison(&self) {
         self.shared.poisoned.store(false, Ordering::SeqCst);
         tracing::warn!("flaga poisoned zdjęta ręcznie");
+    }
+}
+
+impl WatchdogHandle {
+    /// Uchwyt dla sekwencera i panelu; wątek strażnika zostaje tutaj.
+    pub fn marker(&self) -> WatchdogMarker {
+        WatchdogMarker { shared: self.shared.clone() }
+    }
+
+    pub fn mark_keyed(&self) {
+        self.marker().mark_keyed();
+    }
+
+    pub fn mark_unkeyed(&self) {
+        self.marker().mark_unkeyed();
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.marker().is_poisoned()
+    }
+
+    pub fn clear_poison(&self) {
+        self.marker().clear_poison();
     }
 
     pub fn stop(mut self) {
@@ -163,6 +199,28 @@ mod tests {
 
         handle.clear_poison();
         assert!(!handle.is_poisoned());
+
+        handle.stop();
+    }
+
+    #[test]
+    fn a_stuck_key_marked_through_the_marker_is_forced_down_and_poisons() {
+        let ptt = Arc::new(FakePtt::new());
+        let handle = Watchdog::spawn(ptt.clone(), Duration::from_millis(100));
+        let marker = handle.marker();
+
+        ptt.key().unwrap();
+        marker.mark_keyed();
+        assert!(marker.is_keyed());
+        std::thread::sleep(Duration::from_millis(400));
+
+        assert!(!ptt.is_keyed(), "{:?}", ptt.events());
+        assert!(marker.is_poisoned(), "marker musi widzieć flagę strażnika");
+        assert!(handle.is_poisoned());
+        assert!(!marker.is_keyed(), "po interwencji strażnik uznaje PTT za opuszczone");
+
+        marker.clear_poison();
+        assert!(!handle.is_poisoned(), "zdjęcie flagi markerem dotyczy strażnika");
 
         handle.stop();
     }

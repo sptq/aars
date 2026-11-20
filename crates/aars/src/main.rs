@@ -160,6 +160,10 @@ async fn main() -> Result<()> {
             }
 
             stack.sequencer.shutdown();
+            // Jednorazowe nadanie też musi zostawić ślad interwencji w bazie.
+            if stack.watchdog.is_poisoned() {
+                radio::record_poison(&stack.interlocks, &pool).await;
+            }
             stack.watchdog.stop();
         }
         cli::Command::Queue { action } => {
@@ -275,6 +279,7 @@ async fn main() -> Result<()> {
             let queue = Arc::new(QueueRepo::new(pool.clone()));
 
             let shutdown = CancelToken::new();
+            let watchdog_marker = stack.watchdog.marker();
             let dispatcher = Dispatcher::new(
                 queue.clone(),
                 renderer,
@@ -307,19 +312,29 @@ async fn main() -> Result<()> {
                 tracing::error!(%err, "czyszczenie wygasłych sesji zawiodło");
             }
 
-            let app = aars_web::router(aars_web::AppState::new(
-                pool.clone(),
-                queue.clone(),
-                stack.interlocks.clone(),
-                false,
-            )
-            .with_preview(preview));
+            let clear_marker = watchdog_marker.clone();
+            let app = aars_web::router(
+                aars_web::AppState::new(
+                    pool.clone(),
+                    queue.clone(),
+                    stack.interlocks.clone(),
+                    false,
+                )
+                .with_preview(preview)
+                .with_watchdog_clear(Arc::new(move || clear_marker.clear_poison())),
+            );
             let listener = tokio::net::TcpListener::bind(&config.server.bind)
                 .await
                 .with_context(|| format!("nasłuch na {}", config.server.bind))?;
 
             let dispatcher_task = tokio::spawn(dispatcher.run(shutdown.clone()));
             let scheduler_task = tokio::spawn(scheduler.run(shutdown.clone()));
+            let poison_task = tokio::spawn(radio::watch_poison(
+                watchdog_marker,
+                stack.interlocks.clone(),
+                pool.clone(),
+                shutdown.clone(),
+            ));
 
             let server_shutdown = shutdown.clone();
             let server_task = tokio::spawn(async move {
@@ -345,6 +360,7 @@ async fn main() -> Result<()> {
             let _ = dispatcher_task.await;
             let _ = scheduler_task.await;
             let _ = server_task.await;
+            let _ = poison_task.await;
             stack.watchdog.stop();
         }
         cli::Command::Message { action } => {

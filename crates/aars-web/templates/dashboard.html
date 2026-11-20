@@ -9,6 +9,12 @@
     {% else %}<span class="badge off">wyłączone</span>{% endif %}
     {% if poisoned %}<span class="badge off">watchdog — wymaga reset</span>{% endif %}
   </p>
+  {% if poisoned && chrome.is_admin %}
+  <form method="post" action="/watchdog/clear" style="margin-top:0.6rem">
+    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+    <button type="submit" class="danger">Zdejmij blokadę watchdoga</button>
+  </form>
+  {% endif %}
   {% if chrome.can_operate %}
   <form method="post" action="/tx-enabled" style="margin-top:0.6rem">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">

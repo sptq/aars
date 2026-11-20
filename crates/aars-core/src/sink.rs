@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::synth::Pcm;
 
@@ -20,20 +20,41 @@ pub struct PlayReport {
 
 /// Token anulowania sprawdzany co bufor podczas odtwarzania. Przerwanie
 /// nadania musi być natychmiastowe, a nie „po skończeniu pliku".
+///
+/// Opcjonalny termin (`expire_at`) działa jak anulowanie, które samo
+/// zapada o czasie — tak sekwencer ucina nadanie na twardym limicie z tą
+/// samą ziarnistością co przerwanie, bez dotykania wyjść audio.
 #[derive(Debug, Clone, Default)]
-pub struct CancelToken(Arc<AtomicBool>);
+pub struct CancelToken(Arc<TokenState>);
+
+#[derive(Debug, Default)]
+struct TokenState {
+    cancelled: AtomicBool,
+    deadline: OnceLock<Instant>,
+}
 
 impl CancelToken {
     pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self::default()
     }
 
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// Ustala termin, po którym token uznaje się za anulowany. Tylko
+    /// pierwsze wywołanie się liczy — termin nie da się odsunąć.
+    pub fn expire_at(&self, deadline: Instant) {
+        let _ = self.0.deadline.set(deadline);
+    }
+
+    /// Czy minął termin z `expire_at`.
+    pub fn is_expired(&self) -> bool {
+        self.0.deadline.get().is_some_and(|deadline| Instant::now() >= *deadline)
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.cancelled.load(Ordering::SeqCst) || self.is_expired()
     }
 }
 
@@ -122,6 +143,21 @@ mod tests {
         let report = sink.play(&pcm, &cancel).unwrap();
 
         assert!(report.cancelled);
+        assert!(report.played < Duration::from_secs(1), "odtworzono {:?}", report.played);
+    }
+
+    #[test]
+    fn a_token_past_its_deadline_counts_as_cancelled() {
+        let sink = FakeSink::new();
+        let pcm = Pcm::silence(48_000, Duration::from_secs(10));
+        let cancel = CancelToken::new();
+        cancel.expire_at(Instant::now() + Duration::from_millis(200));
+        assert!(!cancel.is_cancelled(), "przed terminem token jest ważny");
+
+        let report = sink.play(&pcm, &cancel).unwrap();
+
+        assert!(report.cancelled);
+        assert!(cancel.is_expired());
         assert!(report.played < Duration::from_secs(1), "odtworzono {:?}", report.played);
     }
 }
