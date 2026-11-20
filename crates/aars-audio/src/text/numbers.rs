@@ -113,7 +113,7 @@ pub fn cardinal_genitive(n: i64) -> Option<String> {
     let rest = n % 100;
     if rest >= 20 {
         parts.push(TENS_GENITIVE[rest / 10]);
-        if rest % 10 > 0 {
+        if !rest.is_multiple_of(10) {
             parts.push(ONES_GENITIVE[rest % 10]);
         }
     } else if rest > 0 {
