@@ -11,7 +11,7 @@ use aars_core::user::{Role, UserRepo};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -77,6 +77,7 @@ async fn request(
     method: &str,
     path: &str,
     cookie: Option<&str>,
+    csrf: &str,
     body: &str,
 ) -> (StatusCode, Option<String>) {
     let mut builder = Request::builder().method(method).uri(path);
@@ -86,7 +87,7 @@ async fn request(
     if method == "POST" {
         builder = builder
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .header("x-csrf-token", "zly");
+            .header("x-csrf-token", csrf);
     }
     let response = app
         .clone()
@@ -101,7 +102,9 @@ async fn request(
     (response.status(), location)
 }
 
-async fn sessions() -> (Router, AppState, Vec<(u8, Option<String>)>, i64) {
+type Session = (u8, Option<(String, String)>);
+
+async fn sessions() -> (Router, AppState, Vec<Session>, i64) {
     let state = state().await;
     let users = UserRepo::new(state.pool.clone());
     for (name, role) in [
@@ -130,7 +133,7 @@ async fn sessions() -> (Router, AppState, Vec<(u8, Option<String>)>, i64) {
     let app = router(state.clone());
     let mut cookies = vec![(ANON, None)];
     for (name, level) in [("v", VIEWER), ("o", OPERATOR), ("a", ADMIN)] {
-        cookies.push((level, Some(login(&app, name, "haslo").await.0)));
+        cookies.push((level, Some(login(&app, name, "haslo").await)));
     }
     (app, state, cookies, message_id)
 }
@@ -168,8 +171,9 @@ async fn every_get_route_enforces_its_minimum_role() {
             let cookie = cookies
                 .iter()
                 .find(|(l, _)| *l == level)
-                .and_then(|(_, c)| c.clone());
-            let (status, location) = request(&app, "GET", route.path, cookie.as_deref(), "").await;
+                .and_then(|(_, c)| c.as_ref().map(|(cookie, _)| cookie.clone()));
+            let (status, location) =
+                request(&app, "GET", route.path, cookie.as_deref(), "", "").await;
             let ok = if level == ANON {
                 status == StatusCode::SEE_OTHER && location.as_deref() == Some("/login")
             } else if level < route.min {
@@ -197,9 +201,9 @@ async fn every_post_route_refuses_a_missing_csrf_token_and_a_too_low_role() {
             let cookie = cookies
                 .iter()
                 .find(|(l, _)| *l == level)
-                .and_then(|(_, c)| c.clone());
+                .and_then(|(_, c)| c.as_ref().map(|(cookie, _)| cookie.clone()));
             let (status, location) =
-                request(&app, "POST", path, cookie.as_deref(), POST_BODY).await;
+                request(&app, "POST", path, cookie.as_deref(), "zly", POST_BODY).await;
             let ok = if level == ANON {
                 status == StatusCode::SEE_OTHER && location.as_deref() == Some("/login")
             } else {
@@ -254,13 +258,100 @@ async fn a_cron_schedule_created_in_the_panel_reaches_the_queue_once_per_minute(
             tick: Duration::from_secs(1),
         },
     );
-    let now = Utc::now();
+    // Początek bieżącej minuty + 10 s, żeby +1 s na pewno został w tej samej minucie.
+    let now = DateTime::from_timestamp(Utc::now().timestamp() / 60 * 60 + 10, 0).unwrap();
     scheduler.tick(now).await.unwrap();
-    scheduler.tick(now).await.unwrap();
+    scheduler
+        .tick(now + chrono::Duration::seconds(1))
+        .await
+        .unwrap();
 
     let pending = queue.pending(10).await.unwrap();
     assert_eq!(pending.len(), 1, "{pending:?}");
     assert_eq!(pending[0].rendered_text, "Test harmonogramu");
     let defined = messages.scheduled().await.unwrap();
     assert_eq!(pending[0].message_id, Some(defined[0].id));
+}
+
+/// Drugi przebieg POST: każda rola z WŁASNYM, poprawnym tokenem CSRF. Dzięki
+/// temu brak `require_role` na trasie nie jest maskowany przez 403 z CSRF.
+/// Id spoza bazy (999) i świeży stan na wiersz — żaden wiersz nie szkodzi
+/// następnym.
+const VALID_BODY: &str = "text=x&priority=normal&title=t&username=nowy&role=viewer\
+&disabled=1&enabled=1&schedule_kind=immediate&current=a&new=b&confirm=b&callsign=SP0XXX\
+&id_mode=off&id_interval_s=600&tx_max_duration_s=60&misfire_grace_s=60&quiet_min_priority=normal";
+
+#[tokio::test]
+async fn every_post_route_enforces_its_role_with_a_valid_csrf_token() {
+    // (ścieżka, minimalna rola, dokładny status dla roli dopuszczonej)
+    let rows: &[(&str, u8, u16)] = &[
+        ("/account/password", VIEWER, 400),
+        ("/compose", OPERATOR, 303),
+        ("/messages", OPERATOR, 303),
+        ("/messages/999", OPERATOR, 404),
+        ("/messages/999/enabled", OPERATOR, 404),
+        ("/messages/999/delete", OPERATOR, 404),
+        ("/messages/999/send", OPERATOR, 404),
+        ("/preview", OPERATOR, 503),
+        ("/tx-enabled", OPERATOR, 303),
+        ("/queue/999/cancel", OPERATOR, 200),
+        ("/queue/group/g/cancel", OPERATOR, 200),
+        ("/watchdog/clear", ADMIN, 303),
+        ("/settings", ADMIN, 400),
+        ("/users", ADMIN, 200),
+        ("/users/999/role", ADMIN, 404),
+        ("/users/999/disabled", ADMIN, 404),
+        ("/users/999/reset", ADMIN, 404),
+        ("/users/999/delete", ADMIN, 404),
+        // Wylogowanie kończy sesję, więc idzie na końcu: 303 na /login.
+        ("/logout", VIEWER, 303),
+    ];
+
+    let mut failures = Vec::new();
+    let (app, _state, sessions, _id) = sessions().await;
+    for (path, min, expected) in rows {
+        for (name, level) in ROLES {
+            let session = sessions
+                .iter()
+                .find(|(l, _)| *l == level)
+                .and_then(|(_, s)| s.as_ref());
+            let (cookie, csrf) = session.map_or((None, String::new()), |(c, t)| {
+                (Some(c.as_str()), t.clone())
+            });
+            let body = format!("csrf={csrf}&{VALID_BODY}");
+            let (status, location) = request(&app, "POST", path, cookie, &csrf, &body).await;
+            let ok = if level == ANON {
+                status == StatusCode::SEE_OTHER && location.as_deref() == Some("/login")
+            } else if level < *min {
+                status == StatusCode::FORBIDDEN
+            } else if *path == "/logout" {
+                status.as_u16() == *expected && location.as_deref() == Some("/login")
+            } else {
+                status.as_u16() == *expected && location.as_deref() != Some("/login")
+            };
+            if !ok {
+                failures.push(format!("POST {path} (min {min}, oczekiwano {expected}) jako {name}: {status} {location:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[tokio::test]
+async fn a_post_without_the_csrf_field_is_refused_and_changes_nothing() {
+    let (app, state, sessions, _id) = sessions().await;
+    let cookie = sessions[2].1.as_ref().map(|(c, _)| c.clone());
+    // Operator bez pola csrf w formularzu i bez nagłówka.
+    let body = "title=t&text=Nowy&priority=normal&schedule_kind=immediate";
+    let (status, _) = request(&app, "POST", "/messages", cookie.as_deref(), "", body).await;
+    assert!(
+        status == StatusCode::FORBIDDEN || status == StatusCode::UNPROCESSABLE_ENTITY,
+        "{status}"
+    );
+    let count = MessageRepo::new(state.pool.clone())
+        .list()
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(count, 1, "brak tokenu nie może utworzyć definicji");
 }
