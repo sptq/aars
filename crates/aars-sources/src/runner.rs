@@ -446,10 +446,12 @@ mod tests {
     use super::*;
     use crate::source::{FetchFuture, SourceError, SourceOutput};
 
+    type SeenCtx = (Option<aars_core::geo::StationPosition>, std::collections::BTreeMap<String, String>);
+
     struct FakeSource {
         script: Mutex<VecDeque<Result<SourceOutput, SourceError>>>,
         calls: AtomicUsize,
-        last_ctx: Mutex<Option<(Option<aars_core::geo::StationPosition>, std::collections::BTreeMap<String, String>)>>,
+        last_ctx: Mutex<Option<SeenCtx>>,
     }
 
     impl FakeSource {
