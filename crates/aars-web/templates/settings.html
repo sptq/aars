@@ -10,7 +10,7 @@
   <form method="post" action="/settings">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     <div style="margin-bottom:0.8rem">
-      <label for="callsign">Znak wywoławczy (3–10 znaków: A–Z, 0–9, / lub -)</label>
+      <label for="callsign">Znak wywoławczy (3–10 znaków: A–Z, 0–9 lub /)</label>
       <input id="callsign" name="callsign" value="{{ callsign }}" maxlength="10">
     </div>
     <div style="margin-bottom:0.8rem">

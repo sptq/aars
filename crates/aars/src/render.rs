@@ -144,11 +144,11 @@ mod tests {
         (PiperPreview::new(cache, synth), dir)
     }
 
-    fn rand_suffix() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+    /// Unikalny w procesie: na macOS dwa testy potrafią dostać te same
+    /// nanosekundy i wspólny katalog (os error 17), stąd licznik.
+    fn rand_suffix() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     #[tokio::test(flavor = "multi_thread")]

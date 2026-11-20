@@ -64,9 +64,9 @@ impl StationSettings {
         let chars_ok = self
             .callsign
             .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '/' || c == '-');
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '/');
         if !self.callsign.is_empty() && (!(3..=10).contains(&len) || !chars_ok) {
-            return Err("znak wywoławczy: 3–10 znaków A–Z, 0–9, / lub -".to_owned());
+            return Err("znak wywoławczy: 3–10 znaków A–Z, 0–9 lub /".to_owned());
         }
         if !(60..=3600).contains(&self.id_interval_s) {
             return Err("odstęp identyfikacji: 60–3600 s".to_owned());
@@ -248,7 +248,8 @@ mod tests {
         s.validate().unwrap();
         assert_eq!(s.callsign, "SP7TQ/P");
 
-        for bad in ["ab", "SP7 TQ", "TOOLONGCALLSIGN", "SP7TQ!"] {
+        // '-' nie ma kodu w identyfikacji CW, więc znak by się w niej zgubił.
+        for bad in ["ab", "SP7 TQ", "TOOLONGCALLSIGN", "SP7TQ!", "SP7TQ-1"] {
             let mut s = sample();
             s.callsign = bad.into();
             assert!(s.validate().is_err(), "{bad}");

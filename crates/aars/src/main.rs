@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
 
             stack.sequencer.shutdown();
             // Jednorazowe nadanie też musi zostawić ślad interwencji w bazie.
-            if stack.watchdog.is_poisoned() && !radio::record_poison(&stack.interlocks, &pool).await
+            if stack.watchdog.is_poisoned() && !radio::record_poison(&stack.watchdog.marker(), &stack.interlocks, &pool).await
             {
                 eprintln!("UWAGA: watchdog interweniował, ale flagi nie udało się zapisać w bazie");
             }
