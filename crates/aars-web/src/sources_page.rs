@@ -16,7 +16,7 @@ use serde::Deserialize;
 
 use crate::audit;
 use crate::auth::{AuthRejection, CurrentUser, require_csrf, require_role};
-use crate::chrome::{Chrome, both_times_now, priority_label, source_label};
+use crate::chrome::{Chrome, both_times_now, plural, priority_label, source_label};
 use crate::render::page;
 use crate::state::AppState;
 
@@ -31,10 +31,8 @@ pub fn health(
     } else if cfg.area.is_empty() {
         ("warn", "brak obszaru".to_owned())
     } else if status.consecutive_failures > 0 {
-        (
-            "off",
-            format!("błąd ({} prób)", status.consecutive_failures),
-        )
+        let n = status.consecutive_failures.unsigned_abs();
+        ("err", format!("błąd ({n} {})", plural(n, "próba", "próby", "prób")))
     } else if status.is_stale(cfg.interval_s, now) {
         ("warn", "przestarzałe".to_owned())
     } else {
@@ -261,7 +259,11 @@ pub async fn save_settings(
         &state,
         current.user.id,
         "source_settings",
-        &format!("{id}: {} wpisów, interwał {interval} s", entries.len()),
+        &format!(
+            "{id}: {} {}, interwał {interval} s",
+            entries.len(),
+            plural(entries.len() as u64, "wpis", "wpisy", "wpisów")
+        ),
     )
     .await;
     Ok(Redirect::to("/sources").into_response())
@@ -619,6 +621,18 @@ mod tests {
         assert!(html.contains("action=\"/tx-enabled\""), "{html}");
     }
 
+    #[tokio::test]
+    async fn a_failing_source_does_not_wear_the_disabled_class() {
+        let (app, cookie, _csrf, state) = app_as(Role::Operator, state().await).await;
+        let repo = SourceStateRepo::new(state.pool.clone());
+        repo.set_enabled("imgw-meteo", true).await.unwrap();
+        repo.save_config("imgw-meteo", "10 łódzkie", 300).await.unwrap();
+        repo.record_failure("imgw-meteo", Utc::now(), "boom").await.unwrap();
+        let (_, html) = get(&app, &cookie, "/sources").await;
+        assert!(html.contains("badge err"), "{html}");
+        assert!(!html.contains("badge off"), "{html}");
+    }
+
     #[test]
     fn health_prefers_stale_over_working_and_reports_failures() {
         use super::health;
@@ -653,7 +667,7 @@ mod tests {
         );
         assert_eq!(
             health(&status(Some(1), 3), &cfg(true, area.clone()), now).1,
-            "błąd (3 prób)"
+            "błąd (3 próby)"
         );
         assert_eq!(
             health(&status(Some(90), 0), &cfg(true, area), now).1,
