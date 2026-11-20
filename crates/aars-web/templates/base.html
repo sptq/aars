@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}AARS{% endblock %}</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/vendor/htmx.min.js" defer></script>
+</head>
+<body>
+<header>
+  <h1>AARS — stacja ostrzegawcza</h1>
+  <nav>
+    <a href="/">Pulpit</a>
+    {% if can_operate %}<a href="/compose">Nadaj</a>{% endif %}
+    <span class="badge warn">{{ username }} · {{ role }}</span>
+    <form method="post" action="/logout" style="margin:0">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="ghost" type="submit">Wyloguj</button>
+    </form>
+  </nav>
+</header>
+<main>{% block content %}{% endblock %}</main>
+</body>
+</html>

@@ -1,0 +1,34 @@
+# Skopiuj do aars.toml i dostosuj. Każde pole można nadpisać zmienną
+# środowiskową, np. AARS_SERVER__BIND=127.0.0.1:8080
+
+[server]
+bind = "0.0.0.0:8080"
+
+[audio]
+device = "default"
+sample_rate = 48000
+gain_db = -3.0
+
+[ptt]
+backend = "vox"         # gpio | serial | vox
+channel_busy = "none"
+tx_tail_ms = 250
+
+[ptt.gpio]
+chip = "/dev/gpiochip0"
+line = 17
+active_low = false
+# inhibit_line = 27
+
+[ptt.serial]
+port = "/dev/ttyUSB0"
+line = "dtr"            # dtr | rts
+
+[tts]
+piper_bin = "piper"
+model = "/var/lib/aars/voices/pl_PL-darkman-medium.onnx"
+
+[storage]
+db_path = "var/aars.db"
+cache_dir = "var/cache"
+cache_max_bytes = 536870912
