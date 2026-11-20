@@ -144,12 +144,15 @@ impl SourceRunner {
             }
         };
 
-        // R9: pozycje śledzone przy innym obszarze znikają po cichu.
+        // R9: pozycje śledzone przy innym obszarze znikają po cichu, a ich
+        // czekające komunikaty z kolejki też (inaczej poprawka literówki w
+        // obszarze nadałaby to samo ostrzeżenie drugi raz).
         let mut kept: Vec<TrackedItem> = Vec::new();
         for item in self.state.active_items(id).await? {
             if item.area == cfg.area_text {
                 kept.push(item);
             } else {
+                self.cancel_waiting(item.queue_item_id).await;
                 self.state.set_state(item.id, TrackedState::Dropped).await?;
             }
         }
@@ -900,5 +903,15 @@ mod tests {
         r.runner.cycle(now()).await;
         assert_eq!(texts(&r.queue).await, vec!["odwołanie a"]);
         assert!(r.state.active_items("imgw-meteo").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fixing_a_typo_in_an_area_label_does_not_air_a_waiting_warning_twice() {
+        let r = rig(vec![ok(vec![warning("a", "f1")]), ok(vec![warning("a", "f1")])]).await;
+        r.state.save_config("imgw-meteo", "1061 Lodz", 300).await.unwrap();
+        r.runner.cycle(now()).await;
+        r.state.save_config("imgw-meteo", "1061 Łódź", 300).await.unwrap();
+        r.runner.cycle(now()).await;
+        assert_eq!(texts(&r.queue).await, vec!["nowe a f1"], "czekające ostrzeżenie nie może pójść dwa razy");
     }
 }
