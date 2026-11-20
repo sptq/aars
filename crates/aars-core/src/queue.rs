@@ -241,8 +241,9 @@ impl QueueRepo {
     async fn finish(&self, id: i64, state: QueueState, error: Option<&str>) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE queue_items
-                SET state = ?, finished_at = ?, error = COALESCE(?, error)
-              WHERE id = ?",
+                SET state = ?1, finished_at = ?2,
+                    error = CASE WHEN ?1 = 'done' THEN NULL ELSE COALESCE(?3, error) END
+              WHERE id = ?4",
         )
         .bind(state.as_str())
         .bind(iso(Utc::now()))
@@ -288,6 +289,21 @@ impl QueueRepo {
     /// z powodem i bez zużytej próby (próby liczą tylko prawdziwe porażki).
     /// Element opuści kolejkę tylko przez nadanie, anulowanie lub `expires_at`.
     pub async fn hold(
+        &self,
+        id: i64,
+        reason: &str,
+        not_before: DateTime<Utc>,
+    ) -> Result<(), DbError> {
+        self.release_claim(id, reason, not_before).await
+    }
+
+    /// Nadanie przerwane pilniejszym komunikatem: wraca od razu, bez zużycia
+    /// próby (spec §5.1), więc wielokrotne przerwania nie kończą się porażką.
+    pub async fn interrupted(&self, id: i64, reason: &str) -> Result<(), DbError> {
+        self.release_claim(id, reason, Utc::now()).await
+    }
+
+    async fn release_claim(
         &self,
         id: i64,
         reason: &str,
@@ -545,6 +561,31 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].attempt, 0);
         assert_eq!(back[0].error.as_deref(), Some("wstrzymane: x"));
+    }
+
+    #[tokio::test]
+    async fn an_item_interrupted_many_times_stays_pending_and_finally_goes_out() {
+        let repo = QueueRepo::new(test_pool().await);
+        let id = repo.enqueue(req("przerywany", Priority::Normal)).await.unwrap()[0];
+
+        for _ in 0..(MAX_ATTEMPTS + 2) {
+            let claimed = repo.claim_next().await.unwrap().expect("wraca do kolejki");
+            repo.interrupted(claimed.id, "przerwane pilniejszym komunikatem").await.unwrap();
+        }
+        let back = repo.pending(10).await.unwrap();
+        assert_eq!(back[0].attempt, 0);
+        assert_eq!(back[0].error.as_deref(), Some("przerwane pilniejszym komunikatem"));
+
+        repo.claim_next().await.unwrap().unwrap();
+        repo.mark_done(id).await.unwrap();
+        let (state, error): (String, Option<String>) =
+            sqlx::query_as("SELECT state, error FROM queue_items WHERE id = ?")
+                .bind(id)
+                .fetch_one(repo.pool())
+                .await
+                .unwrap();
+        assert_eq!(state, "done");
+        assert_eq!(error, None, "nadany element nie niesie starego powodu");
     }
 
     #[tokio::test]

@@ -196,7 +196,7 @@ impl Dispatcher {
             }
             TxOutcome::Aborted => {
                 tracing::warn!(id, "nadanie przerwane, zadanie wraca do kolejki");
-                self.queue.requeue(id, "przerwane pilniejszym komunikatem", Utc::now()).await
+                self.queue.interrupted(id, "przerwane pilniejszym komunikatem").await
             }
             TxOutcome::Failed(err) => {
                 tracing::error!(id, %err, "nadanie nieudane");
@@ -435,6 +435,12 @@ mod tests {
             wait_for_state(h.repo.pool(), id, "done", Duration::from_secs(5)).await,
             "wstrzymany komunikat musi zostać nadany po włączeniu nadawania"
         );
+        let error: Option<String> = sqlx::query_scalar("SELECT error FROM queue_items WHERE id = ?")
+            .bind(id)
+            .fetch_one(h.repo.pool())
+            .await
+            .unwrap();
+        assert_eq!(error, None, "nadany element nie niesie powodu wstrzymania");
 
         h.finish().await;
     }
