@@ -75,6 +75,7 @@ dependencies = [
  "askama",
  "axum",
  "chrono",
+ "croner",
  "mime_guess",
  "rust-embed",
  "serde",

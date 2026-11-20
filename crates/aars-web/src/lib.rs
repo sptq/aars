@@ -2,6 +2,7 @@ pub mod account;
 pub mod assets;
 pub mod auth;
 pub mod chrome;
+pub mod messages;
 pub mod render;
 pub mod state;
 
@@ -315,7 +316,7 @@ async fn queue_fragment(State(state): State<AppState>, current: CurrentUser) -> 
 }
 
 /// Zapis do dziennika audytu: kto kazał i co (spec §5).
-async fn audit(state: &AppState, user_id: i64, action: &str, detail: &str) {
+pub(crate) async fn audit(state: &AppState, user_id: i64, action: &str, detail: &str) {
     if let Err(err) =
         sqlx::query("INSERT INTO audit_log (user_id, action, detail) VALUES (?, ?, ?)")
             .bind(user_id)
@@ -338,6 +339,14 @@ pub fn router(state: AppState) -> Router {
             get(account::password_page).post(account::password_submit),
         )
         .route("/compose", get(compose_page).post(compose_submit))
+        .route("/messages", get(messages::list).post(messages::create))
+        .route("/messages/new", get(messages::new_page))
+        .route("/messages/next", get(messages::next_hint))
+        .route("/messages/{id}/edit", get(messages::edit_page))
+        .route("/messages/{id}", post(messages::update))
+        .route("/messages/{id}/enabled", post(messages::set_enabled))
+        .route("/messages/{id}/delete", post(messages::delete))
+        .route("/messages/{id}/send", post(messages::send))
         .route("/tx-enabled", post(set_tx_enabled))
         .route("/queue/{id}/cancel", post(cancel_item))
         .route("/fragments/queue", get(queue_fragment))
@@ -792,5 +801,214 @@ mod tests {
         assert!(!html.contains("href=\"/settings\""), "{html}");
         assert!(!html.contains("href=\"/users\""), "{html}");
         assert!(html.contains("href=\"/queue\""), "{html}");
+    }
+
+    async fn post_form(
+        app: &Router,
+        cookie: &str,
+        uri: &str,
+        body: String,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn get_html(app: &Router, cookie: &str, uri: &str) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn message_form(csrf: &str, title: &str, text: &str, cron: &str) -> String {
+        format!(
+            "csrf={csrf}&title={title}&text={text}&priority=high&repeat=2&every=60\
+             &schedule_kind=cron&at=&cron={}",
+            cron.replace(' ', "+").replace('*', "%2A")
+        )
+    }
+
+    async fn create_message(app: &Router, cookie: &str, csrf: &str) {
+        let response = post_form(
+            app,
+            cookie,
+            "/messages",
+            message_form(csrf, "biuletyn", "Uwaga+wszystkim", "0 18 * * *"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn an_operator_creates_a_cron_message_and_sees_it_listed() {
+        let (app, cookie, csrf, _state) = logged_in(Role::Operator).await;
+
+        let response = post_form(
+            &app,
+            &cookie,
+            "/messages",
+            message_form(&csrf, "biuletyn", "Uwaga+wszystkim", "0 18 * * *"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/messages");
+
+        let (status, html) = get_html(&app, &cookie, "/messages").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("biuletyn"), "{html}");
+        assert!(html.contains("0 18 * * *"), "{html}");
+        assert!(html.contains("Wysoki"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_cron_is_refused_and_nothing_is_saved() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+
+        let response = post_form(
+            &app,
+            &cookie,
+            "/messages",
+            message_form(&csrf, "zly", "tresc", "0 25 * * *"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let saved = aars_core::message::MessageRepo::new(state.pool.clone()).list().await.unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_message_text_is_refused() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+
+        let response = post_form(
+            &app,
+            &cookie,
+            "/messages",
+            message_form(&csrf, "pusty", "+++", "0 18 * * *"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let saved = aars_core::message::MessageRepo::new(state.pool.clone()).list().await.unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+    }
+
+    #[tokio::test]
+    async fn an_operator_can_edit_a_message() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+        create_message(&app, &cookie, &csrf).await;
+        let repo = aars_core::message::MessageRepo::new(state.pool.clone());
+        let id = repo.list().await.unwrap()[0].id;
+
+        let (status, html) = get_html(&app, &cookie, &format!("/messages/{id}/edit")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("0 18 * * *"), "{html}");
+
+        let response = post_form(
+            &app,
+            &cookie,
+            &format!("/messages/{id}"),
+            message_form(&csrf, "nowy", "Inna+tresc", "30 6 * * *"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let message = repo.get(id).await.unwrap().unwrap();
+        assert_eq!(message.title, "nowy");
+        assert_eq!(
+            message.schedule,
+            aars_core::message::ScheduleKind::Cron("30 6 * * *".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_operator_can_disable_and_delete_a_message() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+        create_message(&app, &cookie, &csrf).await;
+        let repo = aars_core::message::MessageRepo::new(state.pool.clone());
+        let id = repo.list().await.unwrap()[0].id;
+
+        let response = post_form(
+            &app,
+            &cookie,
+            &format!("/messages/{id}/enabled"),
+            format!("csrf={csrf}&enabled=0"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(!repo.get(id).await.unwrap().unwrap().enabled);
+
+        let response =
+            post_form(&app, &cookie, &format!("/messages/{id}/delete"), format!("csrf={csrf}"))
+                .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(repo.get(id).await.unwrap().is_none());
+
+        let audited: Vec<String> = sqlx::query_scalar("SELECT action FROM audit_log ORDER BY id")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(audited, ["message_create", "message_enabled", "message_delete"]);
+    }
+
+    #[tokio::test]
+    async fn send_now_puts_the_definition_on_the_queue() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+        create_message(&app, &cookie, &csrf).await;
+        let id = aars_core::message::MessageRepo::new(state.pool.clone())
+            .list()
+            .await
+            .unwrap()[0]
+            .id;
+
+        let response =
+            post_form(&app, &cookie, &format!("/messages/{id}/send"), format!("csrf={csrf}")).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let pending = state.queue.pending(10).await.unwrap();
+        assert_eq!(pending.len(), 2, "{pending:?}");
+        assert!(pending.iter().all(|item| item.message_id == Some(id)));
+        assert!(pending.iter().all(|item| item.rendered_text == "Uwaga wszystkim"));
+        assert!(pending.iter().all(|item| item.priority == Priority::High));
+    }
+
+    #[tokio::test]
+    async fn a_viewer_cannot_open_messages() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Viewer).await;
+
+        let (status, _) = get_html(&app, &cookie, "/messages").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn the_next_fire_hint_shows_both_times() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Operator).await;
+
+        let (status, text) =
+            get_html(&app, &cookie, "/messages/next?schedule_kind=cron&at=&cron=0+18+%2A+%2A+%2A")
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(text.contains("18:00 UTC"), "{text}");
+        assert!(text.contains("lokalnie"), "{text}");
     }
 }
