@@ -284,6 +284,29 @@ impl QueueRepo {
         Ok(())
     }
 
+    /// Wstrzymuje zadanie odrzucone przez interlock: wraca jako `pending`
+    /// z powodem i bez zużytej próby (próby liczą tylko prawdziwe porażki).
+    /// Element opuści kolejkę tylko przez nadanie, anulowanie lub `expires_at`.
+    pub async fn hold(
+        &self,
+        id: i64,
+        reason: &str,
+        not_before: DateTime<Utc>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE queue_items
+                SET state = 'pending', not_before = ?, started_at = NULL, error = ?,
+                    attempt = MAX(attempt - 1, 0)
+              WHERE id = ? AND state = 'transmitting'",
+        )
+        .bind(iso(not_before))
+        .bind(reason)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn cancel(&self, id: i64) -> Result<u64, DbError> {
         let result = sqlx::query(
             "UPDATE queue_items SET state = 'cancelled', finished_at = ?
@@ -506,6 +529,22 @@ mod tests {
         assert_eq!(back.len(), 1, "odmowa nie może gubić komunikatu");
         assert_eq!(back[0].error.as_deref(), Some("TxDisabled"));
         assert_eq!(back[0].attempt, 1, "liczba prób zostaje");
+    }
+
+    #[tokio::test]
+    async fn a_held_item_keeps_its_attempts_and_never_fails() {
+        let repo = QueueRepo::new(test_pool().await);
+        repo.enqueue(req("wstrzymany", Priority::Normal)).await.unwrap();
+
+        for _ in 0..(MAX_ATTEMPTS + 2) {
+            let claimed = repo.claim_next().await.unwrap().expect("wraca do kolejki");
+            repo.hold(claimed.id, "wstrzymane: x", Utc::now()).await.unwrap();
+        }
+
+        let back = repo.pending(10).await.unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].attempt, 0);
+        assert_eq!(back[0].error.as_deref(), Some("wstrzymane: x"));
     }
 
     #[tokio::test]

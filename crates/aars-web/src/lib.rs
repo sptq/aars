@@ -67,6 +67,8 @@ pub(crate) struct QueueRow {
     not_before: String,
     text: String,
     interrupting: bool,
+    /// Powód wstrzymania po odmowie interlocka; surowe błędy nie trafiają do UI.
+    held: Option<String>,
 }
 
 fn queue_row(item: QueueItem, sizes: &HashMap<String, i64>) -> QueueRow {
@@ -82,6 +84,7 @@ fn queue_row(item: QueueItem, sizes: &HashMap<String, i64>) -> QueueRow {
         not_before: both_times_now(item.not_before),
         text: item.rendered_text,
         interrupting: item.interrupting,
+        held: item.error.filter(|e| e.starts_with(aars_core::dispatcher::HELD_PREFIX)),
     }
 }
 
@@ -948,6 +951,29 @@ mod tests {
             .unwrap();
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         String::from_utf8_lossy(&body).into_owned()
+    }
+
+    #[tokio::test]
+    async fn the_queue_shows_why_an_item_is_held() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Viewer).await;
+        state.queue.enqueue(enqueue(&state, "wstrzymany")).await.unwrap();
+        let claimed = state.queue.claim_next().await.unwrap().unwrap();
+        state
+            .queue
+            .hold(
+                claimed.id,
+                "wstrzymane: nadawanie wyłączone",
+                chrono::Utc::now() + chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        state.queue.enqueue(enqueue(&state, "po błędzie")).await.unwrap();
+        let other = state.queue.claim_next().await.unwrap().unwrap();
+        state.queue.requeue(other.id, "surowy błąd sterownika", chrono::Utc::now()).await.unwrap();
+
+        let html = get_body(app, &cookie, "/fragments/queue").await;
+        assert!(html.contains("wstrzymane: nadawanie wyłączone"), "{html}");
+        assert!(!html.contains("surowy błąd sterownika"), "{html}");
     }
 
     #[tokio::test]
