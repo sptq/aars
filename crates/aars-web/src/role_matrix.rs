@@ -64,6 +64,10 @@ const POSTS: &[(&str, u8)] = &[
     ("/sources/imgw-meteo/settings", ADMIN),
     ("/watchdog/clear", ADMIN),
     ("/settings", ADMIN),
+    ("/settings/hardware", ADMIN),
+    ("/settings/hardware/test-ptt", ADMIN),
+    ("/settings/hardware/test-audio", ADMIN),
+    ("/station/restart", ADMIN),
     ("/users", ADMIN),
     ("/users/1/role", ADMIN),
     ("/users/1/disabled", ADMIN),
@@ -167,6 +171,7 @@ async fn every_get_route_enforces_its_minimum_role() {
         get("/queue", OPERATOR),
         get("/sources", OPERATOR),
         get("/settings", ADMIN),
+        get("/settings/hardware", ADMIN),
         get("/users", ADMIN),
     ];
     let mut failures = Vec::new();
@@ -305,6 +310,11 @@ async fn every_post_route_enforces_its_role_with_a_valid_csrf_token() {
         ("/sources/imgw-meteo/settings", ADMIN, 400),
         ("/watchdog/clear", ADMIN, 303),
         ("/settings", ADMIN, 400),
+        ("/settings/hardware", ADMIN, 400),
+        // Brak potwierdzenia w ciele: 400 przed sprawdzeniem stacji.
+        ("/settings/hardware/test-ptt", ADMIN, 400),
+        ("/settings/hardware/test-audio", ADMIN, 503),
+        ("/station/restart", ADMIN, 503),
         ("/users", ADMIN, 200),
         ("/users/999/role", ADMIN, 404),
         ("/users/999/disabled", ADMIN, 404),

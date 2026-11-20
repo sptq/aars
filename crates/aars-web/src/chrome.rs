@@ -58,6 +58,14 @@ pub fn audit_action_label(action: &str) -> &str {
         "source_enabled" => "źródło wł./wył.",
         "source_refresh" => "odświeżenie źródła",
         "source_settings" => "ustawienia źródła",
+        "hardware" => "zmiana sprzętu",
+        "hardware_apply_failed" => "sprzęt nie wstał",
+        "station_restart" => "restart stacji",
+        "test_ptt" => "test PTT",
+        "test_audio" => "test audio",
+        "position" => "pozycja stacji",
+        "module_enabled" => "moduł wł./wył.",
+        "module_settings" => "ustawienia modułu",
         other => other,
     }
 }
@@ -149,6 +157,18 @@ mod tests {
         assert_eq!(audit_action_label("source_enabled"), "źródło wł./wył.");
         assert_eq!(audit_action_label("source_refresh"), "odświeżenie źródła");
         assert_eq!(audit_action_label("source_settings"), "ustawienia źródła");
+        for (key, label) in [
+            ("hardware", "zmiana sprzętu"),
+            ("hardware_apply_failed", "sprzęt nie wstał"),
+            ("station_restart", "restart stacji"),
+            ("test_ptt", "test PTT"),
+            ("test_audio", "test audio"),
+            ("position", "pozycja stacji"),
+            ("module_enabled", "moduł wł./wył."),
+            ("module_settings", "ustawienia modułu"),
+        ] {
+            assert_eq!(audit_action_label(key), label);
+        }
         assert_eq!(source_label("imgw-meteo"), "Ostrzeżenia meteorologiczne IMGW");
         assert_eq!(source_label("inne"), "inne");
     }

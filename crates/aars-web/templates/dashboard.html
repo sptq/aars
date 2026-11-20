@@ -3,6 +3,12 @@
 {% block content %}
 <div class="card">
   <h2>Stan nadawania</h2>
+  {% if let Some(e) = tx_unavailable %}
+  <p class="error">Nadawanie niedostępne: {{ e }}{% if chrome.is_admin %} <a href="/settings/hardware">Ustawienia sprzętu</a>{% endif %}</p>
+  {% endif %}
+  {% if chrome.is_admin %}{% if let Some(e) = last_good_note %}
+  <p class="error">Działa ostatnia działająca konfiguracja — ustawienia z panelu nie dały się zastosować: {{ e }}</p>
+  {% endif %}{% endif %}
   <p>
     Nadawanie:
     {% if tx_enabled %}<span class="badge on">włączone</span>

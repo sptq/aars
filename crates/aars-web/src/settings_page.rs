@@ -27,7 +27,8 @@ struct SettingsPage {
     quiet_hours: String,
     quiet_min_priority: String,
     quiet_hint: String,
-    hardware: Vec<(String, String)>,
+    pending: Vec<String>,
+    has_station: bool,
     error: Option<String>,
     saved: bool,
     no_callsign: bool,
@@ -68,7 +69,7 @@ fn quiet_hint(window: Option<QuietHours>) -> String {
         .unwrap_or_default()
 }
 
-fn view(
+async fn view(
     state: &AppState,
     current: &CurrentUser,
     s: &StationSettings,
@@ -90,7 +91,8 @@ fn view(
         quiet_hours: s.quiet_hours.map(|q| q.as_text()).unwrap_or_default(),
         quiet_min_priority: priority_value(s.quiet_min_priority).to_owned(),
         quiet_hint: quiet_hint(s.quiet_hours),
-        hardware: state.hardware.clone(),
+        pending: crate::hardware_page::pending_for(state, s).await,
+        has_station: state.station.is_some(),
         error,
         saved,
         no_callsign: s.callsign.is_empty(),
@@ -111,7 +113,7 @@ pub async fn page_view(
 ) -> Result<Response, AuthRejection> {
     require_role(&current.user, aars_core::user::Role::Admin)?;
     match SettingsRepo::new(state.pool.clone()).load().await {
-        Ok(s) => Ok(page(&view(&state, &current, &s, None, false))),
+        Ok(s) => Ok(page(&view(&state, &current, &s, None, false).await)),
         Err(err) => {
             tracing::error!(%err, "odczyt ustawień zawiódł");
             Ok(server_error())
@@ -197,7 +199,7 @@ pub async fn submit(
         Err(message) => {
             return Ok((
                 StatusCode::BAD_REQUEST,
-                page(&view(&state, &current, &stored, Some(message), false)),
+                page(&view(&state, &current, &stored, Some(message), false).await),
             )
                 .into_response());
         }
@@ -214,7 +216,7 @@ pub async fn submit(
         &changed_keys(&stored, &new).join(","),
     )
     .await;
-    Ok(page(&view(&state, &current, &new, None, true)))
+    Ok(page(&view(&state, &current, &new, None, true).await))
 }
 
 #[cfg(test)]
@@ -227,11 +229,8 @@ mod tests {
     use axum::http::{Request, header};
     use tower::ServiceExt;
 
-    async fn logged_in(
-        role: Role,
-        hardware: Vec<(String, String)>,
-    ) -> (Router, String, String, AppState) {
-        let state = AppState::for_tests(aars_core::db::test_pool().await).with_hardware(hardware);
+    async fn logged_in(role: Role) -> (Router, String, String, AppState) {
+        let state = AppState::for_tests(aars_core::db::test_pool().await);
         UserRepo::new(state.pool.clone())
             .create("u", "haslo", role)
             .await
@@ -333,7 +332,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_admin_saves_the_callsign_uppercased() {
-        let (app, cookie, csrf, state) = logged_in(Role::Admin, Vec::new()).await;
+        let (app, cookie, csrf, state) = logged_in(Role::Admin).await;
         let status = post_settings(
             &app,
             &cookie,
@@ -362,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn saving_does_not_touch_tx_enabled_or_poisoned() {
-        let (app, cookie, csrf, state) = logged_in(Role::Admin, Vec::new()).await;
+        let (app, cookie, csrf, state) = logged_in(Role::Admin).await;
         sqlx::query("UPDATE settings SET value = 'false' WHERE key = 'tx_enabled'")
             .execute(&state.pool)
             .await
@@ -378,7 +377,7 @@ mod tests {
 
     #[tokio::test]
     async fn out_of_range_values_are_refused_and_nothing_changes() {
-        let (app, cookie, csrf, state) = logged_in(Role::Admin, Vec::new()).await;
+        let (app, cookie, csrf, state) = logged_in(Role::Admin).await;
         let status = post_settings(
             &app,
             &cookie,
@@ -401,7 +400,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_wrong_csrf_token_is_refused() {
-        let (app, cookie, _, state) = logged_in(Role::Admin, Vec::new()).await;
+        let (app, cookie, _, state) = logged_in(Role::Admin).await;
         assert_eq!(
             post_settings(&app, &cookie, "zly", &[("callsign", "SP7TQ")]).await,
             StatusCode::FORBIDDEN
@@ -411,7 +410,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_operator_cannot_open_settings() {
-        let (app, cookie, csrf, state) = logged_in(Role::Operator, Vec::new()).await;
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
         assert_eq!(
             get(&app, "/settings", &cookie).await.0,
             StatusCode::FORBIDDEN
@@ -424,22 +423,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_page_lists_the_hardware_from_the_config_file() {
-        let hardware = vec![
-            ("Urządzenie audio".to_owned(), "hw:1,0".to_owned()),
-            ("Backend PTT".to_owned(), "GPIO".to_owned()),
-        ];
-        let (app, cookie, _, _) = logged_in(Role::Admin, hardware).await;
-        let (status, html) = get(&app, "/settings", &cookie).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(
-            html.contains("hw:1,0") && html.contains("Backend PTT"),
-            "{html}"
-        );
-        assert!(
-            html.contains("po restarcie"),
-            "strona ma mówić, co wchodzi po restarcie"
-        );
+    async fn the_settings_page_links_to_hardware_and_shows_pending_restart() {
+        let (app, cookie, _, state) = logged_in(Role::Admin).await;
+        let (_, html) = get(&app, "/settings", &cookie).await;
+        assert!(html.contains("href=\"/settings/hardware\""), "{html}");
+        assert!(html.contains("Nic nie czeka na restart"), "{html}");
+        assert!(html.contains("tryb testowy"), "{html}");
+
+        // Stacja działa na VOX, zapisane jest GPIO: różnica czeka na restart.
+        let running = aars_core::hardware::HardwareSettings::from_config(&state.base_config);
+        let mut saved = running.clone();
+        saved.ptt_backend = aars_core::config::PttBackendKind::Gpio;
+        aars_core::hardware::HardwareRepo::new(state.pool.clone())
+            .save(&saved)
+            .await
+            .unwrap();
+        let station = crate::state::testing::FakeStation::new(Some(running));
+        let state = state.with_station(std::sync::Arc::new(station));
+        let app = router(state);
+        let (_, html) = get(&app, "/settings", &cookie).await;
+        assert!(html.contains("ptt.backend: vox → gpio"), "{html}");
+        assert!(html.contains("/station/restart"), "{html}");
     }
 
     #[test]

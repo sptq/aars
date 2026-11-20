@@ -50,14 +50,8 @@
   </form>
 </div>
 <div class="card">
-  <h2>Sprzęt (tylko do odczytu)</h2>
-  <p style="color:var(--muted)">Zmiana sprzętu to edycja pliku aars.toml i restart stacji, nie panel.</p>
-  <table>
-    <tbody>
-      {% for (name, value) in hardware %}
-      <tr><th>{{ name }}</th><td>{{ value }}</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <h2>Sprzęt</h2>
+  <p>Urządzenie audio, PTT, głos i adres panelu ustawia się na stronie <a href="/settings/hardware">Sprzęt</a>. Zmiany wchodzą po restarcie stacji.</p>
 </div>
+{% include "restart_card.html" %}
 {% endblock %}

@@ -4,9 +4,12 @@ use std::sync::Arc;
 
 use crate::preview::PreviewRenderer;
 
+use aars_core::config::Config;
 use aars_core::dispatcher::{StationTest, TestOutcome};
+use aars_core::hardware::probe::HardwareProbe;
 use aars_core::hardware::{ApplyStatus, HardwareSettings};
 use aars_core::interlock::InMemoryInterlocks;
+use aars_core::module::ModuleRegistry;
 use aars_core::queue::QueueRepo;
 use aars_core::settings::StationSettings;
 use sqlx::SqlitePool;
@@ -44,8 +47,14 @@ pub struct AppState {
     /// Zdejmuje flagę z samego watchdoga (jego wątek żyje w binarce);
     /// `None`, gdy panel działa bez stosu nadawczego.
     pub watchdog_clear: Option<WatchdogClear>,
-    /// Sprzęt z `aars.toml` do odczytu na stronie ustawień: (nazwa, wartość).
-    pub hardware: Vec<(String, String)>,
+    /// Działająca stacja (apply status, restart, testy); `None` = panel bez stacji.
+    pub station: Option<Arc<dyn StationControl>>,
+    /// Lista urządzeń hosta do formularza sprzętu; `None` = bez sprawdzania.
+    pub probe: Option<Arc<dyn HardwareProbe>>,
+    /// Rejestr modułów (etap 9).
+    pub modules: Arc<ModuleRegistry>,
+    /// Konfiguracja z pliku i `AARS_*`, bez nadpisań z panelu.
+    pub base_config: Arc<Config>,
     /// Budzi źródło danych o podanym id; `None`, gdy panel działa bez źródeł.
     pub source_refresh: Option<SourceRefresh>,
 }
@@ -71,7 +80,10 @@ impl AppState {
             secure_cookies,
             preview: None,
             watchdog_clear: None,
-            hardware: Vec::new(),
+            station: None,
+            probe: None,
+            modules: Arc::new(ModuleRegistry::new(aars_core::module::builtin())),
+            base_config: Arc::new(Config::default()),
             source_refresh: None,
         }
     }
@@ -86,8 +98,23 @@ impl AppState {
         self
     }
 
-    pub fn with_hardware(mut self, hardware: Vec<(String, String)>) -> Self {
-        self.hardware = hardware;
+    pub fn with_station(mut self, station: Arc<dyn StationControl>) -> Self {
+        self.station = Some(station);
+        self
+    }
+
+    pub fn with_probe(mut self, probe: Arc<dyn HardwareProbe>) -> Self {
+        self.probe = Some(probe);
+        self
+    }
+
+    pub fn with_modules(mut self, modules: Arc<ModuleRegistry>) -> Self {
+        self.modules = modules;
+        self
+    }
+
+    pub fn with_base_config(mut self, config: Arc<Config>) -> Self {
+        self.base_config = config;
         self
     }
 
@@ -106,8 +133,84 @@ impl AppState {
             secure_cookies: false,
             preview: None,
             watchdog_clear: None,
-            hardware: Vec::new(),
+            station: None,
+            probe: None,
+            modules: Arc::new(ModuleRegistry::new({
+                let mut all = aars_core::module::builtin();
+                all.push(aars_core::module::sample_source("imgw-meteo"));
+                all
+            })),
+            base_config: Arc::new(Config::default()),
             source_refresh: None,
+        }
+    }
+}
+
+/// Stacja do testów panelu: stały stan, zliczone restarty, zapisane testy.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub struct FakeStation {
+        pub status: ApplyStatus,
+        pub hardware: Option<HardwareSettings>,
+        pub station: StationSettings,
+        pub restarts: AtomicUsize,
+        pub outcome: Mutex<TestOutcome>,
+        pub tests: Mutex<Vec<StationTest>>,
+    }
+
+    impl FakeStation {
+        pub fn new(hardware: Option<HardwareSettings>) -> Self {
+            Self {
+                status: ApplyStatus {
+                    origin: aars_core::hardware::ConfigOrigin::File,
+                    error: None,
+                },
+                hardware,
+                station: StationSettings {
+                    callsign: String::new(),
+                    id_mode: aars_core::ident::IdMode::Voice,
+                    id_interval_s: 600,
+                    tx_max_duration_s: 180,
+                    misfire_grace_s: 600,
+                    quiet_hours: None,
+                    quiet_min_priority: aars_core::priority::Priority::Emergency,
+                },
+                restarts: AtomicUsize::new(0),
+                outcome: Mutex::new(TestOutcome::Done {
+                    played: std::time::Duration::from_secs(2),
+                    note: None,
+                }),
+                tests: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn restarts(&self) -> usize {
+            self.restarts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl StationControl for FakeStation {
+        fn apply_status(&self) -> ApplyStatus {
+            self.status.clone()
+        }
+        fn running_hardware(&self) -> Option<HardwareSettings> {
+            self.hardware.clone()
+        }
+        fn running_station(&self) -> StationSettings {
+            self.station.clone()
+        }
+        fn request_restart(&self) {
+            self.restarts.fetch_add(1, Ordering::SeqCst);
+        }
+        fn run_test(&self, test: StationTest) -> TestFuture<'_> {
+            Box::pin(async move {
+                self.tests.lock().unwrap().push(test);
+                self.outcome.lock().unwrap().clone()
+            })
         }
     }
 }

@@ -251,6 +251,9 @@ pub struct StationHandle {
     tx_tail: Duration,
 }
 
+/// Najkrótsze oczekiwanie panelu na test PTT: przy krótszym radio mogłoby
+/// zostać włączone już po tym, jak panel powiedział „brak odpowiedzi”.
+const TEST_PTT_MIN_WAIT: Duration = Duration::from_secs(15);
 /// Zapas ponad czas testu PTT na kolejkę dyspozytora, ogony i zapis wyniku.
 const TEST_PTT_MARGIN: Duration = Duration::from_secs(10);
 /// Test audio: synteza plus odtwarzanie ucięte po 15 s (R11).
@@ -281,7 +284,8 @@ impl StationControl for StationHandle {
             };
             let timeout = match &test {
                 StationTest::Ptt { seconds, .. } => {
-                    Duration::from_secs(*seconds) + self.tx_tail * 2 + TEST_PTT_MARGIN
+                    (Duration::from_secs(*seconds) + self.tx_tail * 2 + TEST_PTT_MARGIN)
+                        .max(TEST_PTT_MIN_WAIT)
                 }
                 StationTest::Audio { .. } => TEST_AUDIO_TIMEOUT,
             };
@@ -318,15 +322,14 @@ async fn run_station(
     base: &Config,
     pool: &SqlitePool,
     factory: Arc<dyn HardwareFactory>,
-    // Panel sprzętu dostaje go w Task 8 (`AppState::with_probe`).
-    _probe: Arc<dyn HardwareProbe>,
+    probe: Arc<dyn HardwareProbe>,
     stop: CancelToken,
     ready: Option<oneshot::Sender<Arc<StationHandle>>>,
 ) -> Result<Exit> {
     let sources = aars_sources::modules();
     let mut descriptors = aars_core::module::builtin();
     descriptors.extend(sources.iter().map(|m| m.descriptor));
-    let registry = ModuleRegistry::new(descriptors);
+    let registry = Arc::new(ModuleRegistry::new(descriptors));
     ModuleRepo::new(pool.clone())
         .register(&registry)
         .await
@@ -530,22 +533,10 @@ async fn run_station(
 
     let mut state = aars_web::AppState::new(pool.clone(), queue.clone(), interlocks.clone(), false)
         .with_preview(preview)
-        .with_hardware(vec![
-            (
-                "Pochodzenie konfiguracji".to_owned(),
-                status.origin.label().to_owned(),
-            ),
-            ("Urządzenie audio".to_owned(), config.audio.device.clone()),
-            (
-                "Częstotliwość próbkowania".to_owned(),
-                format!("{} Hz", config.audio.sample_rate),
-            ),
-            (
-                "Backend PTT".to_owned(),
-                config.ptt.backend.label().to_owned(),
-            ),
-            ("Model głosu".to_owned(), config.tts.model.clone()),
-        ]);
+        .with_station(handle.clone())
+        .with_probe(probe)
+        .with_modules(registry.clone())
+        .with_base_config(Arc::new(base.clone()));
     if let Some(marker) = watchdog_marker {
         state = state.with_watchdog_clear(Arc::new(move || marker.clear_poison()));
     }

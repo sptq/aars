@@ -2,6 +2,7 @@ pub mod account;
 pub mod assets;
 pub mod auth;
 pub mod chrome;
+pub mod hardware_page;
 pub mod logs;
 pub mod messages;
 pub mod preview;
@@ -51,6 +52,10 @@ struct DashboardPage {
     sources: Vec<sources_page::SourceView>,
     /// Notka zamiast karty źródeł, gdy odczyt ich stanu zawiódł.
     sources_error: Option<String>,
+    /// Brak stosu nadawczego (R6): powód do bannera dla każdej roli.
+    tx_unavailable: Option<String>,
+    /// Stacja działa na ostatniej działającej konfiguracji (tylko admin).
+    last_good_note: Option<String>,
 }
 
 #[derive(Template)]
@@ -228,8 +233,23 @@ async fn dashboard(State(state): State<AppState>, current: CurrentUser) -> Respo
         }
     };
 
+    let (mut tx_unavailable, mut last_good_note) = (None, None);
+    if let Some(station) = &state.station {
+        let status = station.apply_status();
+        let error = status
+            .error
+            .unwrap_or_else(|| "brak działającej konfiguracji sprzętu".to_owned());
+        match status.origin {
+            aars_core::hardware::ConfigOrigin::None => tx_unavailable = Some(error),
+            aars_core::hardware::ConfigOrigin::LastGood => last_good_note = Some(error),
+            _ => {}
+        }
+    }
+
     page(&DashboardPage {
         chrome: Chrome::from(&current),
+        tx_unavailable,
+        last_good_note,
         tx_enabled: interlocks.tx_enabled,
         poisoned: interlocks.poisoned,
         pending,
@@ -464,6 +484,13 @@ pub fn router(state: AppState) -> Router {
         .route("/queue", get(queue_page::page_view))
         .route("/logs", get(logs::page_view))
         .route("/settings", get(settings_page::page_view).post(settings_page::submit))
+        .route(
+            "/settings/hardware",
+            get(hardware_page::page_view).post(hardware_page::save),
+        )
+        .route("/settings/hardware/test-ptt", post(hardware_page::test_ptt))
+        .route("/settings/hardware/test-audio", post(hardware_page::test_audio))
+        .route("/station/restart", post(hardware_page::restart))
         .route("/users", get(users::page_view).post(users::create))
         .route("/users/{id}/role", post(users::set_role))
         .route("/users/{id}/disabled", post(users::set_disabled))
