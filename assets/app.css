@@ -69,6 +69,7 @@ tr:last-child td { border-bottom: none; }
 }
 .badge.on { background: rgba(63, 207, 142, 0.15); color: var(--good); }
 .badge.off { background: rgba(255, 92, 92, 0.15); color: var(--bad); }
+.badge.err { background: var(--bad); color: #0b0f14; }
 .badge.warn { background: rgba(255, 178, 36, 0.15); color: var(--warn); }
 
 label { display: block; margin-bottom: 0.3rem; color: var(--muted); font-size: 0.85rem; }

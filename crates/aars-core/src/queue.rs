@@ -81,6 +81,12 @@ pub struct EnqueueRequest {
     pub created_by: Option<i64>,
 }
 
+#[derive(Clone, Copy)]
+enum CancelTarget<'a> {
+    Id(i64),
+    Group(&'a str),
+}
+
 /// Jedyne miejsce, które zna tabelę `queue_items`.
 pub struct QueueRepo {
     pool: SqlitePool,
@@ -205,6 +211,7 @@ impl QueueRepo {
               WHERE id = (
                     SELECT id FROM queue_items
                      WHERE state = 'pending'
+                       AND cancel_requested = 0
                        AND not_before <= ?1
                        AND (expires_at IS NULL OR expires_at > ?1)
                        AND attempt < {MAX_ATTEMPTS}
@@ -226,6 +233,7 @@ impl QueueRepo {
         let row = sqlx::query(&format!(
             "SELECT {COLUMNS} FROM queue_items
               WHERE state = 'pending'
+                AND cancel_requested = 0
                 AND interrupting = 1
                 AND priority < ?1
                 AND not_before <= ?2
@@ -286,9 +294,12 @@ impl QueueRepo {
 
         sqlx::query(
             "UPDATE queue_items
-                SET state = 'pending', not_before = ?, started_at = NULL, error = ?
-              WHERE id = ?",
+                SET state = CASE WHEN cancel_requested = 1 THEN 'cancelled' ELSE 'pending' END,
+                    finished_at = CASE WHEN cancel_requested = 1 THEN ?1 ELSE finished_at END,
+                    not_before = ?2, started_at = NULL, error = ?3
+              WHERE id = ?4",
         )
+        .bind(iso(Utc::now()))
         .bind(iso(not_before))
         .bind(reason)
         .bind(id)
@@ -315,6 +326,8 @@ impl QueueRepo {
         self.release_claim(id, reason, Utc::now()).await
     }
 
+    /// Element z prośbą o anulowanie (`cancel` w trakcie claimu) nie wraca
+    /// do kolejki, tylko kończy jako `cancelled`.
     async fn release_claim(
         &self,
         id: i64,
@@ -323,10 +336,13 @@ impl QueueRepo {
     ) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE queue_items
-                SET state = 'pending', not_before = ?, started_at = NULL, error = ?,
+                SET state = CASE WHEN cancel_requested = 1 THEN 'cancelled' ELSE 'pending' END,
+                    finished_at = CASE WHEN cancel_requested = 1 THEN ?1 ELSE finished_at END,
+                    not_before = ?2, started_at = NULL, error = ?3,
                     attempt = MAX(attempt - 1, 0)
-              WHERE id = ? AND state = 'transmitting'",
+              WHERE id = ?4 AND state = 'transmitting'",
         )
+        .bind(iso(Utc::now()))
         .bind(iso(not_before))
         .bind(reason)
         .bind(id)
@@ -335,29 +351,53 @@ impl QueueRepo {
         Ok(())
     }
 
-    pub async fn cancel(&self, id: i64) -> Result<u64, DbError> {
-        let result = sqlx::query(
-            "UPDATE queue_items SET state = 'cancelled', finished_at = ?
-              WHERE id = ? AND state = 'pending'",
-        )
-        .bind(iso(Utc::now()))
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
+    /// Stan jednego elementu kolejki; `None`, gdy go nie ma.
+    pub async fn state_of(&self, id: i64) -> Result<Option<QueueState>, DbError> {
+        let state: Option<String> = sqlx::query_scalar("SELECT state FROM queue_items WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(state.as_deref().and_then(QueueState::parse))
     }
 
-    /// Anuluje pozostałe wystąpienia powtórzenia.
+    /// Anuluje element. Czekający kończy od razu jako `cancelled`. Wzięty
+    /// (`transmitting`) dostaje prośbę o anulowanie: nadanie, które już
+    /// trwa, kończy się normalnie, ale element odrzucony przez interlock
+    /// albo przerwany nie wraca do kolejki (`release_claim`). Zwraca liczbę
+    /// elementów anulowanych albo oznaczonych.
+    pub async fn cancel(&self, id: i64) -> Result<u64, DbError> {
+        self.cancel_where(CancelTarget::Id(id)).await
+    }
+
+    /// Anuluje pozostałe wystąpienia powtórzenia (także wzięte, jak `cancel`).
     pub async fn cancel_group(&self, group: &str) -> Result<u64, DbError> {
-        let result = sqlx::query(
-            "UPDATE queue_items SET state = 'cancelled', finished_at = ?
-              WHERE repeat_group = ? AND state = 'pending'",
-        )
-        .bind(iso(Utc::now()))
-        .bind(group)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
+        self.cancel_where(CancelTarget::Group(group)).await
+    }
+
+    async fn cancel_where(&self, target: CancelTarget<'_>) -> Result<u64, DbError> {
+        let filter = match target {
+            CancelTarget::Id(_) => "id = ?",
+            CancelTarget::Group(_) => "repeat_group = ?",
+        };
+        let cancel = format!(
+            "UPDATE queue_items SET state = 'cancelled', finished_at = ? WHERE {filter} AND state = 'pending'"
+        );
+        let request = format!(
+            "UPDATE queue_items SET cancel_requested = 1
+              WHERE {filter} AND state = 'transmitting' AND cancel_requested = 0"
+        );
+        let cancel = sqlx::query(&cancel).bind(iso(Utc::now()));
+        let request = sqlx::query(&request);
+        let (cancel, request) = match target {
+            CancelTarget::Id(id) => (cancel.bind(id), request.bind(id)),
+            CancelTarget::Group(group) => (cancel.bind(group), request.bind(group)),
+        };
+
+        let mut tx = self.pool.begin().await?;
+        let cancelled = cancel.execute(&mut *tx).await?.rows_affected();
+        let requested = request.execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
+        Ok(cancelled + requested)
     }
 
     /// Oznacza zadania, których termin ważności minął. Nieaktualne
@@ -380,10 +420,13 @@ impl QueueRepo {
     pub async fn recover_after_restart(&self) -> Result<u64, DbError> {
         let result = sqlx::query(
             "UPDATE queue_items
-                SET state = 'pending', started_at = NULL,
+                SET state = CASE WHEN cancel_requested = 1 THEN 'cancelled' ELSE 'pending' END,
+                    finished_at = CASE WHEN cancel_requested = 1 THEN ?1 ELSE finished_at END,
+                    started_at = NULL,
                     error = 'przerwane restartem procesu'
               WHERE state = 'transmitting'",
         )
+        .bind(iso(Utc::now()))
         .execute(&self.pool)
         .await?;
 
@@ -655,6 +698,94 @@ mod tests {
         let expired = repo.expire_stale().await.unwrap();
         assert_eq!(expired, 1);
         assert!(repo.claim_next().await.unwrap().is_none());
+    }
+
+    async fn state(repo: &QueueRepo, id: i64) -> QueueState {
+        repo.state_of(id).await.unwrap().expect("element istnieje")
+    }
+
+    #[tokio::test]
+    async fn a_claimed_item_cancelled_and_then_held_ends_cancelled_and_never_airs() {
+        let repo = QueueRepo::new(test_pool().await);
+        let id = repo.enqueue(req("wycofany", Priority::Normal)).await.unwrap()[0];
+        repo.claim_next().await.unwrap().unwrap();
+
+        assert_eq!(repo.cancel(id).await.unwrap(), 1, "prośba o anulowanie zapisana");
+        assert_eq!(state(&repo, id).await, QueueState::Transmitting, "trwające nadanie nie jest cięte");
+
+        repo.hold(id, "wstrzymane: wyłącznik", Utc::now()).await.unwrap();
+        assert_eq!(state(&repo, id).await, QueueState::Cancelled);
+        assert!(repo.claim_next().await.unwrap().is_none(), "wycofany element nie wraca na antenę");
+        assert!(repo.pending(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_claimed_item_cancelled_and_then_interrupted_or_restarted_ends_cancelled() {
+        let pool = test_pool().await;
+        let repo = QueueRepo::new(pool.clone());
+        let a = repo.enqueue(req("przerwany", Priority::Normal)).await.unwrap()[0];
+        repo.claim_next().await.unwrap().unwrap();
+        repo.cancel(a).await.unwrap();
+        repo.interrupted(a, "przerwane pilniejszym komunikatem").await.unwrap();
+        assert_eq!(state(&repo, a).await, QueueState::Cancelled);
+
+        let b = repo.enqueue(req("restart", Priority::Normal)).await.unwrap()[0];
+        repo.claim_next().await.unwrap().unwrap();
+        repo.cancel(b).await.unwrap();
+        QueueRepo::new(pool).recover_after_restart().await.unwrap();
+        assert_eq!(state(&repo, b).await, QueueState::Cancelled);
+        assert!(repo.claim_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_claimed_item_cancelled_while_really_on_air_finishes_as_done() {
+        let repo = QueueRepo::new(test_pool().await);
+        let id = repo.enqueue(req("na antenie", Priority::Normal)).await.unwrap()[0];
+        repo.claim_next().await.unwrap().unwrap();
+        repo.cancel(id).await.unwrap();
+        repo.mark_done(id).await.unwrap();
+        assert_eq!(state(&repo, id).await, QueueState::Done, "nadany do końca zostaje nadanym");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_finished_item_changes_nothing() {
+        let repo = QueueRepo::new(test_pool().await);
+        let id = repo.enqueue(req("nadany", Priority::Normal)).await.unwrap()[0];
+        repo.claim_next().await.unwrap().unwrap();
+        repo.mark_done(id).await.unwrap();
+        assert_eq!(repo.cancel(id).await.unwrap(), 0);
+        assert_eq!(state(&repo, id).await, QueueState::Done);
+    }
+
+    #[tokio::test]
+    async fn a_pending_item_with_a_cancel_request_is_never_claimed() {
+        let repo = QueueRepo::new(test_pool().await);
+        let mut urgent = req("oznaczony", Priority::Emergency);
+        urgent.interrupting = true;
+        let id = repo.enqueue(urgent).await.unwrap()[0];
+        sqlx::query("UPDATE queue_items SET cancel_requested = 1 WHERE id = ?")
+            .bind(id)
+            .execute(repo.pool())
+            .await
+            .unwrap();
+        assert!(repo.peek_interrupting(Priority::Normal).await.unwrap().is_none());
+        assert!(repo.claim_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_group_also_withdraws_its_claimed_occurrence() {
+        let repo = QueueRepo::new(test_pool().await);
+        let mut repeated = req("seria", Priority::High);
+        repeated.repeat_count = 2;
+        repeated.repeat_interval = Duration::from_secs(60);
+        let ids = repo.enqueue(repeated).await.unwrap();
+        repo.claim_next().await.unwrap().unwrap();
+        let group = repo.pending(10).await.unwrap()[0].repeat_group.clone().unwrap();
+
+        assert_eq!(repo.cancel_group(&group).await.unwrap(), 2);
+        repo.hold(ids[0], "wstrzymane: x", Utc::now()).await.unwrap();
+        assert_eq!(state(&repo, ids[0]).await, QueueState::Cancelled);
+        assert_eq!(state(&repo, ids[1]).await, QueueState::Cancelled);
     }
 
     #[tokio::test]

@@ -27,9 +27,32 @@
 </div>
 
 <div class="card">
+  <h2>Źródła danych</h2>
+  {% if let Some(note) = sources_error %}
+  <p class="error">{{ note }}</p>
+  {% else %}
+  <table>
+    <tbody>
+      {% for s in sources %}
+      <tr>
+        <td>{% if chrome.can_operate %}<a href="/sources">{{ s.name }}</a>{% else %}{{ s.name }}{% endif %}</td>
+        <td><span class="badge {{ s.css }}">{{ s.health }}</span></td>
+        <td>aktywne ostrzeżenia: {{ s.warnings.len() }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+
+<div class="card">
   <h2>Kolejka</h2>
+  {% if let Some(note) = queue_error %}
+  <p class="error">{{ note }}</p>
+  {% else %}
   <div id="queue" hx-get="/fragments/queue" hx-trigger="every 3s" hx-swap="innerHTML">
     {% include "queue_fragment.html" %}
   </div>
+  {% endif %}
 </div>
 {% endblock %}

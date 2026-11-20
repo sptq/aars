@@ -51,7 +51,7 @@ fn say_dry_run_prints_the_normalized_text_without_synthesizing() {
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("wiatr dwanaście metrów na sekundę o godzina osiemnasta"),
+        stdout.contains("wiatr dwanaście metrów na sekundę o godzinie osiemnastej"),
         "stdout: {stdout}"
     );
 }
@@ -225,6 +225,62 @@ fn message_add_rejects_a_broken_cron_expression_up_front() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn source_preview_without_an_area_says_so() {
+    let dir = std::env::temp_dir().join(format!("aars-src-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("src.db");
+    let _ = std::fs::remove_file(&db);
+
+    // Adres wskazuje port, na którym nic nie słucha: test nie dotyka sieci.
+    let out = aars()
+        .env("AARS_STORAGE__DB_PATH", &db)
+        .env("AARS_SOURCES__IMGW_METEO_URL", "http://127.0.0.1:9/")
+        .args(["source", "preview"])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("brak obszaru"), "stdout: {stdout}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn source_preview_reports_a_malformed_area_as_invalid() {
+    let dir = std::env::temp_dir().join(format!("aars-src-bad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("src.db");
+    let _ = std::fs::remove_file(&db);
+
+    let migrate = aars().env("AARS_STORAGE__DB_PATH", &db).arg("migrate").output().unwrap();
+    assert!(migrate.status.success());
+    let set = std::process::Command::new("sqlite3")
+        .arg(&db)
+        .arg("UPDATE settings SET value = 'xx' WHERE key = 'source:imgw-meteo:area';")
+        .status()
+        .unwrap();
+    assert!(set.success());
+
+    let out = aars()
+        .env("AARS_STORAGE__DB_PATH", &db)
+        .env("AARS_SOURCES__IMGW_METEO_URL", "http://127.0.0.1:9/")
+        .args(["source", "preview"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("nieprawidłowy obszar"), "stdout: {stdout}");
+    assert!(!stdout.contains("brak obszaru"), "stdout: {stdout}");
 
     std::fs::remove_dir_all(&dir).ok();
 }

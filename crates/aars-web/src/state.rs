@@ -22,7 +22,13 @@ pub struct AppState {
     pub watchdog_clear: Option<WatchdogClear>,
     /// Sprzęt z `aars.toml` do odczytu na stronie ustawień: (nazwa, wartość).
     pub hardware: Vec<(String, String)>,
+    /// Budzi źródło danych o podanym id; `None`, gdy panel działa bez źródeł.
+    pub source_refresh: Option<SourceRefresh>,
 }
+
+/// „Odśwież teraz” dla źródła: `true`, gdy źródło o tym id istnieje i zostało
+/// obudzone, `false` dla nieznanego id. Panel nie zna crate'a źródeł (spec §3).
+pub type SourceRefresh = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Wywołanie zdejmujące lepką flagę strażnika (`WatchdogMarker::clear_poison`).
 pub type WatchdogClear = Arc<dyn Fn() + Send + Sync>;
@@ -34,11 +40,25 @@ impl AppState {
         interlocks: Arc<InMemoryInterlocks>,
         secure_cookies: bool,
     ) -> Self {
-        Self { pool, queue, interlocks, secure_cookies, preview: None, watchdog_clear: None, hardware: Vec::new() }
+        Self {
+            pool,
+            queue,
+            interlocks,
+            secure_cookies,
+            preview: None,
+            watchdog_clear: None,
+            hardware: Vec::new(),
+            source_refresh: None,
+        }
     }
 
     pub fn with_watchdog_clear(mut self, clear: WatchdogClear) -> Self {
         self.watchdog_clear = Some(clear);
+        self
+    }
+
+    pub fn with_source_refresh(mut self, refresh: SourceRefresh) -> Self {
+        self.source_refresh = Some(refresh);
         self
     }
 
@@ -63,6 +83,23 @@ impl AppState {
             preview: None,
             watchdog_clear: None,
             hardware: Vec::new(),
+            source_refresh: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn source_refresh_is_absent_until_wired() {
+        let state = AppState::for_tests(aars_core::db::test_pool().await);
+        assert!(state.source_refresh.is_none());
+
+        let state = state.with_source_refresh(Arc::new(|id| id == "imgw-meteo"));
+        let refresh = state.source_refresh.as_ref().unwrap();
+        assert!(refresh("imgw-meteo"));
+        assert!(!refresh("nieznane"));
     }
 }

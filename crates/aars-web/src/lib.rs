@@ -8,9 +8,11 @@ pub mod preview;
 pub mod queue_page;
 pub mod render;
 pub mod settings_page;
+pub mod sources_page;
 pub mod state;
 pub mod users;
 
+use aars_core::error::DbError;
 use aars_core::interlock::Interlocks;
 use std::collections::HashMap;
 
@@ -44,6 +46,11 @@ struct DashboardPage {
     poisoned: bool,
     pending: Vec<QueueRow>,
     full: bool,
+    /// Notka zamiast tabeli, gdy odczyt kolejki zawiódł.
+    queue_error: Option<String>,
+    sources: Vec<sources_page::SourceView>,
+    /// Notka zamiast karty źródeł, gdy odczyt ich stanu zawiódł.
+    sources_error: Option<String>,
 }
 
 #[derive(Template)]
@@ -90,18 +97,14 @@ fn queue_row(item: QueueItem, sizes: &HashMap<String, i64>) -> QueueRow {
     }
 }
 
-/// Wiersze kolejki; `Err` to gotowa odpowiedź 500 (błąd już w logu).
-async fn queue_rows(state: &AppState, limit: i64) -> Result<Vec<QueueRow>, Response> {
-    let sizes = state
-        .queue
-        .group_sizes()
-        .await
-        .map_err(|err| db_error("odczyt rozmiarów serii zawiódł", &err))?;
-    let items = state
-        .queue
-        .pending(limit)
-        .await
-        .map_err(|err| db_error("odczyt kolejki zawiódł", &err))?;
+/// Wiersze kolejki; błąd jest już w logu (`tracing::error!`).
+async fn queue_rows(state: &AppState, limit: i64) -> Result<Vec<QueueRow>, DbError> {
+    let sizes = state.queue.group_sizes().await.inspect_err(|err| {
+        tracing::error!(%err, "odczyt rozmiarów serii zawiódł");
+    })?;
+    let items = state.queue.pending(limit).await.inspect_err(|err| {
+        tracing::error!(%err, "odczyt kolejki zawiódł");
+    })?;
     Ok(items.into_iter().map(|item| queue_row(item, &sizes)).collect())
 }
 
@@ -204,9 +207,25 @@ async fn logout(
 
 async fn dashboard(State(state): State<AppState>, current: CurrentUser) -> Response {
     let interlocks = state.interlocks.snapshot();
-    let pending = match queue_rows(&state, 50).await {
-        Ok(rows) => rows,
-        Err(response) => return response,
+    // Błąd kolejki nie może zabrać wyłącznika nadawania: notka zamiast tabeli.
+    let (pending, queue_error) = match queue_rows(&state, 50).await {
+        Ok(rows) => (rows, None),
+        Err(_) => (
+            Vec::new(),
+            Some(
+                "Nie udało się odczytać kolejki — szczegóły w dzienniku stacji. \
+                 Wyłącznik nadawania działa."
+                    .to_owned(),
+            ),
+        ),
+    };
+
+    let (sources, sources_error) = match sources_page::load_views(&state).await {
+        Ok(views) => (views, None),
+        Err(err) => {
+            tracing::error!(%err, "odczyt stanu źródeł zawiódł");
+            (Vec::new(), Some("Nie udało się odczytać stanu źródeł.".to_owned()))
+        }
     };
 
     page(&DashboardPage {
@@ -215,6 +234,9 @@ async fn dashboard(State(state): State<AppState>, current: CurrentUser) -> Respo
         poisoned: interlocks.poisoned,
         pending,
         full: false,
+        queue_error,
+        sources,
+        sources_error,
     })
 }
 
@@ -387,7 +409,7 @@ pub(crate) async fn queue_fragment_response(
 ) -> Response {
     let pending = match queue_rows(state, if full { 200 } else { 50 }).await {
         Ok(rows) => rows,
-        Err(response) => return response,
+        Err(err) => return db_error("odczyt kolejki zawiódł", &err),
     };
     page(&QueueFragment {
         pending,
@@ -448,6 +470,10 @@ pub fn router(state: AppState) -> Router {
         .route("/users/{id}/reset", post(users::reset))
         .route("/users/{id}/delete", post(users::delete))
         .route("/queue/group/{group}/cancel", post(queue_page::cancel_group))
+        .route("/sources", get(sources_page::page_view))
+        .route("/sources/{id}/enabled", post(sources_page::set_enabled))
+        .route("/sources/{id}/refresh", post(sources_page::refresh))
+        .route("/sources/{id}/settings", post(sources_page::save_settings))
         .route("/healthz", get(|| async { "ok" }))
         .route("/assets/{*path}", get(assets::serve))
         .with_state(state)
@@ -1165,7 +1191,7 @@ pub(crate) mod tests {
             .execute(&state.pool)
             .await
             .unwrap();
-        for uri in ["/", "/fragments/queue", "/fragments/queue?full=1", "/queue"] {
+        for uri in ["/fragments/queue", "/fragments/queue?full=1", "/queue"] {
             let (status, html) = get_html(&app, &cookie, uri).await;
             assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}");
             assert!(!html.contains("Kolejka pusta"), "{uri}: {html}");
@@ -1536,5 +1562,27 @@ pub(crate) mod tests {
         let html = dashboard_html(app, &cookie).await;
         assert!(html.contains("watchdog — wymaga resetu"), "operator widzi blokadę");
         assert!(!html.contains("/watchdog/clear"), "operator nie dostaje przycisku");
+    }
+
+    #[tokio::test]
+    async fn the_kill_switch_is_shown_even_when_the_queue_cannot_be_read() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+        sqlx::query("DROP TABLE queue_items").execute(&state.pool).await.unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(html.contains("action=\"/tx-enabled\""), "{html}");
+        assert!(html.contains("Nie udało się odczytać kolejki"));
+        assert!(!html.contains("Kolejka pusta."), "pusta tabela kłamałaby, że nic nie czeka");
     }
 }

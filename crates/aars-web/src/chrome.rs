@@ -55,6 +55,29 @@ pub fn audit_action_label(action: &str) -> &str {
         "user_reset" => "reset hasła",
         "user_delete" => "usunięcie użytkownika",
         "watchdog_clear" => "zdjęcie blokady watchdoga",
+        "source_enabled" => "źródło wł./wył.",
+        "source_refresh" => "odświeżenie źródła",
+        "source_settings" => "ustawienia źródła",
+        other => other,
+    }
+}
+
+/// Polska odmiana rzeczownika przy liczebniku: 1 → `one`, 2–4 (poza 12–14) →
+/// `few`, reszta → `many`.
+pub fn plural<'a>(n: u64, one: &'a str, few: &'a str, many: &'a str) -> &'a str {
+    if n == 1 {
+        one
+    } else if (2..=4).contains(&(n % 10)) && !(12..=14).contains(&(n % 100)) {
+        few
+    } else {
+        many
+    }
+}
+
+/// Polska nazwa źródła danych; nieznany id zostaje bez zmian.
+pub fn source_label(id: &str) -> &str {
+    match id {
+        "imgw-meteo" => "Ostrzeżenia meteorologiczne IMGW",
         other => other,
     }
 }
@@ -123,6 +146,20 @@ mod tests {
         assert_eq!(audit_action_label("watchdog_clear"), "zdjęcie blokady watchdoga");
         assert_eq!(audit_action_label("user_role"), "zmiana roli");
         assert_eq!(audit_action_label("cos_nowego"), "cos_nowego");
+        assert_eq!(audit_action_label("source_enabled"), "źródło wł./wył.");
+        assert_eq!(audit_action_label("source_refresh"), "odświeżenie źródła");
+        assert_eq!(audit_action_label("source_settings"), "ustawienia źródła");
+        assert_eq!(source_label("imgw-meteo"), "Ostrzeżenia meteorologiczne IMGW");
+        assert_eq!(source_label("inne"), "inne");
+    }
+
+    #[test]
+    fn plural_follows_the_polish_rule() {
+        let f = |n| plural(n, "wpis", "wpisy", "wpisów");
+        for (n, want) in [(1, "wpis"), (2, "wpisy"), (4, "wpisy"), (5, "wpisów"), (12, "wpisów"),
+            (14, "wpisów"), (22, "wpisy"), (25, "wpisów"), (112, "wpisów")] {
+            assert_eq!(f(n), want, "{n}");
+        }
     }
 
     #[test]
