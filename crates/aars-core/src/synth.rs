@@ -41,6 +41,19 @@ impl Pcm {
     }
 }
 
+/// Sinus o zadanej częstotliwości, długości i poziomie szczytowym (dBFS).
+/// Służy do testu audio stacji (R11): słychać go nawet wtedy, gdy synteza
+/// nie działa.
+pub fn tone(sample_rate: u32, hz: f32, duration: Duration, dbfs: f32) -> Pcm {
+    let count = (duration.as_secs_f64() * sample_rate as f64).round() as usize;
+    let amplitude = f64::from(i16::MAX) * 10f64.powf(f64::from(dbfs.min(0.0)) / 20.0);
+    let step = 2.0 * std::f64::consts::PI * f64::from(hz) / f64::from(sample_rate);
+    let samples = (0..count)
+        .map(|i| (amplitude * (step * i as f64).sin()).round() as i16)
+        .collect();
+    Pcm { samples, sample_rate }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VoiceParams {
     /// Nazwa głosu; `None` znaczy głos domyślny z konfiguracji.
@@ -153,5 +166,23 @@ mod tests {
         assert!(c.samples.len() > a.samples.len(), "dłuższy tekst to dłuższe audio");
 
         assert_eq!(synth.requests(), vec!["ostrzeżenie", "ostrzeżenie", "ostrzeżenie dłuższe"]);
+    }
+
+    #[test]
+    fn a_tone_has_the_requested_length_frequency_and_level() {
+        let pcm = tone(48_000, 1000.0, Duration::from_millis(500), -6.0);
+
+        assert_eq!(pcm.sample_rate, 48_000);
+        assert_eq!(pcm.samples.len(), 24_000);
+        let peak = pcm.samples.iter().map(|s| s.unsigned_abs()).max().unwrap();
+        // −6 dBFS to połowa pełnej skali (16 422 przy 32 767).
+        assert!((16_000..=16_500).contains(&peak), "szczyt {peak}");
+        // 1 kHz przez 0,5 s to 500 okresów, czyli ~1000 przejść przez zero.
+        let crossings = pcm
+            .samples
+            .windows(2)
+            .filter(|w| (w[0] < 0) != (w[1] < 0))
+            .count();
+        assert!((990..=1010).contains(&crossings), "przejść przez zero: {crossings}");
     }
 }

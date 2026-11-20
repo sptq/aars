@@ -7,7 +7,8 @@ use crate::error::DbError;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TxLogEntry {
-    pub queue_item_id: i64,
+    /// `None` dla nadania spoza kolejki (test PTT, R10).
+    pub queue_item_id: Option<i64>,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
     pub ptt_backend: String,
@@ -18,7 +19,8 @@ pub struct TxLogEntry {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TxLogRow {
-    pub queue_item_id: i64,
+    /// `None` dla nadania spoza kolejki albo gdy zadanie usunięto.
+    pub queue_item_id: Option<i64>,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
     pub duration_ms: i64,
@@ -88,11 +90,7 @@ impl TxLogRepo {
                 let ended: Option<String> = row.get("ended_at");
                 let duration_ms: Option<i64> = row.get("duration_ms");
                 TxLogRow {
-                    queue_item_id: row
-                        .try_get::<Option<i64>, _>("queue_item_id")
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default(),
+                    queue_item_id: row.get("queue_item_id"),
                     started_at: parse_iso(&started),
                     ended_at: ended
                         .as_deref()
@@ -138,7 +136,7 @@ mod tests {
     fn entry(id: i64, minute: u32, result: &'static str) -> TxLogEntry {
         let started = Utc.with_ymd_and_hms(2026, 11, 20, 12, minute, 0).unwrap();
         TxLogEntry {
-            queue_item_id: id,
+            queue_item_id: Some(id),
             started_at: started,
             ended_at: started + chrono::Duration::seconds(5),
             ptt_backend: "gpio".to_owned(),
@@ -159,7 +157,7 @@ mod tests {
         let rows = repo.recent(10).await.unwrap();
 
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].queue_item_id, second);
+        assert_eq!(rows[0].queue_item_id, Some(second));
         assert_eq!(rows[0].text.as_deref(), Some("drugi"));
         assert_eq!(rows[0].result, "failed");
         assert_eq!(rows[1].text.as_deref(), Some("pierwszy"));
@@ -167,5 +165,28 @@ mod tests {
         assert_eq!(rows[1].ptt_backend, "gpio");
 
         assert_eq!(repo.recent(1).await.unwrap().len(), 1, "limit obowiązuje");
+    }
+
+    #[tokio::test]
+    async fn an_entry_without_a_queue_item_is_listed_with_its_note() {
+        let pool = test_pool().await;
+        let repo = TxLogRepo::new(pool.clone());
+        let mut test = entry(0, 3, "ok");
+        test.queue_item_id = None;
+        test.note = Some("test PTT: admin".to_owned());
+        repo.record(test).await.unwrap();
+
+        let rows = repo.recent(10).await.unwrap();
+
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].queue_item_id, None);
+        assert_eq!(rows[0].text, None);
+        assert_eq!(rows[0].note.as_deref(), Some("test PTT: admin"));
+        assert_eq!(rows[0].result, "ok");
+        let raw: Option<i64> = sqlx::query_scalar("SELECT queue_item_id FROM tx_log")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(raw, None, "test bez zadania zapisuje NULL, nie 0");
     }
 }

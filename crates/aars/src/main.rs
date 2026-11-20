@@ -157,6 +157,7 @@ async fn main() -> Result<()> {
                     event,
                     aars_core::sequencer::SeqEvent::Finished { .. }
                         | aars_core::sequencer::SeqEvent::Refused { .. }
+                        | aars_core::sequencer::SeqEvent::Skipped { .. }
                 ) {
                     break;
                 }
@@ -299,6 +300,7 @@ async fn main() -> Result<()> {
                         aars_core::config::PttBackendKind::Serial => "serial",
                         aars_core::config::PttBackendKind::Vox => "vox",
                     },
+                    sample_rate: config.audio.sample_rate,
                 },
             );
             let scheduler = aars_core::scheduler::Scheduler::new(
@@ -384,7 +386,7 @@ async fn main() -> Result<()> {
                 stack.interlocks.clone(),
                 shutdown.clone(),
             ));
-            let dispatcher_task = tokio::spawn(dispatcher.run(shutdown.clone()));
+            let dispatcher_task = tokio::spawn(dispatcher.run(shutdown.clone(), CancelToken::new()));
             let scheduler_task = tokio::spawn(scheduler.run(shutdown.clone()));
             let poison_task = tokio::spawn(radio::watch_poison(
                 watchdog_marker,

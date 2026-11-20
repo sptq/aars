@@ -1419,7 +1419,7 @@ pub(crate) mod tests {
         let now = chrono::Utc::now();
         aars_core::txlog::TxLogRepo::new(state.pool.clone())
             .record(aars_core::txlog::TxLogEntry {
-                queue_item_id: id,
+                queue_item_id: Some(id),
                 started_at: now - chrono::Duration::seconds(7),
                 ended_at: now,
                 ptt_backend: "gpio".to_owned(),
@@ -1438,6 +1438,28 @@ pub(crate) mod tests {
         assert!(html.contains("nowe nadanie"), "{html}");
         assert!(html.contains("UTC"), "{html}");
         assert!(html.contains("lokalnie"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn a_test_ptt_row_shows_its_note_instead_of_a_message() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+        let now = chrono::Utc::now();
+        aars_core::txlog::TxLogRepo::new(state.pool.clone())
+            .record(aars_core::txlog::TxLogEntry {
+                queue_item_id: None,
+                started_at: now - chrono::Duration::seconds(2),
+                ended_at: now,
+                ptt_backend: "gpio".to_owned(),
+                result: "ok",
+                note: Some("test PTT: admin".to_owned()),
+            })
+            .await
+            .unwrap();
+
+        let html = get_body(app, &cookie, "/logs").await;
+
+        assert!(html.contains("test PTT: admin"), "{html}");
+        assert!(html.contains("2.0 s"), "{html}");
     }
 
     #[tokio::test]

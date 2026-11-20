@@ -24,6 +24,8 @@ struct TxRow {
     result: String,
     seconds: String,
     text: String,
+    /// Wiersz bez zadania z kolejki (test PTT): `text` to notka.
+    without_item: bool,
 }
 
 struct AuditRow {
@@ -50,11 +52,15 @@ fn result_label(result: &str) -> &str {
 }
 
 fn tx_row(row: TxLogRow) -> TxRow {
+    let without_item = row.queue_item_id.is_none();
+    // Nadanie spoza kolejki (test PTT) nie ma treści: pokazujemy notkę.
+    let text = if without_item { row.note } else { row.text };
     TxRow {
         at: both_times_now(row.started_at),
         result: result_label(&row.result).to_owned(),
         seconds: format!("{:.1}", row.duration_ms as f64 / 1000.0),
-        text: row.text.unwrap_or_default(),
+        text: text.unwrap_or_default(),
+        without_item,
     }
 }
 
