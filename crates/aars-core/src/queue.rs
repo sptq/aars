@@ -1,0 +1,542 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use sqlx::{Row, SqlitePool};
+
+use crate::error::DbError;
+use crate::priority::Priority;
+
+/// Ile razy próbujemy nadać jedno zadanie, zanim uznamy je za nieudane.
+/// Bez limitu element odrzucany przez interlock krążyłby w nieskończoność.
+pub const MAX_ATTEMPTS: i64 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueState {
+    Pending,
+    Transmitting,
+    Done,
+    Failed,
+    Cancelled,
+    Expired,
+    Interrupted,
+}
+
+impl QueueState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Transmitting => "transmitting",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "transmitting" => Some(Self::Transmitting),
+            "done" => Some(Self::Done),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            "expired" => Some(Self::Expired),
+            "interrupted" => Some(Self::Interrupted),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueItem {
+    pub id: i64,
+    pub message_id: Option<i64>,
+    pub rendered_text: String,
+    pub priority: Priority,
+    pub interrupting: bool,
+    pub state: QueueState,
+    pub not_before: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub repeat_group: Option<String>,
+    pub repeat_index: i64,
+    pub attempt: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnqueueRequest {
+    pub message_id: Option<i64>,
+    pub rendered_text: String,
+    pub priority: Priority,
+    pub interrupting: bool,
+    /// `None` znaczy „teraz".
+    pub not_before: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Ile razy nadać; 1 to jedno nadanie.
+    pub repeat_count: u32,
+    pub repeat_interval: Duration,
+    pub created_by: Option<i64>,
+}
+
+/// Jedyne miejsce, które zna tabelę `queue_items`.
+pub struct QueueRepo {
+    pool: SqlitePool,
+}
+
+/// Licznik do identyfikatorów grup powtórzeń. Znacznik czasu sam nie
+/// wystarcza: dwa zlecenia w tej samej chwili dostałyby jedną grupę.
+static GROUP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn new_group_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let seq = GROUP_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{seq:x}")
+}
+
+fn iso(at: DateTime<Utc>) -> String {
+    at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+fn parse_iso(value: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
+}
+
+const COLUMNS: &str = "id, message_id, rendered_text, priority, interrupting, state, \
+                       not_before, expires_at, repeat_group, repeat_index, attempt, error";
+
+fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> QueueItem {
+    let priority_raw: i64 = row.get("priority");
+    let state_raw: String = row.get("state");
+    let not_before: String = row.get("not_before");
+    let expires_at: Option<String> = row.get("expires_at");
+
+    QueueItem {
+        id: row.get("id"),
+        message_id: row.get("message_id"),
+        rendered_text: row.get("rendered_text"),
+        priority: Priority::from_i64(priority_raw).unwrap_or(Priority::Normal),
+        interrupting: row.get::<i64, _>("interrupting") != 0,
+        state: QueueState::parse(&state_raw).unwrap_or(QueueState::Pending),
+        not_before: parse_iso(&not_before),
+        expires_at: expires_at.as_deref().map(parse_iso),
+        repeat_group: row.get("repeat_group"),
+        repeat_index: row.get("repeat_index"),
+        attempt: row.get("attempt"),
+        error: row.get("error"),
+    }
+}
+
+impl QueueRepo {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    /// Wstawia zadanie, rozwijając powtórzenia w osobne wiersze ze wspólną
+    /// grupą i narastającym `not_before`.
+    pub async fn enqueue(&self, request: EnqueueRequest) -> Result<Vec<i64>, DbError> {
+        let count = request.repeat_count.max(1);
+        let base = request.not_before.unwrap_or_else(Utc::now);
+        let group = if count > 1 { Some(new_group_id()) } else { None };
+
+        let mut ids = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let offset = request.repeat_interval * index;
+            let not_before =
+                base + chrono::Duration::from_std(offset).unwrap_or(chrono::Duration::zero());
+
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO queue_items
+                   (message_id, rendered_text, priority, interrupting, state,
+                    not_before, expires_at, repeat_group, repeat_index, created_by)
+                 VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+                 RETURNING id",
+            )
+            .bind(request.message_id)
+            .bind(&request.rendered_text)
+            .bind(request.priority as i64)
+            .bind(i64::from(request.interrupting))
+            .bind(iso(not_before))
+            .bind(request.expires_at.map(iso))
+            .bind(group.as_deref())
+            .bind(i64::from(index))
+            .bind(request.created_by)
+            .fetch_one(&self.pool)
+            .await?;
+
+            ids.push(id);
+        }
+
+        Ok(ids)
+    }
+
+    /// Bierze najpilniejsze gotowe zadanie i od razu znaczy je jako nadawane,
+    /// żeby nikt nie wziął go drugi raz.
+    pub async fn claim_next(&self) -> Result<Option<QueueItem>, DbError> {
+        let now = iso(Utc::now());
+        let row = sqlx::query(&format!(
+            "UPDATE queue_items
+                SET state = 'transmitting',
+                    started_at = ?1,
+                    attempt = attempt + 1
+              WHERE id = (
+                    SELECT id FROM queue_items
+                     WHERE state = 'pending'
+                       AND not_before <= ?1
+                       AND (expires_at IS NULL OR expires_at > ?1)
+                       AND attempt < {MAX_ATTEMPTS}
+                     ORDER BY priority ASC, not_before ASC, created_at ASC
+                     LIMIT 1)
+            RETURNING {COLUMNS}"
+        ))
+        .bind(&now)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.as_ref().map(row_to_item))
+    }
+
+    /// Szuka zadania przerywającego, które bije trwające nadanie. Nie zabiera
+    /// go — decyzję o przerwaniu podejmuje dyspozytor.
+    pub async fn peek_interrupting(&self, current: Priority) -> Result<Option<QueueItem>, DbError> {
+        let now = iso(Utc::now());
+        let row = sqlx::query(&format!(
+            "SELECT {COLUMNS} FROM queue_items
+              WHERE state = 'pending'
+                AND interrupting = 1
+                AND priority < ?1
+                AND not_before <= ?2
+                AND (expires_at IS NULL OR expires_at > ?2)
+                AND attempt < {MAX_ATTEMPTS}
+              ORDER BY priority ASC, not_before ASC, created_at ASC
+              LIMIT 1"
+        ))
+        .bind(current as i64)
+        .bind(&now)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.as_ref().map(row_to_item))
+    }
+
+    pub async fn mark_done(&self, id: i64) -> Result<(), DbError> {
+        self.finish(id, QueueState::Done, None).await
+    }
+
+    pub async fn mark_failed(&self, id: i64, error: &str) -> Result<(), DbError> {
+        self.finish(id, QueueState::Failed, Some(error)).await
+    }
+
+    async fn finish(&self, id: i64, state: QueueState, error: Option<&str>) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE queue_items
+                SET state = ?, finished_at = ?, error = COALESCE(?, error)
+              WHERE id = ?",
+        )
+        .bind(state.as_str())
+        .bind(iso(Utc::now()))
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Zwraca zadanie do kolejki z powodem. Po wyczerpaniu prób zamiast
+    /// kolejnego obiegu zostaje oznaczone jako nieudane.
+    pub async fn requeue(
+        &self,
+        id: i64,
+        reason: &str,
+        not_before: DateTime<Utc>,
+    ) -> Result<(), DbError> {
+        let attempt: i64 = sqlx::query_scalar("SELECT attempt FROM queue_items WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+
+        if attempt >= MAX_ATTEMPTS {
+            tracing::warn!(id, attempt, reason, "wyczerpane próby nadania, oznaczam jako nieudane");
+            return self.mark_failed(id, reason).await;
+        }
+
+        sqlx::query(
+            "UPDATE queue_items
+                SET state = 'pending', not_before = ?, started_at = NULL, error = ?
+              WHERE id = ?",
+        )
+        .bind(iso(not_before))
+        .bind(reason)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn cancel(&self, id: i64) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE queue_items SET state = 'cancelled', finished_at = ?
+              WHERE id = ? AND state = 'pending'",
+        )
+        .bind(iso(Utc::now()))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Anuluje pozostałe wystąpienia powtórzenia.
+    pub async fn cancel_group(&self, group: &str) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE queue_items SET state = 'cancelled', finished_at = ?
+              WHERE repeat_group = ? AND state = 'pending'",
+        )
+        .bind(iso(Utc::now()))
+        .bind(group)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Oznacza zadania, których termin ważności minął. Nieaktualne
+    /// ostrzeżenie nadane jako aktualne jest gorsze niż nienadane.
+    pub async fn expire_stale(&self) -> Result<u64, DbError> {
+        let now = iso(Utc::now());
+        let result = sqlx::query(
+            "UPDATE queue_items SET state = 'expired', finished_at = ?1
+              WHERE state = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?1",
+        )
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Po starcie procesu zadania zostawione w stanie `transmitting` wracają
+    /// do kolejki: zanik zasilania w trakcie nadania nie może zgubić
+    /// komunikatu ani zostawić wiersza zablokowanego na zawsze.
+    pub async fn recover_after_restart(&self) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE queue_items
+                SET state = 'pending', started_at = NULL,
+                    error = 'przerwane restartem procesu'
+              WHERE state = 'transmitting'",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            tracing::warn!(
+                count = result.rows_affected(),
+                "zadania przerwane restartem wróciły do kolejki"
+            );
+        }
+        Ok(result.rows_affected())
+    }
+
+    pub async fn pending(&self, limit: i64) -> Result<Vec<QueueItem>, DbError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {COLUMNS} FROM queue_items
+              WHERE state = 'pending'
+              ORDER BY priority ASC, not_before ASC, created_at ASC
+              LIMIT ?"
+        ))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(row_to_item).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::test_pool;
+
+    fn req(text: &str, priority: Priority) -> EnqueueRequest {
+        EnqueueRequest {
+            message_id: None,
+            rendered_text: text.to_owned(),
+            priority,
+            interrupting: false,
+            not_before: None,
+            expires_at: None,
+            repeat_count: 1,
+            repeat_interval: Duration::ZERO,
+            created_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn items_are_picked_by_priority_then_by_time() {
+        let repo = QueueRepo::new(test_pool().await);
+        repo.enqueue(req("niski", Priority::Low)).await.unwrap();
+        repo.enqueue(req("pilny", Priority::Emergency)).await.unwrap();
+        repo.enqueue(req("zwykly", Priority::Normal)).await.unwrap();
+
+        let first = repo.claim_next().await.unwrap().expect("coś musi czekać");
+        assert_eq!(first.rendered_text, "pilny");
+        repo.mark_done(first.id).await.unwrap();
+
+        let second = repo.claim_next().await.unwrap().unwrap();
+        assert_eq!(second.rendered_text, "zwykly");
+        repo.mark_done(second.id).await.unwrap();
+
+        let third = repo.claim_next().await.unwrap().unwrap();
+        assert_eq!(third.rendered_text, "niski");
+    }
+
+    #[tokio::test]
+    async fn claiming_marks_the_item_transmitting_so_nobody_takes_it_twice() {
+        let repo = QueueRepo::new(test_pool().await);
+        repo.enqueue(req("jeden", Priority::Normal)).await.unwrap();
+
+        let claimed = repo.claim_next().await.unwrap().expect("pierwszy claim");
+        assert_eq!(claimed.state, QueueState::Transmitting);
+        assert_eq!(claimed.attempt, 1, "claim liczy próbę");
+
+        assert!(repo.claim_next().await.unwrap().is_none(), "drugi claim nie może wziąć tego samego");
+    }
+
+    #[tokio::test]
+    async fn an_item_scheduled_for_later_is_not_claimed_yet() {
+        let repo = QueueRepo::new(test_pool().await);
+        let mut later = req("za godzinę", Priority::Emergency);
+        later.not_before = Some(Utc::now() + chrono::Duration::hours(1));
+        repo.enqueue(later).await.unwrap();
+
+        assert!(repo.claim_next().await.unwrap().is_none(), "not_before musi być respektowane");
+    }
+
+    #[tokio::test]
+    async fn repeats_expand_into_separate_items_sharing_a_group() {
+        let repo = QueueRepo::new(test_pool().await);
+        let mut repeated = req("ostrzeżenie", Priority::High);
+        repeated.repeat_count = 3;
+        repeated.repeat_interval = Duration::from_secs(600);
+
+        let ids = repo.enqueue(repeated).await.unwrap();
+        assert_eq!(ids.len(), 3, "powtórzenia rozwijamy z góry");
+
+        let pending = repo.pending(10).await.unwrap();
+        assert_eq!(pending.len(), 3);
+        let group = pending[0].repeat_group.clone().expect("grupa");
+        assert!(pending.iter().all(|i| i.repeat_group.as_deref() == Some(group.as_str())));
+        assert_eq!(pending.iter().map(|i| i.repeat_index).collect::<Vec<_>>(), vec![0, 1, 2]);
+
+        let claimed = repo.claim_next().await.unwrap().unwrap();
+        assert_eq!(claimed.repeat_index, 0);
+        assert!(repo.claim_next().await.unwrap().is_none(), "kolejne czekają na swój czas");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_group_drops_every_remaining_occurrence() {
+        let repo = QueueRepo::new(test_pool().await);
+        let mut repeated = req("ostrzeżenie", Priority::High);
+        repeated.repeat_count = 3;
+        repeated.repeat_interval = Duration::from_secs(60);
+        repo.enqueue(repeated).await.unwrap();
+
+        let group = repo.pending(10).await.unwrap()[0].repeat_group.clone().unwrap();
+        let cancelled = repo.cancel_group(&group).await.unwrap();
+
+        assert_eq!(cancelled, 3);
+        assert!(repo.pending(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn peek_interrupting_finds_only_what_outranks_the_current_transmission() {
+        let repo = QueueRepo::new(test_pool().await);
+
+        let mut low = req("niski przerywający", Priority::Low);
+        low.interrupting = true;
+        repo.enqueue(low).await.unwrap();
+        assert!(
+            repo.peek_interrupting(Priority::Normal).await.unwrap().is_none(),
+            "niższy priorytet nie przerywa"
+        );
+
+        let mut urgent = req("pilny przerywający", Priority::Emergency);
+        urgent.interrupting = true;
+        repo.enqueue(urgent).await.unwrap();
+        let found = repo.peek_interrupting(Priority::Normal).await.unwrap().expect("musi znaleźć");
+        assert_eq!(found.rendered_text, "pilny przerywający");
+        assert_eq!(found.state, QueueState::Pending, "peek nie zabiera elementu");
+    }
+
+    #[tokio::test]
+    async fn a_requeued_item_comes_back_with_its_reason_recorded() {
+        let repo = QueueRepo::new(test_pool().await);
+        repo.enqueue(req("odrzucony", Priority::Normal)).await.unwrap();
+        let claimed = repo.claim_next().await.unwrap().unwrap();
+
+        repo.requeue(claimed.id, "TxDisabled", Utc::now()).await.unwrap();
+
+        let back = repo.pending(10).await.unwrap();
+        assert_eq!(back.len(), 1, "odmowa nie może gubić komunikatu");
+        assert_eq!(back[0].error.as_deref(), Some("TxDisabled"));
+        assert_eq!(back[0].attempt, 1, "liczba prób zostaje");
+    }
+
+    #[tokio::test]
+    async fn an_item_that_exhausted_its_attempts_fails_instead_of_looping() {
+        let repo = QueueRepo::new(test_pool().await);
+        repo.enqueue(req("uparty", Priority::Normal)).await.unwrap();
+
+        for _ in 0..MAX_ATTEMPTS {
+            let claimed = repo.claim_next().await.unwrap().expect("kolejna próba");
+            repo.requeue(claimed.id, "awaria", Utc::now()).await.unwrap();
+        }
+
+        assert!(
+            repo.claim_next().await.unwrap().is_none(),
+            "po wyczerpaniu prób element nie może krążyć w nieskończoność"
+        );
+        let failed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM queue_items WHERE state = 'failed'")
+                .fetch_one(repo.pool())
+                .await
+                .unwrap();
+        assert_eq!(failed, 1);
+    }
+
+    #[tokio::test]
+    async fn expired_items_are_not_transmitted() {
+        let repo = QueueRepo::new(test_pool().await);
+        let mut stale = req("nieaktualne", Priority::Emergency);
+        stale.expires_at = Some(Utc::now() - chrono::Duration::minutes(5));
+        repo.enqueue(stale).await.unwrap();
+
+        let expired = repo.expire_stale().await.unwrap();
+        assert_eq!(expired, 1);
+        assert!(repo.claim_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_item_interrupted_by_power_loss_returns_to_the_queue_after_restart() {
+        let pool = test_pool().await;
+        let repo = QueueRepo::new(pool.clone());
+        repo.enqueue(req("w trakcie", Priority::High)).await.unwrap();
+        let claimed = repo.claim_next().await.unwrap().unwrap();
+        assert_eq!(claimed.state, QueueState::Transmitting);
+
+        // Zanik zasilania: proces ginie, wiersz zostaje w stanie transmitting.
+        let recovered = QueueRepo::new(pool).recover_after_restart().await.unwrap();
+
+        assert_eq!(recovered, 1);
+        let pending = repo.pending(10).await.unwrap();
+        assert_eq!(pending.len(), 1, "nadanie przerwane zanikiem zasilania wraca do kolejki");
+        assert_eq!(pending[0].rendered_text, "w trakcie");
+    }
+}
