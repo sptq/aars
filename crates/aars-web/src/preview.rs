@@ -16,6 +16,12 @@ use crate::state::AppState;
 
 pub type PreviewFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
 
+/// Błąd renderera zajętego innym podglądem — panel mapuje go na 503.
+pub const BUSY: &str = "podgląd zajęty, spróbuj za chwilę";
+
+/// Najdłuższy tekst przyjmowany do podglądu (znaki).
+pub const MAX_CHARS: usize = 2000;
+
 /// Renderuje tekst do bajtów WAV. Bez `async_trait`, jak `Renderer` w rdzeniu.
 pub trait PreviewRenderer: Send + Sync {
     fn render_wav<'a>(&'a self, text: &'a str) -> PreviewFuture<'a>;
@@ -47,8 +53,15 @@ async fn render(state: &AppState, text: &str) -> Response {
             "pusty tekst — nie ma czego odsłuchać".to_owned(),
         );
     }
+    if text.chars().count() > MAX_CHARS {
+        return text_response(
+            StatusCode::BAD_REQUEST,
+            "treść za długa do podglądu".to_owned(),
+        );
+    }
     match renderer.render_wav(text).await {
         Ok(bytes) => wav_response(bytes),
+        Err(err) if err == BUSY => text_response(StatusCode::SERVICE_UNAVAILABLE, err),
         Err(err) => {
             tracing::error!(%err, "synteza podglądu zawiodła");
             text_response(StatusCode::BAD_GATEWAY, format!("synteza zawiodła: {err}"))
@@ -315,5 +328,25 @@ mod tests {
         let (status, _, body) = post(&app, &cookie, format!("csrf={csrf}&text=Uwaga")).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(String::from_utf8_lossy(&body).contains("piper padł"));
+    }
+
+    #[tokio::test]
+    async fn a_text_over_the_limit_is_400() {
+        let (app, cookie, csrf, _s) = setup(Role::Operator, Some(Ok(b"RIFF-fake".to_vec()))).await;
+        let long = "a".repeat(MAX_CHARS + 1);
+        let (status, _, body) = post(&app, &cookie, format!("csrf={csrf}&text={long}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body).contains("treść za długa do podglądu"));
+        let ok = "a".repeat(MAX_CHARS);
+        let (status, _, _) = post(&app, &cookie, format!("csrf={csrf}&text={ok}")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_busy_renderer_is_503() {
+        let (app, cookie, csrf, _s) = setup(Role::Operator, Some(Err(BUSY.into()))).await;
+        let (status, _, body) = post(&app, &cookie, format!("csrf={csrf}&text=Uwaga")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(String::from_utf8_lossy(&body).contains("podgląd zajęty"));
     }
 }
