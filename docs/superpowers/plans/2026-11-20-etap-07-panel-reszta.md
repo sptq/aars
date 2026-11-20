@@ -203,6 +203,33 @@ Kolejka na pulpicie pokazuje czas „od” przez `both_times_now`. W `lib.rs` (t
 
 ---
 
+### Task 6b: Watchdog twardego limitu faktycznie pilnuje nadawania
+
+Dopisane w trakcie wykonania (ledger, Ruling R3): watchdog z etapu 3 jest uruchamiany w `crates/aars/src/radio.rs`, ale sekwencer nigdy nie woła `mark_keyed`/`mark_unkeyed`, a `SequencerConfig.tx_max_duration` nie jest nigdzie sprawdzany — twardy limit z spec §4.3 nie działa.
+
+**Files:**
+- Modify: `crates/aars-core/src/sequencer.rs`, `crates/aars-core/src/watchdog.rs`, `crates/aars/src/radio.rs`, `crates/aars/src/main.rs`
+- Modify: `crates/aars-web/src/lib.rs` + `templates/dashboard.html` (zdjęcie blokady)
+
+**Interfaces:**
+- Consumes: `Watchdog::spawn`, `WatchdogHandle::{mark_keyed, mark_unkeyed, is_poisoned, clear_poison}`, `aars_core::watchdog::TX_TIMEOUT_ERROR` (Task 6), `Interlocks`/`InMemoryInterlocks::set_poisoned`, ustawienie `settings.poisoned`.
+- Produces:
+  - Sekwencer dostaje uchwyt strażnika (`Sequencer::spawn(..., watchdog: Option<WatchdogMarker>)` albo równoważny lekki typ `Clone` współdzielący stan z `WatchdogHandle` — bez przenoszenia wątku watchdoga do sekwencera) i woła `mark_keyed` zaraz po `ptt.key()`, a `mark_unkeyed` w strażniku RAII, który opuszcza PTT (każda ścieżka wyjścia, spec §4.2).
+  - Sekwencer sam z siebie przerywa odtwarzanie, gdy czas od podniesienia PTT przekroczy `tx_max_duration` (sprawdzane per bufor, jak token anulowania), i kończy nadanie `TxOutcome::Failed(TX_TIMEOUT_ERROR.into())`. Watchdog jest drugą, niezależną linią obrony (osobny wątek OS) na wypadek, gdy sekwencer stanie.
+  - Gdy watchdog interweniuje: `force_unkey()` + `poisoned`; binarka co ≤ 1 s przenosi `is_poisoned()` do `interlocks.set_poisoned(true)` i zapisuje `settings.poisoned = 'true'` (flaga przetrwa restart, spec §4.3 „celowo lepka”).
+  - Panel: na pulpicie przy znaczku „watchdog — wymaga reset” przycisk „Zdejmij blokadę watchdoga” — `POST /watchdog/clear` (**admin**, CSRF), czyści `settings.poisoned`, interlocki i stan watchdoga (`clear_poison`), wpis `audit_log` `watchdog_clear`. Ruling R4: admin, nie operator — zdjęcie blokady przywraca automatyczne nadawanie po awarii sprzętowej.
+
+- [ ] **Step 1: Testy**
+  - `sequencer.rs`: `a_transmission_longer_than_the_limit_is_cut_and_reported_as_timeout` (limit 1 s, PCM 3 s na fałszywym sinku → wynik `Failed(TX_TIMEOUT_ERROR)`, PTT opuszczone, czas grania < 1,5 s); `the_watchdog_marker_sees_key_and_unkey` (po nadaniu marker pokazuje „nie nadaje”); `ptt_is_released_and_the_marker_cleared_when_playback_fails`.
+  - `watchdog.rs` (jeśli brak): `a_stuck_key_is_forced_down_and_poisons` (limit 100 ms, `mark_keyed` bez `mark_unkeyed` → po 300 ms fałszywe PTT opuszczone, `is_poisoned()`).
+  - `aars-web`: `an_admin_clears_the_watchdog_block` (ustaw `poisoned` w interlockach i settings → `POST /watchdog/clear` → oba wyczyszczone); `an_operator_cannot_clear_the_watchdog_block` (`403`).
+- [ ] **Step 2: FAIL**
+- [ ] **Step 3: Implementacja**
+- [ ] **Step 4: PASS** (`cargo test --workspace`, `clippy -D warnings`)
+- [ ] **Step 5: Commit** — `fix(core): twardy limit czasu nadawania pilnowany przez sekwencer i watchdog`
+
+---
+
 ### Task 7: Ustawienia stacji (`/settings`) i okna ciszy
 
 **Files:**
