@@ -18,8 +18,8 @@ enum HourCase {
 
 fn hour_case(previous_core: Option<&str>) -> HourCase {
     match previous_core.map(str::to_lowercase).as_deref() {
-        Some("od" | "do" | "po" | "około") => HourCase::Genitive,
-        Some("o") => HourCase::Locative,
+        Some("od" | "do" | "około") => HourCase::Genitive,
+        Some("o" | "po") => HourCase::Locative,
         _ => HourCase::Nominative,
     }
 }
@@ -333,6 +333,12 @@ mod tests {
         assert_eq!(n("18:00"), "godzina osiemnasta");
         assert_eq!(n("do 24:00"), "do godziny dwudziestej czwartej");
         assert_eq!(n("24:30"), "24:30", "po 24:00 nie ma minut");
+    }
+
+    #[test]
+    fn po_takes_the_locative() {
+        assert_eq!(n("po 18:00"), "po godzinie osiemnastej");
+        assert_eq!(n("po 7:30"), "po godzinie siódmej trzydzieści");
     }
 
     #[test]
