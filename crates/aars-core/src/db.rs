@@ -70,6 +70,7 @@ mod tests {
             "schedule_fires",
             "sessions",
             "settings",
+            "source_items",
             "source_state",
             "tx_log",
             "users",
