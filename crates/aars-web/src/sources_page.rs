@@ -79,6 +79,9 @@ pub(crate) async fn load_views(state: &AppState) -> Result<Vec<SourceView>, DbEr
             .active_items(&status.source_id)
             .await?
             .into_iter()
+            // Wiersz zostaje `active` do udanego cyklu; gdy źródło stoi,
+            // ostrzeżenie po terminie nie jest już aktywne.
+            .filter(|item| item.valid_until.is_none_or(|until| until > now))
             .map(|item| WarningRow {
                 summary: item.summary,
                 priority: priority_label(item.priority),
@@ -279,7 +282,7 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
-    use chrono::{TimeZone, Utc};
+    use chrono::{DateTime, TimeZone, Utc};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
@@ -361,20 +364,24 @@ mod tests {
     }
 
     async fn active_warning(state: &AppState) {
+        tracked_warning(state, "Sk1", "Burze, 1. stopień", Utc::now() + chrono::Duration::hours(10)).await;
+    }
+
+    async fn tracked_warning(state: &AppState, key: &str, summary: &str, valid_until: DateTime<Utc>) {
         let at = Utc.with_ymd_and_hms(2026, 7, 23, 8, 0, 0).unwrap();
         SourceStateRepo::new(state.pool.clone())
             .upsert_active(
                 &NewTracked {
                     source_id: "imgw-meteo".into(),
-                    item_key: "Sk1".into(),
+                    item_key: key.into(),
                     topic: "Burze".into(),
                     fingerprint: "f".into(),
                     area: "1061".into(),
-                    summary: "Burze, 1. stopień".into(),
+                    summary: summary.into(),
                     cancel_text: "Odwołanie".into(),
                     priority: Priority::Normal,
                     valid_from: Some(at),
-                    valid_until: Some(at + chrono::Duration::hours(10)),
+                    valid_until: Some(valid_until),
                     aired: true,
                     first_seen_at: at,
                     last_seen_at: at,
@@ -604,6 +611,19 @@ mod tests {
         assert!(html.contains("Źródła danych"), "{html}");
         assert!(html.contains("Ostrzeżenia meteorologiczne IMGW"), "{html}");
         assert!(html.contains("wyłączone"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn a_warning_past_its_validity_is_neither_listed_nor_counted() {
+        let (app, cookie, _csrf, state) = app_as(Role::Operator, state().await).await;
+        active_warning(&state).await;
+        tracked_warning(&state, "Sk0", "Upał, wczorajszy", Utc::now() - chrono::Duration::hours(1)).await;
+
+        let (_, html) = get(&app, &cookie, "/sources").await;
+        assert!(html.contains("Burze, 1. stopień"), "{html}");
+        assert!(!html.contains("Upał, wczorajszy"), "{html}");
+        let (_, html) = get(&app, &cookie, "/").await;
+        assert!(html.contains("aktywne ostrzeżenia: 1"), "{html}");
     }
 
     #[tokio::test]
