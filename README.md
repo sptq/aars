@@ -5,7 +5,7 @@ Stoi przy radiotelefonie (typowo Raspberry Pi), syntezuje mowę lokalnie
 (Piper, bez internetu), nadaje komunikaty o stałych porach, jednorazowo albo
 natychmiast, a operator może wpisać i nadać własny komunikat z panelu www.
 
-**Status: w trakcie prac** (etapy 1–7 z 10, patrz `docs/superpowers/plans/README.md`).
+**Status: w trakcie prac** (etapy 1–8 z 10, patrz `docs/superpowers/plans/README.md`).
 
 ## Co działa
 
@@ -18,7 +18,9 @@ natychmiast, a operator może wpisać i nadać własny komunikat z panelu www.
 - harmonogram: cron, czas jednorazowy, polityka spóźnień po restarcie,
 - panel www (Axum + Askama + HTMX): logowanie, role, CSRF, nadawanie,
   kolejka na żywo, zarządzanie komunikatami i harmonogramem, ustawienia,
-  użytkownicy, logi (szczegóły w sekcji „Panel”).
+  użytkownicy, logi (szczegóły w sekcji „Panel”),
+- źródło danych IMGW: ostrzeżenia meteorologiczne dla wybranego obszaru trafiają
+  do kolejki jako polski komunikat (sekcja „Źródła danych”).
 
 ## Panel
 
@@ -28,16 +30,40 @@ kierowany na `/login`):
 | Strona | Minimalna rola |
 |---|---|
 | `/`, `/logs`, `/account/password` | viewer |
+| `/sources` (stan, włączanie, „Odśwież teraz”) | operator |
 | `/compose`, `/messages` (lista, nowy, edycja, podgląd audio, nadaj teraz), `/queue` (w tym anulowanie grupy), `/preview` | operator |
-| `/settings`, `/users`, czyszczenie blokady strażnika | admin |
+| `/settings`, `/users`, czyszczenie blokady strażnika, obszar i interwał źródeł | admin |
 
 Każdy formularz zmieniający stan wymaga tokenu CSRF. Wszystkie czasy w panelu
 są pokazane podwójnie: w UTC i w czasie lokalnym urządzenia
 (np. `18:00 UTC (19:00 lokalnie)`); wzorzec cron wpisuje się w UTC.
 
+## Źródła danych
+
+Źródło `imgw-meteo` odpytuje publiczne API ostrzeżeń meteorologicznych IMGW
+(adres w `[sources]` w `aars.toml`) i dokłada do kolejki jeden komunikat na
+ostrzeżenie: stopień 1 ma priorytet Zwykły, stopień 2 Wysoki, stopień 3
+Alarmowy i przerywa nadawanie. Powtórne pobranie tej samej treści nic nie
+dokłada; podniesiony stopień daje jeden komunikat „Zmiana ostrzeżenia”,
+a ostrzeżenie, które zniknie z odpowiedzi dwa razy z rzędu, jest odwołane.
+
+Po instalacji źródło jest wyłączone. W panelu, na stronie `/sources`:
+
+- operator włącza źródło i klika „Odśwież teraz”,
+- administrator ustawia **obszar** (jedna linia na wpis: dwucyfrowy kod
+  województwa, np. `10`, albo czterocyfrowy kod powiatu TERYT z nazwą, którą
+  stacja ma wypowiadać, np. `1061 Łódź`; najwyżej 40 wpisów) oraz
+  **interwał** odpytywania (60–3600 s, domyślnie 300 s). Bez obszaru źródło
+  nic nie ogłasza.
+
+Stan źródła (działa, błąd, przestarzałe, wyłączone, brak obszaru) widać też na
+pulpicie. Podgląd bez zapisu i bez kolejki: `cargo run -p aars -- source preview`
+pobiera ostrzeżenia dla zapisanego obszaru i wypisuje tekst, priorytet oraz
+postać znormalizowaną do syntezy.
+
 ## W planach
 
-Źródła danych IMGW meteo / hydro i PAA z kompozytorem biuletynu, paczka na Raspberry Pi
+Źródła IMGW hydro i PAA z kompozytorem biuletynu, paczka na Raspberry Pi
 z systemd.
 
 ## Uruchomienie
