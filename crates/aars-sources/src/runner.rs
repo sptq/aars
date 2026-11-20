@@ -143,10 +143,10 @@ impl SourceRunner {
                 self.state.set_state(item.id, TrackedState::Dropped).await?;
             }
         }
-        // Lepka flaga „poszło na antenę”: komunikat tej pozycji ma stan `done`.
+        // Lepka flaga „poszło na antenę”: komunikat jest nadawany albo `done`.
         for old in kept.iter_mut().filter(|a| !a.aired) {
             if let Some(queue_id) = old.queue_item_id
-                && self.queue.state_of(queue_id).await? == Some(QueueState::Done)
+                && matches!(self.queue.state_of(queue_id).await?, Some(QueueState::Done | QueueState::Transmitting))
             {
                 self.state.set_aired(old.id).await?;
                 old.aired = true;
@@ -156,6 +156,8 @@ impl SourceRunner {
         let out_keys: HashSet<&str> = output.items.iter().map(|i| i.key.as_str()).collect();
         let live = |a: &TrackedItem| a.valid_until.is_none_or(|until| until > now);
         let mut consumed: HashSet<i64> = HashSet::new();
+        // Wiersze, które w tym cyklu zmieniły odcisk: ich stary odcisk już nie obowiązuje.
+        let mut refingerprinted: HashSet<i64> = HashSet::new();
         let mut seen: HashSet<&str> = HashSet::new();
         // Odcisk -> (element kolejki, czy poszło na antenę) dla pozycji
         // ogłoszonych albo przejętych w tym cyklu.
@@ -180,10 +182,12 @@ impl SourceRunner {
                     self.state.touch(old.id, now).await?;
                     announced.entry(item.fingerprint.as_str()).or_insert((old.queue_item_id, old.aired));
                 } else {
+                    let aired = old.aired || self.is_on_air(old.queue_item_id).await?;
                     let queued = self.announce(item, &item.change_text).await?;
                     self.cancel_waiting(old.queue_item_id).await;
-                    self.track(item, &cfg.area_text, Some(queued), old.aired, now).await?;
-                    announced.insert(item.fingerprint.as_str(), (Some(queued), old.aired));
+                    self.track(item, &cfg.area_text, Some(queued), aired, now).await?;
+                    refingerprinted.insert(old.id);
+                    announced.insert(item.fingerprint.as_str(), (Some(queued), aired));
                     report.changed += 1;
                 }
                 continue;
@@ -195,7 +199,7 @@ impl SourceRunner {
                 self.track(item, &cfg.area_text, queued, aired, now).await?;
                 continue;
             }
-            if let Some(old) = kept.iter().find(|a| live(a) && a.fingerprint == item.fingerprint) {
+            if let Some(old) = kept.iter().find(|a| live(a) && !refingerprinted.contains(&a.id) && a.fingerprint == item.fingerprint) {
                 // Stare id zniknęło: przejmujemy po cichu, stare kończy się jako Replaced.
                 if !out_keys.contains(old.item_key.as_str()) && !consumed.contains(&old.id) {
                     self.state.set_state(old.id, TrackedState::Replaced).await?;
@@ -209,12 +213,13 @@ impl SourceRunner {
                 live(a) && !consumed.contains(&a.id) && a.topic == item.topic && !out_keys.contains(a.item_key.as_str())
             });
             if let Some(old) = replaced {
+                let aired = old.aired || self.is_on_air(old.queue_item_id).await?;
                 let queued = self.announce(item, &item.change_text).await?;
                 self.cancel_waiting(old.queue_item_id).await;
                 self.state.set_state(old.id, TrackedState::Replaced).await?;
                 consumed.insert(old.id);
-                self.track(item, &cfg.area_text, Some(queued), old.aired, now).await?;
-                announced.insert(item.fingerprint.as_str(), (Some(queued), old.aired));
+                self.track(item, &cfg.area_text, Some(queued), aired, now).await?;
+                announced.insert(item.fingerprint.as_str(), (Some(queued), aired));
                 report.changed += 1;
             } else {
                 let queued = self.announce(item, &item.text).await?;
@@ -281,6 +286,17 @@ impl SourceRunner {
 
     async fn announce(&self, item: &SourceItem, text: &str) -> Result<i64, DbError> {
         self.enqueue(text.to_owned(), item.priority, item.interrupting, item.valid_until).await
+    }
+
+    /// Czy element kolejki jest właśnie nadawany albo już nadany.
+    async fn is_on_air(&self, queue_item_id: Option<i64>) -> Result<bool, DbError> {
+        let Some(queue_item_id) = queue_item_id else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            self.queue.state_of(queue_item_id).await?,
+            Some(QueueState::Done | QueueState::Transmitting)
+        ))
     }
 
     /// R7: anuluje element kolejki, który jeszcze czeka. `true`, gdy czekał.
@@ -742,5 +758,18 @@ mod tests {
         let active = r.state.active_items("imgw-meteo").await.unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].item_key, "b");
+    }
+
+    #[tokio::test]
+    async fn a_change_during_transmission_keeps_the_aired_bit() {
+        let r = rig(vec![ok(vec![warning("a", "f1")]), ok(vec![warning("a", "f2")]), ok(vec![]), ok(vec![])]).await;
+        r.runner.cycle(now()).await;
+        // Oryginał jest właśnie nadawany.
+        let claimed = r.queue.claim_next().await.unwrap().unwrap();
+        r.runner.cycle(now()).await;
+        r.queue.mark_done(claimed.id).await.unwrap();
+        r.runner.cycle(now()).await;
+        r.runner.cycle(now()).await;
+        assert_eq!(texts(&r.queue).await, vec!["odwołanie a"]);
     }
 }
