@@ -222,6 +222,9 @@ async fn main() -> Result<()> {
                 },
             }
         }
+        cli::Command::Source { action } => match action {
+            cli::SourceAction::Preview => source_preview(&config).await?,
+        },
         cli::Command::Run => {
             use aars_core::dispatcher::{Dispatcher, DispatcherConfig};
             use aars_core::ident::IdMode;
@@ -313,23 +316,57 @@ async fn main() -> Result<()> {
                 tracing::error!(%err, "czyszczenie wygasłych sesji zawiodło");
             }
 
+            // Źródło jest odizolowane: błąd budowy klienta HTTP wyłącza tylko je.
+            let source_runner =
+                match aars_sources::imgw_meteo::ImgwMeteo::new(&config.sources.imgw_meteo_url) {
+                    Ok(source) => Some(aars_sources::SourceRunner::new(
+                        Arc::new(source),
+                        aars_core::source_state::SourceStateRepo::new(pool.clone()),
+                        queue.clone(),
+                    )),
+                    Err(err) => {
+                        tracing::error!(%err, "źródło imgw-meteo nie wystartuje");
+                        None
+                    }
+                };
+            let source_refresh: Option<aars_web::state::SourceRefresh> =
+                source_runner.as_ref().map(|runner| {
+                    let notify = runner.refresh_handle();
+                    Arc::new(move |id: &str| {
+                        if id == "imgw-meteo" {
+                            notify.notify_one();
+                            true
+                        } else {
+                            false
+                        }
+                    }) as aars_web::state::SourceRefresh
+                });
+
             let clear_marker = watchdog_marker.clone();
-            let app = aars_web::router(
-                aars_web::AppState::new(
-                    pool.clone(),
-                    queue.clone(),
-                    stack.interlocks.clone(),
-                    false,
-                )
-                .with_preview(preview)
-                .with_hardware(vec![
-                    ("Urządzenie audio".to_owned(), config.audio.device.clone()),
-                    ("Częstotliwość próbkowania".to_owned(), format!("{} Hz", config.audio.sample_rate)),
-                    ("Backend PTT".to_owned(), config.ptt.backend.label().to_owned()),
-                    ("Model głosu".to_owned(), config.tts.model.clone()),
-                ])
-                .with_watchdog_clear(Arc::new(move || clear_marker.clear_poison())),
-            );
+            let mut state = aars_web::AppState::new(
+                pool.clone(),
+                queue.clone(),
+                stack.interlocks.clone(),
+                false,
+            )
+            .with_preview(preview)
+            .with_hardware(vec![
+                ("Urządzenie audio".to_owned(), config.audio.device.clone()),
+                (
+                    "Częstotliwość próbkowania".to_owned(),
+                    format!("{} Hz", config.audio.sample_rate),
+                ),
+                (
+                    "Backend PTT".to_owned(),
+                    config.ptt.backend.label().to_owned(),
+                ),
+                ("Model głosu".to_owned(), config.tts.model.clone()),
+            ])
+            .with_watchdog_clear(Arc::new(move || clear_marker.clear_poison()));
+            if let Some(refresh) = source_refresh {
+                state = state.with_source_refresh(refresh);
+            }
+            let app = aars_web::router(state);
             let listener = tokio::net::TcpListener::bind(&config.server.bind)
                 .await
                 .with_context(|| format!("nasłuch na {}", config.server.bind))?;
@@ -347,6 +384,9 @@ async fn main() -> Result<()> {
                 pool.clone(),
                 shutdown.clone(),
             ));
+
+            let source_task =
+                source_runner.map(|runner| tokio::spawn(runner.run(shutdown.clone())));
 
             let server_shutdown = shutdown.clone();
             let server_task = tokio::spawn(async move {
@@ -374,6 +414,9 @@ async fn main() -> Result<()> {
             let _ = server_task.await;
             let _ = poison_task.await;
             let _ = quiet_task.await;
+            if let Some(task) = source_task {
+                let _ = task.await;
+            }
             stack.watchdog.stop();
         }
         cli::Command::Message { action } => {
@@ -466,5 +509,56 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// `aars source preview`: jedno pobranie, bez zapisu i bez kolejki.
+async fn source_preview(config: &Config) -> Result<()> {
+    use aars_sources::DataSource;
+
+    let pool = db::connect(&config.storage.db_path)
+        .await
+        .context("otwieranie bazy")?;
+    db::migrate(&pool).await.context("nakładanie migracji")?;
+
+    let source = aars_sources::imgw_meteo::ImgwMeteo::new(&config.sources.imgw_meteo_url)
+        .map_err(|e| anyhow::anyhow!("klient HTTP: {e}"))?;
+    let cfg = aars_core::source_state::SourceStateRepo::new(pool)
+        .config(source.id())
+        .await
+        .context("odczyt ustawień źródła")?;
+    let Some(cfg) = cfg.filter(|c| !c.area.is_empty()) else {
+        println!("brak obszaru — ustaw go w panelu (/sources) albo w tabeli settings");
+        return Ok(());
+    };
+
+    println!("obszar: {}", cfg.area_text);
+    let ctx = aars_sources::SourceCtx {
+        now: chrono::Utc::now(),
+        area: cfg.area,
+    };
+    let output = source
+        .fetch(&ctx)
+        .await
+        .map_err(|e| anyhow::anyhow!("pobieranie: {e}"))?;
+    if output.items.is_empty() {
+        println!("brak ostrzeżeń dla obszaru");
+    }
+    for item in &output.items {
+        println!(
+            "[{:?}{}] {}",
+            item.priority,
+            if item.interrupting { ", przerywa" } else { "" },
+            item.summary
+        );
+        println!("  tekst:        {}", item.text);
+        println!(
+            "  znormalizowany: {}",
+            aars_audio::text::normalize(&item.text)
+        );
+    }
+    if !output.complete {
+        println!("UWAGA: część odpowiedzi była nieczytelna");
+    }
     Ok(())
 }
