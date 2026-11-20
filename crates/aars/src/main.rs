@@ -291,7 +291,7 @@ async fn main() -> Result<()> {
                 cli::HardwareAction::Reset => {
                     let n = repo.clear().await.context("kasowanie ustawień sprzętu")?;
                     println!(
-                        "usunięto {n} ustawień sprzętu z panelu; przy następnym starcie obowiązuje aars.toml"
+                        "usunięto {n} wpisów sprzętu (ustawienia z panelu, ostatnia działająca, stan zastosowania); przy następnym starcie obowiązuje aars.toml"
                     );
                 }
             }

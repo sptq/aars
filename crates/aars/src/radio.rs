@@ -89,6 +89,11 @@ pub async fn build_stack(
     let tx_tail = Duration::from_millis(config.ptt.tx_tail_ms);
     let watchdog =
         Watchdog::spawn(ptt.clone(), watchdog_limit(Duration::from_secs(tx_max_s), tx_tail));
+    // Nowy strażnik startuje czysty; blokada z bazy musi go zatruć, inaczej
+    // po restarcie test audio zagrałby na wejście radia (przegląd T7, I-3).
+    if interlocks.snapshot().poisoned {
+        watchdog.marker().mark_poisoned();
+    }
 
     let sequencer = Sequencer::spawn(
         ptt,
@@ -159,8 +164,9 @@ pub async fn watch_poison(
     pool: SqlitePool,
     shutdown: CancelToken,
 ) {
-    // Czy bieżąca interwencja jest już zapisana w bazie.
-    let mut persisted = false;
+    // Czy bieżąca interwencja jest już zapisana w bazie. Flaga odtworzona z
+    // bazy przy starcie jest zapisana z definicji.
+    let mut persisted = marker.is_poisoned() && interlocks.snapshot().poisoned;
     while !shutdown.is_cancelled() {
         if marker.is_poisoned() {
             if !persisted || !interlocks.snapshot().poisoned {

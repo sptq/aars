@@ -123,7 +123,9 @@ impl Sequencer {
                                 // R12 jako niezmiennik sekwencera: przy VOX
                                 // dźwięk na wyjściu sam kluczuje nadajnik.
                                 Err("przy VOX odtwarzanie lokalne nadaje na antenę".to_owned())
-                            } else if watchdog.as_ref().is_some_and(|w| w.is_poisoned()) {
+                            } else if watchdog.as_ref().is_some_and(|w| w.is_poisoned())
+                                || interlocks.snapshot().poisoned
+                            {
                                 // Po interwencji strażnika nie wiemy, czy PTT
                                 // naprawdę opadło — dźwięk mógłby iść na antenę.
                                 Err("blokada watchdoga: odtwarzanie niedostępne".to_owned())

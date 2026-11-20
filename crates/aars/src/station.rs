@@ -368,6 +368,10 @@ async fn run_station(
                 config.server.bind, base.server.bind
             );
             tracing::error!(%note);
+            // R6: nieudane zastosowanie ustawienia z panelu idzie do audytu.
+            if panel.contains_key("server.bind") {
+                audit_system(pool, "hardware_apply_failed", &note).await;
+            }
             notes.push(note);
             tokio::net::TcpListener::bind(&base.server.bind)
                 .await
@@ -537,7 +541,7 @@ async fn run_station(
         .with_probe(probe)
         .with_modules(registry.clone())
         .with_base_config(Arc::new(base.clone()));
-    if let Some(marker) = watchdog_marker {
+    if let Some(marker) = watchdog_marker.clone() {
         state = state.with_watchdog_clear(Arc::new(move || marker.clear_poison()));
     }
     if !refreshers.is_empty() {
@@ -589,8 +593,15 @@ async fn run_station(
         let _ = ready.send(handle.clone());
     }
 
+    // Dyspozytor kończy się sam tylko po panice: stacja przestała nadawać,
+    // więc nie udajemy, że działa (I-2).
+    let mut dispatcher_failed = false;
     let exit = loop {
         if stop.is_cancelled() {
+            break Exit::Stop;
+        }
+        if dispatcher_task.as_ref().is_some_and(|t| t.is_finished()) {
+            dispatcher_failed = true;
             break Exit::Stop;
         }
         if restart.is_cancelled() {
@@ -599,6 +610,8 @@ async fn run_station(
         tokio::time::sleep(CONTROL_POLL).await;
     };
 
+    // Panika dyspozytora zostawia wątek sekwencera bez joina (I-2): wtedy
+    // nie wolno otwierać tego samego PTT drugi raz w tym samym procesie.
     if let (Exit::Restart, Some(task)) = (&exit, dispatcher_task.as_mut()) {
         // R4: dyspozytor nie bierze nic nowego, dokańcza nadanie i robi join
         // wątku sekwencera. Strażnik i most działają dalej. Ctrl-C w tym
@@ -607,7 +620,10 @@ async fn run_station(
         drain.cancel();
         loop {
             tokio::select! {
-                _ = &mut *task => break,
+                joined = &mut *task => {
+                    dispatcher_failed = joined.is_err();
+                    break;
+                }
                 () = tokio::time::sleep(CONTROL_POLL) => {
                     if stop.is_cancelled() {
                         shutdown.cancel();
@@ -620,23 +636,68 @@ async fn run_station(
 
     tracing::info!("zatrzymuję zadania stacji");
     shutdown.cancel();
-    if let Some(task) = dispatcher_task {
-        let _ = task.await;
+    if let Some(task) = dispatcher_task
+        && task.await.is_err()
+    {
+        dispatcher_failed = true;
     }
     for task in tasks {
         let _ = task.await;
     }
-    // Po joinie sekwencera: PTT już opuszczone, strażnik nie ma czego pilnować.
-    if let Some(watchdog) = watchdog {
-        watchdog.stop();
+    if dispatcher_failed {
+        tracing::error!("zadanie dyspozytora padło — wątek sekwencera mógł zostać bez joina");
     }
+    finish_radio(watchdog, watchdog_marker.as_ref(), &interlocks, pool).await?;
     drop(handle);
 
+    if dispatcher_failed {
+        // Zamiast restartu w procesie: proces kończy się błędem, a systemd
+        // podnosi go na czysto, z PTT zwolnionym przez jądro.
+        anyhow::bail!("dyspozytor padł — kończę proces zamiast restartu w procesie");
+    }
     Ok(if stop.is_cancelled() {
         Exit::Stop
     } else {
         exit
     })
+}
+
+/// Ile razy próbujemy utrwalić interwencję strażnika przy zamykaniu.
+const FINAL_POISON_TRIES: u32 = 10;
+
+/// Zamyka strażnika bezpiecznie i utrwala jego ostatnie słowo.
+///
+/// Najpierw czeka, aż PTT opadnie: po panice dyspozytora sekwencer może
+/// jeszcze nadawać, a strażnik jest wtedy jedynym limitem (I-2). Czekanie
+/// ogranicza sam strażnik — po swoim limicie opuszcza PTT i znacznik.
+/// Po zatrzymaniu wątku strażnika flaga już się nie zmieni, więc jeden zapis
+/// wystarczy; most odpytywał co 500 ms i mógł nie zdążyć (I-1).
+async fn finish_radio(
+    watchdog: Option<aars_core::watchdog::WatchdogHandle>,
+    marker: Option<&aars_core::watchdog::WatchdogMarker>,
+    interlocks: &aars_core::interlock::InMemoryInterlocks,
+    pool: &SqlitePool,
+) -> Result<()> {
+    let (Some(watchdog), Some(marker)) = (watchdog, marker) else {
+        return Ok(());
+    };
+    if marker.is_keyed() {
+        tracing::warn!("PTT wciąż w górze — czekam, aż opadnie albo zdejmie je strażnik");
+        while marker.is_keyed() {
+            tokio::time::sleep(CONTROL_POLL).await;
+        }
+    }
+    watchdog.stop();
+    if !marker.is_poisoned() {
+        return Ok(());
+    }
+    for _ in 0..FINAL_POISON_TRIES {
+        if radio::record_poison(marker, interlocks, pool).await {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("nie udało się utrwalić interwencji strażnika — kończę proces bez restartu")
 }
 
 #[cfg(test)]
@@ -654,6 +715,8 @@ mod tests {
         seen: Mutex<Vec<(PttBackendKind, String)>>,
         ptt: Arc<FakePtt>,
         last_backend: Mutex<Option<PttBackendKind>>,
+        /// Wyjście podstawione przez test; bez niego świeży `FakeSink`.
+        sink: Mutex<Option<Arc<dyn AudioSink>>>,
     }
 
     impl FakeHardware {
@@ -663,6 +726,7 @@ mod tests {
                 seen: Mutex::new(Vec::new()),
                 ptt: Arc::new(FakePtt::new()),
                 last_backend: Mutex::new(None),
+                sink: Mutex::new(None),
             }
         }
 
@@ -689,6 +753,8 @@ mod tests {
                 .push((backend, cfg.device.clone()));
             if self.fail_devices.contains(&cfg.device) {
                 Err(format!("brak urządzenia {}", cfg.device))
+            } else if let Some(sink) = self.sink.lock().unwrap().clone() {
+                Ok(sink)
             } else {
                 Ok(Arc::new(FakeSink::new()))
             }
@@ -1078,5 +1144,138 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(exit, Exit::Stop));
+    }
+
+    /// Wyjście, które wisi, dopóki strażnik nie opuści PTT, i wraca zaraz
+    /// potem — najgorszy moment dla mostu odpytującego co 500 ms (I-1).
+    struct HangsUntilWatchdog(Arc<FakePtt>);
+
+    impl AudioSink for HangsUntilWatchdog {
+        fn play(
+            &self,
+            _: &aars_core::synth::Pcm,
+            _: &CancelToken,
+        ) -> Result<aars_core::sink::PlayReport, aars_core::sink::SinkError> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !self.0.events().contains(&PttEvent::ForceUnkey) {
+                assert!(std::time::Instant::now() < deadline, "strażnik nie zainterweniował");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(aars_core::sink::PlayReport {
+                played: Duration::from_secs(1),
+                cancelled: false,
+            })
+        }
+    }
+
+    async fn enqueue_one(pool: &SqlitePool, text: &str) {
+        QueueRepo::new(pool.clone())
+            .enqueue(aars_core::queue::EnqueueRequest {
+                message_id: None,
+                rendered_text: text.to_owned(),
+                priority: Priority::Normal,
+                interrupting: false,
+                not_before: None,
+                expires_at: None,
+                repeat_count: 1,
+                repeat_interval: Duration::ZERO,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_watchdog_intervention_during_the_restart_drain_survives_the_restart() {
+        let pool = aars_core::db::test_pool().await;
+        // Strażnik: 1 s + 0 ogona + 2 s zapasu.
+        put(&pool, "tx_max_duration_s", "1").await;
+        enqueue_one(&pool, "komunikat, który zawiesi kartę").await;
+        let hardware = Arc::new(FakeHardware::new(&[]));
+        let ptt = hardware.ptt.clone();
+        *hardware.sink.lock().unwrap() = Some(Arc::new(HangsUntilWatchdog(ptt.clone())));
+        let mut config = station_config("drain-poison");
+        config.ptt.tx_tail_ms = 0;
+        let (task, handle) = start(config, pool.clone(), hardware, CancelToken::new()).await;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ptt.is_keyed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("zadanie musi wejść na antenę");
+        handle.request_restart();
+
+        let exit = tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .expect("restart musi się zakończyć")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Restart));
+        assert_eq!(
+            get(&pool, "poisoned").await.as_deref(),
+            Some("true"),
+            "interwencja w trakcie drenażu musi trafić do bazy przed restartem"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_radio_waits_for_the_watchdog_before_stopping_it() {
+        let pool = aars_core::db::test_pool().await;
+        let ptt = Arc::new(FakePtt::new());
+        let watchdog =
+            aars_core::watchdog::Watchdog::spawn(ptt.clone(), Duration::from_millis(200));
+        let marker = watchdog.marker();
+        // Sekwencer po panice dyspozytora: PTT w górze, nikt go nie opuści.
+        ptt.key().unwrap();
+        marker.mark_keyed();
+        let interlocks = aars_core::interlock::InMemoryInterlocks::permissive();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            finish_radio(Some(watchdog), Some(&marker), &interlocks, &pool),
+        )
+        .await
+        .expect("czekanie ogranicza limit strażnika")
+        .unwrap();
+
+        assert!(!ptt.is_keyed(), "strażnik nie może zniknąć przy wciśniętym PTT");
+        assert!(aars_core::interlock::Interlocks::snapshot(&interlocks).poisoned);
+        assert_eq!(get(&pool, "poisoned").await.as_deref(), Some("true"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_station_poisoned_in_the_database_refuses_the_audio_test_after_restart() {
+        let pool = aars_core::db::test_pool().await;
+        put(&pool, "poisoned", "true").await;
+        let hardware = Arc::new(FakeHardware::new(&[]));
+        let sink = Arc::new(FakeSink::new());
+        *hardware.sink.lock().unwrap() = Some(sink.clone());
+        let stop = CancelToken::new();
+        // Przy VOX test audio jest niedostępny z innego powodu; tu PTT osobne.
+        let mut config = station_config("poisoned-audio");
+        config.ptt.backend = PttBackendKind::Serial;
+        let (task, handle) = start(config, pool.clone(), hardware, stop.clone()).await;
+
+        let outcome = handle
+            .run_test(StationTest::Audio {
+                by: "admin".to_owned(),
+            })
+            .await;
+        assert!(
+            !matches!(outcome, TestOutcome::Done { .. }),
+            "test audio przy blokadzie z bazy: {outcome:?}"
+        );
+        assert_eq!(sink.played_samples(), 0, "nic nie może iść na wejście radia");
+
+        stop.cancel();
+        let exit = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Stop));
+        assert_eq!(get(&pool, "poisoned").await.as_deref(), Some("true"));
     }
 }
