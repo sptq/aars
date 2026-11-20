@@ -5,6 +5,7 @@ pub mod chrome;
 pub mod hardware_page;
 pub mod logs;
 pub mod messages;
+pub mod modules_page;
 pub mod preview;
 pub mod queue_page;
 pub mod render;
@@ -501,7 +502,9 @@ pub fn router(state: AppState) -> Router {
         .route("/sources", get(sources_page::page_view))
         .route("/sources/{id}/enabled", post(sources_page::set_enabled))
         .route("/sources/{id}/refresh", post(sources_page::refresh))
-        .route("/sources/{id}/settings", post(sources_page::save_settings))
+        .route("/modules", get(modules_page::page_view))
+        .route("/modules/{id}/enabled", post(modules_page::set_enabled))
+        .route("/modules/{id}/settings", post(modules_page::save_settings))
         .route("/healthz", get(|| async { "ok" }))
         .route("/assets/{*path}", get(assets::serve))
         .with_state(state)

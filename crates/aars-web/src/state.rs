@@ -137,7 +137,11 @@ impl AppState {
             probe: None,
             modules: Arc::new(ModuleRegistry::new({
                 let mut all = aars_core::module::builtin();
-                all.push(aars_core::module::sample_source("imgw-meteo"));
+                // Schemat jak `imgw-meteo` z crate'a źródeł, nazwa jak na stacji.
+                all.push(aars_core::module::ModuleDescriptor {
+                    name: "Ostrzeżenia meteorologiczne IMGW",
+                    ..aars_core::module::sample_source("imgw-meteo")
+                });
                 all
             })),
             base_config: Arc::new(Config::default()),
