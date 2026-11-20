@@ -150,11 +150,23 @@ impl QueueRepo {
         let base = request.not_before.unwrap_or_else(Utc::now);
         let group = if count > 1 { Some(new_group_id()) } else { None };
 
-        let mut ids = Vec::with_capacity(count as usize);
-        for index in 0..count {
-            let offset = request.repeat_interval * index;
-            let not_before =
-                base + chrono::Duration::from_std(offset).unwrap_or(chrono::Duration::zero());
+        // Wszystkie terminy liczymy przed pierwszym INSERT-em: przepełnienie
+        // to odmowa całego zlecenia, nie panika ani połowa grupy w kolejce.
+        let times = (0..count)
+            .map(|index| {
+                request
+                    .repeat_interval
+                    .checked_mul(index)
+                    .and_then(|offset| chrono::Duration::from_std(offset).ok())
+                    .and_then(|offset| base.checked_add_signed(offset))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                DbError::Invalid("odstęp powtórzeń wychodzi poza zakres dat".to_owned())
+            })?;
+
+        let mut ids = Vec::with_capacity(times.len());
+        for (index, not_before) in (0..count).zip(times) {
 
             let id: i64 = sqlx::query_scalar(
                 "INSERT INTO queue_items
@@ -496,6 +508,29 @@ mod tests {
         let claimed = repo.claim_next().await.unwrap().unwrap();
         assert_eq!(claimed.repeat_index, 0);
         assert!(repo.claim_next().await.unwrap().is_none(), "kolejne czekają na swój czas");
+    }
+
+    #[tokio::test]
+    async fn a_huge_repeat_interval_is_refused_instead_of_panicking() {
+        let repo = QueueRepo::new(test_pool().await);
+        // Duration * u32 przepełnia się przy trzecim powtórzeniu.
+        let mut huge = req("ogromny odstęp", Priority::Normal);
+        huge.repeat_count = 3;
+        huge.repeat_interval = Duration::from_secs(u64::MAX);
+        assert!(repo.enqueue(huge).await.is_err(), "przepełnienie to błąd, nie panika");
+
+        // Mieści się w TimeDelta, ale nie w dacie.
+        let mut far = req("daleko", Priority::Normal);
+        far.repeat_count = 2;
+        far.repeat_interval = Duration::from_secs(1_000_000_000_000_000);
+        assert!(repo.enqueue(far).await.is_err(), "data poza zakresem to błąd");
+
+        // Za duże dla TimeDelta — wcześniej po cichu zero.
+        let mut silent = req("po cichu", Priority::Normal);
+        silent.repeat_count = 2;
+        silent.repeat_interval = Duration::from_secs(u64::MAX / 4);
+        assert!(repo.enqueue(silent).await.is_err());
+        assert!(repo.pending(10).await.unwrap().is_empty(), "nic nie trafia do kolejki");
     }
 
     #[tokio::test]

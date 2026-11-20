@@ -78,7 +78,8 @@ pub enum MessageAction {
         interrupting: bool,
         #[arg(long, default_value_t = 1)]
         repeat: u32,
-        #[arg(long, default_value_t = 600)]
+        #[arg(long, default_value_t = 600,
+              value_parser = clap::value_parser!(u64).range(0..=aars_core::message::MAX_REPEAT_INTERVAL_S))]
         every: u64,
     },
     /// Wypisuje definicje komunikatów.
@@ -105,7 +106,8 @@ pub enum QueueAction {
         #[arg(long, default_value_t = 1)]
         repeat: u32,
         /// Odstęp między powtórzeniami w sekundach.
-        #[arg(long, default_value_t = 600)]
+        #[arg(long, default_value_t = 600,
+              value_parser = clap::value_parser!(u64).range(0..=aars_core::message::MAX_REPEAT_INTERVAL_S))]
         every: u64,
     },
     /// Wypisuje zadania czekające w kolejce.
@@ -117,4 +119,19 @@ pub enum QueueAction {
         #[arg(long, group = "target")]
         group: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_repeat_interval_over_a_day_is_refused_by_the_cli() {
+        assert!(Cli::try_parse_from(["aars", "queue", "add", "x", "--every", "86401"]).is_err());
+        assert!(
+            Cli::try_parse_from(["aars", "message", "add", "x", "--title", "t", "--every", "86401"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["aars", "queue", "add", "x", "--every", "86400"]).is_ok());
+    }
 }
