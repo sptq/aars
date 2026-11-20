@@ -4,7 +4,7 @@
 //! wygenerowało. Nie trafia do logów (`tracing`) ani do `audit_log`.
 
 use aars_core::error::DbError;
-use aars_core::user::{AuthError, Role, UserRepo};
+use aars_core::user::{AuthError, Role, UserChangeError, UserRepo};
 use askama::Template;
 use axum::Form;
 use axum::extract::{Path, State};
@@ -132,6 +132,29 @@ fn db_failure(what: &str, err: &dyn std::fmt::Display) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "błąd zapisu użytkownika").into_response()
 }
 
+/// Odmowa ochrony ostatniego admina to 400 z komunikatem, reszta to 500.
+async fn change_failure(
+    state: &AppState,
+    current: &CurrentUser,
+    what: &str,
+    err: UserChangeError,
+) -> Response {
+    match err {
+        UserChangeError::LastAdmin => {
+            render(
+                state,
+                current,
+                StatusCode::BAD_REQUEST,
+                Some(err.to_string()),
+                None,
+                "",
+            )
+            .await
+        }
+        UserChangeError::Db(err) => db_failure(what, &err),
+    }
+}
+
 fn is_unique_violation(err: &AuthError) -> bool {
     matches!(err, AuthError::Db(DbError::Sqlx(sqlx::Error::Database(e))) if e.is_unique_violation())
 }
@@ -248,7 +271,7 @@ pub async fn set_role(
         .await;
     };
     if let Err(err) = UserRepo::new(state.pool.clone()).set_role(id, role).await {
-        return db_failure("zmiana roli zawiodła", &err);
+        return change_failure(&state, &current, "zmiana roli zawiodła", err).await;
     }
     audit(
         &state,
@@ -280,7 +303,7 @@ pub async fn set_disabled(
         .set_disabled(id, disabled)
         .await
     {
-        return db_failure("zmiana stanu konta zawiodła", &err);
+        return change_failure(&state, &current, "zmiana stanu konta zawiodła", err).await;
     }
     audit(
         &state,
@@ -339,7 +362,7 @@ pub async fn delete(
         Err(response) => return response,
     };
     if let Err(err) = UserRepo::new(state.pool.clone()).delete(id).await {
-        return db_failure("usunięcie użytkownika zawiodło", &err);
+        return change_failure(&state, &current, "usunięcie użytkownika zawiodło", err).await;
     }
     audit(&state, current.user.id, "user_delete", &user.username).await;
     render(&state, &current, StatusCode::OK, None, None, "").await
@@ -643,6 +666,36 @@ mod tests {
             .await
             .unwrap();
         assert!(details.iter().all(|d| !d.contains(&fresh)));
+    }
+
+    #[tokio::test]
+    async fn two_admins_demoting_each_other_at_once_leave_one_admin() {
+        let (app, cookie_a, csrf_a, state) = logged_in(Role::Admin).await;
+        let repo = UserRepo::new(state.pool.clone());
+        let a = user_id(&state, "u").await;
+        let b = repo.create("b", "haslo", Role::Admin).await.unwrap();
+        let cookie_b = login(&app, "b", "haslo").await;
+        let csrf_b = csrf_of(&app, &cookie_b).await;
+
+        let (uri_b, uri_a) = (format!("/users/{b}/role"), format!("/users/{a}/role"));
+        let (first, second) = tokio::join!(
+            post(&app, &uri_b, &cookie_a, format!("csrf={csrf_a}&role=viewer")),
+            post(&app, &uri_a, &cookie_b, format!("csrf={csrf_b}&role=viewer")),
+        );
+        let mut statuses = [first.0, second.0];
+        statuses.sort();
+        // Jeden wygrywa; drugi dostaje 403 (już nie admin) albo 400 (strażnik w SQL).
+        assert_eq!(statuses[0], StatusCode::OK, "{statuses:?}");
+        assert!(
+            matches!(statuses[1], StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN),
+            "{statuses:?}"
+        );
+        let admins: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled = 0")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(admins, 1);
     }
 
     #[tokio::test]
