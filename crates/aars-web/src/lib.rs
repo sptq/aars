@@ -1,10 +1,10 @@
 pub mod assets;
 pub mod auth;
+pub mod chrome;
 pub mod render;
 pub mod state;
 
 use aars_core::interlock::Interlocks;
-use aars_core::priority::Priority;
 use aars_core::queue::{EnqueueRequest, QueueItem};
 use aars_core::user::{AuthError, Role, UserRepo};
 use askama::Template;
@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 
+use crate::chrome::{Chrome, both_times_now, parse_priority, priority_label};
 use crate::auth::{AuthRejection, CurrentUser, require_csrf, require_role};
 use crate::render::page;
 pub use crate::state::AppState;
@@ -29,10 +30,7 @@ struct LoginPage {
 #[derive(Template)]
 #[template(path = "dashboard.html")]
 struct DashboardPage {
-    username: String,
-    role: String,
-    csrf: String,
-    can_operate: bool,
+    chrome: Chrome,
     tx_enabled: bool,
     poisoned: bool,
     pending: Vec<QueueRow>,
@@ -41,18 +39,14 @@ struct DashboardPage {
 #[derive(Template)]
 #[template(path = "compose.html")]
 struct ComposePage {
-    username: String,
-    role: String,
-    csrf: String,
-    can_operate: bool,
+    chrome: Chrome,
 }
 
 #[derive(Template)]
 #[template(path = "queue_fragment.html")]
 struct QueueFragment {
     pending: Vec<QueueRow>,
-    can_operate: bool,
-    csrf: String,
+    chrome: Chrome,
 }
 
 struct QueueRow {
@@ -66,8 +60,8 @@ struct QueueRow {
 fn queue_row(item: QueueItem) -> QueueRow {
     QueueRow {
         id: item.id,
-        priority: format!("{:?}", item.priority),
-        not_before: item.not_before.format("%H:%M:%S").to_string(),
+        priority: priority_label(item.priority).to_owned(),
+        not_before: both_times_now(item.not_before),
         text: item.rendered_text,
         interrupting: item.interrupting,
     }
@@ -80,16 +74,6 @@ async fn queue_rows(state: &AppState) -> Vec<QueueRow> {
             tracing::error!(%err, "odczyt kolejki zawiódł");
             Vec::new()
         }
-    }
-}
-
-fn parse_priority(value: &str) -> Option<Priority> {
-    match value {
-        "emergency" => Some(Priority::Emergency),
-        "high" => Some(Priority::High),
-        "normal" => Some(Priority::Normal),
-        "low" => Some(Priority::Low),
-        _ => None,
     }
 }
 
@@ -194,10 +178,7 @@ async fn dashboard(State(state): State<AppState>, current: CurrentUser) -> Respo
     let interlocks = state.interlocks.snapshot();
 
     page(&DashboardPage {
-        username: current.user.username.clone(),
-        role: current.user.role.as_str().to_owned(),
-        csrf: current.csrf_token.clone(),
-        can_operate: current.user.role.can(Role::Operator),
+        chrome: Chrome::from(&current),
         tx_enabled: interlocks.tx_enabled,
         poisoned: interlocks.poisoned,
         pending: queue_rows(&state).await,
@@ -207,10 +188,7 @@ async fn dashboard(State(state): State<AppState>, current: CurrentUser) -> Respo
 async fn compose_page(current: CurrentUser) -> Result<Response, AuthRejection> {
     require_role(&current.user, Role::Operator)?;
     Ok(page(&ComposePage {
-        username: current.user.username.clone(),
-        role: current.user.role.as_str().to_owned(),
-        csrf: current.csrf_token.clone(),
-        can_operate: true,
+        chrome: Chrome::from(&current),
     }))
 }
 
@@ -324,16 +302,14 @@ async fn cancel_item(
     // Odpowiadamy fragmentem, więc HTMX podmienia tabelę bez przeładowania.
     Ok(page(&QueueFragment {
         pending: queue_rows(&state).await,
-        can_operate: true,
-        csrf: current.csrf_token.clone(),
+        chrome: Chrome::from(&current),
     }))
 }
 
 async fn queue_fragment(State(state): State<AppState>, current: CurrentUser) -> Response {
     page(&QueueFragment {
         pending: queue_rows(&state).await,
-        can_operate: current.user.role.can(Role::Operator),
-        csrf: current.csrf_token.clone(),
+        chrome: Chrome::from(&current),
     })
 }
 
@@ -368,6 +344,7 @@ pub fn router(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aars_core::priority::Priority;
     use aars_core::user::{Role, UserRepo};
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
@@ -769,5 +746,46 @@ mod tests {
         let html = String::from_utf8_lossy(&body);
         assert!(html.contains("w kolejce"), "{html}");
         assert!(!html.contains("<html"), "fragment nie może być całą stroną");
+    }
+
+    async fn get_body(app: Router, cookie: &str, uri: &str) -> String {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    #[tokio::test]
+    async fn the_queue_shows_polish_priority_names() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Viewer).await;
+        let mut request = enqueue(&state, "w kolejce");
+        request.priority = Priority::High;
+        state.queue.enqueue(request).await.unwrap();
+
+        let html = get_body(app, &cookie, "/fragments/queue").await;
+        assert!(html.contains("Wysoki"), "{html}");
+        assert!(!html.contains("High"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn an_admin_sees_admin_links_and_an_operator_does_not() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Admin).await;
+        let html = get_body(app, &cookie, "/").await;
+        assert!(html.contains("href=\"/settings\""), "{html}");
+        assert!(html.contains("href=\"/users\""), "{html}");
+
+        let (app, cookie, _csrf, _state) = logged_in(Role::Operator).await;
+        let html = get_body(app, &cookie, "/").await;
+        assert!(!html.contains("href=\"/settings\""), "{html}");
+        assert!(!html.contains("href=\"/users\""), "{html}");
+        assert!(html.contains("href=\"/queue\""), "{html}");
     }
 }
