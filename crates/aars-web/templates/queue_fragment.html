@@ -4,7 +4,7 @@
 <table>
   <thead>
     <tr>
-      <th>#</th><th>Priorytet</th><th>Od</th><th>Treść</th>
+      <th>#</th><th>Priorytet</th><th>Od</th><th>Treść</th><th>Powtórzenie</th>
       {% if chrome.can_operate %}<th></th>{% endif %}
     </tr>
   </thead>
@@ -16,10 +16,17 @@
           <span class="badge warn">przerywa</span>{% endif %}</td>
       <td>{{ item.not_before }}</td>
       <td>{{ item.text }}</td>
+      <td>{{ item.repeat_label }}</td>
       {% if chrome.can_operate %}
-      <td><button class="ghost" hx-post="/queue/{{ item.id }}/cancel"
+      <td><button class="ghost" hx-post="/queue/{{ item.id }}/cancel{% if full %}?full=1{% endif %}"
                   hx-headers='{"x-csrf-token": "{{ chrome.csrf }}"}'
-                  hx-target="#queue" hx-swap="innerHTML">Anuluj</button></td>
+                  hx-target="#queue" hx-swap="innerHTML">Anuluj</button>
+        {% if let Some(group) = item.group %}
+        <button class="ghost" hx-post="/queue/group/{{ group }}/cancel{% if full %}?full=1{% endif %}"
+                hx-headers='{"x-csrf-token": "{{ chrome.csrf }}"}'
+                hx-confirm="Anulować wszystkie pozostałe powtórzenia tej serii?"
+                hx-target="#queue" hx-swap="innerHTML">Anuluj serię</button>
+        {% endif %}</td>
       {% endif %}
     </tr>
     {% endfor %}

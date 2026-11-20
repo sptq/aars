@@ -399,7 +399,7 @@ pub async fn send(
     match state.queue.enqueue(request).await {
         Ok(_) => {
             audit(&state, current.user.id, "message_send", &message.title).await;
-            Ok(Redirect::to("/").into_response())
+            Ok(Redirect::to("/queue").into_response())
         }
         Err(err) => Ok(server_error("dodanie do kolejki zawiodło", &err)),
     }

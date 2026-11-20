@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}AARS — kolejka{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Kolejka</h2>
+  <div id="queue" hx-get="/fragments/queue?full=1" hx-trigger="every 3s" hx-swap="innerHTML">
+    {% include "queue_fragment.html" %}
+  </div>
+</div>
+{% endblock %}

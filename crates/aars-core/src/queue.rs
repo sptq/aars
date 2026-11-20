@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -344,6 +345,21 @@ impl QueueRepo {
         Ok(result.rows_affected())
     }
 
+    /// Liczba wszystkich wystąpień (także zakończonych) każdej serii, która
+    /// ma jeszcze coś w kolejce; mianownik „n/N” na stronie kolejki.
+    pub async fn group_sizes(&self) -> Result<HashMap<String, i64>, DbError> {
+        let rows = sqlx::query(
+            "SELECT repeat_group, COUNT(*) AS size FROM queue_items
+              WHERE repeat_group IN (
+                    SELECT repeat_group FROM queue_items
+                     WHERE state = 'pending' AND repeat_group IS NOT NULL)
+              GROUP BY repeat_group",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| (r.get("repeat_group"), r.get("size"))).collect())
+    }
+
     pub async fn pending(&self, limit: i64) -> Result<Vec<QueueItem>, DbError> {
         let rows = sqlx::query(&format!(
             "SELECT {COLUMNS} FROM queue_items
@@ -406,7 +422,10 @@ mod tests {
         assert_eq!(claimed.state, QueueState::Transmitting);
         assert_eq!(claimed.attempt, 1, "claim liczy próbę");
 
-        assert!(repo.claim_next().await.unwrap().is_none(), "drugi claim nie może wziąć tego samego");
+        assert!(
+            repo.claim_next().await.unwrap().is_none(),
+            "drugi claim nie może wziąć tego samego"
+        );
     }
 
     #[tokio::test]
