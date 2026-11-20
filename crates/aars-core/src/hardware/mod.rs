@@ -61,6 +61,10 @@ fn err(field: &'static str, message: &str) -> FieldError {
     FieldError { field, message: message.to_owned() }
 }
 
+fn device_ok(v: &str) -> bool {
+    (1..=128).contains(&v.chars().count()) && !v.chars().any(char::is_control)
+}
+
 fn backend_text(b: PttBackendKind) -> &'static str {
     match b {
         PttBackendKind::Gpio => "gpio",
@@ -91,7 +95,7 @@ fn take<T>(
         Some(parsed) => *slot = parsed,
         None => warnings.push(format!(
             "{key}: nieczytelna wartość „{v}”, używam {}",
-            from_file.get(key).map(String::as_str).unwrap_or("")
+            from_file.get(key).map(String::as_str).filter(|v| !v.is_empty()).unwrap_or("brak")
         )),
     }
 }
@@ -165,15 +169,36 @@ impl HardwareSettings {
         let (d, w) = (&file, &mut warnings);
         let text = |v: &str| Some(v.to_owned());
 
-        take("server.bind", pairs, d, w, text, &mut s.bind);
-        take("audio.device", pairs, d, w, text, &mut s.audio_device);
-        take("audio.sample_rate", pairs, d, w, |v| v.trim().parse().ok(), &mut s.sample_rate);
+        take(
+            "server.bind",
+            pairs,
+            d,
+            w,
+            |v| v.parse::<SocketAddr>().ok().filter(|a| a.port() >= 1024).map(|_| v.to_owned()),
+            &mut s.bind,
+        );
+        take(
+            "audio.device",
+            pairs,
+            d,
+            w,
+            |v| device_ok(v).then(|| v.to_owned()),
+            &mut s.audio_device,
+        );
+        take(
+            "audio.sample_rate",
+            pairs,
+            d,
+            w,
+            |v| v.trim().parse().ok().filter(|r| SAMPLE_RATES.contains(r)),
+            &mut s.sample_rate,
+        );
         take(
             "audio.gain_db",
             pairs,
             d,
             w,
-            |v| v.trim().replace(',', ".").parse::<f32>().ok().filter(|g| g.is_finite()),
+            |v| v.trim().replace(',', ".").parse::<f32>().ok().filter(|g| (-30.0..=0.0).contains(g)),
             &mut s.gain_db,
         );
         take(
@@ -189,9 +214,23 @@ impl HardwareSettings {
             },
             &mut s.ptt_backend,
         );
-        take("ptt.tx_tail_ms", pairs, d, w, |v| v.trim().parse().ok(), &mut s.tx_tail_ms);
+        take(
+            "ptt.tx_tail_ms",
+            pairs,
+            d,
+            w,
+            |v| v.trim().parse().ok().filter(|t| *t <= 2000),
+            &mut s.tx_tail_ms,
+        );
         take("ptt.gpio.chip", pairs, d, w, text, &mut s.gpio_chip);
-        take("ptt.gpio.line", pairs, d, w, |v| v.trim().parse().ok(), &mut s.gpio_line);
+        take(
+            "ptt.gpio.line",
+            pairs,
+            d,
+            w,
+            |v| v.trim().parse().ok().filter(|l| *l <= 511),
+            &mut s.gpio_line,
+        );
         take(
             "ptt.gpio.active_low",
             pairs,
@@ -211,11 +250,18 @@ impl HardwareSettings {
             w,
             |v| {
                 let v = v.trim();
-                if v.is_empty() { Some(None) } else { v.parse().ok().map(Some) }
+                if v.is_empty() { Some(None) } else { v.parse().ok().filter(|l| *l <= 511).map(Some) }
             },
             &mut s.gpio_inhibit_line,
         );
-        take("ptt.serial.port", pairs, d, w, text, &mut s.serial_port);
+        take(
+            "ptt.serial.port",
+            pairs,
+            d,
+            w,
+            |v| v.starts_with("/dev/").then(|| v.to_owned()),
+            &mut s.serial_port,
+        );
         take(
             "ptt.serial.line",
             pairs,
@@ -228,7 +274,14 @@ impl HardwareSettings {
             },
             &mut s.serial_line,
         );
-        take("tts.model", pairs, d, w, text, &mut s.voice_model);
+        take(
+            "tts.model",
+            pairs,
+            d,
+            w,
+            |v| v.ends_with(".onnx").then(|| v.to_owned()),
+            &mut s.voice_model,
+        );
         (s, warnings)
     }
 
@@ -242,8 +295,7 @@ impl HardwareSettings {
             }
             Ok(_) => {}
         }
-        let dev_len = self.audio_device.chars().count();
-        if !(1..=128).contains(&dev_len) || self.audio_device.chars().any(char::is_control) {
+        if !device_ok(&self.audio_device) {
             e.push(err(
                 "audio.device",
                 "urządzenie audio: 1–128 znaków bez znaków sterujących",
@@ -261,21 +313,28 @@ impl HardwareSettings {
         if self.tx_tail_ms > 2000 {
             e.push(err("ptt.tx_tail_ms", "opóźnienie PTT: 0–2000 ms"));
         }
-        if self.gpio_line > 511 {
-            e.push(err("ptt.gpio.line", "linia GPIO: 0–511"));
-        }
-        if let Some(inhibit) = self.gpio_inhibit_line {
-            if inhibit > 511 {
-                e.push(err("ptt.gpio.inhibit_line", "linia GPIO: 0–511"));
-            } else if inhibit == self.gpio_line {
-                e.push(err(
-                    "ptt.gpio.inhibit_line",
-                    "linia blokująca musi być inna niż linia PTT",
-                ));
+        match self.ptt_backend {
+            PttBackendKind::Gpio => {
+                if self.gpio_line > 511 {
+                    e.push(err("ptt.gpio.line", "linia GPIO: 0–511"));
+                }
+                if let Some(inhibit) = self.gpio_inhibit_line {
+                    if inhibit > 511 {
+                        e.push(err("ptt.gpio.inhibit_line", "linia GPIO: 0–511"));
+                    } else if inhibit == self.gpio_line {
+                        e.push(err(
+                            "ptt.gpio.inhibit_line",
+                            "linia blokująca musi być inna niż linia PTT",
+                        ));
+                    }
+                }
             }
-        }
-        if !self.serial_port.starts_with("/dev/") {
-            e.push(err("ptt.serial.port", "port szeregowy: podaj ścieżkę /dev/…"));
+            PttBackendKind::Serial => {
+                if !self.serial_port.starts_with("/dev/") {
+                    e.push(err("ptt.serial.port", "port szeregowy: podaj ścieżkę /dev/…"));
+                }
+            }
+            PttBackendKind::Vox => {}
         }
         if !self.voice_model.ends_with(".onnx") {
             e.push(err("tts.model", "model głosu: plik .onnx"));
@@ -522,10 +581,12 @@ mod tests {
         assert_eq!(only(&s), one("ptt.tx_tail_ms", "opóźnienie PTT: 0–2000 ms"));
 
         let mut s = base();
+        s.ptt_backend = PttBackendKind::Gpio;
         s.gpio_line = 512;
         assert_eq!(only(&s), one("ptt.gpio.line", "linia GPIO: 0–511"));
 
         let mut s = base();
+        s.ptt_backend = PttBackendKind::Gpio;
         s.gpio_inhibit_line = Some(s.gpio_line);
         assert_eq!(
             only(&s),
@@ -533,6 +594,7 @@ mod tests {
         );
 
         let mut s = base();
+        s.ptt_backend = PttBackendKind::Serial;
         s.serial_port = "COM3".into();
         assert_eq!(only(&s), one("ptt.serial.port", "port szeregowy: podaj ścieżkę /dev/…"));
 
@@ -547,6 +609,38 @@ mod tests {
                 only(&s),
                 one("audio.device", "urządzenie audio: 1–128 znaków bez znaków sterujących")
             );
+        }
+    }
+
+    #[test]
+    fn unused_backend_fields_do_not_block_saving() {
+        let mut s = base();
+        s.serial_port = String::new();
+        s.gpio_chip = String::new();
+        s.gpio_line = 9999;
+        assert!(s.validate().is_ok(), "vox");
+        s.ptt_backend = PttBackendKind::Gpio;
+        s.gpio_line = 17;
+        assert!(s.validate().is_ok(), "gpio z pustym portem szeregowym");
+        s.ptt_backend = PttBackendKind::Serial;
+        s.serial_port = "/dev/ttyUSB0".into();
+        assert!(s.validate().is_ok(), "serial z pustym układem GPIO");
+    }
+
+    #[test]
+    fn a_stored_value_that_fails_validation_falls_back_like_an_unreadable_one() {
+        let cfg = Config::default();
+        for (key, bad) in [
+            ("audio.sample_rate", "12345"),
+            ("ptt.tx_tail_ms", "999999"),
+            ("server.bind", "x"),
+            ("tts.model", "foo"),
+        ] {
+            let pairs = BTreeMap::from([(key.to_owned(), bad.to_owned())]);
+            let (s, w) = HardwareSettings::from_pairs(&cfg, &pairs);
+            assert_eq!(s, HardwareSettings::from_config(&cfg), "{key}");
+            assert_eq!(w.len(), 1, "{key}");
+            assert!(w[0].contains(key) && w[0].contains(bad), "{w:?}");
         }
     }
 
