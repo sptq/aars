@@ -1,10 +1,19 @@
+pub mod account;
 pub mod assets;
 pub mod auth;
+pub mod chrome;
+pub mod logs;
+pub mod messages;
+pub mod preview;
+pub mod queue_page;
 pub mod render;
+pub mod settings_page;
 pub mod state;
+pub mod users;
 
 use aars_core::interlock::Interlocks;
-use aars_core::priority::Priority;
+use std::collections::HashMap;
+
 use aars_core::queue::{EnqueueRequest, QueueItem};
 use aars_core::user::{AuthError, Role, UserRepo};
 use askama::Template;
@@ -17,7 +26,8 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 
 use crate::auth::{AuthRejection, CurrentUser, require_csrf, require_role};
-use crate::render::page;
+use crate::chrome::{Chrome, both_times_now, parse_priority, priority_label};
+use crate::render::{db_error, page};
 pub use crate::state::AppState;
 
 #[derive(Template)]
@@ -29,68 +39,70 @@ struct LoginPage {
 #[derive(Template)]
 #[template(path = "dashboard.html")]
 struct DashboardPage {
-    username: String,
-    role: String,
-    csrf: String,
-    can_operate: bool,
+    chrome: Chrome,
     tx_enabled: bool,
     poisoned: bool,
     pending: Vec<QueueRow>,
+    full: bool,
 }
 
 #[derive(Template)]
 #[template(path = "compose.html")]
 struct ComposePage {
-    username: String,
-    role: String,
-    csrf: String,
-    can_operate: bool,
+    chrome: Chrome,
 }
 
 #[derive(Template)]
 #[template(path = "queue_fragment.html")]
 struct QueueFragment {
     pending: Vec<QueueRow>,
-    can_operate: bool,
-    csrf: String,
+    chrome: Chrome,
+    /// Pełna strona kolejki: przyciski i odświeżanie zostają przy limicie 200.
+    full: bool,
 }
 
-struct QueueRow {
+pub(crate) struct QueueRow {
     id: i64,
+    group: Option<String>,
+    repeat_label: String,
     priority: String,
     not_before: String,
     text: String,
     interrupting: bool,
+    /// Powód wstrzymania po odmowie interlocka; surowe błędy nie trafiają do UI.
+    held: Option<String>,
 }
 
-fn queue_row(item: QueueItem) -> QueueRow {
+fn queue_row(item: QueueItem, sizes: &HashMap<String, i64>) -> QueueRow {
+    let repeat_label = match item.repeat_group.as_ref().and_then(|g| sizes.get(g)) {
+        Some(size) => format!("{}/{}", item.repeat_index + 1, size),
+        None => String::new(),
+    };
     QueueRow {
         id: item.id,
-        priority: format!("{:?}", item.priority),
-        not_before: item.not_before.format("%H:%M:%S").to_string(),
+        group: item.repeat_group,
+        repeat_label,
+        priority: priority_label(item.priority).to_owned(),
+        not_before: both_times_now(item.not_before),
         text: item.rendered_text,
         interrupting: item.interrupting,
+        held: item.error.filter(|e| e.starts_with(aars_core::dispatcher::HELD_PREFIX)),
     }
 }
 
-async fn queue_rows(state: &AppState) -> Vec<QueueRow> {
-    match state.queue.pending(50).await {
-        Ok(items) => items.into_iter().map(queue_row).collect(),
-        Err(err) => {
-            tracing::error!(%err, "odczyt kolejki zawiódł");
-            Vec::new()
-        }
-    }
-}
-
-fn parse_priority(value: &str) -> Option<Priority> {
-    match value {
-        "emergency" => Some(Priority::Emergency),
-        "high" => Some(Priority::High),
-        "normal" => Some(Priority::Normal),
-        "low" => Some(Priority::Low),
-        _ => None,
-    }
+/// Wiersze kolejki; `Err` to gotowa odpowiedź 500 (błąd już w logu).
+async fn queue_rows(state: &AppState, limit: i64) -> Result<Vec<QueueRow>, Response> {
+    let sizes = state
+        .queue
+        .group_sizes()
+        .await
+        .map_err(|err| db_error("odczyt rozmiarów serii zawiódł", &err))?;
+    let items = state
+        .queue
+        .pending(limit)
+        .await
+        .map_err(|err| db_error("odczyt kolejki zawiódł", &err))?;
+    Ok(items.into_iter().map(|item| queue_row(item, &sizes)).collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,9 +186,9 @@ async fn logout(
 ) -> Result<Response, AuthRejection> {
     require_csrf(&current.csrf_token, Some(&form.csrf))?;
 
-    if let Some(session_id) = auth::session_id_from_cookies(
-        headers.get(header::COOKIE).and_then(|v| v.to_str().ok()),
-    ) {
+    if let Some(session_id) =
+        auth::session_id_from_cookies(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()))
+    {
         let _ = UserRepo::new(state.pool.clone()).end_session(&session_id).await;
     }
 
@@ -192,26 +204,23 @@ async fn logout(
 
 async fn dashboard(State(state): State<AppState>, current: CurrentUser) -> Response {
     let interlocks = state.interlocks.snapshot();
+    let pending = match queue_rows(&state, 50).await {
+        Ok(rows) => rows,
+        Err(response) => return response,
+    };
 
     page(&DashboardPage {
-        username: current.user.username.clone(),
-        role: current.user.role.as_str().to_owned(),
-        csrf: current.csrf_token.clone(),
-        can_operate: current.user.role.can(Role::Operator),
+        chrome: Chrome::from(&current),
         tx_enabled: interlocks.tx_enabled,
         poisoned: interlocks.poisoned,
-        pending: queue_rows(&state).await,
+        pending,
+        full: false,
     })
 }
 
 async fn compose_page(current: CurrentUser) -> Result<Response, AuthRejection> {
     require_role(&current.user, Role::Operator)?;
-    Ok(page(&ComposePage {
-        username: current.user.username.clone(),
-        role: current.user.role.as_str().to_owned(),
-        csrf: current.csrf_token.clone(),
-        can_operate: true,
-    }))
+    Ok(page(&ComposePage { chrome: Chrome::from(&current) }))
 }
 
 async fn compose_submit(
@@ -225,14 +234,17 @@ async fn compose_submit(
     let text = form.text.trim().to_owned();
     if text.is_empty() {
         // Puste nadanie to wejście na pasmo z ciszą — odmawiamy.
-        return Ok(
-            (StatusCode::BAD_REQUEST, "treść komunikatu nie może być pusta").into_response()
-        );
+        return Ok((StatusCode::BAD_REQUEST, "treść komunikatu nie może być pusta").into_response());
     }
 
     let Some(priority) = parse_priority(&form.priority) else {
         return Ok((StatusCode::BAD_REQUEST, "nieznany priorytet").into_response());
     };
+
+    if form.every > aars_core::message::MAX_REPEAT_INTERVAL_S {
+        return Ok((StatusCode::BAD_REQUEST, aars_core::message::REPEAT_INTERVAL_ERROR)
+            .into_response());
+    }
 
     let request = EnqueueRequest {
         message_id: None,
@@ -289,13 +301,44 @@ async fn set_tx_enabled(
     }
 
     tracing::warn!(user = %current.user.username, enabled, "zmiana stanu nadawania z panelu");
-    audit(
-        &state,
-        current.user.id,
-        "tx_enabled",
-        if enabled { "włączone" } else { "wyłączone" },
+    audit(&state, current.user.id, "tx_enabled", if enabled { "włączone" } else { "wyłączone" })
+        .await;
+
+    Ok(Redirect::to("/").into_response())
+}
+
+/// Zdejmuje blokadę po interwencji watchdoga. Tylko admin (Ruling R4):
+/// zdjęcie przywraca automatyczne nadawanie po awarii sprzętowej.
+async fn clear_watchdog(
+    State(state): State<AppState>,
+    current: CurrentUser,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, AuthRejection> {
+    require_role(&current.user, Role::Admin)?;
+    require_csrf(&current.csrf_token, Some(&form.csrf))?;
+
+    // Najpierw sam strażnik: binarka przenosi jego flagę do interlocków,
+    // więc wyczyszczenie interlocków przy wciąż zatrutym strażniku nic by
+    // nie dało.
+    if let Some(clear) = &state.watchdog_clear {
+        clear();
+    }
+
+    if let Err(err) = sqlx::query(
+        "UPDATE settings SET value = 'false', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+          WHERE key = 'poisoned'",
     )
-    .await;
+    .execute(&state.pool)
+    .await
+    {
+        // Bez zapisu blokada wróciłaby po restarcie — nie udajemy sukcesu.
+        tracing::error!(%err, "zapis zdjęcia blokady watchdoga zawiódł");
+        return Ok((StatusCode::INTERNAL_SERVER_ERROR, "błąd bazy").into_response());
+    }
+    state.interlocks.set_poisoned(false);
+
+    tracing::warn!(user = %current.user.username, "blokada watchdoga zdjęta z panelu");
+    audit(&state, current.user.id, "watchdog_clear", "blokada zdjęta").await;
 
     Ok(Redirect::to("/").into_response())
 }
@@ -305,13 +348,11 @@ async fn cancel_item(
     current: CurrentUser,
     headers: header::HeaderMap,
     axum::extract::Path(id): axum::extract::Path<i64>,
+    axum::extract::Query(view): axum::extract::Query<ViewQuery>,
 ) -> Result<Response, AuthRejection> {
     require_role(&current.user, Role::Operator)?;
     // HTMX wysyła token nagłówkiem, bo przycisk nie jest formularzem.
-    require_csrf(
-        &current.csrf_token,
-        headers.get("x-csrf-token").and_then(|v| v.to_str().ok()),
-    )?;
+    require_csrf(&current.csrf_token, headers.get("x-csrf-token").and_then(|v| v.to_str().ok()))?;
 
     match state.queue.cancel(id).await {
         Ok(count) => {
@@ -322,23 +363,49 @@ async fn cancel_item(
     }
 
     // Odpowiadamy fragmentem, więc HTMX podmienia tabelę bez przeładowania.
-    Ok(page(&QueueFragment {
-        pending: queue_rows(&state).await,
-        can_operate: true,
-        csrf: current.csrf_token.clone(),
-    }))
+    Ok(queue_fragment_response(&state, &current, view.full).await)
 }
 
-async fn queue_fragment(State(state): State<AppState>, current: CurrentUser) -> Response {
+/// `?full=1` oznacza fragment strony `/queue` (limit 200 zamiast 50).
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct ViewQuery {
+    #[serde(default, deserialize_with = "flag")]
+    pub(crate) full: bool,
+}
+
+/// Flaga z adresu: szablony wysyłają `?full=1`, a serde dla `bool`
+/// przyjmuje tylko `true`/`false` (bez tego fragment pełnej kolejki to 400).
+fn flag<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(matches!(value.as_str(), "1" | "true" | "on"))
+}
+
+pub(crate) async fn queue_fragment_response(
+    state: &AppState,
+    current: &CurrentUser,
+    full: bool,
+) -> Response {
+    let pending = match queue_rows(state, if full { 200 } else { 50 }).await {
+        Ok(rows) => rows,
+        Err(response) => return response,
+    };
     page(&QueueFragment {
-        pending: queue_rows(&state).await,
-        can_operate: current.user.role.can(Role::Operator),
-        csrf: current.csrf_token.clone(),
+        pending,
+        chrome: Chrome::from(current),
+        full,
     })
 }
 
+async fn queue_fragment(
+    State(state): State<AppState>,
+    current: CurrentUser,
+    axum::extract::Query(view): axum::extract::Query<ViewQuery>,
+) -> Response {
+    queue_fragment_response(&state, &current, view.full).await
+}
+
 /// Zapis do dziennika audytu: kto kazał i co (spec §5).
-async fn audit(state: &AppState, user_id: i64, action: &str, detail: &str) {
+pub(crate) async fn audit(state: &AppState, user_id: i64, action: &str, detail: &str) {
     if let Err(err) =
         sqlx::query("INSERT INTO audit_log (user_id, action, detail) VALUES (?, ?, ?)")
             .bind(user_id)
@@ -356,30 +423,56 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(dashboard))
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", post(logout))
+        .route("/account/password", get(account::password_page).post(account::password_submit))
         .route("/compose", get(compose_page).post(compose_submit))
+        .route("/messages", get(messages::list).post(messages::create))
+        .route("/messages/new", get(messages::new_page))
+        .route("/messages/next", get(messages::next_hint))
+        .route("/messages/{id}/edit", get(messages::edit_page))
+        .route("/messages/{id}", post(messages::update))
+        .route("/messages/{id}/enabled", post(messages::set_enabled))
+        .route("/messages/{id}/delete", post(messages::delete))
+        .route("/messages/{id}/send", post(messages::send))
+        .route("/messages/{id}/preview.wav", get(preview::stored))
+        .route("/preview", post(preview::from_text))
         .route("/tx-enabled", post(set_tx_enabled))
+        .route("/watchdog/clear", post(clear_watchdog))
         .route("/queue/{id}/cancel", post(cancel_item))
         .route("/fragments/queue", get(queue_fragment))
+        .route("/queue", get(queue_page::page_view))
+        .route("/logs", get(logs::page_view))
+        .route("/settings", get(settings_page::page_view).post(settings_page::submit))
+        .route("/users", get(users::page_view).post(users::create))
+        .route("/users/{id}/role", post(users::set_role))
+        .route("/users/{id}/disabled", post(users::set_disabled))
+        .route("/users/{id}/reset", post(users::reset))
+        .route("/users/{id}/delete", post(users::delete))
+        .route("/queue/group/{group}/cancel", post(queue_page::cancel_group))
         .route("/healthz", get(|| async { "ok" }))
         .route("/assets/{*path}", get(assets::serve))
         .with_state(state)
 }
 
 #[cfg(test)]
-mod tests {
+mod role_matrix;
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
+    use aars_core::priority::Priority;
     use aars_core::user::{Role, UserRepo};
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
+    use std::sync::Arc;
     use tower::ServiceExt;
 
-    async fn state() -> AppState {
+    pub(crate) async fn state() -> AppState {
         AppState::for_tests(aars_core::db::test_pool().await)
     }
 
     /// Loguje się i zwraca cookie sesji wraz z tokenem CSRF odczytanym ze
     /// strony pulpitu — dokładnie tak, jak robi to przeglądarka.
-    async fn login(app: &Router, username: &str, password: &str) -> (String, String) {
+    pub(crate) async fn login(app: &Router, username: &str, password: &str) -> (String, String) {
         let response = app
             .clone()
             .oneshot(
@@ -423,7 +516,7 @@ mod tests {
         (cookie, csrf)
     }
 
-    async fn logged_in(role: Role) -> (Router, String, String, AppState) {
+    pub(crate) async fn logged_in(role: Role) -> (Router, String, String, AppState) {
         let state = state().await;
         UserRepo::new(state.pool.clone()).create("u", "haslo", role).await.unwrap();
         let app = router(state.clone());
@@ -639,7 +732,9 @@ mod tests {
                     .uri("/compose")
                     .header(header::COOKIE, cookie)
                     .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(format!("csrf={csrf}&text=proba&priority=normal&repeat=1&every=0")))
+                    .body(Body::from(format!(
+                        "csrf={csrf}&text=proba&priority=normal&repeat=1&every=0"
+                    )))
                     .unwrap(),
             )
             .await
@@ -660,7 +755,9 @@ mod tests {
                     .uri("/compose")
                     .header(header::COOKIE, cookie)
                     .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from("csrf=podrobiony&text=atak&priority=emergency&repeat=1&every=0"))
+                    .body(Body::from(
+                        "csrf=podrobiony&text=atak&priority=emergency&repeat=1&every=0",
+                    ))
                     .unwrap(),
             )
             .await
@@ -684,7 +781,9 @@ mod tests {
                     .uri("/compose")
                     .header(header::COOKIE, cookie)
                     .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(format!("csrf={csrf}&text=+++&priority=normal&repeat=1&every=0")))
+                    .body(Body::from(format!(
+                        "csrf={csrf}&text=+++&priority=normal&repeat=1&every=0"
+                    )))
                     .unwrap(),
             )
             .await
@@ -748,6 +847,106 @@ mod tests {
         assert!(state.queue.pending(10).await.unwrap().is_empty());
     }
 
+    fn repeated(state: &AppState) -> EnqueueRequest {
+        let mut request = enqueue(state, "seria");
+        request.repeat_count = 3;
+        request.repeat_interval = std::time::Duration::from_secs(60);
+        request
+    }
+
+    async fn post_cancel(app: Router, cookie: &str, csrf: Option<&str>, uri: String) -> StatusCode {
+        let mut builder = Request::builder().method("POST").uri(uri).header(header::COOKIE, cookie);
+        if let Some(csrf) = csrf {
+            builder = builder.header("x-csrf-token", csrf);
+        }
+        app.oneshot(builder.body(Body::empty()).unwrap()).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_group_removes_all_remaining_repeats() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+        state.queue.enqueue(repeated(&state)).await.unwrap();
+        let group = state.queue.pending(10).await.unwrap()[0].repeat_group.clone().unwrap();
+
+        let status =
+            post_cancel(app, &cookie, Some(&csrf), format!("/queue/group/{group}/cancel")).await;
+
+        assert!(status.is_success(), "{status:?}");
+        assert!(state.queue.pending(10).await.unwrap().is_empty());
+        let logged: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'queue_cancel_group'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(logged, 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_repeat_keeps_the_others() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+        let ids = state.queue.enqueue(repeated(&state)).await.unwrap();
+
+        let status =
+            post_cancel(app, &cookie, Some(&csrf), format!("/queue/{}/cancel", ids[0])).await;
+
+        assert!(status.is_success(), "{status:?}");
+        assert_eq!(state.queue.pending(10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_queue_page_shows_repeat_position() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+        state.queue.enqueue(repeated(&state)).await.unwrap();
+
+        let html = get_body(app, &cookie, "/queue").await;
+
+        assert!(html.contains("1/3"), "{html}");
+        assert!(html.contains("3/3"), "{html}");
+        assert!(html.contains("Anuluj serię"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn a_viewer_cannot_open_the_queue_page() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Viewer).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/queue")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn group_cancel_without_csrf_is_refused() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+        state.queue.enqueue(repeated(&state)).await.unwrap();
+        let group = state.queue.pending(10).await.unwrap()[0].repeat_group.clone().unwrap();
+
+        let status = post_cancel(app, &cookie, None, format!("/queue/group/{group}/cancel")).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(state.queue.pending(10).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_viewer_cannot_cancel_a_group() {
+        let (app, cookie, csrf, state) = logged_in(Role::Viewer).await;
+        state.queue.enqueue(repeated(&state)).await.unwrap();
+        let group = state.queue.pending(10).await.unwrap()[0].repeat_group.clone().unwrap();
+
+        let status =
+            post_cancel(app, &cookie, Some(&csrf), format!("/queue/group/{group}/cancel")).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(state.queue.pending(10).await.unwrap().len(), 3);
+    }
+
     #[tokio::test]
     async fn the_queue_fragment_is_served_for_live_updates() {
         let (app, cookie, _csrf, state) = logged_in(Role::Viewer).await;
@@ -769,5 +968,573 @@ mod tests {
         let html = String::from_utf8_lossy(&body);
         assert!(html.contains("w kolejce"), "{html}");
         assert!(!html.contains("<html"), "fragment nie może być całą stroną");
+    }
+
+    async fn get_body(app: Router, cookie: &str, uri: &str) -> String {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    #[tokio::test]
+    async fn the_queue_shows_why_an_item_is_held() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Viewer).await;
+        state.queue.enqueue(enqueue(&state, "wstrzymany")).await.unwrap();
+        let claimed = state.queue.claim_next().await.unwrap().unwrap();
+        state
+            .queue
+            .hold(
+                claimed.id,
+                "wstrzymane: nadawanie wyłączone",
+                chrono::Utc::now() + chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        state.queue.enqueue(enqueue(&state, "po błędzie")).await.unwrap();
+        let other = state.queue.claim_next().await.unwrap().unwrap();
+        state.queue.requeue(other.id, "surowy błąd sterownika", chrono::Utc::now()).await.unwrap();
+
+        let html = get_body(app, &cookie, "/fragments/queue").await;
+        assert!(html.contains("wstrzymane: nadawanie wyłączone"), "{html}");
+        assert!(!html.contains("surowy błąd sterownika"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn the_queue_shows_polish_priority_names() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Viewer).await;
+        let mut request = enqueue(&state, "w kolejce");
+        request.priority = Priority::High;
+        state.queue.enqueue(request).await.unwrap();
+
+        let html = get_body(app, &cookie, "/fragments/queue").await;
+        assert!(html.contains("Wysoki"), "{html}");
+        assert!(!html.contains("High"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn an_admin_sees_admin_links_and_an_operator_does_not() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Admin).await;
+        let html = get_body(app, &cookie, "/").await;
+        assert!(html.contains("href=\"/settings\""), "{html}");
+        assert!(html.contains("href=\"/users\""), "{html}");
+
+        let (app, cookie, _csrf, _state) = logged_in(Role::Operator).await;
+        let html = get_body(app, &cookie, "/").await;
+        assert!(!html.contains("href=\"/settings\""), "{html}");
+        assert!(!html.contains("href=\"/users\""), "{html}");
+        assert!(html.contains("href=\"/queue\""), "{html}");
+    }
+
+    async fn post_form(
+        app: &Router,
+        cookie: &str,
+        uri: &str,
+        body: String,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn get_html(app: &Router, cookie: &str, uri: &str) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn message_form(csrf: &str, title: &str, text: &str, cron: &str) -> String {
+        format!(
+            "csrf={csrf}&title={title}&text={text}&priority=high&repeat=2&every=60\
+             &schedule_kind=cron&at=&cron={}",
+            cron.replace(' ', "+").replace('*', "%2A")
+        )
+    }
+
+    async fn create_message(app: &Router, cookie: &str, csrf: &str) {
+        let response = post_form(
+            app,
+            cookie,
+            "/messages",
+            message_form(csrf, "biuletyn", "Uwaga+wszystkim", "0 18 * * *"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn an_operator_creates_a_cron_message_and_sees_it_listed() {
+        let (app, cookie, csrf, _state) = logged_in(Role::Operator).await;
+
+        let response = post_form(
+            &app,
+            &cookie,
+            "/messages",
+            message_form(&csrf, "biuletyn", "Uwaga+wszystkim", "0 18 * * *"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/messages");
+
+        let (status, html) = get_html(&app, &cookie, "/messages").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("biuletyn"), "{html}");
+        assert!(html.contains("0 18 * * *"), "{html}");
+        assert!(html.contains("Wysoki"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn a_huge_repeat_interval_is_refused_in_compose_and_in_definitions() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+
+        let response = post_form(
+            &app,
+            &cookie,
+            "/compose",
+            format!("csrf={csrf}&text=uwaga&priority=normal&repeat=3&every=18446744073709551615"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("86400"));
+        assert!(state.queue.pending(10).await.unwrap().is_empty());
+
+        let response = post_form(
+            &app,
+            &cookie,
+            "/messages",
+            message_form(&csrf, "biuletyn", "tresc", "0 18 * * *")
+                .replace("every=60", "every=86401"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let saved = aars_core::message::MessageRepo::new(state.pool.clone()).list().await.unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+
+        // Granica jest włącznie.
+        let response = post_form(
+            &app,
+            &cookie,
+            "/messages",
+            message_form(&csrf, "biuletyn", "tresc", "0 18 * * *")
+                .replace("every=60", "every=86400"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn the_full_queue_fragment_accepts_full_1_from_the_templates() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Operator).await;
+        let (status, html) = get_html(&app, &cookie, "/fragments/queue?full=1").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+    }
+
+    #[tokio::test]
+    async fn a_broken_queue_table_is_a_500_not_an_empty_queue() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+        sqlx::query("ALTER TABLE queue_items RENAME TO queue_items_gone")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        for uri in ["/", "/fragments/queue", "/fragments/queue?full=1", "/queue"] {
+            let (status, html) = get_html(&app, &cookie, uri).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}");
+            assert!(!html.contains("Kolejka pusta"), "{uri}: {html}");
+        }
+    }
+
+    #[tokio::test]
+    async fn broken_log_tables_are_a_500_not_empty_logs() {
+        for table in ["tx_log", "audit_log"] {
+            let (app, cookie, _csrf, state) = logged_in(Role::Viewer).await;
+            sqlx::query(&format!("ALTER TABLE {table} RENAME TO {table}_gone"))
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            let (status, html) = get_html(&app, &cookie, "/logs").await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{table}");
+            assert!(!html.contains("Nic jeszcze nie nadano"), "{table}: {html}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_header_badge_and_the_audit_log_speak_polish() {
+        let (app, cookie, csrf, _state) = logged_in(Role::Operator).await;
+        let response = post_form(
+            &app,
+            &cookie,
+            "/compose",
+            format!("csrf={csrf}&text=uwaga&priority=normal&repeat=1&every=0"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let (status, html) = get_html(&app, &cookie, "/logs").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("u · Operator"), "{html}");
+        assert!(html.contains("<td>nowe nadanie</td>"), "{html}");
+        assert!(!html.contains("<td>compose</td>"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn links_use_the_panel_accent_colour() {
+        let css = String::from_utf8(
+            crate::assets::Assets::get("app.css").unwrap().data.into_owned(),
+        )
+        .unwrap();
+        assert!(css.contains("a, a:visited { color: var(--accent); }"), "{css}");
+        assert!(css.contains("a:hover"), "{css}");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_cron_is_refused_and_nothing_is_saved() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+
+        let response = post_form(
+            &app,
+            &cookie,
+            "/messages",
+            message_form(&csrf, "zly", "tresc", "0 25 * * *"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let saved = aars_core::message::MessageRepo::new(state.pool.clone()).list().await.unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_message_text_is_refused() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+
+        let response = post_form(
+            &app,
+            &cookie,
+            "/messages",
+            message_form(&csrf, "pusty", "+++", "0 18 * * *"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let saved = aars_core::message::MessageRepo::new(state.pool.clone()).list().await.unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+    }
+
+    #[tokio::test]
+    async fn an_operator_can_edit_a_message() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+        create_message(&app, &cookie, &csrf).await;
+        let repo = aars_core::message::MessageRepo::new(state.pool.clone());
+        let id = repo.list().await.unwrap()[0].id;
+
+        let (status, html) = get_html(&app, &cookie, &format!("/messages/{id}/edit")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("0 18 * * *"), "{html}");
+
+        let response = post_form(
+            &app,
+            &cookie,
+            &format!("/messages/{id}"),
+            message_form(&csrf, "nowy", "Inna+tresc", "30 6 * * *"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let message = repo.get(id).await.unwrap().unwrap();
+        assert_eq!(message.title, "nowy");
+        assert_eq!(
+            message.schedule,
+            aars_core::message::ScheduleKind::Cron("30 6 * * *".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_operator_can_disable_and_delete_a_message() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+        create_message(&app, &cookie, &csrf).await;
+        let repo = aars_core::message::MessageRepo::new(state.pool.clone());
+        let id = repo.list().await.unwrap()[0].id;
+
+        let response = post_form(
+            &app,
+            &cookie,
+            &format!("/messages/{id}/enabled"),
+            format!("csrf={csrf}&enabled=0"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(!repo.get(id).await.unwrap().unwrap().enabled);
+
+        let response =
+            post_form(&app, &cookie, &format!("/messages/{id}/delete"), format!("csrf={csrf}"))
+                .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(repo.get(id).await.unwrap().is_none());
+
+        let audited: Vec<String> = sqlx::query_scalar("SELECT action FROM audit_log ORDER BY id")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(audited, ["message_create", "message_enabled", "message_delete"]);
+    }
+
+    #[tokio::test]
+    async fn send_now_puts_the_definition_on_the_queue() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+        create_message(&app, &cookie, &csrf).await;
+        let id =
+            aars_core::message::MessageRepo::new(state.pool.clone()).list().await.unwrap()[0].id;
+
+        let response =
+            post_form(&app, &cookie, &format!("/messages/{id}/send"), format!("csrf={csrf}")).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/queue");
+
+        let pending = state.queue.pending(10).await.unwrap();
+        assert_eq!(pending.len(), 2, "{pending:?}");
+        assert!(pending.iter().all(|item| item.message_id == Some(id)));
+        assert!(pending.iter().all(|item| item.rendered_text == "Uwaga wszystkim"));
+        assert!(pending.iter().all(|item| item.priority == Priority::High));
+    }
+
+    #[tokio::test]
+    async fn a_viewer_cannot_open_messages() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Viewer).await;
+
+        let (status, _) = get_html(&app, &cookie, "/messages").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn the_next_fire_hint_shows_both_times() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Operator).await;
+
+        let (status, text) =
+            get_html(&app, &cookie, "/messages/next?schedule_kind=cron&at=&cron=0+18+%2A+%2A+%2A")
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(text.contains("18:00 UTC"), "{text}");
+        assert!(text.contains("lokalnie"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn creating_a_message_without_csrf_is_forbidden_and_saves_nothing() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+
+        let response = post_form(
+            &app,
+            &cookie,
+            "/messages",
+            "csrf=zly&title=x&text=tresc&priority=normal&schedule_kind=immediate".to_owned(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let saved = aars_core::message::MessageRepo::new(state.pool.clone()).list().await.unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+    }
+
+    #[tokio::test]
+    async fn sending_an_unknown_message_is_not_found() {
+        let (app, cookie, csrf, _state) = logged_in(Role::Operator).await;
+
+        let response =
+            post_form(&app, &cookie, "/messages/9999/send", format!("csrf={csrf}")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_viewer_sees_transmissions_and_audit_entries() {
+        let (app, op_cookie, csrf, state) = logged_in(Role::Operator).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/compose")
+                    .header(header::COOKIE, op_cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("csrf={csrf}&text=komunikat+dziennika&priority=normal")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let id = state.queue.pending(10).await.unwrap()[0].id;
+        let now = chrono::Utc::now();
+        aars_core::txlog::TxLogRepo::new(state.pool.clone())
+            .record(aars_core::txlog::TxLogEntry {
+                queue_item_id: id,
+                started_at: now - chrono::Duration::seconds(7),
+                ended_at: now,
+                ptt_backend: "gpio".to_owned(),
+                result: "ok",
+                note: None,
+            })
+            .await
+            .unwrap();
+
+        UserRepo::new(state.pool.clone()).create("v", "haslo", Role::Viewer).await.unwrap();
+        let (viewer_cookie, _) = login(&app, "v", "haslo").await;
+        let html = get_body(app, &viewer_cookie, "/logs").await;
+
+        assert!(html.contains("nadane"), "{html}");
+        assert!(html.contains("komunikat dziennika"), "{html}");
+        assert!(html.contains("nowe nadanie"), "{html}");
+        assert!(html.contains("UTC"), "{html}");
+        assert!(html.contains("lokalnie"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn anonymous_visitors_are_sent_to_login() {
+        let response = router(state().await)
+            .oneshot(Request::builder().uri("/logs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/login");
+    }
+
+    /// Stan zatruty po interwencji watchdoga, z licznikiem wywołań
+    /// `clear_poison` po stronie strażnika.
+    async fn poisoned_as(
+        role: Role,
+    ) -> (Router, String, String, AppState, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cleared = Arc::new(AtomicUsize::new(0));
+        let counter = cleared.clone();
+        let state = state().await.with_watchdog_clear(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        state.interlocks.set_poisoned(true);
+        sqlx::query("UPDATE settings SET value = 'true' WHERE key = 'poisoned'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        UserRepo::new(state.pool.clone()).create("u", "haslo", role).await.unwrap();
+        let app = router(state.clone());
+        let (cookie, csrf) = login(&app, "u", "haslo").await;
+        (app, cookie, csrf, state, cleared)
+    }
+
+    fn clear_request(cookie: &str, csrf: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/watchdog/clear")
+            .header(header::COOKIE, cookie)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!("csrf={csrf}")))
+            .unwrap()
+    }
+
+    async fn stored_poison(state: &AppState) -> String {
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'poisoned'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_admin_clears_the_watchdog_block() {
+        let (app, cookie, csrf, state, cleared) = poisoned_as(Role::Admin).await;
+
+        let response = app.oneshot(clear_request(&cookie, &csrf)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(!state.interlocks.snapshot().poisoned, "interlocki muszą przepuszczać");
+        assert_eq!(stored_poison(&state).await, "false", "zdjęcie musi przetrwać restart");
+        assert_eq!(
+            cleared.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "flaga musi zniknąć też w samym watchdogu"
+        );
+        let audited: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'watchdog_clear'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(audited, 1);
+    }
+
+    #[tokio::test]
+    async fn an_operator_cannot_clear_the_watchdog_block() {
+        let (app, cookie, csrf, state, cleared) = poisoned_as(Role::Operator).await;
+
+        let response = app.oneshot(clear_request(&cookie, &csrf)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(state.interlocks.snapshot().poisoned);
+        assert_eq!(stored_poison(&state).await, "true");
+        assert_eq!(cleared.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn clearing_the_watchdog_block_needs_a_csrf_token() {
+        let (app, cookie, _csrf, state, cleared) = poisoned_as(Role::Admin).await;
+
+        let response = app.oneshot(clear_request(&cookie, "podrobiony")).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(state.interlocks.snapshot().poisoned);
+        assert_eq!(cleared.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    async fn dashboard_html(app: Router, cookie: &str) -> String {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_dashboard_offers_the_watchdog_reset_only_to_an_admin() {
+        let (app, cookie, _, _, _) = poisoned_as(Role::Admin).await;
+        let html = dashboard_html(app, &cookie).await;
+        assert!(html.contains("watchdog — wymaga resetu"));
+        assert!(html.contains("action=\"/watchdog/clear\""), "{html}");
+        assert!(html.contains("Zdejmij blokadę watchdoga"));
+
+        let (app, cookie, _, _, _) = poisoned_as(Role::Operator).await;
+        let html = dashboard_html(app, &cookie).await;
+        assert!(html.contains("watchdog — wymaga resetu"), "operator widzi blokadę");
+        assert!(!html.contains("/watchdog/clear"), "operator nie dostaje przycisku");
     }
 }

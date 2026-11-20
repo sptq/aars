@@ -42,6 +42,17 @@ pub enum PttBackendKind {
     Vox,
 }
 
+impl PttBackendKind {
+    /// Nazwa dla człowieka (panel), nie `{:?}`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gpio => "GPIO",
+            Self::Serial => "port szeregowy",
+            Self::Vox => "VOX",
+        }
+    }
+}
+
 /// Źródło informacji o zajętości kanału. W MVP zawsze `None` — spec §4.4
 /// zostawia to pole, by dołożenie COS/RMS nie wymagało ruszania sekwencera.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +174,14 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ptt_backends_have_human_labels() {
+        use super::PttBackendKind;
+        assert_eq!(PttBackendKind::Gpio.label(), "GPIO");
+        assert_eq!(PttBackendKind::Serial.label(), "port szeregowy");
+        assert_eq!(PttBackendKind::Vox.label(), "VOX");
+    }
+
     use super::*;
 
     // Każdy test dotykający konfiguracji pracuje w `figment::Jail`, który

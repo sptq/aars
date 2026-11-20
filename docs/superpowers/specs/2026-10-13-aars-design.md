@@ -163,6 +163,11 @@ i `AtomicU64` ze znacznikiem podniesienia PTT ustawianym przez sekwencer.
 Gdy `now - keyed_at > tx_max_duration` → `force_unkey()` + ustawienie flagi
 `poisoned`, którą sekwencer sprawdza przed każdym kolejnym nadaniem i która
 wymaga ręcznego zdjęcia w panelu. Limit domyślny 180 s, konfigurowalny.
+Watchdog działa z limitem `tx_max_duration + tx_tail + WATCHDOG_GRACE`
+(`WATCHDOG_GRACE` = 2 s), bo sekwencer sam ucina nadanie na limicie, a po
+audio trzyma jeszcze PTT przez `tx_tail`; watchdog jest drugą linią obrony na
+wypadek zawieszenia sekwencera. Bez `tx_tail` w limicie długi ogon radia
+zatruwałby stację na zwykłym komunikacie o maksymalnej długości.
 
 Flaga `poisoned` jest celowo lepka: jeśli watchdog musiał interweniować, coś
 jest fundamentalnie zepsute i dalsze automatyczne nadawanie byłoby
@@ -336,7 +341,10 @@ Dwa poziomy, rozdzielone po tym, kto i kiedy je zmienia:
   `AARS_*` (figment).
 - **`settings` w bazie** — rzeczy operacyjne: kill switch, okna ciszy, znak
   wywoławczy, tryb i interwał ID, limit czasu TX, `misfire_grace_s`, rozmiar
-  cache. Zmieniane z panelu, działają od razu.
+  cache. Zmieniane z panelu. Kill switch i okno ciszy działają od razu;
+  *(etap 7: znak wywoławczy, tryb i interwał ID, limit czasu TX oraz
+  `misfire_grace_s` są czytane przy starcie stacji, więc wchodzą w życie po
+  restarcie — panel mówi to wprost przy formularzu ustawień).*
 
 ```toml
 [server]

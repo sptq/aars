@@ -22,6 +22,32 @@ pub enum AuthError {
     Hash(String),
 }
 
+/// Zmiana konta, która mogłaby zostawić stację bez administratora.
+#[derive(Debug, thiserror::Error)]
+pub enum UserChangeError {
+    #[error("stacja musi mieć co najmniej jednego aktywnego administratora")]
+    LastAdmin,
+    #[error(transparent)]
+    Db(#[from] DbError),
+}
+
+impl From<sqlx::Error> for UserChangeError {
+    fn from(err: sqlx::Error) -> Self {
+        Self::Db(DbError::Sqlx(err))
+    }
+}
+
+/// Warunek SQL: konto `id_param` nie jest aktywnym adminem albo istnieje inny
+/// aktywny admin. Sprawdzany w tym samym zapytaniu co zmiana, więc dwie
+/// równoległe degradacje nie zostawią stacji bez admina.
+fn keeps_an_admin(id_param: &str) -> String {
+    format!(
+        "(NOT (role = 'admin' AND disabled = 0)
+          OR EXISTS (SELECT 1 FROM users o
+                      WHERE o.id <> {id_param} AND o.role = 'admin' AND o.disabled = 0))"
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Viewer,
@@ -101,6 +127,11 @@ fn random_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Losowe hasło tymczasowe: 20 znaków szesnastkowych (80 bitów).
+fn random_password() -> String {
+    random_token()[..20].to_owned()
 }
 
 fn row_to_user(row: &sqlx::sqlite::SqliteRow) -> User {
@@ -195,12 +226,20 @@ impl UserRepo {
 
     /// Wyłącza konto i od razu zrywa jego sesje — wyłączenie, które działa
     /// dopiero po wygaśnięciu sesji, nie jest wyłączeniem.
-    pub async fn set_disabled(&self, id: i64, disabled: bool) -> Result<(), DbError> {
-        sqlx::query("UPDATE users SET disabled = ? WHERE id = ?")
-            .bind(i64::from(disabled))
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+    ///
+    /// Odmawia ([`UserChangeError::LastAdmin`]) wyłączenia ostatniego aktywnego admina.
+    pub async fn set_disabled(&self, id: i64, disabled: bool) -> Result<(), UserChangeError> {
+        let result = sqlx::query(&format!(
+            "UPDATE users SET disabled = ?1 WHERE id = ?2 AND (?1 = 0 OR {})",
+            keeps_an_admin("?2")
+        ))
+        .bind(i64::from(disabled))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return self.refused_or_missing(id).await;
+        }
 
         if disabled {
             sqlx::query("DELETE FROM sessions WHERE user_id = ?")
@@ -211,9 +250,79 @@ impl UserRepo {
         Ok(())
     }
 
-    pub async fn delete(&self, id: i64) -> Result<u64, DbError> {
-        let result =
-            sqlx::query("DELETE FROM users WHERE id = ?").bind(id).execute(&self.pool).await?;
+    /// Zmienia rolę konta. Odmawia degradacji ostatniego aktywnego admina.
+    pub async fn set_role(&self, id: i64, role: Role) -> Result<(), UserChangeError> {
+        let result = sqlx::query(&format!(
+            "UPDATE users SET role = ?1 WHERE id = ?2 AND (?1 = 'admin' OR {})",
+            keeps_an_admin("?2")
+        ))
+        .bind(role.as_str())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return self.refused_or_missing(id).await;
+        }
+        Ok(())
+    }
+
+    /// Zapytanie strzeżone nic nie zmieniło: brak konta to nie błąd,
+    /// istniejące konto znaczy, że zadziałała ochrona ostatniego admina.
+    async fn refused_or_missing(&self, id: i64) -> Result<(), UserChangeError> {
+        match self.by_id(id).await? {
+            Some(_) => Err(UserChangeError::LastAdmin),
+            None => Ok(()),
+        }
+    }
+
+    /// Losowe hasło tymczasowe: 20 znaków, `must_change_password = 1`,
+    /// sesje konta zerwane. Zwraca hasło, żeby admin przekazał je użytkownikowi.
+    pub async fn reset_password(&self, id: i64) -> Result<String, AuthError> {
+        let password = random_password();
+        let hash = hash_password(&password)?;
+        sqlx::query("UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?")
+            .bind(hash)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AuthError::Db(DbError::Sqlx(e)))?;
+        self.end_all_sessions(id).await?;
+        Ok(password)
+    }
+
+    /// Tworzy konto z losowym hasłem tymczasowym (do zmiany przy pierwszym logowaniu).
+    pub async fn create_with_temporary_password(
+        &self,
+        username: &str,
+        role: Role,
+    ) -> Result<(i64, String), AuthError> {
+        let password = random_password();
+        let hash = hash_password(&password)?;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO users (username, password_hash, role, must_change_password)
+             VALUES (?, ?, ?, 1) RETURNING id",
+        )
+        .bind(username)
+        .bind(hash)
+        .bind(role.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| AuthError::Db(DbError::Sqlx(e)))?;
+        Ok((id, password))
+    }
+
+    /// Usuwa konto; ostatniego aktywnego admina — nie.
+    pub async fn delete(&self, id: i64) -> Result<u64, UserChangeError> {
+        let result = sqlx::query(&format!(
+            "DELETE FROM users WHERE id = ?1 AND {}",
+            keeps_an_admin("?1")
+        ))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            self.refused_or_missing(id).await?;
+        }
         Ok(result.rows_affected())
     }
 
@@ -265,6 +374,15 @@ impl UserRepo {
         Ok(())
     }
 
+    /// Kończy wszystkie sesje użytkownika (np. po zmianie hasła).
+    pub async fn end_all_sessions(&self, user_id: i64) -> Result<u64, DbError> {
+        let result = sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn purge_expired_sessions(&self) -> Result<u64, DbError> {
         let result = sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
             .bind(iso(Utc::now()))
@@ -285,7 +403,7 @@ impl UserRepo {
             return Ok(None);
         }
 
-        let password = random_token()[..20].to_owned();
+        let password = random_password();
         let hash = hash_password(&password)?;
         sqlx::query(
             "INSERT INTO users (username, password_hash, role, must_change_password)
@@ -365,6 +483,22 @@ mod tests {
             repo.session_user(&session.id).await.unwrap().is_none(),
             "wylogowanie musi działać natychmiast"
         );
+    }
+
+    #[tokio::test]
+    async fn ending_all_sessions_leaves_other_users_alone() {
+        let repo = UserRepo::new(test_pool().await);
+        let a = repo.create("a", "haslo", Role::Operator).await.unwrap();
+        let b = repo.create("b", "haslo", Role::Operator).await.unwrap();
+        let a1 = repo.start_session(a, None).await.unwrap();
+        let a2 = repo.start_session(a, None).await.unwrap();
+        let b1 = repo.start_session(b, None).await.unwrap();
+
+        assert_eq!(repo.end_all_sessions(a).await.unwrap(), 2);
+
+        assert!(repo.session_user(&a1.id).await.unwrap().is_none());
+        assert!(repo.session_user(&a2.id).await.unwrap().is_none());
+        assert!(repo.session_user(&b1.id).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -451,5 +585,76 @@ mod tests {
             repo.ensure_bootstrap_admin().await.unwrap().is_none(),
             "drugi start nie może nadpisać konta"
         );
+    }
+
+    #[tokio::test]
+    async fn reset_password_forces_a_change_and_ends_sessions() {
+        let repo = UserRepo::new(test_pool().await);
+        let id = repo.create("operator", "stare-haslo", Role::Operator).await.unwrap();
+        let session = repo.start_session(id, None).await.unwrap();
+
+        let fresh = repo.reset_password(id).await.unwrap();
+
+        assert_eq!(fresh.len(), 20);
+        assert!(repo.session_user(&session.id).await.unwrap().is_none());
+        assert!(matches!(
+            repo.authenticate("operator", "stare-haslo").await,
+            Err(AuthError::InvalidCredentials)
+        ));
+        let user = repo.authenticate("operator", &fresh).await.unwrap();
+        assert!(user.must_change_password);
+    }
+
+    #[tokio::test]
+    async fn set_role_changes_what_the_user_can_do() {
+        let repo = UserRepo::new(test_pool().await);
+        repo.create("admin", "haslo", Role::Admin).await.unwrap();
+        let id = repo.create("operator", "haslo", Role::Viewer).await.unwrap();
+        repo.set_role(id, Role::Admin).await.unwrap();
+        assert_eq!(repo.by_id(id).await.unwrap().unwrap().role, Role::Admin);
+        repo.set_role(id, Role::Operator).await.unwrap();
+        assert_eq!(repo.by_id(id).await.unwrap().unwrap().role, Role::Operator);
+    }
+
+    #[tokio::test]
+    async fn the_last_enabled_admin_cannot_be_demoted_disabled_or_deleted() {
+        let repo = UserRepo::new(test_pool().await);
+        let a = repo.create("a", "haslo", Role::Admin).await.unwrap();
+        let b = repo.create("b", "haslo", Role::Admin).await.unwrap();
+
+        // Dwóch adminów: A degraduje B — wolno.
+        repo.set_role(b, Role::Operator).await.unwrap();
+
+        // B (już w bazie nie-admin, ale np. ze starym widokiem) próbuje zdjąć A:
+        // A jest ostatnim aktywnym adminem, więc baza odmawia za każdym razem.
+        assert!(repo.set_role(a, Role::Viewer).await.is_err());
+        assert!(repo.set_disabled(a, true).await.is_err());
+        assert!(repo.delete(a).await.is_err());
+
+        let admin = repo.by_id(a).await.unwrap().unwrap();
+        assert_eq!((admin.role, admin.disabled), (Role::Admin, false));
+
+        // Wyłączony admin się nie liczy.
+        let c = repo.create("c", "haslo", Role::Admin).await.unwrap();
+        repo.set_disabled(c, true).await.unwrap();
+        assert!(repo.set_role(a, Role::Operator).await.is_err());
+        // Ale można go wyłączyć/usunąć, a gdy jest drugi aktywny — także A.
+        repo.set_disabled(c, false).await.unwrap();
+        repo.set_disabled(a, true).await.unwrap();
+        assert!(repo.delete(c).await.is_err(), "c jest teraz ostatnim aktywnym adminem");
+        // Nieaktywnego admina można usunąć.
+        assert_eq!(repo.delete(a).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_temporary_password_account_must_change_it_and_a_duplicate_is_refused() {
+        let repo = UserRepo::new(test_pool().await);
+        let (id, password) =
+            repo.create_with_temporary_password("nowy", Role::Operator).await.unwrap();
+        assert_eq!(password.len(), 20);
+        let user = repo.authenticate("nowy", &password).await.unwrap();
+        assert_eq!(user.id, id);
+        assert!(user.must_change_password);
+        assert!(repo.create_with_temporary_password("nowy", Role::Viewer).await.is_err());
     }
 }

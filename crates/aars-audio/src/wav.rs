@@ -16,8 +16,32 @@ pub fn write_wav_mono(path: &Path, pcm: &Pcm) -> Result<(), SynthError> {
             .write_sample(*sample)
             .map_err(|e| SynthError::Engine(format!("zapis próbki: {e}")))?;
     }
-    writer.finalize().map_err(|e| SynthError::Engine(format!("domknięcie WAV: {e}")))?;
+    writer
+        .finalize()
+        .map_err(|e| SynthError::Engine(format!("domknięcie WAV: {e}")))?;
     Ok(())
+}
+
+/// WAV w pamięci (16 bit, mono) — do odsłuchu w panelu.
+pub fn wav_bytes_mono(pcm: &Pcm) -> Result<Vec<u8>, SynthError> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: pcm.sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = hound::WavWriter::new(&mut cursor, spec)
+        .map_err(|e| SynthError::Engine(format!("zapis WAV: {e}")))?;
+    for sample in &pcm.samples {
+        writer
+            .write_sample(*sample)
+            .map_err(|e| SynthError::Engine(format!("zapis próbki: {e}")))?;
+    }
+    writer
+        .finalize()
+        .map_err(|e| SynthError::Engine(format!("domknięcie WAV: {e}")))?;
+    Ok(cursor.into_inner())
 }
 
 pub fn read_wav_mono(path: &Path) -> Result<Pcm, SynthError> {
@@ -26,17 +50,24 @@ pub fn read_wav_mono(path: &Path) -> Result<Pcm, SynthError> {
     let spec = reader.spec();
 
     let samples: Result<Vec<i16>, _> = reader.samples::<i16>().collect();
-    let samples =
-        samples.map_err(|e| SynthError::Engine(format!("odczyt próbek {}: {e}", path.display())))?;
+    let samples = samples
+        .map_err(|e| SynthError::Engine(format!("odczyt próbek {}: {e}", path.display())))?;
 
     // Gdy plik jest wielokanałowy, bierzemy pierwszy kanał: nadajemy mono.
     let samples = if spec.channels > 1 {
-        samples.iter().step_by(spec.channels as usize).copied().collect()
+        samples
+            .iter()
+            .step_by(spec.channels as usize)
+            .copied()
+            .collect()
     } else {
         samples
     };
 
-    Ok(Pcm { samples, sample_rate: spec.sample_rate })
+    Ok(Pcm {
+        samples,
+        sample_rate: spec.sample_rate,
+    })
 }
 
 #[cfg(test)]
@@ -50,11 +81,32 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rt.wav");
 
-        let pcm = Pcm { samples: vec![0, 1000, -1000, 32767, -32768], sample_rate: 22_050 };
+        let pcm = Pcm {
+            samples: vec![0, 1000, -1000, 32767, -32768],
+            sample_rate: 22_050,
+        };
         write_wav_mono(&path, &pcm).unwrap();
         let read = read_wav_mono(&path).unwrap();
 
         assert_eq!(read, pcm);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wav_bytes_round_trip() {
+        let samples: Vec<i16> = (0..480).map(|i| (i * 37 % 2000 - 1000) as i16).collect();
+        let pcm = Pcm {
+            samples,
+            sample_rate: 22_050,
+        };
+        let bytes = wav_bytes_mono(&pcm).unwrap();
+        assert_eq!(&bytes[..4], b"RIFF");
+
+        let dir = std::env::temp_dir().join(format!("aars-wavb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b.wav");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(read_wav_mono(&path).unwrap(), pcm);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

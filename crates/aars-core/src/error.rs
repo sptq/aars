@@ -18,4 +18,7 @@ pub enum DbError {
     Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("błąd wejścia/wyjścia: {0}")]
     Io(#[from] std::io::Error),
+    /// Dane, których nie da się zapisać (np. termin poza zakresem dat).
+    #[error("niepoprawne dane: {0}")]
+    Invalid(String),
 }

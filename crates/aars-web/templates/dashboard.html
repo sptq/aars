@@ -7,11 +7,17 @@
     Nadawanie:
     {% if tx_enabled %}<span class="badge on">włączone</span>
     {% else %}<span class="badge off">wyłączone</span>{% endif %}
-    {% if poisoned %}<span class="badge off">watchdog — wymaga reset</span>{% endif %}
+    {% if poisoned %}<span class="badge off">watchdog — wymaga resetu</span>{% endif %}
   </p>
-  {% if can_operate %}
+  {% if poisoned && chrome.is_admin %}
+  <form method="post" action="/watchdog/clear" style="margin-top:0.6rem">
+    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+    <button type="submit" class="danger">Zdejmij blokadę watchdoga</button>
+  </form>
+  {% endif %}
+  {% if chrome.can_operate %}
   <form method="post" action="/tx-enabled" style="margin-top:0.6rem">
-    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     <input type="hidden" name="enabled" value="{% if tx_enabled %}0{% else %}1{% endif %}">
     <button type="submit" class="{% if tx_enabled %}danger{% endif %}">
       {% if tx_enabled %}Zatrzymaj nadawanie{% else %}Włącz nadawanie{% endif %}

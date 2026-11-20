@@ -160,6 +160,11 @@ async fn main() -> Result<()> {
             }
 
             stack.sequencer.shutdown();
+            // Jednorazowe nadanie też musi zostawić ślad interwencji w bazie.
+            if stack.watchdog.is_poisoned() && !radio::record_poison(&stack.watchdog.marker(), &stack.interlocks, &pool).await
+            {
+                eprintln!("UWAGA: watchdog interweniował, ale flagi nie udało się zapisać w bazie");
+            }
             stack.watchdog.stop();
         }
         cli::Command::Queue { action } => {
@@ -252,6 +257,7 @@ async fn main() -> Result<()> {
                 config.storage.cache_dir.clone(),
                 config.storage.cache_max_bytes,
             );
+            let preview = Arc::new(render::PiperPreview::new(cache.clone(), synth.clone()));
             let renderer = Arc::new(render::PiperRenderer::new(
                 cache,
                 synth,
@@ -274,11 +280,19 @@ async fn main() -> Result<()> {
             let queue = Arc::new(QueueRepo::new(pool.clone()));
 
             let shutdown = CancelToken::new();
+            let watchdog_marker = stack.watchdog.marker();
             let dispatcher = Dispatcher::new(
                 queue.clone(),
                 renderer,
                 stack.sequencer,
-                DispatcherConfig { tick: std::time::Duration::from_millis(500) },
+                DispatcherConfig {
+                    tick: std::time::Duration::from_millis(500),
+                    ptt_backend: match config.ptt.backend {
+                        aars_core::config::PttBackendKind::Gpio => "gpio",
+                        aars_core::config::PttBackendKind::Serial => "serial",
+                        aars_core::config::PttBackendKind::Vox => "vox",
+                    },
+                },
             );
             let scheduler = aars_core::scheduler::Scheduler::new(
                 aars_core::message::MessageRepo::new(pool.clone()),
@@ -299,18 +313,40 @@ async fn main() -> Result<()> {
                 tracing::error!(%err, "czyszczenie wygasłych sesji zawiodło");
             }
 
-            let app = aars_web::router(aars_web::AppState::new(
-                pool.clone(),
-                queue.clone(),
-                stack.interlocks.clone(),
-                false,
-            ));
+            let clear_marker = watchdog_marker.clone();
+            let app = aars_web::router(
+                aars_web::AppState::new(
+                    pool.clone(),
+                    queue.clone(),
+                    stack.interlocks.clone(),
+                    false,
+                )
+                .with_preview(preview)
+                .with_hardware(vec![
+                    ("Urządzenie audio".to_owned(), config.audio.device.clone()),
+                    ("Częstotliwość próbkowania".to_owned(), format!("{} Hz", config.audio.sample_rate)),
+                    ("Backend PTT".to_owned(), config.ptt.backend.label().to_owned()),
+                    ("Model głosu".to_owned(), config.tts.model.clone()),
+                ])
+                .with_watchdog_clear(Arc::new(move || clear_marker.clear_poison())),
+            );
             let listener = tokio::net::TcpListener::bind(&config.server.bind)
                 .await
                 .with_context(|| format!("nasłuch na {}", config.server.bind))?;
 
+            let quiet_task = tokio::spawn(radio::quiet_hours_task(
+                pool.clone(),
+                stack.interlocks.clone(),
+                shutdown.clone(),
+            ));
             let dispatcher_task = tokio::spawn(dispatcher.run(shutdown.clone()));
             let scheduler_task = tokio::spawn(scheduler.run(shutdown.clone()));
+            let poison_task = tokio::spawn(radio::watch_poison(
+                watchdog_marker,
+                stack.interlocks.clone(),
+                pool.clone(),
+                shutdown.clone(),
+            ));
 
             let server_shutdown = shutdown.clone();
             let server_task = tokio::spawn(async move {
@@ -336,6 +372,8 @@ async fn main() -> Result<()> {
             let _ = dispatcher_task.await;
             let _ = scheduler_task.await;
             let _ = server_task.await;
+            let _ = poison_task.await;
+            let _ = quiet_task.await;
             stack.watchdog.stop();
         }
         cli::Command::Message { action } => {

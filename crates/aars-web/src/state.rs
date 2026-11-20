@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::preview::PreviewRenderer;
+
 use aars_core::interlock::InMemoryInterlocks;
 use aars_core::queue::QueueRepo;
 use sqlx::SqlitePool;
@@ -13,7 +15,17 @@ pub struct AppState {
     pub interlocks: Arc<InMemoryInterlocks>,
     /// Czy cookie sesji ma mieć flagę `Secure`.
     pub secure_cookies: bool,
+    /// Synteza do odsłuchu w panelu; `None`, gdy nie skonfigurowano.
+    pub preview: Option<Arc<dyn PreviewRenderer>>,
+    /// Zdejmuje flagę z samego watchdoga (jego wątek żyje w binarce);
+    /// `None`, gdy panel działa bez stosu nadawczego.
+    pub watchdog_clear: Option<WatchdogClear>,
+    /// Sprzęt z `aars.toml` do odczytu na stronie ustawień: (nazwa, wartość).
+    pub hardware: Vec<(String, String)>,
 }
+
+/// Wywołanie zdejmujące lepką flagę strażnika (`WatchdogMarker::clear_poison`).
+pub type WatchdogClear = Arc<dyn Fn() + Send + Sync>;
 
 impl AppState {
     pub fn new(
@@ -22,7 +34,22 @@ impl AppState {
         interlocks: Arc<InMemoryInterlocks>,
         secure_cookies: bool,
     ) -> Self {
-        Self { pool, queue, interlocks, secure_cookies }
+        Self { pool, queue, interlocks, secure_cookies, preview: None, watchdog_clear: None, hardware: Vec::new() }
+    }
+
+    pub fn with_watchdog_clear(mut self, clear: WatchdogClear) -> Self {
+        self.watchdog_clear = Some(clear);
+        self
+    }
+
+    pub fn with_hardware(mut self, hardware: Vec<(String, String)>) -> Self {
+        self.hardware = hardware;
+        self
+    }
+
+    pub fn with_preview(mut self, preview: Arc<dyn PreviewRenderer>) -> Self {
+        self.preview = Some(preview);
+        self
     }
 
     /// Stan na potrzeby testów: własna kolejka, interlocki przepuszczające.
@@ -33,6 +60,9 @@ impl AppState {
             interlocks: Arc::new(InMemoryInterlocks::permissive()),
             pool,
             secure_cookies: false,
+            preview: None,
+            watchdog_clear: None,
+            hardware: Vec::new(),
         }
     }
 }
