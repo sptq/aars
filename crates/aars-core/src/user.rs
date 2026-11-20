@@ -265,6 +265,15 @@ impl UserRepo {
         Ok(())
     }
 
+    /// Kończy wszystkie sesje użytkownika (np. po zmianie hasła).
+    pub async fn end_all_sessions(&self, user_id: i64) -> Result<u64, DbError> {
+        let result = sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn purge_expired_sessions(&self) -> Result<u64, DbError> {
         let result = sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
             .bind(iso(Utc::now()))
@@ -365,6 +374,22 @@ mod tests {
             repo.session_user(&session.id).await.unwrap().is_none(),
             "wylogowanie musi działać natychmiast"
         );
+    }
+
+    #[tokio::test]
+    async fn ending_all_sessions_leaves_other_users_alone() {
+        let repo = UserRepo::new(test_pool().await);
+        let a = repo.create("a", "haslo", Role::Operator).await.unwrap();
+        let b = repo.create("b", "haslo", Role::Operator).await.unwrap();
+        let a1 = repo.start_session(a, None).await.unwrap();
+        let a2 = repo.start_session(a, None).await.unwrap();
+        let b1 = repo.start_session(b, None).await.unwrap();
+
+        assert_eq!(repo.end_all_sessions(a).await.unwrap(), 2);
+
+        assert!(repo.session_user(&a1.id).await.unwrap().is_none());
+        assert!(repo.session_user(&a2.id).await.unwrap().is_none());
+        assert!(repo.session_user(&b1.id).await.unwrap().is_some());
     }
 
     #[tokio::test]
