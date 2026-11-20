@@ -230,6 +230,27 @@ Dopisane w trakcie wykonania (ledger, Ruling R3): watchdog z etapu 3 jest urucha
 
 ---
 
+### Task 6c: Odmowa przez interlock nie gubi komunikatu
+
+Dopisane w trakcie wykonania (ledger, Ruling R5): przy wyłączonym nadawaniu dyspozytor odrzuca element, zwraca go do kolejki, a po 3 próbach (ok. 30 s) oznacza jako `failed` z błędem `TxDisabled`. Wyłączenie nadawania na minutę wyrzuca więc zaległe ostrzeżenia. Spec §4.4: „Odmowa nie gubi komunikatu: element wraca do kolejki z `not_before` i powodem widocznym w panelu.”
+
+**Files:**
+- Modify: `crates/aars-core/src/dispatcher.rs`, `crates/aars-core/src/queue.rs` (jeśli trzeba osobnej metody), `crates/aars-web/templates/queue_fragment.html`, `crates/aars-web/src/lib.rs` (`QueueRow`)
+
+**Interfaces:**
+- Odmowa przez interlock (`poisoned`, `TxDisabled`, `inhibited`, okno ciszy) **nie zwiększa** `attempt` i nigdy nie kończy się `failed`: element wraca jako `pending` z `not_before = now + odstęp` i z powodem zapisanym w kolumnie `error` (np. `wstrzymane: nadawanie wyłączone`). `attempt` liczy tylko prawdziwe porażki (synteza, błąd nadania).
+- Element nadal może wygasnąć przez `expires_at` (`expire_stale`) — to jedyna droga, którą wstrzymany komunikat opuszcza kolejkę bez nadania.
+- Odstęp ponownych prób przy odmowie: 30 s (żeby po włączeniu nadawania komunikat poszedł szybko, a dyspozytor nie kręcił się w pętli).
+- Kolejka w panelu pokazuje powód wstrzymania przy elemencie (kolumna „Uwagi” albo plakietka), po polsku.
+
+- [ ] **Step 1: Testy** (`dispatcher.rs`, harness z etapu 4): `a_refused_item_waits_instead_of_failing` (interlocki z `tx_enabled = false`, element czeka > 3 cykle odmowy, nadal `pending`, `attempt = 0`, `error` zawiera powód); `a_held_item_goes_out_after_transmitting_is_enabled_again` (po `set_tx_enabled(true)` element zostaje nadany i `done`); `a_real_failure_still_counts_attempts` (błąd renderowania nadal kończy się `failed`). `aars-web`: `the_queue_shows_why_an_item_is_held`.
+- [ ] **Step 2: FAIL**
+- [ ] **Step 3: Implementacja**
+- [ ] **Step 4: PASS** (`cargo test --workspace`, clippy)
+- [ ] **Step 5: Commit** — `fix(core): odmowa przez interlock wstrzymuje komunikat zamiast go gubić`
+
+---
+
 ### Task 7: Ustawienia stacji (`/settings`) i okna ciszy
 
 **Files:**
