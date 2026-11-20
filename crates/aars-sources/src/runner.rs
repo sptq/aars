@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aars_core::error::DbError;
+use aars_core::geo::PositionRepo;
+use aars_core::settings::SettingsRepo;
 use aars_core::priority::Priority;
 use aars_core::queue::{EnqueueRequest, QueueRepo, QueueState};
 use aars_core::sink::CancelToken;
@@ -114,6 +116,27 @@ impl SourceRunner {
         }
     }
 
+    /// Pozycja i ustawienia modułu na ten cykl (R20). Błąd odczytu nie
+    /// przerywa cyklu: źródło dostaje `None` albo puste ustawienia.
+    async fn context(&self, now: DateTime<Utc>, id: &str, area: Vec<aars_core::area::AreaEntry>) -> SourceCtx {
+        let pool = self.state.pool().clone();
+        let position = match PositionRepo::new(pool.clone()).load().await {
+            Ok(p) => p,
+            Err(error) => {
+                tracing::warn!(source = id, %error, "nie można odczytać pozycji stacji");
+                None
+            }
+        };
+        let settings = match SettingsRepo::new(pool).kv_prefix(&format!("source:{id}:")).await {
+            Ok(s) => s,
+            Err(error) => {
+                tracing::warn!(source = id, %error, "nie można odczytać ustawień modułu");
+                Default::default()
+            }
+        };
+        SourceCtx { now, area, position, settings }
+    }
+
     async fn run_cycle(&self, now: DateTime<Utc>, report: &mut CycleReport) -> Result<(), DbError> {
         let id = self.source.id();
         let Some(cfg) = self.state.config(id).await? else {
@@ -132,7 +155,7 @@ impl SourceRunner {
         self.settle_pending_cancellations(id, now).await?;
 
         report.fetched = true;
-        let ctx = SourceCtx { now, area: cfg.area.clone() };
+        let ctx = self.context(now, id, cfg.area.clone()).await;
         let output = match self.source.fetch(&ctx).await {
             Ok(output) => output,
             Err(error) => {
@@ -426,11 +449,12 @@ mod tests {
     struct FakeSource {
         script: Mutex<VecDeque<Result<SourceOutput, SourceError>>>,
         calls: AtomicUsize,
+        last_ctx: Mutex<Option<(Option<aars_core::geo::StationPosition>, std::collections::BTreeMap<String, String>)>>,
     }
 
     impl FakeSource {
         fn new(script: Vec<Result<SourceOutput, SourceError>>) -> Arc<Self> {
-            Arc::new(Self { script: Mutex::new(script.into()), calls: AtomicUsize::new(0) })
+            Arc::new(Self { script: Mutex::new(script.into()), calls: AtomicUsize::new(0), last_ctx: Mutex::new(None) })
         }
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
@@ -444,8 +468,9 @@ mod tests {
         fn default_interval(&self) -> Duration {
             Duration::from_secs(300)
         }
-        fn fetch<'a>(&'a self, _ctx: &'a SourceCtx) -> FetchFuture<'a> {
+        fn fetch<'a>(&'a self, ctx: &'a SourceCtx) -> FetchFuture<'a> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_ctx.lock().unwrap() = Some((ctx.position.clone(), ctx.settings.clone()));
             let next = self.script.lock().ok().and_then(|mut s| s.pop_front());
             Box::pin(async move { next.unwrap_or(Err(SourceError::Http("skrypt wyczerpany".into()))) })
         }
@@ -667,6 +692,33 @@ mod tests {
         let report = r.runner.cycle(now()).await;
         assert_eq!(report.cancelled, 1);
         assert!(r.queue.pending(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_source_disabled_between_cycles_does_not_fetch_again() {
+        let r = rig(vec![ok(vec![]), ok(vec![])]).await;
+        assert!(r.runner.cycle(now()).await.fetched);
+        assert_eq!(r.source.calls(), 1);
+        r.state.set_enabled("imgw-meteo", false).await.unwrap();
+        let report = r.runner.cycle(now()).await;
+        assert_eq!(r.source.calls(), 1);
+        assert_eq!(report.skipped, Some("wyłączone"));
+    }
+
+    #[tokio::test]
+    async fn the_context_carries_position_and_module_settings() {
+        let r = rig(vec![ok(vec![]), ok(vec![])]).await;
+        r.runner.cycle(now()).await;
+        let (pos, settings) = r.source.last_ctx.lock().unwrap().clone().unwrap();
+        assert!(pos.is_none());
+        assert_eq!(settings["interval_s"], "300");
+
+        let pool = r.state.pool().clone();
+        let p = aars_core::geo::parse_position("", "", "JO91RS").unwrap();
+        PositionRepo::new(pool).save(p.as_ref()).await.unwrap();
+        r.runner.cycle(now()).await;
+        let (pos, _) = r.source.last_ctx.lock().unwrap().clone().unwrap();
+        assert_eq!(pos.unwrap().locator, "JO91RS");
     }
 
     #[tokio::test]

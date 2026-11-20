@@ -187,6 +187,11 @@ pub struct SourceStateRepo {
 }
 
 impl SourceStateRepo {
+    /// Wspólna pula bazy (runner czyta z niej pozycję stacji i ustawienia).
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }

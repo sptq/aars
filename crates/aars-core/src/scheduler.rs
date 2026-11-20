@@ -9,6 +9,7 @@ use crate::error::DbError;
 use crate::message::{Message, MessageRepo, ScheduleKind};
 use crate::priority::Priority;
 use crate::queue::{EnqueueRequest, QueueRepo};
+use crate::settings::SettingsRepo;
 use crate::sink::CancelToken;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -28,6 +29,8 @@ pub struct TickReport {
     pub skipped: u32,
     /// Definicje, których nie dało się policzyć (np. zepsuty wzorzec cron).
     pub errors: u32,
+    /// Harmonogram wyłączony w panelu: ten tik niczego nie zrobił ani nie zapisał.
+    pub disabled: bool,
 }
 
 /// Dlaczego scheduler zdecydował tak, a nie inaczej.
@@ -59,6 +62,15 @@ impl Scheduler {
     /// Jeden przebieg. Wydzielony z `run` i przyjmujący `now` jawnie, żeby
     /// polityka spóźnień dała się przetestować bez czekania na zegar.
     pub async fn tick(&self, now: DateTime<Utc>) -> Result<TickReport, DbError> {
+        // R14: wyłączony harmonogram nie wstawia niczego i nie zapisuje
+        // `schedule_fires`, więc po włączeniu zaległości ocenia polityka
+        // spóźnień (bez lawiny). Brak klucza albo wartość inna niż `false`
+        // znaczy: włączony.
+        let flag = SettingsRepo::new(self.queue.pool().clone()).kv_get("module:scheduler:enabled").await?;
+        if flag.as_deref() == Some("false") {
+            return Ok(TickReport { disabled: true, ..TickReport::default() });
+        }
+
         let mut report = TickReport::default();
 
         for message in self.messages.scheduled().await? {
@@ -450,5 +462,61 @@ mod tests {
         let pending = rig.queue.pending(10).await.unwrap();
         assert_eq!(pending.len(), 3, "powtórzenia rozwijane przez kolejkę");
         assert!(pending.iter().all(|i| i.repeat_group.is_some()));
+    }
+
+    async fn set_scheduler_enabled(rig: &Rig, enabled: bool) {
+        SettingsRepo::new(rig.messages.pool().clone())
+            .kv_put("module:scheduler:enabled", if enabled { "true" } else { "false" })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_disabled_scheduler_fires_nothing_and_records_nothing() {
+        let rig = rig(Duration::from_secs(300)).await;
+        rig.messages
+            .create(definition("co minutę", ScheduleKind::Cron("* * * * *".into()), Priority::Normal))
+            .await
+            .unwrap();
+        set_scheduler_enabled(&rig, false).await;
+
+        for now in ["2026-10-13T18:00:10Z", "2026-10-13T18:01:10Z"] {
+            let report = rig.scheduler.tick(at(now)).await.unwrap();
+            assert!(report.disabled, "{report:?}");
+            assert_eq!(report.queued, 0);
+        }
+        assert!(rig.queue.pending(10).await.unwrap().is_empty());
+        let fires: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schedule_fires")
+            .fetch_one(rig.messages.pool())
+            .await
+            .unwrap();
+        assert_eq!(fires, 0);
+    }
+
+    #[tokio::test]
+    async fn re_enabling_does_not_replay_missed_fires() {
+        let rig = rig(Duration::from_secs(300)).await;
+        rig.messages
+            .create(definition("co minutę", ScheduleKind::Cron("* * * * *".into()), Priority::Normal))
+            .await
+            .unwrap();
+        let start = at("2026-10-13T18:00:10Z");
+        set_scheduler_enabled(&rig, false).await;
+        for minute in 0..20 {
+            let r = rig.scheduler.tick(start + chrono::Duration::minutes(minute)).await.unwrap();
+            assert!(r.disabled);
+        }
+        set_scheduler_enabled(&rig, true).await;
+
+        let report = rig.scheduler.tick(start + chrono::Duration::minutes(20)).await.unwrap();
+        assert!(!report.disabled);
+        assert_eq!(report.queued, 1, "{report:?}");
+        let pending = rig.queue.pending(100).await.unwrap();
+        assert_eq!(pending.len(), 1, "żadnej lawiny zaległości");
+        let fires: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schedule_fires")
+            .fetch_one(rig.messages.pool())
+            .await
+            .unwrap();
+        assert_eq!(fires, 1);
     }
 }

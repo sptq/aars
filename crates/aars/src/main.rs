@@ -563,6 +563,8 @@ async fn source_preview(config: &Config) -> Result<()> {
     let ctx = aars_sources::SourceCtx {
         now: chrono::Utc::now(),
         area,
+        position: None,
+        settings: std::collections::BTreeMap::new(),
     };
     let output = source
         .fetch(&ctx)
