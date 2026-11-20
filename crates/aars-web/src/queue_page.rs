@@ -27,7 +27,7 @@ pub async fn page_view(
     require_role(&current.user, Role::Operator)?;
     let pending = match queue_rows(&state, 200).await {
         Ok(rows) => rows,
-        Err(response) => return Ok(response),
+        Err(err) => return Ok(crate::render::db_error("odczyt kolejki zawiódł", &err)),
     };
     Ok(page(&QueuePage {
         chrome: Chrome::from(&current),
