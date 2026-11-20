@@ -59,6 +59,9 @@ const POSTS: &[(&str, u8)] = &[
     ("/tx-enabled", OPERATOR),
     ("/queue/1/cancel", OPERATOR),
     ("/queue/group/g/cancel", OPERATOR),
+    ("/sources/imgw-meteo/enabled", OPERATOR),
+    ("/sources/imgw-meteo/refresh", OPERATOR),
+    ("/sources/imgw-meteo/settings", ADMIN),
     ("/watchdog/clear", ADMIN),
     ("/settings", ADMIN),
     ("/users", ADMIN),
@@ -70,7 +73,7 @@ const POSTS: &[(&str, u8)] = &[
 
 const POST_BODY: &str = "csrf=zly&text=x&priority=normal&title=t&username=nowy&role=viewer\
 &disabled=1&enabled=1&schedule_kind=immediate&current=a&new=b&confirm=b&callsign=SP0XXX\
-&id_mode=off&id_interval_s=600&tx_max_duration_s=60&misfire_grace_s=60&quiet_min_priority=normal";
+&id_mode=off&id_interval_s=600&tx_max_duration_s=60&misfire_grace_s=60&quiet_min_priority=normal&area=&interval_s=5";
 
 async fn request(
     app: &Router,
@@ -162,6 +165,7 @@ async fn every_get_route_enforces_its_minimum_role() {
             allowed: StatusCode::SERVICE_UNAVAILABLE,
         },
         get("/queue", OPERATOR),
+        get("/sources", OPERATOR),
         get("/settings", ADMIN),
         get("/users", ADMIN),
     ];
@@ -279,7 +283,7 @@ async fn a_cron_schedule_created_in_the_panel_reaches_the_queue_once_per_minute(
 /// następnym.
 const VALID_BODY: &str = "text=x&priority=normal&title=t&username=nowy&role=viewer\
 &disabled=1&enabled=1&schedule_kind=immediate&current=a&new=b&confirm=b&callsign=SP0XXX\
-&id_mode=off&id_interval_s=600&tx_max_duration_s=60&misfire_grace_s=60&quiet_min_priority=normal";
+&id_mode=off&id_interval_s=600&tx_max_duration_s=60&misfire_grace_s=60&quiet_min_priority=normal&area=&interval_s=5";
 
 #[tokio::test]
 async fn every_post_route_enforces_its_role_with_a_valid_csrf_token() {
@@ -296,6 +300,9 @@ async fn every_post_route_enforces_its_role_with_a_valid_csrf_token() {
         ("/tx-enabled", OPERATOR, 303),
         ("/queue/999/cancel", OPERATOR, 200),
         ("/queue/group/g/cancel", OPERATOR, 200),
+        ("/sources/imgw-meteo/enabled", OPERATOR, 303),
+        ("/sources/imgw-meteo/refresh", OPERATOR, 503),
+        ("/sources/imgw-meteo/settings", ADMIN, 400),
         ("/watchdog/clear", ADMIN, 303),
         ("/settings", ADMIN, 400),
         ("/users", ADMIN, 200),

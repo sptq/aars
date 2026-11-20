@@ -8,6 +8,7 @@ pub mod preview;
 pub mod queue_page;
 pub mod render;
 pub mod settings_page;
+pub mod sources_page;
 pub mod state;
 pub mod users;
 
@@ -47,6 +48,9 @@ struct DashboardPage {
     full: bool,
     /// Notka zamiast tabeli, gdy odczyt kolejki zawiódł.
     queue_error: Option<String>,
+    sources: Vec<sources_page::SourceView>,
+    /// Notka zamiast karty źródeł, gdy odczyt ich stanu zawiódł.
+    sources_error: Option<String>,
 }
 
 #[derive(Template)]
@@ -216,6 +220,14 @@ async fn dashboard(State(state): State<AppState>, current: CurrentUser) -> Respo
         ),
     };
 
+    let (sources, sources_error) = match sources_page::load_views(&state).await {
+        Ok(views) => (views, None),
+        Err(err) => {
+            tracing::error!(%err, "odczyt stanu źródeł zawiódł");
+            (Vec::new(), Some("Nie udało się odczytać stanu źródeł.".to_owned()))
+        }
+    };
+
     page(&DashboardPage {
         chrome: Chrome::from(&current),
         tx_enabled: interlocks.tx_enabled,
@@ -223,6 +235,8 @@ async fn dashboard(State(state): State<AppState>, current: CurrentUser) -> Respo
         pending,
         full: false,
         queue_error,
+        sources,
+        sources_error,
     })
 }
 
@@ -456,6 +470,10 @@ pub fn router(state: AppState) -> Router {
         .route("/users/{id}/reset", post(users::reset))
         .route("/users/{id}/delete", post(users::delete))
         .route("/queue/group/{group}/cancel", post(queue_page::cancel_group))
+        .route("/sources", get(sources_page::page_view))
+        .route("/sources/{id}/enabled", post(sources_page::set_enabled))
+        .route("/sources/{id}/refresh", post(sources_page::refresh))
+        .route("/sources/{id}/settings", post(sources_page::save_settings))
         .route("/healthz", get(|| async { "ok" }))
         .route("/assets/{*path}", get(assets::serve))
         .with_state(state)

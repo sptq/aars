@@ -55,6 +55,17 @@ pub fn audit_action_label(action: &str) -> &str {
         "user_reset" => "reset hasła",
         "user_delete" => "usunięcie użytkownika",
         "watchdog_clear" => "zdjęcie blokady watchdoga",
+        "source_enabled" => "źródło wł./wył.",
+        "source_refresh" => "odświeżenie źródła",
+        "source_settings" => "ustawienia źródła",
+        other => other,
+    }
+}
+
+/// Polska nazwa źródła danych; nieznany id zostaje bez zmian.
+pub fn source_label(id: &str) -> &str {
+    match id {
+        "imgw-meteo" => "Ostrzeżenia meteorologiczne IMGW",
         other => other,
     }
 }
@@ -123,6 +134,11 @@ mod tests {
         assert_eq!(audit_action_label("watchdog_clear"), "zdjęcie blokady watchdoga");
         assert_eq!(audit_action_label("user_role"), "zmiana roli");
         assert_eq!(audit_action_label("cos_nowego"), "cos_nowego");
+        assert_eq!(audit_action_label("source_enabled"), "źródło wł./wył.");
+        assert_eq!(audit_action_label("source_refresh"), "odświeżenie źródła");
+        assert_eq!(audit_action_label("source_settings"), "ustawienia źródła");
+        assert_eq!(source_label("imgw-meteo"), "Ostrzeżenia meteorologiczne IMGW");
+        assert_eq!(source_label("inne"), "inne");
     }
 
     #[test]
