@@ -430,14 +430,22 @@ kończy się czymś, co da się uruchomić i sprawdzić.
    test PTT i test audio bez nadawania na antenę, oraz moduły (wtyczki): lista
    funkcji stacji (źródła, harmonogram, auto-ID, biuletyn) z włącz/wyłącz
    i ustawieniami każdego modułu. Plik `aars.toml` zostaje tylko dla ścieżek
-   i bootstrapu; ustawienia z panelu mają pierwszeństwo.
+   i bootstrapu; ustawienia z panelu mają pierwszeństwo. Pozycja stacji
+   (szerokość/długość albo lokator QTH) wybierana na mapie (Leaflet + podkład
+   OpenStreetMap) — używają jej moduły pogodowe.
 10. Obraz Raspberry Pi i autoaktualizacja: gotowy obraz `.img` (Raspberry Pi OS
     Lite 64-bit, Piper z polskim głosem, usługa systemd) w wydaniach GitHub;
     pierwsze uruchomienie bez SSH (Wi-Fi i hasło z Raspberry Pi Imager albo
     kreator pierwszego admina w panelu); autoaktualizacja z GitHub Releases
     na żądanie admina: suma kontrolna, podmiana binarki, restart, powrót do
     poprzedniej wersji, gdy nowa nie wstanie; nigdy w trakcie nadawania.
-11. `imgw-hydro`, `paa`, kompozytor biuletynu
+11. `imgw-hydro`, `paa`, kompozytor biuletynu, moduł pogody z otwartego API
+    po współrzędnych stacji: Open-Meteo (bez klucza, CC BY 4.0 — „Źródło:
+    Open-Meteo”), zapasowo MET Norway (`api.met.no`, wymaga User-Agent
+    z kontaktem); prognoza o ustalonych godzinach i komunikat po przekroczeniu
+    progów (wiatr, mróz, opady) ustawianych w panelu; mapa w panelu: powiaty
+    pod ostrzeżeniem IMGW kolorem stopnia + pozycja stacji (granice powiatów
+    z PRG GUGiK, uproszczone). Oba API sprawdzone zapytaniem 2026-11-20.
 
 (2026-11-20, właściciel: „rób od razu obraz na raspberry pi… moduł autoupdate…
 panel admina… zmienne… znak stacji… jakie funkcje uruchamiamy — system
