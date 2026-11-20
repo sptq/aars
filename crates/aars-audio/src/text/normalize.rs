@@ -49,7 +49,9 @@ fn genitive_number(value: &NumberText, previous_core: Option<&str>) -> Option<St
     if value.fraction.is_some() || !takes_genitive_number(previous_core) {
         return None;
     }
-    cardinal_genitive(value.integer.parse::<i64>().ok()?)
+    let n = value.integer.parse::<i64>().ok()?;
+    let spoken = cardinal_genitive(n.checked_abs()?)?;
+    Some(if n < 0 { format!("minus {spoken}") } else { spoken })
 }
 
 fn is_month(core: &str) -> bool {
@@ -208,6 +210,13 @@ pub fn normalize(input: &str) -> String {
             continue;
         }
 
+        // „do minus 5": przyimek stoi przed słowem „minus".
+        let genitive_prev = match previous_core {
+            Some(p) if p.eq_ignore_ascii_case("minus") => {
+                idx.checked_sub(2).map(|p| parts[p].1)
+            }
+            other => other,
+        };
         if let Some((value, rest)) = number_prefix(core) {
             // Liczba + jednostka jako dwa tokeny: „12 m/s,"
             if rest.is_empty()
@@ -216,7 +225,7 @@ pub fn normalize(input: &str) -> String {
                 && let Some(unit) = match_unit(next_core)
                 && unit.len() == next_core.len()
             {
-                let genitive = genitive_number(&value, previous_core);
+                let genitive = genitive_number(&value, genitive_prev);
                 push_word(
                     &mut out,
                     lead,
@@ -238,7 +247,7 @@ pub fn normalize(input: &str) -> String {
                 && let Some(unit) = match_unit(rest)
                 && unit.len() == rest.len()
             {
-                let genitive = genitive_number(&value, previous_core);
+                let genitive = genitive_number(&value, genitive_prev);
                 push_word(
                     &mut out,
                     lead,
@@ -271,7 +280,7 @@ pub fn normalize(input: &str) -> String {
             // Sama liczba
             if rest.is_empty() {
                 let spoken =
-                    genitive_number(&value, previous_core).unwrap_or_else(|| spoken_number(&value));
+                    genitive_number(&value, genitive_prev).unwrap_or_else(|| spoken_number(&value));
                 push_word(&mut out, lead, &spoken, trail);
                 idx += 1;
                 continue;
@@ -371,7 +380,7 @@ fn unit_form(text: &str, value: &NumberText, genitive: bool) -> &'static str {
         return unit.genitive_sg;
     }
     if genitive {
-        return if value.integer.parse::<i64>() == Ok(1) {
+        return if value.integer.parse::<i64>().is_ok_and(|n| n.abs() == 1) {
             unit.genitive_sg
         } else {
             unit.plural_gen
@@ -533,6 +542,16 @@ mod tests {
             "do tysiąc pięćset milimetrów",
             "powyżej 999 mianownik"
         );
+        assert_eq!(n("do 21 mm"), "do dwudziestu jeden milimetrów");
+        assert_eq!(n("do 41 m"), "do czterdziestu jeden metrów");
+        assert_eq!(n("do 101 mm"), "do stu jeden milimetrów");
+        assert_eq!(n("do 991 mm"), "do dziewięciuset dziewięćdziesięciu jeden milimetrów");
+        assert_eq!(n("do 11 mm"), "do jedenastu milimetrów");
+        assert_eq!(n("do -5°C"), "do minus pięciu stopni Celsjusza");
+        assert_eq!(n("do -5 °C"), "do minus pięciu stopni Celsjusza");
+        assert_eq!(n("do -1 °C"), "do minus jednego stopnia Celsjusza");
+        assert_eq!(n("do minus 5 °C"), "do minus pięciu stopni Celsjusza");
+        assert_eq!(n("temperatura -5 °C"), "temperatura minus pięć stopni Celsjusza");
         assert_eq!(n("do 30 lipca"), "do trzydziestego lipca", "daty jak dotąd");
     }
 
@@ -552,6 +571,11 @@ mod tests {
         assert_eq!(g(300), "trzystu");
         assert_eq!(g(400), "czterystu");
         assert_eq!(g(500), "pięciuset");
+        assert_eq!(g(21), "dwudziestu jeden");
+        assert_eq!(g(41), "czterdziestu jeden");
+        assert_eq!(g(101), "stu jeden");
+        assert_eq!(g(111), "stu jedenastu");
+        assert_eq!(g(991), "dziewięciuset dziewięćdziesięciu jeden");
         assert_eq!(g(999), "dziewięciuset dziewięćdziesięciu dziewięciu");
         assert_eq!(super::super::numbers::cardinal_genitive(1000), None);
         for n in 0..=999 {
