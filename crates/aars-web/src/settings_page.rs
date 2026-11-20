@@ -1,5 +1,6 @@
-//! Ustawienia stacji (admin) i okno ciszy.
+//! Ustawienia stacji (admin), okno ciszy i położenie stacji.
 
+use aars_core::geo::{PositionRepo, StationPosition, parse_position};
 use aars_core::settings::{QuietHours, SettingsRepo, StationSettings};
 use askama::Template;
 use axum::Form;
@@ -32,6 +33,54 @@ struct SettingsPage {
     error: Option<String>,
     saved: bool,
     no_callsign: bool,
+    position: PositionCard,
+}
+
+/// Karta „Położenie stacji” (R17, R18): zapisana pozycja, wartości w polach
+/// i środek mapy.
+#[derive(Debug, Default)]
+struct PositionCard {
+    /// `51.77083, 19.45833 · JO91RS`; `None` = pozycja nieustawiona.
+    text: Option<String>,
+    lat: String,
+    lon: String,
+    locator: String,
+    map_lat: String,
+    map_lon: String,
+    error: Option<String>,
+}
+
+impl PositionCard {
+    fn from_saved(saved: Option<&StationPosition>) -> Self {
+        match saved {
+            None => Self::default(),
+            Some(p) => {
+                let lat = format!("{:.5}", p.lat);
+                let lon = format!("{:.5}", p.lon);
+                Self {
+                    text: Some(format!("{lat}, {lon} · {}", p.locator)),
+                    locator: p.locator.clone(),
+                    map_lat: lat.clone(),
+                    map_lon: lon.clone(),
+                    lat,
+                    lon,
+                    error: None,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PositionForm {
+    #[serde(default)]
+    csrf: String,
+    #[serde(default)]
+    lat: String,
+    #[serde(default)]
+    lon: String,
+    #[serde(default)]
+    locator: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +145,19 @@ async fn view(
         error,
         saved,
         no_callsign: s.callsign.is_empty(),
+        position: PositionCard::from_saved(saved_position(state).await.as_ref()),
+    }
+}
+
+/// Zapisana pozycja; błąd odczytu kończy się kartą bez pozycji i wpisem w
+/// logu, a nie stroną błędu (reszta ustawień dalej się wyświetla).
+async fn saved_position(state: &AppState) -> Option<StationPosition> {
+    match PositionRepo::new(state.pool.clone()).load().await {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::error!(%err, "odczyt pozycji stacji zawiódł");
+            None
+        }
     }
 }
 
@@ -217,6 +279,51 @@ pub async fn submit(
     )
     .await;
     Ok(page(&view(&state, &current, &new, None, true).await))
+}
+
+/// `POST /settings/position` (admin, R17): współrzędne albo lokator; wszystkie
+/// pola puste kasują pozycję.
+pub async fn submit_position(
+    State(state): State<AppState>,
+    current: CurrentUser,
+    Form(form): Form<PositionForm>,
+) -> Result<Response, AuthRejection> {
+    require_role(&current.user, aars_core::user::Role::Admin)?;
+    require_csrf(&current.csrf_token, Some(&form.csrf))?;
+
+    let position = match parse_position(&form.lat, &form.lon, &form.locator) {
+        Ok(position) => position,
+        Err(message) => {
+            let stored = match SettingsRepo::new(state.pool.clone()).load().await {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::error!(%err, "odczyt ustawień zawiódł");
+                    return Ok(server_error());
+                }
+            };
+            let mut shown = view(&state, &current, &stored, None, false).await;
+            // Wpisane wartości zostają w polach, mapa dalej pokazuje zapisaną pozycję.
+            shown.position.lat = form.lat.clone();
+            shown.position.lon = form.lon.clone();
+            shown.position.locator = form.locator.clone();
+            shown.position.error = Some(message);
+            return Ok((StatusCode::BAD_REQUEST, page(&shown)).into_response());
+        }
+    };
+
+    if let Err(err) = PositionRepo::new(state.pool.clone())
+        .save(position.as_ref())
+        .await
+    {
+        tracing::error!(%err, "zapis pozycji stacji zawiódł");
+        return Ok(server_error());
+    }
+    let detail = match &position {
+        Some(p) => format!("{:.5}, {:.5} ({})", p.lat, p.lon, p.locator),
+        None => "usunięto".to_owned(),
+    };
+    audit(&state, current.user.id, "position", &detail).await;
+    Ok(axum::response::Redirect::to("/settings#polozenie").into_response())
 }
 
 #[cfg(test)]
@@ -444,6 +551,153 @@ mod tests {
         let (_, html) = get(&app, "/settings", &cookie).await;
         assert!(html.contains("ptt.backend: vox → gpio"), "{html}");
         assert!(html.contains("/station/restart"), "{html}");
+    }
+
+    async fn post_position(
+        app: &Router,
+        cookie: &str,
+        csrf: &str,
+        lat: &str,
+        lon: &str,
+        locator: &str,
+    ) -> (StatusCode, Option<String>, String) {
+        let body = format!("csrf={csrf}&lat={lat}&lon={lon}&locator={locator}");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/settings/position")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, location, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn audit_details(state: &AppState, action: &str) -> Vec<String> {
+        sqlx::query_scalar("SELECT detail FROM audit_log WHERE action = ? ORDER BY id")
+            .bind(action)
+            .fetch_all(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    fn positions(state: &AppState) -> aars_core::geo::PositionRepo {
+        aars_core::geo::PositionRepo::new(state.pool.clone())
+    }
+
+    #[tokio::test]
+    async fn an_admin_sets_the_position_from_coordinates() {
+        let (app, cookie, csrf, state) = logged_in(Role::Admin).await;
+        let (status, location, _) =
+            post_position(&app, &cookie, &csrf, "51.759", "19.456", "").await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(location.as_deref(), Some("/settings#polozenie"));
+        let saved = positions(&state).load().await.unwrap().unwrap();
+        assert_eq!(saved.locator, "JO91RS");
+        assert_eq!(
+            audit_details(&state, "position").await,
+            vec!["51.75900, 19.45600 (JO91RS)".to_owned()]
+        );
+        let (_, html) = get(&app, "/settings", &cookie).await;
+        assert!(html.contains("51.75900, 19.45600 · JO91RS"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn an_admin_sets_the_position_from_a_locator_alone() {
+        let (app, cookie, csrf, state) = logged_in(Role::Admin).await;
+        let (status, _, _) = post_position(&app, &cookie, &csrf, "", "", "jo91rs").await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let saved = positions(&state).load().await.unwrap().unwrap();
+        assert_eq!(saved.lat, 51.77083);
+        assert_eq!(saved.lon, 19.45833);
+        assert_eq!(saved.locator, "JO91RS");
+        let (_, html) = get(&app, "/settings", &cookie).await;
+        assert!(html.contains("51.77083, 19.45833 · JO91RS"), "{html}");
+        assert!(html.contains("data-lat=\"51.77083\""), "{html}");
+    }
+
+    #[tokio::test]
+    async fn half_a_position_is_refused_and_nothing_changes() {
+        let (app, cookie, csrf, state) = logged_in(Role::Admin).await;
+        post_position(&app, &cookie, &csrf, "", "", "JO91").await;
+        let before = positions(&state).load().await.unwrap();
+        let (status, _, html) = post_position(&app, &cookie, &csrf, "51.759", "", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(html.contains("podaj obie współrzędne albo lokator"), "{html}");
+        assert!(html.contains("value=\"51.759\""), "wpisana wartość zostaje: {html}");
+        assert_eq!(positions(&state).load().await.unwrap(), before);
+        assert_eq!(audit_details(&state, "position").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clearing_all_fields_removes_the_position() {
+        let (app, cookie, csrf, state) = logged_in(Role::Admin).await;
+        post_position(&app, &cookie, &csrf, "", "", "JO91RS").await;
+        assert!(positions(&state).load().await.unwrap().is_some());
+        let (status, _, _) = post_position(&app, &cookie, &csrf, "", "", "").await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(positions(&state).load().await.unwrap().is_none());
+        assert_eq!(
+            audit_details(&state, "position").await.last().map(String::as_str),
+            Some("usunięto")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_operator_cannot_set_the_position() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+        let (status, _, _) = post_position(&app, &cookie, &csrf, "", "", "JO91RS").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(positions(&state).load().await.unwrap().is_none());
+        assert!(audit_details(&state, "position").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_wrong_csrf_token_does_not_set_the_position() {
+        let (app, cookie, _, state) = logged_in(Role::Admin).await;
+        let (status, _, _) = post_position(&app, &cookie, "zly", "", "", "JO91RS").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(positions(&state).load().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_settings_page_has_the_map_and_the_fallback_form() {
+        let (app, cookie, _, _) = logged_in(Role::Admin).await;
+        let (_, html) = get(&app, "/settings", &cookie).await;
+        for needle in [
+            "id=\"polozenie\"",
+            "id=\"station-map\"",
+            "data-tiles=\"https://tile.openstreetmap.org/{z}/{x}/{y}.png\"",
+            "name=\"lat\"",
+            "name=\"lon\"",
+            "name=\"locator\"",
+            "action=\"/settings/position\"",
+            "/assets/vendor/leaflet/leaflet.js",
+            "/assets/vendor/leaflet/leaflet.css",
+            "/assets/station-map.js",
+            "id=\"map-note\" hidden",
+            "<noscript>",
+            "Używają jej moduły pogodowe.",
+        ] {
+            assert!(html.contains(needle), "brak {needle}: {html}");
+        }
+        // Leaflet tylko na tej stronie.
+        let (_, dashboard) = get(&app, "/", &cookie).await;
+        assert!(!dashboard.contains("leaflet"), "{dashboard}");
     }
 
     #[test]

@@ -484,6 +484,7 @@ pub fn router(state: AppState) -> Router {
         .route("/queue", get(queue_page::page_view))
         .route("/logs", get(logs::page_view))
         .route("/settings", get(settings_page::page_view).post(settings_page::submit))
+        .route("/settings/position", post(settings_page::submit_position))
         .route(
             "/settings/hardware",
             get(hardware_page::page_view).post(hardware_page::save),
