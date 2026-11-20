@@ -427,7 +427,7 @@ mod tests {
     async fn the_page_lists_the_hardware_from_the_config_file() {
         let hardware = vec![
             ("Urządzenie audio".to_owned(), "hw:1,0".to_owned()),
-            ("Backend PTT".to_owned(), "Gpio".to_owned()),
+            ("Backend PTT".to_owned(), "GPIO".to_owned()),
         ];
         let (app, cookie, _, _) = logged_in(Role::Admin, hardware).await;
         let (status, html) = get(&app, "/settings", &cookie).await;

@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use crate::audit;
 use crate::auth::{AuthRejection, CurrentUser, require_csrf, require_role};
-use crate::chrome::Chrome;
+use crate::chrome::{Chrome, role_label};
 use crate::render::page;
 use crate::state::AppState;
 
@@ -64,14 +64,6 @@ pub struct CsrfForm {
 }
 
 const SELF_MESSAGE: &str = "nie możesz odebrać uprawnień sam sobie";
-
-fn role_label(role: Role) -> &'static str {
-    match role {
-        Role::Viewer => "Podgląd",
-        Role::Operator => "Operator",
-        Role::Admin => "Administrator",
-    }
-}
 
 /// `[a-z0-9_.-]{3,32}`.
 fn valid_username(name: &str) -> bool {

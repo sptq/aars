@@ -7,8 +7,8 @@ use axum::response::Response;
 use chrono::{DateTime, Utc};
 
 use crate::auth::{AuthRejection, CurrentUser};
-use crate::chrome::{Chrome, both_times_now};
-use crate::render::page;
+use crate::chrome::{Chrome, audit_action_label, both_times_now};
+use crate::render::{db_error, page};
 use crate::state::AppState;
 
 #[derive(Template)]
@@ -58,17 +58,14 @@ fn tx_row(row: TxLogRow) -> TxRow {
     }
 }
 
-async fn transmissions(state: &AppState) -> Vec<TxRow> {
+async fn transmissions(state: &AppState) -> Result<Vec<TxRow>, Response> {
     match TxLogRepo::new(state.pool.clone()).recent(LIMIT).await {
-        Ok(rows) => rows.into_iter().map(tx_row).collect(),
-        Err(err) => {
-            tracing::error!(%err, "odczyt dziennika nadań zawiódł");
-            Vec::new()
-        }
+        Ok(rows) => Ok(rows.into_iter().map(tx_row).collect()),
+        Err(err) => Err(db_error("odczyt dziennika nadań zawiódł", &err)),
     }
 }
 
-async fn audit_rows(state: &AppState) -> Vec<AuditRow> {
+async fn audit_rows(state: &AppState) -> Result<Vec<AuditRow>, Response> {
     let rows: Result<Vec<AuditDbRow>, _> = sqlx::query_as(
         "SELECT a.at, u.username, a.action, a.detail \
          FROM audit_log a LEFT JOIN users u ON u.id = a.user_id \
@@ -79,21 +76,18 @@ async fn audit_rows(state: &AppState) -> Vec<AuditRow> {
     .await;
 
     match rows {
-        Ok(rows) => rows
+        Ok(rows) => Ok(rows
             .into_iter()
             .map(|(at, user, action, detail)| AuditRow {
                 at: DateTime::parse_from_rfc3339(&at)
                     .map(|dt| both_times_now(dt.with_timezone(&Utc)))
                     .unwrap_or(at),
                 user: user.unwrap_or_else(|| "—".to_owned()),
-                action,
+                action: audit_action_label(&action).to_owned(),
                 detail: detail.unwrap_or_default(),
             })
-            .collect(),
-        Err(err) => {
-            tracing::error!(%err, "odczyt dziennika audytu zawiódł");
-            Vec::new()
-        }
+            .collect()),
+        Err(err) => Err(db_error("odczyt dziennika audytu zawiódł", &err)),
     }
 }
 
@@ -101,9 +95,17 @@ pub async fn page_view(
     State(state): State<AppState>,
     current: CurrentUser,
 ) -> Result<Response, AuthRejection> {
+    let transmissions = match transmissions(&state).await {
+        Ok(rows) => rows,
+        Err(response) => return Ok(response),
+    };
+    let audit = match audit_rows(&state).await {
+        Ok(rows) => rows,
+        Err(response) => return Ok(response),
+    };
     Ok(page(&LogsPage {
         chrome: Chrome::from(&current),
-        transmissions: transmissions(&state).await,
-        audit: audit_rows(&state).await,
+        transmissions,
+        audit,
     }))
 }

@@ -325,7 +325,7 @@ async fn main() -> Result<()> {
                 .with_hardware(vec![
                     ("Urządzenie audio".to_owned(), config.audio.device.clone()),
                     ("Częstotliwość próbkowania".to_owned(), format!("{} Hz", config.audio.sample_rate)),
-                    ("Backend PTT".to_owned(), format!("{:?}", config.ptt.backend)),
+                    ("Backend PTT".to_owned(), config.ptt.backend.label().to_owned()),
                     ("Model głosu".to_owned(), config.tts.model.clone()),
                 ])
                 .with_watchdog_clear(Arc::new(move || clear_marker.clear_poison())),
