@@ -9,6 +9,7 @@ pub mod queue_page;
 pub mod render;
 pub mod settings_page;
 pub mod state;
+pub mod users;
 
 use aars_core::interlock::Interlocks;
 use std::collections::HashMap;
@@ -420,6 +421,11 @@ pub fn router(state: AppState) -> Router {
         .route("/queue", get(queue_page::page_view))
         .route("/logs", get(logs::page_view))
         .route("/settings", get(settings_page::page_view).post(settings_page::submit))
+        .route("/users", get(users::page_view).post(users::create))
+        .route("/users/{id}/role", post(users::set_role))
+        .route("/users/{id}/disabled", post(users::set_disabled))
+        .route("/users/{id}/reset", post(users::reset))
+        .route("/users/{id}/delete", post(users::delete))
         .route("/queue/group/{group}/cancel", post(queue_page::cancel_group))
         .route("/healthz", get(|| async { "ok" }))
         .route("/assets/{*path}", get(assets::serve))
