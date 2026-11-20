@@ -13,7 +13,7 @@ uruchomić i sprawdzić, i ma własny plik planu z zadaniami w cyklu TDD.
 | 4 | `2026-10-13-etap-04-kolejka.md` | Trwała kolejka: priorytety, przerywanie, powtórzenia | Komunikat `Emergency` przerywa trwające nadanie; kolejka ocala restart |
 | 5 | `2026-10-13-etap-05-harmonogram.md` | Cron, czas jednorazowy, idempotencja, polityka spóźnień | Komunikat cykliczny odpala raz na okres także po restarcie; zaległości starsze niż `misfire_grace_s` są pomijane poza `Emergency` |
 | 6 | `2026-10-13-etap-06-panel-rdzen.md` | Auth, role, dashboard, compose, kolejka, SSE | Logowanie działa, operator nadaje komunikat z panelu, status TX aktualizuje się na żywo |
-| 7 | `2026-10-13-etap-07-panel-reszta.md` | CRUD komunikatów, ustawienia, użytkownicy, logi | Harmonogram konfigurowalny z panelu; macierz rola × endpoint przechodzi |
+| 7 ✓ | `2026-10-13-etap-07-panel-reszta.md` | CRUD komunikatów, ustawienia, użytkownicy, logi | Harmonogram konfigurowalny z panelu; macierz rola × endpoint przechodzi |
 | 8 | `2026-10-13-etap-08-zrodla.md` | `trait DataSource` + `imgw-meteo` | Ostrzeżenie meteo pojawia się w kolejce bez powtarzania przy każdym odpytaniu |
 | 9 | `2026-10-13-etap-09-zrodla-reszta.md` | `imgw-hydro`, `paa`, kompozytor biuletynu | Biuletyn składa segmenty z trzech źródeł; źródło przestarzałe wypada z biuletynu |
 | 10 | `2026-10-13-etap-10-wdrozenie.md` | Cross-compile aarch64, systemd, dokumentacja | Binarka działa na Raspberry Pi pod systemd |

@@ -433,7 +433,10 @@ pub fn router(state: AppState) -> Router {
 }
 
 #[cfg(test)]
-mod tests {
+mod role_matrix;
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
     use aars_core::priority::Priority;
     use aars_core::user::{Role, UserRepo};
@@ -442,13 +445,13 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    async fn state() -> AppState {
+    pub(crate) async fn state() -> AppState {
         AppState::for_tests(aars_core::db::test_pool().await)
     }
 
     /// Loguje się i zwraca cookie sesji wraz z tokenem CSRF odczytanym ze
     /// strony pulpitu — dokładnie tak, jak robi to przeglądarka.
-    async fn login(app: &Router, username: &str, password: &str) -> (String, String) {
+    pub(crate) async fn login(app: &Router, username: &str, password: &str) -> (String, String) {
         let response = app
             .clone()
             .oneshot(
@@ -492,7 +495,7 @@ mod tests {
         (cookie, csrf)
     }
 
-    async fn logged_in(role: Role) -> (Router, String, String, AppState) {
+    pub(crate) async fn logged_in(role: Role) -> (Router, String, String, AppState) {
         let state = state().await;
         UserRepo::new(state.pool.clone()).create("u", "haslo", role).await.unwrap();
         let app = router(state.clone());
