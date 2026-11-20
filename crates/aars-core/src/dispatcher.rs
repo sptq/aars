@@ -263,12 +263,30 @@ impl Dispatcher {
         // Czekające prośby o test dostają odpowiedź od razu (kanał zamknięty).
         drop(tests_rx);
         let releaser = sequencer.releaser();
-        // Join wątku sekwencera blokuje, więc poza wątkami tokio. Restart
-        // (drain) czeka bez limitu: nowy stos nie może otworzyć PTT i karty,
-        // zanim stary wątek je zwolni. Ctrl-C czeka najwyżej `join_timeout`
-        // (także gdy przyszło w trakcie czekania na restart), potem wychodzi
-        // mimo to — strażnik już opuścił PTT, a my wymuszamy to raz jeszcze.
-        let mut join = tokio::task::spawn_blocking(move || sequencer.shutdown());
+        // Join wątku sekwencera blokuje, więc poza wątkami tokio — i na
+        // zwykłym, odłączonym wątku, nie w `spawn_blocking`: runtime tokio
+        // przy zamykaniu czeka bez limitu na swoje wątki blokujące, więc
+        // zawieszony join zatrzymałby wyjście procesu po Ctrl-C. Odłączony
+        // wątek std nie blokuje wyjścia.
+        //
+        // Restart (drain) czeka bez limitu: nowy stos nie może otworzyć PTT
+        // i karty, zanim stary wątek je zwolni. Ctrl-C czeka najwyżej
+        // `join_timeout` (także gdy przyszło w trakcie czekania na restart),
+        // potem wychodzi mimo to — strażnik już opuścił PTT, a my wymuszamy
+        // to raz jeszcze.
+        let (joined_tx, mut join) = oneshot::channel::<()>();
+        let spawned = std::thread::Builder::new().name("aars-seq-join".to_owned()).spawn(
+            move || {
+                sequencer.shutdown();
+                let _ = joined_tx.send(());
+            },
+        );
+        if let Err(err) = spawned {
+            // Bez wątku nie da się zrobić joinu; uchwyt sekwencera zginął
+            // razem z domknięciem, więc wątek sekwencera już się zamyka.
+            tracing::error!(%err, "nie udało się uruchomić wątku zamykania sekwencera");
+            releaser.force_unkey();
+        }
         let mut give_up_at: Option<tokio::time::Instant> = None;
         loop {
             let now = tokio::time::Instant::now();
@@ -286,7 +304,8 @@ impl Dispatcher {
             match tokio::time::timeout(STOP_POLL, &mut join).await {
                 Ok(Ok(())) => break,
                 Ok(Err(_)) => {
-                    tracing::error!("zamykanie sekwencera zakończyło się paniką");
+                    // Nadawca zginął bez wysłania: panika w joinie albo brak wątku.
+                    tracing::error!("zamykanie sekwencera nie potwierdziło joinu");
                     releaser.force_unkey();
                     break;
                 }
@@ -469,7 +488,8 @@ impl Dispatcher {
             }
             SeqEvent::Skipped { id } => {
                 // Nie weszło na antenę: bez wpisu w dzienniku nadań.
-                if let Err(err) = self.queue.hold(id, HELD_BY_SHUTDOWN, Utc::now()).await {
+                let reason = skipped_reason(shutdown.is_cancelled());
+                if let Err(err) = self.queue.hold(id, reason, Utc::now()).await {
                     tracing::error!(id, %err, "zwrot pominiętego zadania zawiódł");
                 }
             }
@@ -732,6 +752,12 @@ impl Dispatcher {
         }
         Some((claimed.id, claimed.priority))
     }
+}
+
+/// Powód zwrotu zadania, które sekwencer pominął przed `key()`: zatrzymanie
+/// stacji albo przerwanie pilniejszym komunikatem (anulowany token).
+fn skipped_reason(shutting_down: bool) -> &'static str {
+    if shutting_down { HELD_BY_SHUTDOWN } else { ABORTED_BY_PREEMPTION }
 }
 
 /// Powód wstrzymania pokazywany w panelu. Prefiks `wstrzymane:` odróżnia go
@@ -1683,5 +1709,48 @@ mod tests {
         assert_eq!(s.repo.state_of(urgent).await.unwrap(), Some(crate::queue::QueueState::Pending));
         let keys = s.ptt.events().iter().filter(|e| **e == PttEvent::Key).count();
         assert_eq!(keys, 1, "podczas drain nic nowego nie wchodzi na antenę: {:?}", s.ptt.events());
+    }
+
+    /// Cały proces, nie tylko `run`: po Ctrl-C z zawieszonym wyjściem audio
+    /// także zamknięcie runtime'u tokio (jak koniec `main`) musi się skończyć.
+    /// Wątek blokujący tokio, który wisiałby w joinie, zatrzymałby wyjście.
+    #[test]
+    fn ctrl_c_with_a_hung_sequencer_does_not_hang_runtime_teardown() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            let runtime =
+                tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            let ptt = runtime.block_on(async {
+                let s = station(StationOpts {
+                    sink: Some(Arc::new(HungSink(Duration::from_secs(20)))),
+                    join_timeout: Some(Duration::from_millis(300)),
+                    ..StationOpts::default()
+                })
+                .await;
+                let id = s.repo.enqueue(req("zawieszone", Priority::Normal, false)).await.unwrap()[0];
+                assert!(
+                    wait_for_state(s.repo.pool(), id, "transmitting", Duration::from_secs(5)).await
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                s.shutdown.cancel();
+                s.task.await.unwrap();
+                s.ptt.clone()
+            });
+            drop(runtime);
+            let _ = done_tx.send((began.elapsed(), ptt.is_keyed()));
+        });
+
+        let (took, keyed) = done_rx
+            .recv_timeout(Duration::from_secs(8))
+            .expect("zamknięcie runtime'u wisi na wątku sekwencera");
+        assert!(took < Duration::from_secs(6), "zamknięcie trwało {took:?}");
+        assert!(!keyed, "PTT opuszczone");
+    }
+
+    #[test]
+    fn a_skipped_item_is_held_with_the_reason_of_what_stopped_it() {
+        assert_eq!(skipped_reason(true), HELD_BY_SHUTDOWN);
+        assert_eq!(skipped_reason(false), ABORTED_BY_PREEMPTION);
     }
 }
