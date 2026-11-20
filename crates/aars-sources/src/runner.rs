@@ -39,6 +39,14 @@ pub fn next_delay(interval: Duration, consecutive_failures: u32) -> Duration {
     interval.saturating_mul(factor).min(ceiling)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fate {
+    Aired,
+    NotAired,
+    /// Element jest wzięty do nadania albo jeszcze czeka.
+    Unresolved,
+}
+
 pub struct SourceRunner {
     source: Arc<dyn DataSource>,
     state: SourceStateRepo,
@@ -121,6 +129,8 @@ impl SourceRunner {
             return Ok(());
         }
 
+        self.settle_pending_cancellations(id, now).await?;
+
         report.fetched = true;
         let ctx = SourceCtx { now, area: cfg.area.clone() };
         let output = match self.source.fetch(&ctx).await {
@@ -143,11 +153,11 @@ impl SourceRunner {
                 self.state.set_state(item.id, TrackedState::Dropped).await?;
             }
         }
-        // Lepka flaga „poszło na antenę”: komunikat jest nadawany albo `done`.
+        // Lepka flaga „poszło na antenę”: obecny albo zastąpiony element
+        // kolejki skończył jako `done`. Samo `transmitting` nie wystarcza:
+        // to też „wzięty i zaraz odrzucony przez interlock” (I1).
         for old in kept.iter_mut().filter(|a| !a.aired) {
-            if let Some(queue_id) = old.queue_item_id
-                && matches!(self.queue.state_of(queue_id).await?, Some(QueueState::Done | QueueState::Transmitting))
-            {
+            if self.fate(old.queue_ids()).await? == Fate::Aired {
                 self.state.set_aired(old.id).await?;
                 old.aired = true;
             }
@@ -159,9 +169,9 @@ impl SourceRunner {
         // Wiersze, które w tym cyklu zmieniły odcisk: ich stary odcisk już nie obowiązuje.
         let mut refingerprinted: HashSet<i64> = HashSet::new();
         let mut seen: HashSet<&str> = HashSet::new();
-        // Odcisk -> (element kolejki, czy poszło na antenę) dla pozycji
-        // ogłoszonych albo przejętych w tym cyklu.
-        let mut announced: HashMap<&str, (Option<i64>, bool)> = HashMap::new();
+        // Odcisk -> (element kolejki, czy poszło na antenę, zastąpione
+        // elementy) dla pozycji ogłoszonych albo przejętych w tym cyklu.
+        let mut announced: HashMap<&str, (Option<i64>, bool, Vec<i64>)> = HashMap::new();
 
         for item in &output.items {
             if !seen.insert(item.key.as_str()) {
@@ -180,14 +190,15 @@ impl SourceRunner {
                 consumed.insert(old.id);
                 if old.fingerprint == item.fingerprint {
                     self.state.touch(old.id, now).await?;
-                    announced.entry(item.fingerprint.as_str()).or_insert((old.queue_item_id, old.aired));
+                    announced
+                        .entry(item.fingerprint.as_str())
+                        .or_insert((old.queue_item_id, old.aired, old.superseded.clone()));
                 } else {
-                    let aired = old.aired || self.is_on_air(old.queue_item_id).await?;
                     let queued = self.announce(item, &item.change_text).await?;
-                    self.cancel_waiting(old.queue_item_id).await;
-                    self.track(item, &cfg.area_text, Some(queued), aired, now).await?;
+                    let (aired, superseded) = self.supersede(old).await?;
+                    self.track(item, &cfg.area_text, Some(queued), aired, superseded.clone(), now).await?;
                     refingerprinted.insert(old.id);
-                    announced.insert(item.fingerprint.as_str(), (Some(queued), aired));
+                    announced.insert(item.fingerprint.as_str(), (Some(queued), aired, superseded));
                     report.changed += 1;
                 }
                 continue;
@@ -195,8 +206,8 @@ impl SourceRunner {
 
             // Nowy klucz (R4): ten sam odcisk co jakakolwiek aktywna albo
             // ogłoszona w tym cyklu pozycja to to samo ostrzeżenie.
-            if let Some(&(queued, aired)) = announced.get(item.fingerprint.as_str()) {
-                self.track(item, &cfg.area_text, queued, aired, now).await?;
+            if let Some((queued, aired, superseded)) = announced.get(item.fingerprint.as_str()) {
+                self.track(item, &cfg.area_text, *queued, *aired, superseded.clone(), now).await?;
                 continue;
             }
             if let Some(old) = kept.iter().find(|a| live(a) && !refingerprinted.contains(&a.id) && a.fingerprint == item.fingerprint) {
@@ -205,26 +216,25 @@ impl SourceRunner {
                     self.state.set_state(old.id, TrackedState::Replaced).await?;
                     consumed.insert(old.id);
                 }
-                self.track(item, &cfg.area_text, old.queue_item_id, old.aired, now).await?;
-                announced.insert(item.fingerprint.as_str(), (old.queue_item_id, old.aired));
+                self.track(item, &cfg.area_text, old.queue_item_id, old.aired, old.superseded.clone(), now).await?;
+                announced.insert(item.fingerprint.as_str(), (old.queue_item_id, old.aired, old.superseded.clone()));
                 continue;
             }
             let replaced = kept.iter().find(|a| {
                 live(a) && !consumed.contains(&a.id) && a.topic == item.topic && !out_keys.contains(a.item_key.as_str())
             });
             if let Some(old) = replaced {
-                let aired = old.aired || self.is_on_air(old.queue_item_id).await?;
                 let queued = self.announce(item, &item.change_text).await?;
-                self.cancel_waiting(old.queue_item_id).await;
+                let (aired, superseded) = self.supersede(old).await?;
                 self.state.set_state(old.id, TrackedState::Replaced).await?;
                 consumed.insert(old.id);
-                self.track(item, &cfg.area_text, Some(queued), aired, now).await?;
-                announced.insert(item.fingerprint.as_str(), (Some(queued), aired));
+                self.track(item, &cfg.area_text, Some(queued), aired, superseded.clone(), now).await?;
+                announced.insert(item.fingerprint.as_str(), (Some(queued), aired, superseded));
                 report.changed += 1;
             } else {
                 let queued = self.announce(item, &item.text).await?;
-                self.track(item, &cfg.area_text, Some(queued), false, now).await?;
-                announced.insert(item.fingerprint.as_str(), (Some(queued), false));
+                self.track(item, &cfg.area_text, Some(queued), false, Vec::new(), now).await?;
+                announced.insert(item.fingerprint.as_str(), (Some(queued), false, Vec::new()));
                 report.announced += 1;
             }
         }
@@ -245,11 +255,18 @@ impl SourceRunner {
             } else if old.misses + 1 < MISSES_TO_CANCEL {
                 self.state.set_misses(old.id, old.misses + 1).await?;
             } else {
-                // R16: najpierw komunikat, potem stan. Poszło na antenę tylko
-                // to, co `aired`; czekający element kolejki zawsze anulujemy.
+                // R16: najpierw komunikat, potem stan. Odwołanie nadajemy
+                // tylko po tym, co poszło na antenę; element kolejki zawsze
+                // wycofujemy. Gdy oryginał jest właśnie wzięty, rozstrzygnie
+                // to późniejszy cykl (`settle_pending_cancellations`).
                 self.cancel_waiting(old.queue_item_id).await;
-                if old.aired {
-                    self.enqueue(old.cancel_text.clone(), Priority::Normal, false, old.valid_until).await?;
+                let fate = if old.aired { Fate::Aired } else { self.fate(old.queue_ids()).await? };
+                match fate {
+                    Fate::Aired => {
+                        self.enqueue(old.cancel_text.clone(), Priority::Normal, false, old.valid_until).await?;
+                    }
+                    Fate::Unresolved => self.state.set_cancel_pending(old.id, true).await?,
+                    Fate::NotAired => {}
                 }
                 self.state.set_state(old.id, TrackedState::Cancelled).await?;
                 report.cancelled += 1;
@@ -288,15 +305,60 @@ impl SourceRunner {
         self.enqueue(text.to_owned(), item.priority, item.interrupting, item.valid_until).await
     }
 
-    /// Czy element kolejki jest właśnie nadawany albo już nadany.
-    async fn is_on_air(&self, queue_item_id: Option<i64>) -> Result<bool, DbError> {
-        let Some(queue_item_id) = queue_item_id else {
-            return Ok(false);
-        };
-        Ok(matches!(
-            self.queue.state_of(queue_item_id).await?,
-            Some(QueueState::Done | QueueState::Transmitting)
-        ))
+    /// Co wiadomo o nadaniu pozycji z jej elementów kolejki: `done`
+    /// któregokolwiek to nadanie; wzięty albo czekający jeszcze się waży.
+    async fn fate(&self, ids: impl Iterator<Item = i64>) -> Result<Fate, DbError> {
+        let mut fate = Fate::NotAired;
+        for queue_item_id in ids {
+            match self.queue.state_of(queue_item_id).await? {
+                Some(QueueState::Done) => return Ok(Fate::Aired),
+                Some(QueueState::Transmitting | QueueState::Pending) => fate = Fate::Unresolved,
+                _ => {}
+            }
+        }
+        Ok(fate)
+    }
+
+    /// Wycofuje element kolejki pozycji zastępowanej zmianą. Zwraca, czy
+    /// pozycja poszła na antenę, i zastąpione elementy do dalszej obserwacji:
+    /// wzięty element może jeszcze skończyć jako `done` (N1) albo, gdy
+    /// interlock go odrzuci, jako `cancelled` (I1).
+    async fn supersede(&self, old: &TrackedItem) -> Result<(bool, Vec<i64>), DbError> {
+        let mut superseded = old.superseded.clone();
+        let mut aired = old.aired;
+        if let Some(queue_item_id) = old.queue_item_id {
+            self.cancel_waiting(Some(queue_item_id)).await;
+            match self.queue.state_of(queue_item_id).await? {
+                Some(QueueState::Done) => aired = true,
+                Some(QueueState::Transmitting) => superseded.push(queue_item_id),
+                _ => {}
+            }
+        }
+        Ok((aired, superseded))
+    }
+
+    /// Odwołania odłożone, bo oryginał był wzięty do nadania: gdy poszedł
+    /// na antenę, nadajemy odwołanie; gdy skończył inaczej, nic.
+    async fn settle_pending_cancellations(&self, id: &str, now: DateTime<Utc>) -> Result<(), DbError> {
+        for waiting in self.state.awaiting_cancellation(id).await? {
+            match self.fate(waiting.queue_ids()).await? {
+                Fate::Aired => {
+                    if waiting.valid_until.is_none_or(|until| until > now) {
+                        self.enqueue(waiting.cancel_text.clone(), Priority::Normal, false, waiting.valid_until)
+                            .await?;
+                    }
+                    self.state.set_aired(waiting.id).await?;
+                    self.state.set_cancel_pending(waiting.id, false).await?;
+                }
+                Fate::NotAired => self.state.set_cancel_pending(waiting.id, false).await?,
+                Fate::Unresolved => {
+                    for queue_item_id in waiting.queue_ids() {
+                        self.cancel_waiting(Some(queue_item_id)).await;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// R7: anuluje element kolejki, który jeszcze czeka. `true`, gdy czekał.
@@ -321,6 +383,7 @@ impl SourceRunner {
         area_text: &str,
         queue_item_id: Option<i64>,
         aired: bool,
+        superseded: Vec<i64>,
         now: DateTime<Utc>,
     ) -> Result<(), DbError> {
         let new = NewTracked {
@@ -338,6 +401,7 @@ impl SourceRunner {
             first_seen_at: now,
             last_seen_at: now,
             queue_item_id,
+            superseded,
         };
         self.state.upsert_active(&new, now).await?;
         Ok(())
@@ -771,5 +835,70 @@ mod tests {
         r.runner.cycle(now()).await;
         r.runner.cycle(now()).await;
         assert_eq!(texts(&r.queue).await, vec!["odwołanie a"]);
+    }
+
+    async fn queue_state(r: &Rig, id: i64) -> QueueState {
+        r.queue.state_of(id).await.unwrap().expect("element kolejki istnieje")
+    }
+
+    #[tokio::test]
+    async fn an_original_claimed_and_held_by_the_kill_switch_is_not_aired_and_its_withdrawal_is_silent() {
+        let r = rig(vec![ok(vec![warning("a", "f1")]), ok(vec![warning("a", "f1")]), ok(vec![]), ok(vec![]), ok(vec![])]).await;
+        r.runner.cycle(now()).await;
+        // Wyłącznik: dyspozytor bierze element, sekwencer odmawia, hold.
+        let original = r.queue.claim_next().await.unwrap().unwrap().id;
+        r.runner.cycle(now()).await;
+        r.queue.hold(original, "wstrzymane: wyłącznik", Utc::now()).await.unwrap();
+        assert!(!r.state.active_items("imgw-meteo").await.unwrap()[0].aired, "wzięty i odrzucony to nie nadany");
+
+        r.runner.cycle(now()).await;
+        // Odwołanie przychodzi, gdy element znów jest wzięty, a potem wstrzymany.
+        r.queue.claim_next().await.unwrap().unwrap();
+        r.runner.cycle(now()).await;
+        r.queue.hold(original, "wstrzymane: wyłącznik", Utc::now()).await.unwrap();
+        r.runner.cycle(now()).await;
+
+        assert!(texts(&r.queue).await.is_empty(), "żadnego odwołania niesłyszanego ostrzeżenia");
+        assert_eq!(queue_state(&r, original).await, QueueState::Cancelled);
+        assert!(r.queue.claim_next().await.unwrap().is_none(), "wycofany oryginał nie wychodzi po wstrzymaniu");
+        assert!(r.state.active_items("imgw-meteo").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_change_while_the_original_is_claimed_and_held_airs_only_the_change_once() {
+        let r = rig(vec![
+            ok(vec![warning("a", "f1")]),
+            ok(vec![warning("a", "f2")]),
+            ok(vec![warning("a", "f2")]),
+            ok(vec![warning("a", "f2")]),
+        ])
+        .await;
+        r.runner.cycle(now()).await;
+        let original = r.queue.claim_next().await.unwrap().unwrap().id;
+        r.runner.cycle(now()).await;
+        r.queue.hold(original, "wstrzymane: cisza nocna", Utc::now()).await.unwrap();
+        r.runner.cycle(now()).await;
+
+        assert_eq!(queue_state(&r, original).await, QueueState::Cancelled, "stary tekst nie wraca do kolejki");
+        assert_eq!(texts(&r.queue).await, vec!["zmiana a f2"]);
+        let change = r.queue.claim_next().await.unwrap().unwrap();
+        assert_eq!(change.rendered_text, "zmiana a f2");
+        r.queue.mark_done(change.id).await.unwrap();
+        r.runner.cycle(now()).await;
+        assert!(r.queue.claim_next().await.unwrap().is_none(), "zmiana idzie raz");
+    }
+
+    #[tokio::test]
+    async fn a_withdrawal_while_the_original_is_really_on_air_is_broadcast_once_it_finishes() {
+        let r = rig(vec![ok(vec![warning("a", "f1")]), ok(vec![]), ok(vec![]), ok(vec![]), ok(vec![])]).await;
+        r.runner.cycle(now()).await;
+        r.runner.cycle(now()).await;
+        let original = r.queue.claim_next().await.unwrap().unwrap().id;
+        r.runner.cycle(now()).await;
+        r.queue.mark_done(original).await.unwrap();
+        r.runner.cycle(now()).await;
+        r.runner.cycle(now()).await;
+        assert_eq!(texts(&r.queue).await, vec!["odwołanie a"]);
+        assert!(r.state.active_items("imgw-meteo").await.unwrap().is_empty());
     }
 }
