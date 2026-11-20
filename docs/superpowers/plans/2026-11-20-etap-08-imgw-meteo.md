@@ -418,3 +418,10 @@ assert_eq!(queue.pending(10).await.unwrap().len(), 1, "powtórne pobranie bez zm
 - Macierz rola × endpoint przechodzi, łącznie z nowymi trasami `/sources` (Task 8).
 - Pulpit pokazuje wyłącznik nadawania także wtedy, gdy odczyt kolejki zawiedzie (Task 1).
 - `cargo test --workspace` zielone bez ruchu sieciowego, `clippy -D warnings` czyste.
+
+Uwaga przy wdrożeniu: bazę utworzoną przez kompilację ze środka gałęzi etapu 8
+trzeba utworzyć od nowa (albo usunąć wiersz 3 z `_sqlx_migrations`, tabelę
+`source_items`, wiersz `imgw-meteo` z `source_state` i klucze `source:imgw-meteo:*`
+z `settings`, bo 0003 wstawia je ponownie), bo migracja 0003 zmieniała się
+w trakcie etapu i sqlx odrzuci jej sumę kontrolną. Bazy z etapu 7 (master) przechodzą migracje 0003 i 0004 bez
+zmian.
