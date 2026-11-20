@@ -119,6 +119,11 @@ pub fn cardinal_genitive(n: i64) -> Option<String> {
     } else if rest > 0 {
         parts.push(ONES_GENITIVE[rest]);
     }
+    // Złożenie kończące się na 1 (21, 101) ma nieodmienione „jeden".
+    if n > 1 && rest % 10 == 1 && rest != 11 {
+        parts.pop();
+        parts.push("jeden");
+    }
     Some(parts.join(" "))
 }
 
