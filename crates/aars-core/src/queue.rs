@@ -335,6 +335,15 @@ impl QueueRepo {
         Ok(())
     }
 
+    /// Stan jednego elementu kolejki; `None`, gdy go nie ma.
+    pub async fn state_of(&self, id: i64) -> Result<Option<QueueState>, DbError> {
+        let state: Option<String> = sqlx::query_scalar("SELECT state FROM queue_items WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(state.as_deref().and_then(QueueState::parse))
+    }
+
     pub async fn cancel(&self, id: i64) -> Result<u64, DbError> {
         let result = sqlx::query(
             "UPDATE queue_items SET state = 'cancelled', finished_at = ?

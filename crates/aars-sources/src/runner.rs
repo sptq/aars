@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use aars_core::error::DbError;
 use aars_core::priority::Priority;
-use aars_core::queue::{EnqueueRequest, QueueRepo};
+use aars_core::queue::{EnqueueRequest, QueueRepo, QueueState};
 use aars_core::sink::CancelToken;
 use aars_core::source_state::{NewTracked, SourceStateRepo, TrackedItem, TrackedState};
 use chrono::{DateTime, Utc};
@@ -143,11 +143,23 @@ impl SourceRunner {
                 self.state.set_state(item.id, TrackedState::Dropped).await?;
             }
         }
+        // Lepka flaga „poszło na antenę”: komunikat tej pozycji ma stan `done`.
+        for old in kept.iter_mut().filter(|a| !a.aired) {
+            if let Some(queue_id) = old.queue_item_id
+                && self.queue.state_of(queue_id).await? == Some(QueueState::Done)
+            {
+                self.state.set_aired(old.id).await?;
+                old.aired = true;
+            }
+        }
 
         let out_keys: HashSet<&str> = output.items.iter().map(|i| i.key.as_str()).collect();
+        let live = |a: &TrackedItem| a.valid_until.is_none_or(|until| until > now);
         let mut consumed: HashSet<i64> = HashSet::new();
         let mut seen: HashSet<&str> = HashSet::new();
-        let mut announced_fingerprints: HashMap<&str, Option<i64>> = HashMap::new();
+        // Odcisk -> (element kolejki, czy poszło na antenę) dla pozycji
+        // ogłoszonych albo przejętych w tym cyklu.
+        let mut announced: HashMap<&str, (Option<i64>, bool)> = HashMap::new();
 
         for item in &output.items {
             if !seen.insert(item.key.as_str()) {
@@ -166,67 +178,76 @@ impl SourceRunner {
                 consumed.insert(old.id);
                 if old.fingerprint == item.fingerprint {
                     self.state.touch(old.id, now).await?;
+                    announced.entry(item.fingerprint.as_str()).or_insert((old.queue_item_id, old.aired));
                 } else {
-                    let queued = self.announce(item, &item.change_text, item.priority, item.interrupting).await?;
+                    let queued = self.announce(item, &item.change_text).await?;
                     self.cancel_waiting(old.queue_item_id).await;
-                    self.track(item, &cfg.area_text, Some(queued), now).await?;
-                    announced_fingerprints.insert(item.fingerprint.as_str(), Some(queued));
+                    self.track(item, &cfg.area_text, Some(queued), old.aired, now).await?;
+                    announced.insert(item.fingerprint.as_str(), (Some(queued), old.aired));
                     report.changed += 1;
                 }
                 continue;
             }
 
-            // Nowy klucz (R4).
-            if let Some(queued) = announced_fingerprints.get(item.fingerprint.as_str()) {
-                self.track(item, &cfg.area_text, *queued, now).await?;
+            // Nowy klucz (R4): ten sam odcisk co jakakolwiek aktywna albo
+            // ogłoszona w tym cyklu pozycja to to samo ostrzeżenie.
+            if let Some(&(queued, aired)) = announced.get(item.fingerprint.as_str()) {
+                self.track(item, &cfg.area_text, queued, aired, now).await?;
                 continue;
             }
-            if let Some(old) = kept
-                .iter()
-                .find(|a| !consumed.contains(&a.id) && a.fingerprint == item.fingerprint)
-            {
-                // To samo ostrzeżenie pod nowym id: przejmujemy po cichu.
-                if !out_keys.contains(old.item_key.as_str()) {
+            if let Some(old) = kept.iter().find(|a| live(a) && a.fingerprint == item.fingerprint) {
+                // Stare id zniknęło: przejmujemy po cichu, stare kończy się jako Replaced.
+                if !out_keys.contains(old.item_key.as_str()) && !consumed.contains(&old.id) {
                     self.state.set_state(old.id, TrackedState::Replaced).await?;
                     consumed.insert(old.id);
                 }
-                self.track(item, &cfg.area_text, old.queue_item_id, now).await?;
-                announced_fingerprints.insert(item.fingerprint.as_str(), old.queue_item_id);
+                self.track(item, &cfg.area_text, old.queue_item_id, old.aired, now).await?;
+                announced.insert(item.fingerprint.as_str(), (old.queue_item_id, old.aired));
                 continue;
             }
             let replaced = kept.iter().find(|a| {
-                !consumed.contains(&a.id) && a.topic == item.topic && !out_keys.contains(a.item_key.as_str())
+                live(a) && !consumed.contains(&a.id) && a.topic == item.topic && !out_keys.contains(a.item_key.as_str())
             });
             if let Some(old) = replaced {
-                let queued = self.announce(item, &item.change_text, item.priority, item.interrupting).await?;
+                let queued = self.announce(item, &item.change_text).await?;
                 self.cancel_waiting(old.queue_item_id).await;
                 self.state.set_state(old.id, TrackedState::Replaced).await?;
                 consumed.insert(old.id);
-                self.track(item, &cfg.area_text, Some(queued), now).await?;
-                announced_fingerprints.insert(item.fingerprint.as_str(), Some(queued));
+                self.track(item, &cfg.area_text, Some(queued), old.aired, now).await?;
+                announced.insert(item.fingerprint.as_str(), (Some(queued), old.aired));
                 report.changed += 1;
             } else {
-                let queued = self.announce(item, &item.text, item.priority, item.interrupting).await?;
-                self.track(item, &cfg.area_text, Some(queued), now).await?;
-                announced_fingerprints.insert(item.fingerprint.as_str(), Some(queued));
+                let queued = self.announce(item, &item.text).await?;
+                self.track(item, &cfg.area_text, Some(queued), false, now).await?;
+                announced.insert(item.fingerprint.as_str(), (Some(queued), false));
                 report.announced += 1;
             }
         }
 
         // Pozycje, których nie ma w odpowiedzi.
-        if output.complete {
-            for old in kept.iter().filter(|a| !consumed.contains(&a.id) && !out_keys.contains(a.item_key.as_str())) {
-                if old.valid_until.is_some_and(|until| until <= now) {
-                    self.state.set_state(old.id, TrackedState::Expired).await?;
-                } else if old.misses + 1 < MISSES_TO_CANCEL {
-                    self.state.set_misses(old.id, old.misses + 1).await?;
-                } else {
-                    self.state.set_state(old.id, TrackedState::Cancelled).await?;
-                    report.cancelled += 1;
-                    if !self.cancel_waiting(old.queue_item_id).await {
-                        self.enqueue(old.cancel_text.clone(), Priority::Normal, false, None).await?;
-                    }
+        for old in kept.iter().filter(|a| !consumed.contains(&a.id) && !out_keys.contains(a.item_key.as_str())) {
+            if !live(old) {
+                self.state.set_state(old.id, TrackedState::Expired).await?;
+            } else if !output.complete {
+                continue;
+            } else if output.items.iter().any(|i| {
+                i.key != old.item_key
+                    && i.fingerprint == old.fingerprint
+                    && i.valid_until.is_none_or(|until| until > now)
+            }) {
+                // To samo ostrzeżenie żyje dalej pod innym id.
+                self.state.set_state(old.id, TrackedState::Replaced).await?;
+            } else if old.misses + 1 < MISSES_TO_CANCEL {
+                self.state.set_misses(old.id, old.misses + 1).await?;
+            } else {
+                // R16: najpierw komunikat, potem stan. Poszło na antenę tylko
+                // to, co `aired`; czekający element kolejki zawsze anulujemy.
+                self.cancel_waiting(old.queue_item_id).await;
+                if old.aired {
+                    self.enqueue(old.cancel_text.clone(), Priority::Normal, false, old.valid_until).await?;
                 }
+                self.state.set_state(old.id, TrackedState::Cancelled).await?;
+                report.cancelled += 1;
             }
         }
 
@@ -258,14 +279,8 @@ impl SourceRunner {
         ids.first().copied().ok_or_else(|| DbError::Invalid("kolejka nie zwróciła identyfikatora".to_owned()))
     }
 
-    async fn announce(
-        &self,
-        item: &SourceItem,
-        text: &str,
-        priority: Priority,
-        interrupting: bool,
-    ) -> Result<i64, DbError> {
-        self.enqueue(text.to_owned(), priority, interrupting, item.valid_until).await
+    async fn announce(&self, item: &SourceItem, text: &str) -> Result<i64, DbError> {
+        self.enqueue(text.to_owned(), item.priority, item.interrupting, item.valid_until).await
     }
 
     /// R7: anuluje element kolejki, który jeszcze czeka. `true`, gdy czekał.
@@ -289,6 +304,7 @@ impl SourceRunner {
         item: &SourceItem,
         area_text: &str,
         queue_item_id: Option<i64>,
+        aired: bool,
         now: DateTime<Utc>,
     ) -> Result<(), DbError> {
         let new = NewTracked {
@@ -302,14 +318,12 @@ impl SourceRunner {
             priority: item.priority,
             valid_from: item.valid_from,
             valid_until: item.valid_until,
+            aired,
             first_seen_at: now,
             last_seen_at: now,
-            queue_item_id: None,
+            queue_item_id,
         };
-        let row = self.state.upsert_active(&new, now).await?;
-        if let Some(queue_item_id) = queue_item_id {
-            self.state.set_queue_item(row, queue_item_id).await?;
-        }
+        self.state.upsert_active(&new, now).await?;
         Ok(())
     }
 }
@@ -620,5 +634,113 @@ mod tests {
         shutdown.cancel();
         let finished = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(finished.is_ok(), "run nie zakończył się po zamknięciu");
+    }
+
+    async fn air(r: &Rig) {
+        let claimed = r.queue.claim_next().await.unwrap().unwrap();
+        r.queue.mark_done(claimed.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_warning_under_two_ids_at_once_is_announced_once_in_either_order() {
+        for (order, label) in [(["a", "b"], "old first"), (["b", "a"], "new first")] {
+            let both = || ok(order.iter().map(|k| warning(k, "f1")).collect());
+            let r = rig(vec![ok(vec![warning("a", "f1")]), both(), ok(vec![warning("b", "f1")]), ok(vec![warning("b", "f1")]), ok(vec![warning("b", "f1")])]).await;
+            for _ in 0..5 {
+                r.runner.cycle(now()).await;
+            }
+            assert_eq!(texts(&r.queue).await, vec!["nowe a f1"], "{label}");
+            assert_eq!(r.state.active_items("imgw-meteo").await.unwrap().len(), 1, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_old_id_vanishing_while_the_same_warning_lives_on_is_not_a_cancellation() {
+        let r = rig(vec![
+            ok(vec![warning("a", "f1"), warning("b", "f1")]),
+            ok(vec![warning("b", "f1")]),
+            ok(vec![warning("b", "f1")]),
+        ])
+        .await;
+        r.runner.cycle(now()).await;
+        air(&r).await;
+        r.runner.cycle(now()).await;
+        r.runner.cycle(now()).await;
+        assert!(texts(&r.queue).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_cancellation_enqueue_leaves_the_item_active_for_a_retry() {
+        let r = rig(vec![ok(vec![warning("a", "f1")]), ok(vec![]), ok(vec![]), ok(vec![])]).await;
+        r.runner.cycle(now()).await;
+        air(&r).await;
+        r.runner.cycle(now()).await;
+        sqlx::query("CREATE TRIGGER no_insert BEFORE INSERT ON queue_items BEGIN SELECT RAISE(ABORT, 'zablokowane'); END")
+            .execute(r.queue.pool())
+            .await
+            .unwrap();
+        let report = r.runner.cycle(now()).await;
+        assert!(report.error.is_some());
+        assert_eq!(r.state.active_items("imgw-meteo").await.unwrap().len(), 1);
+        sqlx::query("DROP TRIGGER no_insert").execute(r.queue.pool()).await.unwrap();
+        let report = r.runner.cycle(now()).await;
+        assert_eq!(report.cancelled, 1);
+        assert_eq!(texts(&r.queue).await, vec!["odwołanie a"]);
+    }
+
+    #[tokio::test]
+    async fn a_pending_change_is_cancelled_and_the_cancellation_is_broadcast_when_the_original_aired() {
+        let r = rig(vec![ok(vec![warning("a", "f1")]), ok(vec![warning("a", "f2")]), ok(vec![]), ok(vec![]), ok(vec![])]).await;
+        r.runner.cycle(now()).await;
+        air(&r).await;
+        r.runner.cycle(now()).await;
+        for _ in 0..3 {
+            r.runner.cycle(now()).await;
+        }
+        assert_eq!(texts(&r.queue).await, vec!["odwołanie a"]);
+    }
+
+    #[tokio::test]
+    async fn the_aired_flag_survives_a_second_change() {
+        let r = rig(vec![
+            ok(vec![warning("a", "f1")]),
+            ok(vec![warning("a", "f2")]),
+            ok(vec![warning("a", "f3")]),
+            ok(vec![]),
+            ok(vec![]),
+        ])
+        .await;
+        r.runner.cycle(now()).await;
+        air(&r).await;
+        for _ in 0..4 {
+            r.runner.cycle(now()).await;
+        }
+        assert_eq!(texts(&r.queue).await, vec!["odwołanie a"]);
+    }
+
+    #[tokio::test]
+    async fn an_original_cancelled_by_the_operator_is_not_followed_by_a_cancellation() {
+        let r = rig(vec![ok(vec![warning("a", "f1")]), ok(vec![]), ok(vec![])]).await;
+        r.runner.cycle(now()).await;
+        let queued = r.queue.pending(10).await.unwrap()[0].id;
+        r.queue.cancel(queued).await.unwrap();
+        r.runner.cycle(now()).await;
+        r.runner.cycle(now()).await;
+        assert!(texts(&r.queue).await.is_empty());
+        assert!(r.state.active_items("imgw-meteo").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_new_warning_after_the_old_one_expired_is_new_not_a_change() {
+        let mut old = warning("a", "f1");
+        old.valid_until = Some(at("2026-07-23T10:30:00Z"));
+        let r = rig(vec![ok(vec![old]), ok(vec![warning("b", "f2")])]).await;
+        r.runner.cycle(now()).await;
+        let report = r.runner.cycle(at("2026-07-23T11:00:00Z")).await;
+        assert_eq!((report.announced, report.changed), (1, 0));
+        assert_eq!(texts(&r.queue).await.last().map(String::as_str), Some("nowe b f2"));
+        let active = r.state.active_items("imgw-meteo").await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].item_key, "b");
     }
 }
