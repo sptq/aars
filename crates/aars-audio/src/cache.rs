@@ -9,6 +9,7 @@ use crate::wav::{read_wav_mono, write_wav_mono};
 /// Cache audio adresowany treścią: ten sam tekst i te same parametry głosu
 /// dają ten sam plik, więc podgląd w panelu i nadanie na pasmo korzystają z
 /// jednego WAV-a (spec §4.1).
+#[derive(Clone)]
 pub struct AudioCache {
     pool: SqlitePool,
     dir: PathBuf,
