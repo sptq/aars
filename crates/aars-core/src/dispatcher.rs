@@ -10,6 +10,8 @@ use crate::queue::{QueueItem, QueueRepo};
 use crate::sequencer::{SeqEvent, SequencerHandle, TransmitRequest, TxOutcome};
 use crate::sink::CancelToken;
 use crate::synth::Pcm;
+use crate::txlog::{TxLogEntry, TxLogRepo};
+use crate::watchdog::TX_TIMEOUT_ERROR;
 
 pub type RenderFuture<'a> = Pin<Box<dyn Future<Output = Result<Pcm, String>> + Send + 'a>>;
 
@@ -26,12 +28,15 @@ pub trait Renderer: Send + Sync {
 pub struct DispatcherConfig {
     /// Jak często zaglądać do kolejki, gdy nic nie leci.
     pub tick: Duration,
+    /// Nazwa backendu PTT zapisywana w dzienniku nadań.
+    pub ptt_backend: &'static str,
 }
 
 /// Spina kolejkę z sekwencerem: bierze zadanie, syntezuje, nadaje, zapisuje
 /// wynik. Jedyne miejsce, które decyduje o przerwaniu trwającego nadania.
 pub struct Dispatcher {
     queue: Arc<QueueRepo>,
+    tx_log: TxLogRepo,
     renderer: Arc<dyn Renderer>,
     sequencer: SequencerHandle,
     config: DispatcherConfig,
@@ -44,7 +49,8 @@ impl Dispatcher {
         sequencer: SequencerHandle,
         config: DispatcherConfig,
     ) -> Self {
-        Self { queue, renderer, sequencer, config }
+        let tx_log = TxLogRepo::new(queue.pool().clone());
+        Self { queue, tx_log, renderer, sequencer, config }
     }
 
     pub async fn run(mut self, shutdown: CancelToken) {
@@ -150,6 +156,24 @@ impl Dispatcher {
     }
 
     async fn record_outcome(&self, id: i64, outcome: TxOutcome, played: Duration) {
+        // Dziennik nadań jest dodatkiem: jego awaria jest tylko logowana
+        // i nie rusza aktualizacji stanu kolejki.
+        let ended_at = Utc::now();
+        let played_for =
+            chrono::Duration::from_std(played).unwrap_or_else(|_| chrono::Duration::zero());
+        let (tx_result, note) = tx_result(&outcome);
+        let entry = TxLogEntry {
+            queue_item_id: id,
+            started_at: ended_at - played_for,
+            ended_at,
+            ptt_backend: self.config.ptt_backend.to_owned(),
+            result: tx_result,
+            note,
+        };
+        if let Err(err) = self.tx_log.record(entry).await {
+            tracing::error!(id, %err, "zapis do dziennika nadań zawiódł");
+        }
+
         let result = match outcome {
             TxOutcome::Ok => {
                 tracing::info!(id, played_ms = played.as_millis(), "nadanie zakończone");
@@ -217,6 +241,16 @@ impl Dispatcher {
             tracing::error!(id = claimed.id, %err, "sekwencer nie przyjął komunikatu przerywającego");
             let _ = self.queue.mark_failed(claimed.id, &err).await;
         }
+    }
+}
+
+/// Wynik do `tx_log` i notatka (treść błędu) dla zakończonego nadania.
+fn tx_result(outcome: &TxOutcome) -> (&'static str, Option<String>) {
+    match outcome {
+        TxOutcome::Ok => ("ok", None),
+        TxOutcome::Aborted => ("aborted", None),
+        TxOutcome::Failed(err) if err == TX_TIMEOUT_ERROR => ("timeout", Some(err.clone())),
+        TxOutcome::Failed(err) => ("failed", Some(err.clone())),
     }
 }
 
@@ -303,7 +337,7 @@ mod tests {
             repo.clone(),
             Arc::new(FakeRenderer::new(48_000, ms_per_char)),
             spawn_sequencer(ptt.clone()),
-            DispatcherConfig { tick: Duration::from_millis(10) },
+            DispatcherConfig { tick: Duration::from_millis(10), ptt_backend: "fake" },
         );
         let task = tokio::spawn(dispatcher.run(shutdown.clone()));
 
@@ -446,7 +480,7 @@ mod tests {
             repo.clone(),
             Arc::new(FakeRenderer::new(48_000, 2)),
             spawn_sequencer(Arc::new(FakePtt::new())),
-            DispatcherConfig { tick: Duration::from_millis(10) },
+            DispatcherConfig { tick: Duration::from_millis(10), ptt_backend: "fake" },
         );
         let task = tokio::spawn(dispatcher.run(shutdown.clone()));
 
@@ -457,5 +491,64 @@ mod tests {
 
         shutdown.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    async fn tx_log_rows(repo: &QueueRepo) -> Vec<crate::txlog::TxLogRow> {
+        crate::txlog::TxLogRepo::new(repo.pool().clone()).recent(10).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_finished_transmission_is_written_to_the_tx_log() {
+        let h = harness(2).await;
+        let id = h.repo.enqueue(req("komunikat", Priority::Normal, false)).await.unwrap()[0];
+        assert!(h.wait_for_state(id, "done", Duration::from_secs(5)).await);
+
+        let rows = tx_log_rows(&h.repo).await;
+
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].queue_item_id, id);
+        assert_eq!(rows[0].result, "ok");
+        assert_eq!(rows[0].ptt_backend, "fake");
+        assert!(rows[0].duration_ms > 0, "{:?}", rows[0]);
+        assert_eq!(rows[0].text.as_deref(), Some("komunikat"));
+
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_transmission_is_logged_as_aborted() {
+        let h = harness(40).await;
+        let slow = h
+            .repo
+            .enqueue(req("dlugi komunikat zwyczajny", Priority::Normal, false))
+            .await
+            .unwrap()[0];
+        assert!(h.wait_for_state(slow, "transmitting", Duration::from_secs(5)).await);
+        let urgent = h.repo.enqueue(req("alarm", Priority::Emergency, true)).await.unwrap()[0];
+        assert!(h.wait_for_state(urgent, "done", Duration::from_secs(10)).await);
+
+        let rows = tx_log_rows(&h.repo).await;
+
+        assert!(
+            rows.iter().any(|r| r.queue_item_id == slow && r.result == "aborted"),
+            "{rows:?}"
+        );
+
+        h.finish().await;
+    }
+
+    #[test]
+    fn only_the_watchdog_message_maps_to_a_timeout() {
+        use crate::watchdog::TX_TIMEOUT_ERROR;
+        assert_eq!(tx_result(&TxOutcome::Ok), ("ok", None));
+        assert_eq!(tx_result(&TxOutcome::Aborted), ("aborted", None));
+        assert_eq!(
+            tx_result(&TxOutcome::Failed(TX_TIMEOUT_ERROR.to_owned())),
+            ("timeout", Some(TX_TIMEOUT_ERROR.to_owned()))
+        );
+        assert_eq!(
+            tx_result(&TxOutcome::Failed("inny błąd".to_owned())),
+            ("failed", Some("inny błąd".to_owned()))
+        );
     }
 }
