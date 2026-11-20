@@ -632,6 +632,13 @@ async fn run_station(
             }
         }
         dispatcher_task = None;
+        // Po zwykłym drenażu wątek sekwencera jest dołączony i znacznik czysty.
+        // Znacznik w górze bez Ctrl-C znaczy, że joina nie było (np. nie
+        // wystartował wątek `aars-seq-join`): stary wątek trzyma jeszcze PTT
+        // i kartę, więc nie otwieramy ich drugi raz w tym procesie (F2-1).
+        if !stop.is_cancelled() && watchdog_marker.as_ref().is_some_and(|m| m.is_keyed()) {
+            dispatcher_failed = true;
+        }
     }
 
     tracing::info!("zatrzymuję zadania stacji");
