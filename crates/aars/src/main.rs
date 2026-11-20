@@ -325,7 +325,11 @@ async fn main() -> Result<()> {
                         queue.clone(),
                     )),
                     Err(err) => {
-                        tracing::error!(%err, "źródło imgw-meteo nie wystartuje");
+                        source_start_failed(
+                            &aars_core::source_state::SourceStateRepo::new(pool.clone()),
+                            &err.to_string(),
+                        )
+                        .await;
                         None
                     }
                 };
@@ -512,6 +516,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Źródła nie udało się zbudować: ślad w `source_state`, żeby panel pokazał je
+/// jako awaryjne, a nie „włączone” bez prób.
+async fn source_start_failed(state: &aars_core::source_state::SourceStateRepo, reason: &str) {
+    tracing::error!(%reason, "źródło imgw-meteo nie wystartuje");
+    let message = format!("klient HTTP: {reason}");
+    if let Err(err) = state.record_failure("imgw-meteo", chrono::Utc::now(), &message).await {
+        tracing::error!(%err, "nie udało się zapisać porażki źródła");
+    }
+}
+
 /// `aars source preview`: jedno pobranie, bez zapisu i bez kolejki.
 async fn source_preview(config: &Config) -> Result<()> {
     use aars_sources::DataSource;
@@ -523,19 +537,29 @@ async fn source_preview(config: &Config) -> Result<()> {
 
     let source = aars_sources::imgw_meteo::ImgwMeteo::new(&config.sources.imgw_meteo_url)
         .map_err(|e| anyhow::anyhow!("klient HTTP: {e}"))?;
-    let cfg = aars_core::source_state::SourceStateRepo::new(pool)
-        .config(source.id())
+    // `SourceStateRepo::config` zamienia zepsuty obszar na pusty, a tu trzeba
+    // je odróżnić, więc czytamy surowy zapis.
+    let raw: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+        .bind(format!("source:{}:area", source.id()))
+        .fetch_optional(&pool)
         .await
-        .context("odczyt ustawień źródła")?;
-    let Some(cfg) = cfg.filter(|c| !c.area.is_empty()) else {
+        .context("odczyt obszaru źródła")?;
+    let area = match aars_core::area::parse_area(raw.as_deref().unwrap_or_default()) {
+        Ok(area) => area,
+        Err(reason) => {
+            println!("nieprawidłowy obszar: {reason}");
+            return Ok(());
+        }
+    };
+    if area.is_empty() {
         println!("brak obszaru — ustaw go w panelu (/sources) albo w tabeli settings");
         return Ok(());
-    };
+    }
 
-    println!("obszar: {}", cfg.area_text);
+    println!("obszar: {}", aars_core::area::area_text(&area));
     let ctx = aars_sources::SourceCtx {
         now: chrono::Utc::now(),
-        area: cfg.area,
+        area,
     };
     let output = source
         .fetch(&ctx)
@@ -546,8 +570,8 @@ async fn source_preview(config: &Config) -> Result<()> {
     }
     for item in &output.items {
         println!(
-            "[{:?}{}] {}",
-            item.priority,
+            "[{}{}] {}",
+            aars_web::chrome::priority_label(item.priority),
             if item.interrupting { ", przerywa" } else { "" },
             item.summary
         );
@@ -561,4 +585,20 @@ async fn source_preview(config: &Config) -> Result<()> {
         println!("UWAGA: część odpowiedzi była nieczytelna");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn a_source_that_cannot_start_is_recorded_as_failing() {
+        let pool = aars_core::db::test_pool().await;
+        let repo = aars_core::source_state::SourceStateRepo::new(pool);
+        super::source_start_failed(&repo, "boom").await;
+
+        let statuses = repo.statuses().await.unwrap();
+        let status = statuses.iter().find(|s| s.source_id == "imgw-meteo").unwrap();
+        assert_eq!(status.consecutive_failures, 1);
+        assert!(status.last_error.as_deref().unwrap().contains("boom"));
+        assert!(status.last_run_at.is_some());
+    }
 }
