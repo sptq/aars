@@ -52,6 +52,10 @@ pub const TEST_AUDIO_TEXT: &str = "Test audio stacji.";
 /// Ile czekamy na opuszczenie PTT po Ctrl-C, zanim dyspozytor się podda.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
+/// Ile po Ctrl-C czekamy na zakończenie wątku sekwencera, zanim proces
+/// wyjdzie mimo to (strażnik i tak opuścił PTT).
+const SHUTDOWN_JOIN: Duration = Duration::from_secs(5);
+
 /// Jak często w trakcie nadania sprawdzamy zatrzymanie: Ctrl-C ma zdjąć
 /// nadajnik z anteny w ~150 ms, niezależnie od `tick`.
 const STOP_POLL: Duration = Duration::from_millis(20);
@@ -131,6 +135,8 @@ pub struct Dispatcher {
     tests_rx: mpsc::Receiver<TestRequest>,
     /// Prawda, gdy trwa nadanie z kolejki albo test.
     busy: Arc<AtomicBool>,
+    /// Ile po Ctrl-C czekamy na wątek sekwencera (restart czeka bez limitu).
+    join_timeout: Duration,
 }
 
 /// Odstęp ponownej próby po odmowie: po włączeniu nadawania komunikat idzie
@@ -139,8 +145,9 @@ const HOLD_RETRY: Duration = Duration::from_secs(30);
 
 /// Jak skończyło się czekanie na nadania w locie.
 enum Settled {
-    /// Wszystkie się zakończyły; dla nadania testowego jego ostatnie zdarzenie.
-    All(Option<SeqEvent>),
+    /// Wszystkie się zakończyły; dla nadania testowego jego ostatnie zdarzenie
+    /// i czas na antenie (od `Started`, czyli z oboma ogonami).
+    All(Option<(SeqEvent, Option<Duration>)>),
     /// Zatrzymanie: sekwencer nie oddał nadań w `SHUTDOWN_GRACE` albo nie żyje.
     Gave,
 }
@@ -180,12 +187,19 @@ impl Dispatcher {
             tests_tx,
             tests_rx,
             busy: Arc::new(AtomicBool::new(false)),
+            join_timeout: SHUTDOWN_JOIN,
         }
     }
 
     /// Skraca odstęp ponownej próby po odmowie (testy).
     pub fn with_hold_retry(mut self, hold_retry: Duration) -> Self {
         self.hold_retry = hold_retry;
+        self
+    }
+
+    /// Zmienia limit czekania na wątek sekwencera po Ctrl-C (testy).
+    pub fn with_join_timeout(mut self, timeout: Duration) -> Self {
+        self.join_timeout = timeout;
         self
     }
 
@@ -245,12 +259,39 @@ impl Dispatcher {
             }
         }
 
-        let Dispatcher { sequencer, tests_rx, .. } = self;
+        let Dispatcher { sequencer, tests_rx, join_timeout, .. } = self;
         // Czekające prośby o test dostają odpowiedź od razu (kanał zamknięty).
         drop(tests_rx);
-        // Join wątku sekwencera blokuje, więc poza wątkami tokio.
-        if tokio::task::spawn_blocking(move || sequencer.shutdown()).await.is_err() {
-            tracing::error!("zamykanie sekwencera zakończyło się paniką");
+        let releaser = sequencer.releaser();
+        // Join wątku sekwencera blokuje, więc poza wątkami tokio. Restart
+        // (drain) czeka bez limitu: nowy stos nie może otworzyć PTT i karty,
+        // zanim stary wątek je zwolni. Ctrl-C czeka najwyżej `join_timeout`
+        // (także gdy przyszło w trakcie czekania na restart), potem wychodzi
+        // mimo to — strażnik już opuścił PTT, a my wymuszamy to raz jeszcze.
+        let mut join = tokio::task::spawn_blocking(move || sequencer.shutdown());
+        let mut give_up_at: Option<tokio::time::Instant> = None;
+        loop {
+            let now = tokio::time::Instant::now();
+            if shutdown.is_cancelled() {
+                let deadline = *give_up_at.get_or_insert(now + join_timeout);
+                if now >= deadline {
+                    tracing::error!(
+                        timeout_ms = join_timeout.as_millis(),
+                        "wątek sekwencera nie zakończył się po zatrzymaniu, wychodzę mimo to"
+                    );
+                    releaser.force_unkey();
+                    break;
+                }
+            }
+            match tokio::time::timeout(STOP_POLL, &mut join).await {
+                Ok(Ok(())) => break,
+                Ok(Err(_)) => {
+                    tracing::error!("zamykanie sekwencera zakończyło się paniką");
+                    releaser.force_unkey();
+                    break;
+                }
+                Err(_) => continue,
+            }
         }
         tracing::info!("dyspozytor zatrzymany");
     }
@@ -324,6 +365,8 @@ impl Dispatcher {
         preempt: bool,
     ) -> Settled {
         let mut in_flight = vec![first];
+        // Chwila `Started` (PTT już podniesione) każdego nadania w locie.
+        let mut keyed_at: Vec<(i64, std::time::Instant)> = Vec::new();
         let mut current = priority;
         let mut test_event = None;
         let mut give_up_at: Option<tokio::time::Instant> = None;
@@ -359,16 +402,23 @@ impl Dispatcher {
                         return Settled::Gave;
                     };
                     let done = match &event {
-                        SeqEvent::Started { .. } => continue,
+                        SeqEvent::Started { id } => {
+                            keyed_at.push((*id, std::time::Instant::now()));
+                            continue;
+                        }
                         SeqEvent::Refused { id, .. }
                         | SeqEvent::Finished { id, .. }
                         | SeqEvent::Skipped { id } => *id,
                     };
                     in_flight.retain(|id| *id != done);
+                    let on_air = keyed_at
+                        .iter()
+                        .position(|(id, _)| *id == done)
+                        .map(|at| keyed_at.swap_remove(at).1.elapsed());
                     if done == TEST_TX_ID {
-                        test_event = Some(event);
+                        test_event = Some((event, on_air));
                     } else {
-                        self.record_event(event, shutdown).await;
+                        self.record_event(event, on_air, shutdown).await;
                     }
                 }
                 _ = tokio::time::sleep(STOP_POLL) => {
@@ -379,7 +429,9 @@ impl Dispatcher {
                         && now >= next_preempt_check
                     {
                         next_preempt_check = now + self.config.tick;
-                        if let Some((id, priority)) = self.maybe_preempt(current).await {
+                        if let Some((id, priority)) =
+                            self.maybe_preempt(current, shutdown, drain).await
+                        {
                             in_flight.push(id);
                             current = priority;
                         }
@@ -401,7 +453,7 @@ impl Dispatcher {
         }
     }
 
-    async fn record_event(&self, event: SeqEvent, shutdown: &CancelToken) {
+    async fn record_event(&self, event: SeqEvent, on_air: Option<Duration>, shutdown: &CancelToken) {
         match event {
             SeqEvent::Started { .. } => {}
             SeqEvent::Refused { id, reason } => {
@@ -427,7 +479,8 @@ impl Dispatcher {
                 } else {
                     ABORTED_BY_PREEMPTION
                 };
-                self.record_outcome(id, outcome, played, aborted_because).await;
+                self.record_outcome(id, outcome, on_air.unwrap_or(played), played, aborted_because)
+                    .await;
             }
         }
     }
@@ -435,13 +488,13 @@ impl Dispatcher {
     fn log_entry(
         &self,
         queue_item_id: Option<i64>,
-        played: Duration,
+        on_air: Duration,
         result: &'static str,
         note: Option<String>,
     ) -> TxLogEntry {
         let ended_at = Utc::now();
         let played_for =
-            chrono::Duration::from_std(played).unwrap_or_else(|_| chrono::Duration::zero());
+            chrono::Duration::from_std(on_air).unwrap_or_else(|_| chrono::Duration::zero());
         TxLogEntry {
             queue_item_id,
             started_at: ended_at - played_for,
@@ -452,17 +505,20 @@ impl Dispatcher {
         }
     }
 
+    /// `on_air` (czas podniesionego PTT, z ogonami) idzie do dziennika
+    /// nadań, `played` (samo audio) do logów.
     async fn record_outcome(
         &self,
         id: i64,
         outcome: TxOutcome,
+        on_air: Duration,
         played: Duration,
         aborted_because: &str,
     ) {
         // Dziennik nadań jest dodatkiem: jego awaria jest tylko logowana
         // i nie rusza aktualizacji stanu kolejki.
         let (tx_result, note) = tx_result(&outcome);
-        let entry = self.log_entry(Some(id), played, tx_result, note);
+        let entry = self.log_entry(Some(id), on_air, tx_result, note);
         if let Err(err) = self.tx_log.record(entry).await {
             tracing::error!(id, %err, "zapis do dziennika nadań zawiódł");
         }
@@ -531,8 +587,8 @@ impl Dispatcher {
 
         let settled =
             self.await_outcome(TEST_TX_ID, Priority::Low, shutdown, drain, false).await;
-        let event = match settled {
-            Settled::All(Some(event)) => event,
+        let (event, on_air) = match settled {
+            Settled::All(Some(settled)) => settled,
             Settled::All(None) | Settled::Gave => return TestOutcome::Failed(STOPPING.to_owned()),
         };
 
@@ -547,7 +603,7 @@ impl Dispatcher {
                     Some(error) => format!("test PTT: {by}; {error}"),
                     None => format!("test PTT: {by}"),
                 };
-                let entry = self.log_entry(None, played, result, Some(note));
+                let entry = self.log_entry(None, on_air.unwrap_or(played), result, Some(note));
                 if let Err(err) = self.tx_log.record(entry).await {
                     tracing::error!(%err, "zapis testu PTT do dziennika nadań zawiódł");
                 }
@@ -614,7 +670,12 @@ impl Dispatcher {
     /// Jeśli w kolejce czeka zadanie przerywające o wyższym priorytecie,
     /// bierze je i zleca — sekwencer przerwie trwające nadanie. Zwraca
     /// identyfikator i priorytet zleconego zadania.
-    async fn maybe_preempt(&mut self, current: Priority) -> Option<(i64, Priority)> {
+    async fn maybe_preempt(
+        &mut self,
+        current: Priority,
+        shutdown: &CancelToken,
+        drain: &CancelToken,
+    ) -> Option<(i64, Priority)> {
         let candidate = match self.queue.peek_interrupting(current).await {
             Ok(Some(item)) => item,
             Ok(None) => return None,
@@ -646,6 +707,15 @@ impl Dispatcher {
                 return None;
             }
         };
+
+        // Synteza mogła trwać sekundy: zatrzymanie albo restart, które
+        // przyszły w tym czasie, nie mogą wpuścić nowego nadania na antenę.
+        if shutdown.is_cancelled() || drain.is_cancelled() {
+            if let Err(err) = self.queue.hold(claimed.id, HELD_BY_SHUTDOWN, Utc::now()).await {
+                tracing::error!(id = claimed.id, %err, "zwrot komunikatu przerywającego zawiódł");
+            }
+            return None;
+        }
 
         let request = TransmitRequest {
             id: claimed.id,
@@ -1132,6 +1202,10 @@ mod tests {
         ptt_backend: &'static str,
         watchdog: Option<crate::watchdog::WatchdogMarker>,
         tick: Duration,
+        tx_tail: Duration,
+        /// Wyjście zamiast `FakeSink` (np. zawieszone).
+        sink: Option<Arc<dyn crate::sink::AudioSink>>,
+        join_timeout: Option<Duration>,
     }
 
     impl Default for StationOpts {
@@ -1141,6 +1215,9 @@ mod tests {
                 ptt_backend: "fake",
                 watchdog: None,
                 tick: Duration::from_millis(10),
+                tx_tail: Duration::from_millis(1),
+                sink: None,
+                join_timeout: None,
             }
         }
     }
@@ -1150,12 +1227,16 @@ mod tests {
         let ptt = Arc::new(FakePtt::new());
         let sink = Arc::new(FakeSink::new());
         let interlocks = Arc::new(InMemoryInterlocks::permissive());
+        let out: Arc<dyn crate::sink::AudioSink> = match opts.sink {
+            Some(custom) => custom,
+            None => sink.clone(),
+        };
         let sequencer = Sequencer::spawn(
             ptt.clone(),
-            sink.clone(),
+            out,
             interlocks.clone(),
             SequencerConfig {
-                tx_tail: Duration::from_millis(1),
+                tx_tail: opts.tx_tail,
                 tx_max_duration: Duration::from_secs(30),
                 id_interval: Duration::from_secs(600),
             },
@@ -1167,6 +1248,9 @@ mod tests {
             sequencer,
             DispatcherConfig { tick: opts.tick, ptt_backend: opts.ptt_backend, sample_rate: 48_000 },
         );
+        if let Some(timeout) = opts.join_timeout {
+            dispatcher = dispatcher.with_join_timeout(timeout);
+        }
         let control = dispatcher.control();
         let shutdown = CancelToken::new();
         let drain = CancelToken::new();
@@ -1502,5 +1586,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "aborted");
+    }
+
+    #[tokio::test]
+    async fn a_test_ptt_log_row_includes_the_tail() {
+        let s = station(StationOpts { tx_tail: Duration::from_millis(300), ..StationOpts::default() })
+            .await;
+
+        done(s.test(ptt_test(1)).await);
+
+        let duration_ms: i64 = sqlx::query_scalar("SELECT duration_ms FROM tx_log")
+            .fetch_one(s.repo.pool())
+            .await
+            .unwrap();
+        assert!(duration_ms >= 1500, "czas na antenie z dwoma ogonami, było {duration_ms} ms");
+        assert!(duration_ms <= 2500, "{duration_ms} ms");
+
+        s.finish().await;
+    }
+
+    /// Wyjście, które się zawiesza i ignoruje anulowanie.
+    struct HungSink(Duration);
+
+    impl crate::sink::AudioSink for HungSink {
+        fn play(
+            &self,
+            _pcm: &Pcm,
+            _cancel: &CancelToken,
+        ) -> Result<crate::sink::PlayReport, crate::sink::SinkError> {
+            std::thread::sleep(self.0);
+            Ok(crate::sink::PlayReport { played: self.0, cancelled: false })
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_gives_up_on_a_hung_sequencer_and_forces_the_ptt_down() {
+        let s = station(StationOpts {
+            sink: Some(Arc::new(HungSink(Duration::from_secs(8)))),
+            join_timeout: Some(Duration::from_millis(300)),
+            ..StationOpts::default()
+        })
+        .await;
+        let id = s.repo.enqueue(req("zawieszone", Priority::Normal, false)).await.unwrap()[0];
+        assert!(wait_for_state(s.repo.pool(), id, "transmitting", Duration::from_secs(5)).await);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(s.ptt.is_keyed());
+
+        let began = tokio::time::Instant::now();
+        s.shutdown.cancel();
+        tokio::time::timeout(Duration::from_millis(4000), s.task)
+            .await
+            .expect("Ctrl-C nie może wisieć na zawieszonym sekwencerze")
+            .unwrap();
+
+        assert!(began.elapsed() < Duration::from_millis(3500), "{:?}", began.elapsed());
+        assert!(!s.ptt.is_keyed(), "PTT wymuszone w dół: {:?}", s.ptt.events());
+        assert!(s.ptt.events().contains(&PttEvent::ForceUnkey));
+        assert_eq!(s.repo.state_of(id).await.unwrap(), Some(crate::queue::QueueState::Pending));
+    }
+
+    /// Renderer, który syntezuje komunikaty z „alarm” powoli (jak Piper).
+    struct SlowAlarmRenderer(FakeRenderer);
+
+    impl Renderer for SlowAlarmRenderer {
+        fn render<'a>(&'a self, text: &'a str) -> RenderFuture<'a> {
+            Box::pin(async move {
+                if text.contains("alarm") {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                }
+                self.0.render(text).await
+            })
+        }
+
+        fn ident(&self) -> Option<Pcm> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn a_preemption_rendered_during_drain_is_not_aired() {
+        let s = station(StationOpts {
+            renderer: Arc::new(SlowAlarmRenderer(FakeRenderer::new(48_000, 100))),
+            ..StationOpts::default()
+        })
+        .await;
+        let slow = s.repo.enqueue(req("pierwszy komuni", Priority::Normal, false)).await.unwrap()[0];
+        assert!(wait_for_state(s.repo.pool(), slow, "transmitting", Duration::from_secs(5)).await);
+        let urgent = s.repo.enqueue(req("alarm", Priority::Emergency, true)).await.unwrap()[0];
+        // Wzięte do przerwania i w trakcie (powolnej) syntezy.
+        assert!(wait_for_state(s.repo.pool(), urgent, "transmitting", Duration::from_secs(2)).await);
+
+        s.drain.cancel();
+        tokio::time::timeout(Duration::from_secs(4), s.task).await.expect("drain kończy").unwrap();
+
+        assert_eq!(s.repo.state_of(slow).await.unwrap(), Some(crate::queue::QueueState::Done));
+        assert_eq!(s.repo.state_of(urgent).await.unwrap(), Some(crate::queue::QueueState::Pending));
+        let keys = s.ptt.events().iter().filter(|e| **e == PttEvent::Key).count();
+        assert_eq!(keys, 1, "podczas drain nic nowego nie wchodzi na antenę: {:?}", s.ptt.events());
     }
 }
