@@ -1011,4 +1011,30 @@ mod tests {
         assert!(text.contains("18:00 UTC"), "{text}");
         assert!(text.contains("lokalnie"), "{text}");
     }
+
+    #[tokio::test]
+    async fn creating_a_message_without_csrf_is_forbidden_and_saves_nothing() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+
+        let response = post_form(
+            &app,
+            &cookie,
+            "/messages",
+            "csrf=zly&title=x&text=tresc&priority=normal&schedule_kind=immediate".to_owned(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let saved = aars_core::message::MessageRepo::new(state.pool.clone()).list().await.unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+    }
+
+    #[tokio::test]
+    async fn sending_an_unknown_message_is_not_found() {
+        let (app, cookie, csrf, _state) = logged_in(Role::Operator).await;
+
+        let response =
+            post_form(&app, &cookie, "/messages/9999/send", format!("csrf={csrf}")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }

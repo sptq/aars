@@ -194,7 +194,9 @@ impl MessageRepo {
         Ok(())
     }
 
-    /// Zmienia definicję; zadania już w kolejce zostają, jakie były. Zwraca
+    /// Zmienia treść, priorytet, powtórzenia i harmonogram; zadania już w
+    /// kolejce zostają, jakie były. `valid_from`, `valid_until`, `source_id`
+    /// i `kind` z `new` są ignorowane (zostają, jakie były). Zwraca
     /// liczbę zmienionych wierszy (0, gdy definicji nie ma).
     pub async fn update(&self, id: i64, new: NewMessage) -> Result<u64, DbError> {
         let (schedule_at, cron_expr) = match &new.schedule {
@@ -205,14 +207,12 @@ impl MessageRepo {
 
         let result = sqlx::query(
             "UPDATE messages
-                SET title = ?, kind = ?, body_template = ?, priority = ?, interrupting = ?,
+                SET title = ?, body_template = ?, priority = ?, interrupting = ?,
                     repeat_count = ?, repeat_interval_s = ?, schedule_kind = ?,
-                    schedule_at = ?, cron_expr = ?, valid_from = ?, valid_until = ?,
-                    source_id = ?, updated_at = ?
+                    schedule_at = ?, cron_expr = ?, updated_at = ?
               WHERE id = ?",
         )
         .bind(&new.title)
-        .bind(if new.source_id.is_some() { "source" } else { "manual" })
         .bind(&new.body_template)
         .bind(new.priority as i64)
         .bind(i64::from(new.interrupting))
@@ -221,9 +221,6 @@ impl MessageRepo {
         .bind(new.schedule.kind_str())
         .bind(schedule_at)
         .bind(cron_expr)
-        .bind(new.valid_from.map(iso))
-        .bind(new.valid_until.map(iso))
-        .bind(&new.source_id)
         .bind(iso(Utc::now()))
         .bind(id)
         .execute(&self.pool)
@@ -321,7 +318,11 @@ mod tests {
         let pool = test_pool().await;
         let repo = MessageRepo::new(pool.clone());
         let queue = QueueRepo::new(pool);
-        let id = repo.create(cron_message("stary", "0 18 * * *")).await.unwrap();
+        let until = Utc::now() + chrono::Duration::days(30);
+        let mut old = cron_message("stary", "0 18 * * *");
+        old.valid_until = Some(until);
+        old.source_id = Some("zrodlo-1".to_owned());
+        let id = repo.create(old).await.unwrap();
         queue
             .enqueue(EnqueueRequest {
                 message_id: Some(id),
@@ -347,6 +348,9 @@ mod tests {
         assert_eq!(message.body_template, "nowa treść");
         assert_eq!(message.priority, Priority::High);
         assert_eq!(message.schedule, ScheduleKind::Cron("30 6 * * *".to_owned()));
+        // Pola, których formularz nie edytuje, zostają.
+        assert_eq!(message.valid_until.map(|t| t.timestamp()), Some(until.timestamp()));
+        assert_eq!(message.source_id.as_deref(), Some("zrodlo-1"));
 
         let pending = queue.pending(10).await.unwrap();
         assert_eq!(pending.len(), 1);
