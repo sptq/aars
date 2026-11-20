@@ -1,11 +1,22 @@
 use super::numbers::{
-    PluralForm, cardinal, day_ordinal_genitive, hour_ordinal, hour_ordinal_genitive, plural_form,
+    PluralForm, cardinal, cardinal_genitive, day_ordinal_genitive, hour_ordinal,
+    hour_ordinal_genitive, plural_form,
 };
 
 /// Nazwy miesięcy w dopełniaczu — po dniu („23 lipca"). Używa ich też `imgw_meteo::speech`.
 pub const MONTHS_GENITIVE: [&str; 12] = [
-    "stycznia", "lutego", "marca", "kwietnia", "maja", "czerwca", "lipca", "sierpnia",
-    "września", "października", "listopada", "grudnia",
+    "stycznia",
+    "lutego",
+    "marca",
+    "kwietnia",
+    "maja",
+    "czerwca",
+    "lipca",
+    "sierpnia",
+    "września",
+    "października",
+    "listopada",
+    "grudnia",
 ];
 
 /// Przypadek godziny wymagany przez poprzedzający przyimek.
@@ -22,6 +33,23 @@ fn hour_case(previous_core: Option<&str>) -> HourCase {
         Some("o" | "po") => HourCase::Locative,
         _ => HourCase::Nominative,
     }
+}
+
+/// Przyimki, po których liczebnik stoi w dopełniaczu („do 30 mm").
+fn takes_genitive_number(previous_core: Option<&str>) -> bool {
+    matches!(
+        previous_core.map(str::to_lowercase).as_deref(),
+        Some("od" | "do" | "około" | "ponad" | "powyżej" | "poniżej" | "z")
+    )
+}
+
+/// Liczba w dopełniaczu, gdy przyimek tego wymaga i da się ją zapisać
+/// (całkowita, 0–999); inaczej `None` i zostaje mianownik.
+fn genitive_number(value: &NumberText, previous_core: Option<&str>) -> Option<String> {
+    if value.fraction.is_some() || !takes_genitive_number(previous_core) {
+        return None;
+    }
+    cardinal_genitive(value.integer.parse::<i64>().ok()?)
 }
 
 fn is_month(core: &str) -> bool {
@@ -42,17 +70,83 @@ struct Unit {
 /// Kolejność ma znaczenie: dłuższe tokeny muszą być sprawdzane pierwsze,
 /// żeby „m/s" nie dopasowało się jako „m".
 const UNITS: &[Unit] = &[
-    Unit { token: "km/h", singular: "kilometr na godzinę", plural_nom: "kilometry na godzinę", plural_gen: "kilometrów na godzinę", genitive_sg: "kilometra na godzinę" },
-    Unit { token: "m/s",  singular: "metr na sekundę",     plural_nom: "metry na sekundę",     plural_gen: "metrów na sekundę",     genitive_sg: "metra na sekundę" },
-    Unit { token: "µSv/h", singular: "mikrosiwert na godzinę", plural_nom: "mikrosiwerty na godzinę", plural_gen: "mikrosiwertów na godzinę", genitive_sg: "mikrosiwerta na godzinę" },
-    Unit { token: "uSv/h", singular: "mikrosiwert na godzinę", plural_nom: "mikrosiwerty na godzinę", plural_gen: "mikrosiwertów na godzinę", genitive_sg: "mikrosiwerta na godzinę" },
-    Unit { token: "hPa",  singular: "hektopaskal",         plural_nom: "hektopaskale",         plural_gen: "hektopaskali",          genitive_sg: "hektopaskala" },
-    Unit { token: "°C",   singular: "stopień Celsjusza",   plural_nom: "stopnie Celsjusza",    plural_gen: "stopni Celsjusza",      genitive_sg: "stopnia Celsjusza" },
-    Unit { token: "mm",   singular: "milimetr",            plural_nom: "milimetry",            plural_gen: "milimetrów",            genitive_sg: "milimetra" },
-    Unit { token: "cm",   singular: "centymetr",           plural_nom: "centymetry",           plural_gen: "centymetrów",           genitive_sg: "centymetra" },
-    Unit { token: "km",   singular: "kilometr",            plural_nom: "kilometry",            plural_gen: "kilometrów",            genitive_sg: "kilometra" },
-    Unit { token: "%",    singular: "procent",             plural_nom: "procent",              plural_gen: "procent",               genitive_sg: "procent" },
-    Unit { token: "m",    singular: "metr",                plural_nom: "metry",                plural_gen: "metrów",                genitive_sg: "metra" },
+    Unit {
+        token: "km/h",
+        singular: "kilometr na godzinę",
+        plural_nom: "kilometry na godzinę",
+        plural_gen: "kilometrów na godzinę",
+        genitive_sg: "kilometra na godzinę",
+    },
+    Unit {
+        token: "m/s",
+        singular: "metr na sekundę",
+        plural_nom: "metry na sekundę",
+        plural_gen: "metrów na sekundę",
+        genitive_sg: "metra na sekundę",
+    },
+    Unit {
+        token: "µSv/h",
+        singular: "mikrosiwert na godzinę",
+        plural_nom: "mikrosiwerty na godzinę",
+        plural_gen: "mikrosiwertów na godzinę",
+        genitive_sg: "mikrosiwerta na godzinę",
+    },
+    Unit {
+        token: "uSv/h",
+        singular: "mikrosiwert na godzinę",
+        plural_nom: "mikrosiwerty na godzinę",
+        plural_gen: "mikrosiwertów na godzinę",
+        genitive_sg: "mikrosiwerta na godzinę",
+    },
+    Unit {
+        token: "hPa",
+        singular: "hektopaskal",
+        plural_nom: "hektopaskale",
+        plural_gen: "hektopaskali",
+        genitive_sg: "hektopaskala",
+    },
+    Unit {
+        token: "°C",
+        singular: "stopień Celsjusza",
+        plural_nom: "stopnie Celsjusza",
+        plural_gen: "stopni Celsjusza",
+        genitive_sg: "stopnia Celsjusza",
+    },
+    Unit {
+        token: "mm",
+        singular: "milimetr",
+        plural_nom: "milimetry",
+        plural_gen: "milimetrów",
+        genitive_sg: "milimetra",
+    },
+    Unit {
+        token: "cm",
+        singular: "centymetr",
+        plural_nom: "centymetry",
+        plural_gen: "centymetrów",
+        genitive_sg: "centymetra",
+    },
+    Unit {
+        token: "km",
+        singular: "kilometr",
+        plural_nom: "kilometry",
+        plural_gen: "kilometrów",
+        genitive_sg: "kilometra",
+    },
+    Unit {
+        token: "%",
+        singular: "procent",
+        plural_nom: "procent",
+        plural_gen: "procent",
+        genitive_sg: "procent",
+    },
+    Unit {
+        token: "m",
+        singular: "metr",
+        plural_nom: "metry",
+        plural_gen: "metrów",
+        genitive_sg: "metra",
+    },
 ];
 
 const ABBREVIATIONS: &[(&str, &str)] = &[
@@ -122,8 +216,19 @@ pub fn normalize(input: &str) -> String {
                 && let Some(unit) = match_unit(next_core)
                 && unit.len() == next_core.len()
             {
-                push_word(&mut out, lead, &spoken_number(&value), "");
-                push_word(&mut out, "", unit_form(next_core, &value), next_trail);
+                let genitive = genitive_number(&value, previous_core);
+                push_word(
+                    &mut out,
+                    lead,
+                    &genitive.clone().unwrap_or_else(|| spoken_number(&value)),
+                    "",
+                );
+                push_word(
+                    &mut out,
+                    "",
+                    unit_form(next_core, &value, genitive.is_some()),
+                    next_trail,
+                );
                 idx += 2;
                 continue;
             }
@@ -133,8 +238,19 @@ pub fn normalize(input: &str) -> String {
                 && let Some(unit) = match_unit(rest)
                 && unit.len() == rest.len()
             {
-                push_word(&mut out, lead, &spoken_number(&value), "");
-                push_word(&mut out, "", unit_form(rest, &value), trail);
+                let genitive = genitive_number(&value, previous_core);
+                push_word(
+                    &mut out,
+                    lead,
+                    &genitive.clone().unwrap_or_else(|| spoken_number(&value)),
+                    "",
+                );
+                push_word(
+                    &mut out,
+                    "",
+                    unit_form(rest, &value, genitive.is_some()),
+                    trail,
+                );
                 idx += 1;
                 continue;
             }
@@ -154,7 +270,9 @@ pub fn normalize(input: &str) -> String {
 
             // Sama liczba
             if rest.is_empty() {
-                push_word(&mut out, lead, &spoken_number(&value), trail);
+                let spoken =
+                    genitive_number(&value, previous_core).unwrap_or_else(|| spoken_number(&value));
+                push_word(&mut out, lead, &spoken, trail);
                 idx += 1;
                 continue;
             }
@@ -243,11 +361,21 @@ fn match_unit(text: &str) -> Option<&'static str> {
 /// Dobiera formę jednostki. Ułamek i liczba, której nie da się sparsować,
 /// biorą dopełniacz liczby pojedynczej — przy nieznanej wielkości to
 /// najbezpieczniejsza forma.
-fn unit_form(text: &str, value: &NumberText) -> &'static str {
+///
+/// Po liczebniku w dopełniaczu (`genitive`) jednostka jest w dopełniaczu:
+/// „do jednego milimetra", „do dwóch milimetrów".
+fn unit_form(text: &str, value: &NumberText, genitive: bool) -> &'static str {
     let unit = find_unit(text).expect("unit_form wołane tylko po match_unit");
 
     if value.fraction.is_some() {
         return unit.genitive_sg;
+    }
+    if genitive {
+        return if value.integer.parse::<i64>() == Ok(1) {
+            unit.genitive_sg
+        } else {
+            unit.plural_gen
+        };
     }
 
     match value.integer.parse::<i64>() {
@@ -303,12 +431,27 @@ mod tests {
         assert_eq!(n("wiatr 12 m/s"), "wiatr dwanaście metrów na sekundę");
         assert_eq!(n("wiatr 1 m/s"), "wiatr jeden metr na sekundę");
         assert_eq!(n("wiatr 3 m/s"), "wiatr trzy metry na sekundę");
-        assert_eq!(n("temperatura 22 °C"), "temperatura dwadzieścia dwa stopnie Celsjusza");
-        assert_eq!(n("temperatura -5 °C"), "temperatura minus pięć stopni Celsjusza");
-        assert_eq!(n("ciśnienie 1013 hPa"), "ciśnienie tysiąc trzynaście hektopaskali");
-        assert_eq!(n("stan wody 245 cm"), "stan wody dwieście czterdzieści pięć centymetrów");
+        assert_eq!(
+            n("temperatura 22 °C"),
+            "temperatura dwadzieścia dwa stopnie Celsjusza"
+        );
+        assert_eq!(
+            n("temperatura -5 °C"),
+            "temperatura minus pięć stopni Celsjusza"
+        );
+        assert_eq!(
+            n("ciśnienie 1013 hPa"),
+            "ciśnienie tysiąc trzynaście hektopaskali"
+        );
+        assert_eq!(
+            n("stan wody 245 cm"),
+            "stan wody dwieście czterdzieści pięć centymetrów"
+        );
         assert_eq!(n("opad 2 mm"), "opad dwa milimetry");
-        assert_eq!(n("wilgotność 85 %"), "wilgotność osiemdziesiąt pięć procent");
+        assert_eq!(
+            n("wilgotność 85 %"),
+            "wilgotność osiemdziesiąt pięć procent"
+        );
     }
 
     #[test]
@@ -349,12 +492,71 @@ mod tests {
             n("30 grudnia od 02:00 do 10:00."),
             "trzydziestego grudnia od godziny drugiej do godziny dziesiątej."
         );
-        assert_eq!(n("32 lipca"), "trzydzieści dwa lipca", "poza 1–31 zostaje liczebnik główny");
+        assert_eq!(
+            n("32 lipca"),
+            "trzydzieści dwa lipca",
+            "poza 1–31 zostaje liczebnik główny"
+        );
+    }
+
+    #[test]
+    fn numbers_after_od_do_take_the_genitive_with_their_unit() {
         assert_eq!(
             n("od 15 mm do 25 mm"),
-            "od piętnaście milimetrów do dwadzieścia pięć milimetrów",
-            "jednostki bez zmian"
+            "od piętnastu milimetrów do dwudziestu pięciu milimetrów"
         );
+        assert_eq!(n("do 30 mm"), "do trzydziestu milimetrów");
+        assert_eq!(
+            n("do 75 km/h"),
+            "do siedemdziesięciu pięciu kilometrów na godzinę"
+        );
+        assert_eq!(
+            n("do 35 km/h,"),
+            "do trzydziestu pięciu kilometrów na godzinę,"
+        );
+        assert_eq!(n("1 mm"), "jeden milimetr");
+        assert_eq!(n("do 1 mm"), "do jednego milimetra");
+        assert_eq!(n("do 2 mm"), "do dwóch milimetrów");
+        assert_eq!(n("około 120 m/s"), "około stu dwudziestu metrów na sekundę");
+        assert_eq!(n("ponad 5 °C"), "ponad pięciu stopni Celsjusza");
+        assert_eq!(n("powyżej 80 %"), "powyżej osiemdziesięciu procent");
+        assert_eq!(n("poniżej 0 °C"), "poniżej zera stopni Celsjusza");
+        assert_eq!(n("z 15 do 25"), "z piętnastu do dwudziestu pięciu");
+        assert_eq!(n("do 30mm"), "do trzydziestu milimetrów");
+        assert_eq!(
+            n("do 2,5 mm"),
+            "do dwa przecinek pięć milimetra",
+            "ułamek bez zmian"
+        );
+        assert_eq!(
+            n("do 1500 mm"),
+            "do tysiąc pięćset milimetrów",
+            "powyżej 999 mianownik"
+        );
+        assert_eq!(n("do 30 lipca"), "do trzydziestego lipca", "daty jak dotąd");
+    }
+
+    #[test]
+    fn genitive_cardinals_cover_0_to_999() {
+        use super::super::numbers::cardinal_genitive as g;
+        let g = |n| g(n).unwrap();
+        assert_eq!(g(0), "zera");
+        assert_eq!(g(1), "jednego");
+        assert_eq!(g(3), "trzech");
+        assert_eq!(g(4), "czterech");
+        assert_eq!(g(12), "dwunastu");
+        assert_eq!(g(20), "dwudziestu");
+        assert_eq!(g(22), "dwudziestu dwóch");
+        assert_eq!(g(100), "stu");
+        assert_eq!(g(200), "dwustu");
+        assert_eq!(g(300), "trzystu");
+        assert_eq!(g(400), "czterystu");
+        assert_eq!(g(500), "pięciuset");
+        assert_eq!(g(999), "dziewięciuset dziewięćdziesięciu dziewięciu");
+        assert_eq!(super::super::numbers::cardinal_genitive(1000), None);
+        for n in 0..=999 {
+            assert!(!g(n).is_empty());
+        }
     }
 
     #[test]
@@ -385,7 +587,10 @@ mod tests {
             "wiatr dwadzieścia dwa metry na sekundę, temperatura minus pięć stopni Celsjusza, \
              ciśnienie tysiąc trzynaście hektopaskali."
         );
-        assert_eq!(n("od 18:00 do 06:30,"), "od godziny osiemnastej do godziny szóstej trzydzieści,");
+        assert_eq!(
+            n("od 18:00 do 06:30,"),
+            "od godziny osiemnastej do godziny szóstej trzydzieści,"
+        );
         assert_eq!(n("kierunek SW,"), "kierunek południowo-zachodni,");
         assert_eq!(n("stopień 2."), "stopień dwa.");
         assert_eq!(n("(12 m/s)"), "(dwanaście metrów na sekundę)");
@@ -393,7 +598,10 @@ mod tests {
 
     #[test]
     fn whitespace_is_collapsed_and_text_is_left_otherwise_intact() {
-        assert_eq!(n("  ostrzeżenie   pierwszego  stopnia \n"), "ostrzeżenie pierwszego stopnia");
+        assert_eq!(
+            n("  ostrzeżenie   pierwszego  stopnia \n"),
+            "ostrzeżenie pierwszego stopnia"
+        );
     }
 
     #[test]
@@ -402,7 +610,10 @@ mod tests {
         assert_eq!(n("   "), "");
         assert_eq!(n("m/s"), "m/s", "jednostka bez liczby zostaje jak jest");
         assert_eq!(n("99:99"), "99:99", "niepoprawna godzina zostaje jak jest");
-        assert_eq!(n("12345678901234567890 m"), "12345678901234567890 metra",
-            "liczba poza zakresem nie wywala normalizacji");
+        assert_eq!(
+            n("12345678901234567890 m"),
+            "12345678901234567890 metra",
+            "liczba poza zakresem nie wywala normalizacji"
+        );
     }
 }
