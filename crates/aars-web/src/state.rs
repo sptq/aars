@@ -20,6 +20,8 @@ pub struct AppState {
     /// Zdejmuje flagę z samego watchdoga (jego wątek żyje w binarce);
     /// `None`, gdy panel działa bez stosu nadawczego.
     pub watchdog_clear: Option<WatchdogClear>,
+    /// Sprzęt z `aars.toml` do odczytu na stronie ustawień: (nazwa, wartość).
+    pub hardware: Vec<(String, String)>,
 }
 
 /// Wywołanie zdejmujące lepką flagę strażnika (`WatchdogMarker::clear_poison`).
@@ -32,11 +34,16 @@ impl AppState {
         interlocks: Arc<InMemoryInterlocks>,
         secure_cookies: bool,
     ) -> Self {
-        Self { pool, queue, interlocks, secure_cookies, preview: None, watchdog_clear: None }
+        Self { pool, queue, interlocks, secure_cookies, preview: None, watchdog_clear: None, hardware: Vec::new() }
     }
 
     pub fn with_watchdog_clear(mut self, clear: WatchdogClear) -> Self {
         self.watchdog_clear = Some(clear);
+        self
+    }
+
+    pub fn with_hardware(mut self, hardware: Vec<(String, String)>) -> Self {
+        self.hardware = hardware;
         self
     }
 
@@ -55,6 +62,7 @@ impl AppState {
             secure_cookies: false,
             preview: None,
             watchdog_clear: None,
+            hardware: Vec::new(),
         }
     }
 }

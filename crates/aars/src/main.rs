@@ -322,12 +322,23 @@ async fn main() -> Result<()> {
                     false,
                 )
                 .with_preview(preview)
+                .with_hardware(vec![
+                    ("Urządzenie audio".to_owned(), config.audio.device.clone()),
+                    ("Częstotliwość próbkowania".to_owned(), format!("{} Hz", config.audio.sample_rate)),
+                    ("Backend PTT".to_owned(), format!("{:?}", config.ptt.backend)),
+                    ("Model głosu".to_owned(), config.tts.model.clone()),
+                ])
                 .with_watchdog_clear(Arc::new(move || clear_marker.clear_poison())),
             );
             let listener = tokio::net::TcpListener::bind(&config.server.bind)
                 .await
                 .with_context(|| format!("nasłuch na {}", config.server.bind))?;
 
+            let quiet_task = tokio::spawn(radio::quiet_hours_task(
+                pool.clone(),
+                stack.interlocks.clone(),
+                shutdown.clone(),
+            ));
             let dispatcher_task = tokio::spawn(dispatcher.run(shutdown.clone()));
             let scheduler_task = tokio::spawn(scheduler.run(shutdown.clone()));
             let poison_task = tokio::spawn(radio::watch_poison(
@@ -362,6 +373,7 @@ async fn main() -> Result<()> {
             let _ = scheduler_task.await;
             let _ = server_task.await;
             let _ = poison_task.await;
+            let _ = quiet_task.await;
             stack.watchdog.stop();
         }
         cli::Command::Message { action } => {

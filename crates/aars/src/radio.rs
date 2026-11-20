@@ -122,10 +122,64 @@ pub async fn watch_poison(
     }
 }
 
+/// Jak często sprawdzamy, czy trwa cisza nocna.
+const QUIET_POLL: Duration = Duration::from_secs(30);
+
+/// Jedno sprawdzenie okna ciszy (czas lokalny `now`). Dotyka wyłącznie
+/// `set_quiet`, więc nie walczy z innymi piszącymi do interlocków.
+pub async fn apply_quiet_hours(
+    pool: &SqlitePool,
+    interlocks: &InMemoryInterlocks,
+    now: chrono::NaiveTime,
+) {
+    match aars_core::settings::SettingsRepo::new(pool.clone()).load().await {
+        Ok(settings) => {
+            let quiet = settings.quiet_hours.is_some_and(|window| window.contains(now));
+            interlocks.set_quiet(quiet, settings.quiet_min_priority);
+        }
+        Err(err) => tracing::error!(%err, "odczyt okna ciszy zawiódł"),
+    }
+}
+
+pub async fn quiet_hours_task(
+    pool: SqlitePool,
+    interlocks: Arc<InMemoryInterlocks>,
+    shutdown: CancelToken,
+) {
+    while !shutdown.is_cancelled() {
+        apply_quiet_hours(&pool, &interlocks, chrono::Local::now().time()).await;
+        tokio::time::sleep(QUIET_POLL).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use aars_core::ptt::{FakePtt, PttBackend};
+
+    #[tokio::test]
+    async fn the_quiet_window_switches_the_interlocks_with_the_clock() {
+        let pool = aars_core::db::test_pool().await;
+        sqlx::query("UPDATE settings SET value = '22:00-06:00' WHERE key = 'quiet_hours'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE settings SET value = '1' WHERE key = 'quiet_min_priority'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let locks = InMemoryInterlocks::permissive();
+        let at = |h| chrono::NaiveTime::from_hms_opt(h, 0, 0).unwrap();
+
+        apply_quiet_hours(&pool, &locks, at(23)).await;
+        assert!(locks.snapshot().quiet_now);
+        assert_eq!(locks.check(Priority::Normal), Err(aars_core::interlock::RefusalReason::QuietHours));
+        assert!(locks.check(Priority::High).is_ok());
+
+        apply_quiet_hours(&pool, &locks, at(12)).await;
+        assert!(!locks.snapshot().quiet_now);
+        assert!(locks.check(Priority::Normal).is_ok());
+    }
 
     async fn stored_poison(pool: &SqlitePool) -> String {
         read_setting(pool, "poisoned").await.unwrap()
