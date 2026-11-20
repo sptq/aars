@@ -317,6 +317,7 @@ mod tests {
                 tx_max_duration: Duration::from_secs(30),
                 id_interval: Duration::from_secs(600),
             },
+            None,
         )
     }
 

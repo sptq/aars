@@ -292,6 +292,42 @@ async fn set_tx_enabled(
     Ok(Redirect::to("/").into_response())
 }
 
+/// Zdejmuje blokadę po interwencji watchdoga. Tylko admin (Ruling R4):
+/// zdjęcie przywraca automatyczne nadawanie po awarii sprzętowej.
+async fn clear_watchdog(
+    State(state): State<AppState>,
+    current: CurrentUser,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, AuthRejection> {
+    require_role(&current.user, Role::Admin)?;
+    require_csrf(&current.csrf_token, Some(&form.csrf))?;
+
+    // Najpierw sam strażnik: binarka przenosi jego flagę do interlocków,
+    // więc wyczyszczenie interlocków przy wciąż zatrutym strażniku nic by
+    // nie dało.
+    if let Some(clear) = &state.watchdog_clear {
+        clear();
+    }
+
+    if let Err(err) = sqlx::query(
+        "UPDATE settings SET value = 'false', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+          WHERE key = 'poisoned'",
+    )
+    .execute(&state.pool)
+    .await
+    {
+        // Bez zapisu blokada wróciłaby po restarcie — nie udajemy sukcesu.
+        tracing::error!(%err, "zapis zdjęcia blokady watchdoga zawiódł");
+        return Ok((StatusCode::INTERNAL_SERVER_ERROR, "błąd bazy").into_response());
+    }
+    state.interlocks.set_poisoned(false);
+
+    tracing::warn!(user = %current.user.username, "blokada watchdoga zdjęta z panelu");
+    audit(&state, current.user.id, "watchdog_clear", "blokada zdjęta").await;
+
+    Ok(Redirect::to("/").into_response())
+}
+
 async fn cancel_item(
     State(state): State<AppState>,
     current: CurrentUser,
@@ -374,6 +410,7 @@ pub fn router(state: AppState) -> Router {
         .route("/messages/{id}/preview.wav", get(preview::stored))
         .route("/preview", post(preview::from_text))
         .route("/tx-enabled", post(set_tx_enabled))
+        .route("/watchdog/clear", post(clear_watchdog))
         .route("/queue/{id}/cancel", post(cancel_item))
         .route("/fragments/queue", get(queue_fragment))
         .route("/queue", get(queue_page::page_view))
@@ -391,6 +428,7 @@ mod tests {
     use aars_core::user::{Role, UserRepo};
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     async fn state() -> AppState {
@@ -1223,5 +1261,118 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/login");
+    }
+
+    /// Stan zatruty po interwencji watchdoga, z licznikiem wywołań
+    /// `clear_poison` po stronie strażnika.
+    async fn poisoned_as(
+        role: Role,
+    ) -> (Router, String, String, AppState, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cleared = Arc::new(AtomicUsize::new(0));
+        let counter = cleared.clone();
+        let state = state().await.with_watchdog_clear(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        state.interlocks.set_poisoned(true);
+        sqlx::query("UPDATE settings SET value = 'true' WHERE key = 'poisoned'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        UserRepo::new(state.pool.clone()).create("u", "haslo", role).await.unwrap();
+        let app = router(state.clone());
+        let (cookie, csrf) = login(&app, "u", "haslo").await;
+        (app, cookie, csrf, state, cleared)
+    }
+
+    fn clear_request(cookie: &str, csrf: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/watchdog/clear")
+            .header(header::COOKIE, cookie)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!("csrf={csrf}")))
+            .unwrap()
+    }
+
+    async fn stored_poison(state: &AppState) -> String {
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'poisoned'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_admin_clears_the_watchdog_block() {
+        let (app, cookie, csrf, state, cleared) = poisoned_as(Role::Admin).await;
+
+        let response = app.oneshot(clear_request(&cookie, &csrf)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(!state.interlocks.snapshot().poisoned, "interlocki muszą przepuszczać");
+        assert_eq!(stored_poison(&state).await, "false", "zdjęcie musi przetrwać restart");
+        assert_eq!(
+            cleared.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "flaga musi zniknąć też w samym watchdogu"
+        );
+        let audited: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'watchdog_clear'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(audited, 1);
+    }
+
+    #[tokio::test]
+    async fn an_operator_cannot_clear_the_watchdog_block() {
+        let (app, cookie, csrf, state, cleared) = poisoned_as(Role::Operator).await;
+
+        let response = app.oneshot(clear_request(&cookie, &csrf)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(state.interlocks.snapshot().poisoned);
+        assert_eq!(stored_poison(&state).await, "true");
+        assert_eq!(cleared.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn clearing_the_watchdog_block_needs_a_csrf_token() {
+        let (app, cookie, _csrf, state, cleared) = poisoned_as(Role::Admin).await;
+
+        let response = app.oneshot(clear_request(&cookie, "podrobiony")).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(state.interlocks.snapshot().poisoned);
+        assert_eq!(cleared.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    async fn dashboard_html(app: Router, cookie: &str) -> String {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_dashboard_offers_the_watchdog_reset_only_to_an_admin() {
+        let (app, cookie, _, _, _) = poisoned_as(Role::Admin).await;
+        let html = dashboard_html(app, &cookie).await;
+        assert!(html.contains("watchdog — wymaga reset"));
+        assert!(html.contains("action=\"/watchdog/clear\""), "{html}");
+        assert!(html.contains("Zdejmij blokadę watchdoga"));
+
+        let (app, cookie, _, _, _) = poisoned_as(Role::Operator).await;
+        let html = dashboard_html(app, &cookie).await;
+        assert!(html.contains("watchdog — wymaga reset"), "operator widzi blokadę");
+        assert!(!html.contains("/watchdog/clear"), "operator nie dostaje przycisku");
     }
 }

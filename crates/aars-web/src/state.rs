@@ -17,7 +17,13 @@ pub struct AppState {
     pub secure_cookies: bool,
     /// Synteza do odsłuchu w panelu; `None`, gdy nie skonfigurowano.
     pub preview: Option<Arc<dyn PreviewRenderer>>,
+    /// Zdejmuje flagę z samego watchdoga (jego wątek żyje w binarce);
+    /// `None`, gdy panel działa bez stosu nadawczego.
+    pub watchdog_clear: Option<WatchdogClear>,
 }
+
+/// Wywołanie zdejmujące lepką flagę strażnika (`WatchdogMarker::clear_poison`).
+pub type WatchdogClear = Arc<dyn Fn() + Send + Sync>;
 
 impl AppState {
     pub fn new(
@@ -26,7 +32,12 @@ impl AppState {
         interlocks: Arc<InMemoryInterlocks>,
         secure_cookies: bool,
     ) -> Self {
-        Self { pool, queue, interlocks, secure_cookies, preview: None }
+        Self { pool, queue, interlocks, secure_cookies, preview: None, watchdog_clear: None }
+    }
+
+    pub fn with_watchdog_clear(mut self, clear: WatchdogClear) -> Self {
+        self.watchdog_clear = Some(clear);
+        self
     }
 
     pub fn with_preview(mut self, preview: Arc<dyn PreviewRenderer>) -> Self {
@@ -43,6 +54,7 @@ impl AppState {
             pool,
             secure_cookies: false,
             preview: None,
+            watchdog_clear: None,
         }
     }
 }
