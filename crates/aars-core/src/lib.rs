@@ -1,3 +1,4 @@
+pub mod area;
 pub mod config;
 pub mod db;
 pub mod dispatcher;
@@ -11,6 +12,7 @@ pub mod queue;
 pub mod scheduler;
 pub mod settings;
 pub mod sequencer;
+pub mod source_state;
 pub mod sink;
 pub mod synth;
 pub mod txlog;
