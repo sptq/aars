@@ -252,6 +252,7 @@ async fn main() -> Result<()> {
                 config.storage.cache_dir.clone(),
                 config.storage.cache_max_bytes,
             );
+            let preview = Arc::new(render::PiperPreview::new(cache.clone(), synth.clone()));
             let renderer = Arc::new(render::PiperRenderer::new(
                 cache,
                 synth,
@@ -304,7 +305,8 @@ async fn main() -> Result<()> {
                 queue.clone(),
                 stack.interlocks.clone(),
                 false,
-            ));
+            )
+            .with_preview(preview));
             let listener = tokio::net::TcpListener::bind(&config.server.bind)
                 .await
                 .with_context(|| format!("nasłuch na {}", config.server.bind))?;

@@ -3,6 +3,7 @@ pub mod assets;
 pub mod auth;
 pub mod chrome;
 pub mod messages;
+pub mod preview;
 pub mod render;
 pub mod state;
 
@@ -347,6 +348,8 @@ pub fn router(state: AppState) -> Router {
         .route("/messages/{id}/enabled", post(messages::set_enabled))
         .route("/messages/{id}/delete", post(messages::delete))
         .route("/messages/{id}/send", post(messages::send))
+        .route("/messages/{id}/preview.wav", get(preview::stored))
+        .route("/preview", post(preview::from_text))
         .route("/tx-enabled", post(set_tx_enabled))
         .route("/queue/{id}/cancel", post(cancel_item))
         .route("/fragments/queue", get(queue_fragment))
