@@ -103,6 +103,11 @@ fn random_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Losowe hasło tymczasowe: 20 znaków szesnastkowych (80 bitów).
+fn random_password() -> String {
+    random_token()[..20].to_owned()
+}
+
 fn row_to_user(row: &sqlx::sqlite::SqliteRow) -> User {
     let role: String = row.get("role");
     User {
@@ -211,6 +216,52 @@ impl UserRepo {
         Ok(())
     }
 
+    /// Zmienia rolę konta.
+    pub async fn set_role(&self, id: i64, role: Role) -> Result<(), DbError> {
+        sqlx::query("UPDATE users SET role = ? WHERE id = ?")
+            .bind(role.as_str())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Losowe hasło tymczasowe: 20 znaków, `must_change_password = 1`,
+    /// sesje konta zerwane. Zwraca hasło, żeby admin przekazał je użytkownikowi.
+    pub async fn reset_password(&self, id: i64) -> Result<String, AuthError> {
+        let password = random_password();
+        let hash = hash_password(&password)?;
+        sqlx::query("UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?")
+            .bind(hash)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AuthError::Db(DbError::Sqlx(e)))?;
+        self.end_all_sessions(id).await?;
+        Ok(password)
+    }
+
+    /// Tworzy konto z losowym hasłem tymczasowym (do zmiany przy pierwszym logowaniu).
+    pub async fn create_with_temporary_password(
+        &self,
+        username: &str,
+        role: Role,
+    ) -> Result<(i64, String), AuthError> {
+        let password = random_password();
+        let hash = hash_password(&password)?;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO users (username, password_hash, role, must_change_password)
+             VALUES (?, ?, ?, 1) RETURNING id",
+        )
+        .bind(username)
+        .bind(hash)
+        .bind(role.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| AuthError::Db(DbError::Sqlx(e)))?;
+        Ok((id, password))
+    }
+
     pub async fn delete(&self, id: i64) -> Result<u64, DbError> {
         let result =
             sqlx::query("DELETE FROM users WHERE id = ?").bind(id).execute(&self.pool).await?;
@@ -294,7 +345,7 @@ impl UserRepo {
             return Ok(None);
         }
 
-        let password = random_token()[..20].to_owned();
+        let password = random_password();
         let hash = hash_password(&password)?;
         sqlx::query(
             "INSERT INTO users (username, password_hash, role, must_change_password)
@@ -476,5 +527,45 @@ mod tests {
             repo.ensure_bootstrap_admin().await.unwrap().is_none(),
             "drugi start nie może nadpisać konta"
         );
+    }
+
+    #[tokio::test]
+    async fn reset_password_forces_a_change_and_ends_sessions() {
+        let repo = UserRepo::new(test_pool().await);
+        let id = repo.create("operator", "stare-haslo", Role::Operator).await.unwrap();
+        let session = repo.start_session(id, None).await.unwrap();
+
+        let fresh = repo.reset_password(id).await.unwrap();
+
+        assert_eq!(fresh.len(), 20);
+        assert!(repo.session_user(&session.id).await.unwrap().is_none());
+        assert!(matches!(
+            repo.authenticate("operator", "stare-haslo").await,
+            Err(AuthError::InvalidCredentials)
+        ));
+        let user = repo.authenticate("operator", &fresh).await.unwrap();
+        assert!(user.must_change_password);
+    }
+
+    #[tokio::test]
+    async fn set_role_changes_what_the_user_can_do() {
+        let repo = UserRepo::new(test_pool().await);
+        let id = repo.create("operator", "haslo", Role::Viewer).await.unwrap();
+        repo.set_role(id, Role::Admin).await.unwrap();
+        assert_eq!(repo.by_id(id).await.unwrap().unwrap().role, Role::Admin);
+        repo.set_role(id, Role::Operator).await.unwrap();
+        assert_eq!(repo.by_id(id).await.unwrap().unwrap().role, Role::Operator);
+    }
+
+    #[tokio::test]
+    async fn a_temporary_password_account_must_change_it_and_a_duplicate_is_refused() {
+        let repo = UserRepo::new(test_pool().await);
+        let (id, password) =
+            repo.create_with_temporary_password("nowy", Role::Operator).await.unwrap();
+        assert_eq!(password.len(), 20);
+        let user = repo.authenticate("nowy", &password).await.unwrap();
+        assert_eq!(user.id, id);
+        assert!(user.must_change_password);
+        assert!(repo.create_with_temporary_password("nowy", Role::Viewer).await.is_err());
     }
 }
