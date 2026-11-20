@@ -1,3 +1,4 @@
+pub mod account;
 pub mod assets;
 pub mod auth;
 pub mod chrome;
@@ -332,6 +333,10 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(dashboard))
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", post(logout))
+        .route(
+            "/account/password",
+            get(account::password_page).post(account::password_submit),
+        )
         .route("/compose", get(compose_page).post(compose_submit))
         .route("/tx-enabled", post(set_tx_enabled))
         .route("/queue/{id}/cancel", post(cancel_item))
