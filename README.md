@@ -5,7 +5,7 @@ Stoi przy radiotelefonie (typowo Raspberry Pi), syntezuje mowę lokalnie
 (Piper, bez internetu), nadaje komunikaty o stałych porach, jednorazowo albo
 natychmiast, a operator może wpisać i nadać własny komunikat z panelu www.
 
-**Status: w trakcie prac** (etapy 1–8 z 10, patrz `docs/superpowers/plans/README.md`).
+**Status: w trakcie prac** (etapy 1–8 z 11, patrz `docs/superpowers/plans/README.md`).
 
 ## Co działa
 
@@ -47,14 +47,15 @@ Alarmowy i przerywa nadawanie. Powtórne pobranie tej samej treści nic nie
 dokłada; podniesiony stopień daje jeden komunikat „Zmiana ostrzeżenia”,
 a ostrzeżenie, które zniknie z odpowiedzi dwa razy z rzędu, jest odwołane.
 
-Po instalacji źródło jest wyłączone. W panelu, na stronie `/sources`:
+Po instalacji źródło jest wyłączone. W panelu, na stronie `/sources`, w tej
+kolejności:
 
-- operator włącza źródło i klika „Odśwież teraz”,
-- administrator ustawia **obszar** (jedna linia na wpis: dwucyfrowy kod
-  województwa, np. `10`, albo czterocyfrowy kod powiatu TERYT z nazwą, którą
-  stacja ma wypowiadać, np. `1061 Łódź`; najwyżej 40 wpisów) oraz
-  **interwał** odpytywania (60–3600 s, domyślnie 300 s). Bez obszaru źródło
-  nic nie ogłasza.
+1. administrator ustawia **obszar** (jedna linia na wpis: dwucyfrowy kod
+   województwa, np. `10`, albo czterocyfrowy kod powiatu TERYT z nazwą, którą
+   stacja ma wypowiadać, np. `1061 Łódź`; najwyżej 40 wpisów) oraz
+   **interwał** odpytywania (60–3600 s, domyślnie 300 s). Bez obszaru źródło
+   nic nie pobiera i nic nie ogłasza,
+2. operator włącza źródło i klika „Odśwież teraz”.
 
 Stan źródła (działa, błąd, przestarzałe, wyłączone, brak obszaru) widać też na
 pulpicie. Podgląd bez zapisu i bez kolejki: `cargo run -p aars -- source preview`
@@ -63,8 +64,13 @@ postać znormalizowaną do syntezy.
 
 ## W planach
 
-Źródła IMGW hydro i PAA z kompozytorem biuletynu, paczka na Raspberry Pi
-z systemd.
+Według spec §13:
+
+- etap 9: konfiguracja sprzętu i stacji z panelu admina (PTT, audio, głos,
+  sieć, pozycja stacji na mapie) oraz moduły włączane i ustawiane z panelu,
+- etap 10: gotowy obraz Raspberry Pi i autoaktualizacja z GitHub Releases,
+- etap 11: źródła IMGW hydro i PAA z kompozytorem biuletynu, moduł pogody
+  (Open-Meteo, zapasowo MET Norway) i mapa ostrzeżeń w panelu.
 
 ## Uruchomienie
 
