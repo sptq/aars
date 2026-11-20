@@ -647,7 +647,7 @@ async fn run_station(
     if dispatcher_failed {
         tracing::error!("zadanie dyspozytora padło — wątek sekwencera mógł zostać bez joina");
     }
-    finish_radio(watchdog, watchdog_marker.as_ref(), &interlocks, pool).await?;
+    finish_radio(watchdog, watchdog_marker.as_ref(), &interlocks, pool, dispatcher_failed).await?;
     drop(handle);
 
     if dispatcher_failed {
@@ -667,9 +667,13 @@ const FINAL_POISON_TRIES: u32 = 10;
 
 /// Zamyka strażnika bezpiecznie i utrwala jego ostatnie słowo.
 ///
-/// Najpierw czeka, aż PTT opadnie: po panice dyspozytora sekwencer może
-/// jeszcze nadawać, a strażnik jest wtedy jedynym limitem (I-2). Czekanie
-/// ogranicza sam strażnik — po swoim limicie opuszcza PTT i znacznik.
+/// Po panice dyspozytora (`dispatcher_failed`) najpierw czeka, aż PTT
+/// opadnie: sekwencer może jeszcze nadawać, a strażnik jest wtedy jedynym
+/// limitem (I-2). Czekanie ogranicza sam strażnik — po swoim limicie opuszcza
+/// PTT i znacznik. Gdy dyspozytor skończył normalnie, PTT już opuścił (także
+/// `force_unkey` po zawieszonym wyjściu przy Ctrl-C), a znacznik może zostać
+/// „w górze” tylko dlatego, że zawieszony wątek sekwencera go nie zdjął —
+/// czekanie dałoby wtedy minuty zamiast ograniczonego joina (F-1).
 /// Po zatrzymaniu wątku strażnika flaga już się nie zmieni, więc jeden zapis
 /// wystarczy; most odpytywał co 500 ms i mógł nie zdążyć (I-1).
 async fn finish_radio(
@@ -677,11 +681,12 @@ async fn finish_radio(
     marker: Option<&aars_core::watchdog::WatchdogMarker>,
     interlocks: &aars_core::interlock::InMemoryInterlocks,
     pool: &SqlitePool,
+    dispatcher_failed: bool,
 ) -> Result<()> {
     let (Some(watchdog), Some(marker)) = (watchdog, marker) else {
         return Ok(());
     };
-    if marker.is_keyed() {
+    if dispatcher_failed && marker.is_keyed() {
         tracing::warn!("PTT wciąż w górze — czekam, aż opadnie albo zdejmie je strażnik");
         while marker.is_keyed() {
             tokio::time::sleep(CONTROL_POLL).await;
@@ -1234,7 +1239,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            finish_radio(Some(watchdog), Some(&marker), &interlocks, &pool),
+            finish_radio(Some(watchdog), Some(&marker), &interlocks, &pool, true),
         )
         .await
         .expect("czekanie ogranicza limit strażnika")
@@ -1488,5 +1493,52 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    /// Wyjście, które wisi dłużej niż ograniczony join i ignoruje anulowanie.
+    struct HangsLong;
+
+    impl AudioSink for HangsLong {
+        fn play(
+            &self,
+            _: &aars_core::synth::Pcm,
+            _: &CancelToken,
+        ) -> Result<aars_core::sink::PlayReport, aars_core::sink::SinkError> {
+            std::thread::sleep(Duration::from_secs(30));
+            Ok(aars_core::sink::PlayReport {
+                played: Duration::ZERO,
+                cancelled: true,
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ctrl_c_with_a_hung_output_ends_within_the_bounded_join() {
+        let pool = aars_core::db::test_pool().await;
+        enqueue_one(&pool, "komunikat na zawieszoną kartę").await;
+        let hardware = Arc::new(FakeHardware::new(&[]));
+        let ptt = hardware.ptt.clone();
+        *hardware.sink.lock().unwrap() = Some(Arc::new(HangsLong));
+        let stop = CancelToken::new();
+        let (task, _handle) =
+            start(station_config("hung-stop"), pool.clone(), hardware, stop.clone()).await;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ptt.is_keyed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("zadanie musi wejść na antenę");
+        stop.cancel();
+
+        let exit = tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .expect("Ctrl-C nie może czekać na limit strażnika (minuty)")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Stop));
+        assert!(!ptt.is_keyed(), "PTT opuszczone przez ograniczony join");
+        assert_eq!(get(&pool, "poisoned").await.as_deref(), Some("false"));
     }
 }

@@ -442,6 +442,14 @@ fn build_fields(
     add("serial_line", "Linia portu szeregowego", "ptt.serial.line", "select", &input.serial_line, serial_lines, None);
 
     let (kind, options, note) = match lists {
+        // Bez żadnego głosu w katalogu lista byłaby pusta i nie dałoby się
+        // wpisać modelu spoza niego (R8) — wtedy zwykłe pole.
+        Some(l) if l.voices.is_empty() => choice(
+            Vec::new(),
+            None,
+            "W katalogu głosów nie ma modeli — wpisz ścieżkę modelu .onnx ręcznie.",
+            &input.voice_model,
+        ),
         Some(l) => {
             let o = l.voices.iter().map(|v| (v.path.clone(), v.name.clone())).collect();
             choice(o, None, "", &input.voice_model)
@@ -914,6 +922,25 @@ mod tests {
             .fetch_all(&env.state.pool)
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn without_any_installed_voice_the_model_is_a_text_field() {
+        let lists = HostLists {
+            audio: Ok(vec![]),
+            serial: Ok(vec![]),
+            gpio: Ok(vec![]),
+            voices: vec![],
+        };
+        let file = HardwareSettings::from_config(&aars_core::config::Config::default());
+        let input = FormInput {
+            voice_model: "/opt/glosy/pl_PL-inny.onnx".to_owned(),
+            ..FormInput::default()
+        };
+        let fields = build_fields(&input, &[], &file, Some(&lists));
+        let voice = fields.iter().find(|f| f.name == "voice_model").unwrap();
+        assert_eq!(voice.kind, "text", "pusta lista nie może zablokować wpisania modelu (R8)");
+        assert!(voice.note.is_some());
     }
 
     #[tokio::test]

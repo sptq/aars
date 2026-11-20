@@ -69,6 +69,7 @@ const POSTS: &[(&str, u8)] = &[
     ("/settings/position", ADMIN),
     ("/station/restart", ADMIN),
     ("/modules/scheduler/enabled", ADMIN),
+    ("/modules/imgw-meteo/enabled", ADMIN),
     ("/modules/imgw-meteo/settings", ADMIN),
     ("/users", ADMIN),
     ("/users/1/role", ADMIN),
@@ -320,6 +321,7 @@ async fn every_post_route_enforces_its_role_with_a_valid_csrf_token() {
         ("/settings/position", ADMIN, 303),
         ("/station/restart", ADMIN, 503),
         ("/modules/scheduler/enabled", ADMIN, 303),
+        ("/modules/imgw-meteo/enabled", ADMIN, 303),
         // `interval_s=5` jest poza zakresem 60–3600.
         ("/modules/imgw-meteo/settings", ADMIN, 400),
         ("/users", ADMIN, 200),
