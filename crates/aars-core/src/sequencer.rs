@@ -192,9 +192,11 @@ fn transmit_one(
         }
     };
 
-    if report.cancelled && cancel.is_expired() {
-        // Limit ma pierwszeństwo przed przerwaniem: nadanie, które go
-        // przekracza, przekroczy go i po ponownym wstawieniu do kolejki.
+    if cancel.is_expired() {
+        // Powrót z wyjścia po terminie to przekroczenie limitu, nawet gdy
+        // wyjście nie zgłosiło anulowania (zawieszony sink). Limit ma też
+        // pierwszeństwo przed przerwaniem: nadanie, które go przekracza,
+        // przekroczy go i po ponownym wstawieniu do kolejki.
         tracing::error!(
             id = request.id,
             limit_s = config.tx_max_duration.as_secs(),
@@ -634,6 +636,73 @@ mod tests {
             "{event:?}"
         );
         assert_eq!(ptt.events(), before, "PTT nie może drgnąć przy odmowie");
+        watchdog.stop();
+    }
+
+    /// Wyjście, które się zawiesza: ignoruje anulowanie i termin, śpi długo
+    /// po limicie — model zawieszonego sekwencera. Zapamiętuje, czy PTT było
+    /// jeszcze podniesione, gdy w końcu wróciło.
+    struct HangingSink {
+        hang: Duration,
+        ptt: Arc<FakePtt>,
+        keyed_on_return: Mutex<Option<bool>>,
+    }
+
+    impl AudioSink for HangingSink {
+        fn play(&self, _pcm: &Pcm, _cancel: &CancelToken) -> Result<PlayReport, SinkError> {
+            std::thread::sleep(self.hang);
+            *self.keyed_on_return.lock().unwrap() = Some(self.ptt.is_keyed());
+            Ok(PlayReport { played: self.hang, cancelled: false })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hung_sequencer_is_forced_down_by_the_watchdog_and_the_next_transmission_refused() {
+        let ptt = Arc::new(FakePtt::new());
+        // Limit sekwencera 200 ms, watchdog 300 ms; sink wisi 1,5 s.
+        let watchdog = Watchdog::spawn(ptt.clone(), Duration::from_millis(300));
+        let marker = watchdog.marker();
+        let sink = Arc::new(HangingSink {
+            hang: Duration::from_millis(1500),
+            ptt: ptt.clone(),
+            keyed_on_return: Mutex::new(None),
+        });
+        let mut handle = Sequencer::spawn(
+            ptt.clone(),
+            sink.clone(),
+            Arc::new(InMemoryInterlocks::permissive()),
+            SequencerConfig {
+                tx_tail: Duration::from_millis(1),
+                tx_max_duration: Duration::from_millis(200),
+                id_interval: Duration::from_secs(600),
+            },
+            Some(marker.clone()),
+        );
+
+        handle.transmit(request(1, Priority::Normal)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        // Sekwencer wciąż wisi w sinku, a nadajnik już jest zdjęty z anteny.
+        assert!(!ptt.is_keyed(), "watchdog musi opuścić PTT zawieszonego sekwencera");
+        assert!(ptt.events().contains(&PttEvent::ForceUnkey), "{:?}", ptt.events());
+        assert!(marker.is_poisoned());
+
+        let event = finished(&mut handle).await;
+        assert_eq!(*sink.keyed_on_return.lock().unwrap(), Some(false));
+        assert!(
+            matches!(&event, SeqEvent::Finished { id: 1, outcome: TxOutcome::Failed(err), .. }
+                if err == TX_TIMEOUT_ERROR),
+            "nadanie po terminie to timeout, nawet gdy sink udaje sukces: {event:?}"
+        );
+
+        let keys_before = ptt.events().iter().filter(|e| **e == PttEvent::Key).count();
+        handle.transmit(request(2, Priority::Emergency)).await.unwrap();
+        let event = handle.next_event().await.unwrap();
+        assert!(
+            matches!(event, SeqEvent::Refused { id: 2, reason: RefusalReason::Poisoned }),
+            "{event:?}"
+        );
+        let keys_after = ptt.events().iter().filter(|e| **e == PttEvent::Key).count();
+        assert_eq!(keys_before, keys_after, "po interwencji PTT nie może się podnieść");
         watchdog.stop();
     }
 }

@@ -74,36 +74,50 @@ pub async fn build_stack(config: &Config, pool: &SqlitePool) -> Result<RadioStac
 
 /// Utrwala interwencję strażnika: interlocki od razu, `settings.poisoned`
 /// tak, by blokada przetrwała restart (spec §4.3, „celowo lepka”).
-pub async fn record_poison(interlocks: &InMemoryInterlocks, pool: &SqlitePool) {
+/// Zwraca, czy zapis do bazy się udał.
+pub async fn record_poison(interlocks: &InMemoryInterlocks, pool: &SqlitePool) -> bool {
     interlocks.set_poisoned(true);
-    if let Err(err) = sqlx::query(
+    match sqlx::query(
         "UPDATE settings SET value = 'true', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
           WHERE key = 'poisoned'",
     )
     .execute(pool)
     .await
     {
-        tracing::error!(%err, "zapis flagi poisoned zawiódł");
+        Ok(_) => true,
+        Err(err) => {
+            tracing::error!(%err, "zapis flagi poisoned zawiódł, ponowię");
+            false
+        }
     }
 }
 
 /// Co `POISON_POLL` przenosi flagę strażnika do interlocków i bazy.
-/// Reaguje na zbocze „czysty → zatruty”, więc nie walczy z ręcznym
-/// zdjęciem blokady w panelu, które czyści wszystkie trzy miejsca.
+/// Działa poziomem, nie zboczem: dopóki strażnik jest zatruty, a stan nie
+/// jest utrwalony (interlocki czyste albo zapis do bazy zawiódł), ponawia.
+/// Nie walczy z ręcznym zdjęciem blokady, bo panel czyści najpierw samego
+/// strażnika — wtedy most nie ma już czego przenosić.
 pub async fn watch_poison(
     marker: WatchdogMarker,
     interlocks: Arc<InMemoryInterlocks>,
     pool: SqlitePool,
     shutdown: CancelToken,
 ) {
-    let mut was_poisoned = false;
+    // Czy bieżąca interwencja jest już zapisana w bazie.
+    let mut persisted = false;
     while !shutdown.is_cancelled() {
-        let poisoned = marker.is_poisoned();
-        if poisoned && !was_poisoned {
-            tracing::error!("watchdog interweniował — nadawanie zablokowane do ręcznego zdjęcia");
-            record_poison(&interlocks, &pool).await;
+        if marker.is_poisoned() {
+            if !persisted || !interlocks.snapshot().poisoned {
+                if !persisted {
+                    tracing::error!(
+                        "watchdog interweniował — nadawanie zablokowane do ręcznego zdjęcia"
+                    );
+                }
+                persisted = record_poison(&interlocks, &pool).await;
+            }
+        } else {
+            persisted = false;
         }
-        was_poisoned = poisoned;
         tokio::time::sleep(POISON_POLL).await;
     }
 }
@@ -158,6 +172,45 @@ mod tests {
             .await
             .expect("most kończy się po sygnale zatrzymania")
             .unwrap();
+        watchdog.stop();
+    }
+
+    #[tokio::test]
+    async fn a_failed_poison_write_is_retried_until_it_lands() {
+        let pool = aars_core::db::test_pool().await;
+        // Baza odmawia zapisu flagi, dopóki trigger istnieje.
+        sqlx::query(
+            "CREATE TRIGGER refuse_poison BEFORE UPDATE ON settings WHEN NEW.key = 'poisoned'
+             BEGIN SELECT RAISE(ABORT, 'zapis zablokowany w teście'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ptt = Arc::new(FakePtt::new());
+        let watchdog = Watchdog::spawn(ptt.clone(), Duration::from_millis(50));
+        let marker = watchdog.marker();
+        let interlocks = Arc::new(InMemoryInterlocks::permissive());
+        let shutdown = CancelToken::new();
+        let task = tokio::spawn(watch_poison(
+            marker.clone(),
+            interlocks.clone(),
+            pool.clone(),
+            shutdown.clone(),
+        ));
+
+        ptt.key().unwrap();
+        marker.mark_keyed();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(interlocks.snapshot().poisoned, "interlocki nie mogą czekać na bazę");
+        assert_eq!(stored_poison(&pool).await, "false", "zapis miał się nie udać");
+
+        sqlx::query("DROP TRIGGER refuse_poison").execute(&pool).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(stored_poison(&pool).await, "true", "most musi ponawiać zapis do skutku");
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(3), task).await.unwrap().unwrap();
         watchdog.stop();
     }
 }
