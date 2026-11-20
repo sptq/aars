@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -149,11 +150,23 @@ impl QueueRepo {
         let base = request.not_before.unwrap_or_else(Utc::now);
         let group = if count > 1 { Some(new_group_id()) } else { None };
 
-        let mut ids = Vec::with_capacity(count as usize);
-        for index in 0..count {
-            let offset = request.repeat_interval * index;
-            let not_before =
-                base + chrono::Duration::from_std(offset).unwrap_or(chrono::Duration::zero());
+        // Wszystkie terminy liczymy przed pierwszym INSERT-em: przepełnienie
+        // to odmowa całego zlecenia, nie panika ani połowa grupy w kolejce.
+        let times = (0..count)
+            .map(|index| {
+                request
+                    .repeat_interval
+                    .checked_mul(index)
+                    .and_then(|offset| chrono::Duration::from_std(offset).ok())
+                    .and_then(|offset| base.checked_add_signed(offset))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                DbError::Invalid("odstęp powtórzeń wychodzi poza zakres dat".to_owned())
+            })?;
+
+        let mut ids = Vec::with_capacity(times.len());
+        for (index, not_before) in (0..count).zip(times) {
 
             let id: i64 = sqlx::query_scalar(
                 "INSERT INTO queue_items
@@ -240,8 +253,9 @@ impl QueueRepo {
     async fn finish(&self, id: i64, state: QueueState, error: Option<&str>) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE queue_items
-                SET state = ?, finished_at = ?, error = COALESCE(?, error)
-              WHERE id = ?",
+                SET state = ?1, finished_at = ?2,
+                    error = CASE WHEN ?1 = 'done' THEN NULL ELSE COALESCE(?3, error) END
+              WHERE id = ?4",
         )
         .bind(state.as_str())
         .bind(iso(Utc::now()))
@@ -274,6 +288,44 @@ impl QueueRepo {
             "UPDATE queue_items
                 SET state = 'pending', not_before = ?, started_at = NULL, error = ?
               WHERE id = ?",
+        )
+        .bind(iso(not_before))
+        .bind(reason)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Wstrzymuje zadanie odrzucone przez interlock: wraca jako `pending`
+    /// z powodem i bez zużytej próby (próby liczą tylko prawdziwe porażki).
+    /// Element opuści kolejkę tylko przez nadanie, anulowanie lub `expires_at`.
+    pub async fn hold(
+        &self,
+        id: i64,
+        reason: &str,
+        not_before: DateTime<Utc>,
+    ) -> Result<(), DbError> {
+        self.release_claim(id, reason, not_before).await
+    }
+
+    /// Nadanie przerwane pilniejszym komunikatem: wraca od razu, bez zużycia
+    /// próby (spec §5.1), więc wielokrotne przerwania nie kończą się porażką.
+    pub async fn interrupted(&self, id: i64, reason: &str) -> Result<(), DbError> {
+        self.release_claim(id, reason, Utc::now()).await
+    }
+
+    async fn release_claim(
+        &self,
+        id: i64,
+        reason: &str,
+        not_before: DateTime<Utc>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE queue_items
+                SET state = 'pending', not_before = ?, started_at = NULL, error = ?,
+                    attempt = MAX(attempt - 1, 0)
+              WHERE id = ? AND state = 'transmitting'",
         )
         .bind(iso(not_before))
         .bind(reason)
@@ -344,6 +396,21 @@ impl QueueRepo {
         Ok(result.rows_affected())
     }
 
+    /// Liczba wszystkich wystąpień (także zakończonych) każdej serii, która
+    /// ma jeszcze coś w kolejce; mianownik „n/N” na stronie kolejki.
+    pub async fn group_sizes(&self) -> Result<HashMap<String, i64>, DbError> {
+        let rows = sqlx::query(
+            "SELECT repeat_group, COUNT(*) AS size FROM queue_items
+              WHERE repeat_group IN (
+                    SELECT repeat_group FROM queue_items
+                     WHERE state = 'pending' AND repeat_group IS NOT NULL)
+              GROUP BY repeat_group",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| (r.get("repeat_group"), r.get("size"))).collect())
+    }
+
     pub async fn pending(&self, limit: i64) -> Result<Vec<QueueItem>, DbError> {
         let rows = sqlx::query(&format!(
             "SELECT {COLUMNS} FROM queue_items
@@ -406,7 +473,10 @@ mod tests {
         assert_eq!(claimed.state, QueueState::Transmitting);
         assert_eq!(claimed.attempt, 1, "claim liczy próbę");
 
-        assert!(repo.claim_next().await.unwrap().is_none(), "drugi claim nie może wziąć tego samego");
+        assert!(
+            repo.claim_next().await.unwrap().is_none(),
+            "drugi claim nie może wziąć tego samego"
+        );
     }
 
     #[tokio::test]
@@ -438,6 +508,29 @@ mod tests {
         let claimed = repo.claim_next().await.unwrap().unwrap();
         assert_eq!(claimed.repeat_index, 0);
         assert!(repo.claim_next().await.unwrap().is_none(), "kolejne czekają na swój czas");
+    }
+
+    #[tokio::test]
+    async fn a_huge_repeat_interval_is_refused_instead_of_panicking() {
+        let repo = QueueRepo::new(test_pool().await);
+        // Duration * u32 przepełnia się przy trzecim powtórzeniu.
+        let mut huge = req("ogromny odstęp", Priority::Normal);
+        huge.repeat_count = 3;
+        huge.repeat_interval = Duration::from_secs(u64::MAX);
+        assert!(repo.enqueue(huge).await.is_err(), "przepełnienie to błąd, nie panika");
+
+        // Mieści się w TimeDelta, ale nie w dacie.
+        let mut far = req("daleko", Priority::Normal);
+        far.repeat_count = 2;
+        far.repeat_interval = Duration::from_secs(1_000_000_000_000_000);
+        assert!(repo.enqueue(far).await.is_err(), "data poza zakresem to błąd");
+
+        // Za duże dla TimeDelta — wcześniej po cichu zero.
+        let mut silent = req("po cichu", Priority::Normal);
+        silent.repeat_count = 2;
+        silent.repeat_interval = Duration::from_secs(u64::MAX / 4);
+        assert!(repo.enqueue(silent).await.is_err());
+        assert!(repo.pending(10).await.unwrap().is_empty(), "nic nie trafia do kolejki");
     }
 
     #[tokio::test]
@@ -487,6 +580,47 @@ mod tests {
         assert_eq!(back.len(), 1, "odmowa nie może gubić komunikatu");
         assert_eq!(back[0].error.as_deref(), Some("TxDisabled"));
         assert_eq!(back[0].attempt, 1, "liczba prób zostaje");
+    }
+
+    #[tokio::test]
+    async fn a_held_item_keeps_its_attempts_and_never_fails() {
+        let repo = QueueRepo::new(test_pool().await);
+        repo.enqueue(req("wstrzymany", Priority::Normal)).await.unwrap();
+
+        for _ in 0..(MAX_ATTEMPTS + 2) {
+            let claimed = repo.claim_next().await.unwrap().expect("wraca do kolejki");
+            repo.hold(claimed.id, "wstrzymane: x", Utc::now()).await.unwrap();
+        }
+
+        let back = repo.pending(10).await.unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].attempt, 0);
+        assert_eq!(back[0].error.as_deref(), Some("wstrzymane: x"));
+    }
+
+    #[tokio::test]
+    async fn an_item_interrupted_many_times_stays_pending_and_finally_goes_out() {
+        let repo = QueueRepo::new(test_pool().await);
+        let id = repo.enqueue(req("przerywany", Priority::Normal)).await.unwrap()[0];
+
+        for _ in 0..(MAX_ATTEMPTS + 2) {
+            let claimed = repo.claim_next().await.unwrap().expect("wraca do kolejki");
+            repo.interrupted(claimed.id, "przerwane pilniejszym komunikatem").await.unwrap();
+        }
+        let back = repo.pending(10).await.unwrap();
+        assert_eq!(back[0].attempt, 0);
+        assert_eq!(back[0].error.as_deref(), Some("przerwane pilniejszym komunikatem"));
+
+        repo.claim_next().await.unwrap().unwrap();
+        repo.mark_done(id).await.unwrap();
+        let (state, error): (String, Option<String>) =
+            sqlx::query_as("SELECT state, error FROM queue_items WHERE id = ?")
+                .bind(id)
+                .fetch_one(repo.pool())
+                .await
+                .unwrap();
+        assert_eq!(state, "done");
+        assert_eq!(error, None, "nadany element nie niesie starego powodu");
     }
 
     #[tokio::test]

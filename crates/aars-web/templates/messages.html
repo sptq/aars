@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}AARS — komunikaty{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Komunikaty</h2>
+  <p><a href="/messages/new">Nowy komunikat</a></p>
+  {% if rows.is_empty() %}
+  <p style="color:var(--muted)">Brak zdefiniowanych komunikatów.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Tytuł</th><th>Priorytet</th><th>Harmonogram</th><th>Następne nadanie</th><th>Stan</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td><a href="/messages/{{ row.id }}/edit">{{ row.title }}</a></td>
+        <td>{{ row.priority }}</td>
+        <td>{{ row.schedule }}</td>
+        <td>{{ row.next }}</td>
+        <td>{% if row.enabled %}<span class="badge on">włączony</span>{% else %}<span class="badge off">wyłączony</span>{% endif %}</td>
+        <td style="white-space:nowrap">
+          <button type="button" class="ghost" onclick="var a=document.getElementById('preview-audio');a.src='/messages/{{ row.id }}/preview.wav';a.play()">Odsłuchaj</button>
+          <form method="post" action="/messages/{{ row.id }}/send" style="display:inline">
+            <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+            <button type="submit">Nadaj teraz</button>
+          </form>
+          <form method="post" action="/messages/{{ row.id }}/enabled" style="display:inline">
+            <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+            <input type="hidden" name="enabled" value="{% if row.enabled %}0{% else %}1{% endif %}">
+            <button type="submit" class="ghost">{% if row.enabled %}Wyłącz{% else %}Włącz{% endif %}</button>
+          </form>
+          <form method="post" action="/messages/{{ row.id }}/delete" style="display:inline"
+                onsubmit="return confirm('Usunąć komunikat?')">
+            <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+            <button type="submit" class="danger">Usuń</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  <audio id="preview-audio" controls style="width:100%;margin-top:1rem"></audio>
+</div>
+{% endblock %}

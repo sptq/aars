@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}AARS — komunikat{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>{% if id.is_some() %}Edycja komunikatu{% else %}Nowy komunikat{% endif %}</h2>
+  <form method="post" action="{% if let Some(id) = id %}/messages/{{ id }}{% else %}/messages{% endif %}"
+        id="message-form">
+    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+    <div style="margin-bottom:0.9rem">
+      <label for="title">Tytuł</label>
+      <input id="title" name="title" required value="{{ title }}">
+    </div>
+    <div style="margin-bottom:0.9rem">
+      <label for="text">Treść</label>
+      <textarea id="text" name="text" required>{{ text }}</textarea>
+    </div>
+    <div class="row">
+      <div>
+        <label for="priority">Priorytet</label>
+        <select id="priority" name="priority">
+          <option value="normal" {% if priority == "normal" %}selected{% endif %}>Zwykły</option>
+          <option value="low" {% if priority == "low" %}selected{% endif %}>Niski</option>
+          <option value="high" {% if priority == "high" %}selected{% endif %}>Wysoki</option>
+          <option value="emergency" {% if priority == "emergency" %}selected{% endif %}>Alarmowy</option>
+        </select>
+      </div>
+      <div>
+        <label for="repeat">Powtórzeń</label>
+        <input id="repeat" name="repeat" type="number" value="{{ repeat }}" min="1" max="20">
+      </div>
+      <div>
+        <label for="every">Odstęp (s)</label>
+        <input id="every" name="every" type="number" value="{{ every }}" min="0" max="86400">
+      </div>
+    </div>
+    <label style="display:flex;gap:0.5rem;align-items:center;margin-bottom:1rem">
+      <input type="checkbox" name="interrupting" value="1" style="width:auto"
+             {% if interrupting %}checked{% endif %}>
+      Przerwij trwające nadanie o niższym priorytecie
+    </label>
+    <div class="row">
+      <div>
+        <label for="schedule_kind">Harmonogram</label>
+        <select id="schedule_kind" name="schedule_kind">
+          <option value="immediate" {% if kind == "immediate" %}selected{% endif %}>Na żądanie</option>
+          <option value="at" {% if kind == "at" %}selected{% endif %}>Jednorazowo</option>
+          <option value="cron" {% if kind == "cron" %}selected{% endif %}>Cyklicznie (cron)</option>
+        </select>
+      </div>
+      <div>
+        <label for="at">Jednorazowo — czas lokalny</label>
+        <input id="at" name="at" type="datetime-local" value="{{ at }}">
+      </div>
+      <div>
+        <label for="cron">Cron, UTC</label>
+        <input id="cron" name="cron" placeholder="0 18 * * *" value="{{ cron }}">
+      </div>
+    </div>
+    <p id="next-hint" style="color:var(--muted)"
+       hx-get="/messages/next" hx-include="#message-form"
+       hx-trigger="load, input from:#message-form, change from:#message-form"></p>
+    <div style="margin-bottom:1rem">
+      <button type="button" class="ghost" id="preview-btn">Odsłuchaj</button>
+      <span id="preview-note" style="color:var(--muted)"></span>
+      <audio id="preview-audio" controls style="width:100%;margin-top:0.5rem"></audio>
+    </div>
+    <button type="submit">Zapisz</button>
+    <a href="/messages">Anuluj</a>
+  </form>
+</div>
+
+<script>
+(function () {
+  var btn = document.getElementById('preview-btn');
+  if (!btn) return;
+  var audio = document.getElementById('preview-audio');
+  var note = document.getElementById('preview-note');
+  btn.addEventListener('click', function () {
+    var form = btn.form;
+    var body = new URLSearchParams();
+    body.set('text', form.elements['text'].value);
+    body.set('csrf', form.elements['csrf'].value);
+    note.textContent = 'Synteza…';
+    fetch('/preview', { method: 'POST', body: body })
+      .then(function (r) {
+        if (!r.ok) return r.text().then(function (t) { throw new Error(t); });
+        return r.blob();
+      })
+      .then(function (blob) {
+        note.textContent = '';
+        if (audio.dataset.url) URL.revokeObjectURL(audio.dataset.url);
+        audio.dataset.url = URL.createObjectURL(blob);
+        audio.src = audio.dataset.url;
+        audio.play();
+      })
+      .catch(function (e) { note.textContent = e.message; });
+  });
+})();
+</script>
+{% endblock %}

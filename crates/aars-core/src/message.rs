@@ -6,6 +6,13 @@ use sqlx::{Row, SqlitePool};
 use crate::error::DbError;
 use crate::priority::Priority;
 
+/// Najdłuższy odstęp między powtórzeniami (doba). Panel i CLI odrzucają
+/// większe wartości, zanim dotrą do kolejki.
+pub const MAX_REPEAT_INTERVAL_S: u64 = 86_400;
+
+/// Komunikat dla operatora, gdy odstęp wychodzi poza zakres.
+pub const REPEAT_INTERVAL_ERROR: &str = "odstęp powtórzeń musi mieścić się w 0–86400 s";
+
 /// Kiedy komunikat ma być nadany.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduleKind {
@@ -194,6 +201,40 @@ impl MessageRepo {
         Ok(())
     }
 
+    /// Zmienia treść, priorytet, powtórzenia i harmonogram; zadania już w
+    /// kolejce zostają, jakie były. `valid_from`, `valid_until`, `source_id`
+    /// i `kind` z `new` są ignorowane (zostają, jakie były). Zwraca
+    /// liczbę zmienionych wierszy (0, gdy definicji nie ma).
+    pub async fn update(&self, id: i64, new: NewMessage) -> Result<u64, DbError> {
+        let (schedule_at, cron_expr) = match &new.schedule {
+            ScheduleKind::Immediate => (None, None),
+            ScheduleKind::At(at) => (Some(iso(*at)), None),
+            ScheduleKind::Cron(expr) => (None, Some(expr.clone())),
+        };
+
+        let result = sqlx::query(
+            "UPDATE messages
+                SET title = ?, body_template = ?, priority = ?, interrupting = ?,
+                    repeat_count = ?, repeat_interval_s = ?, schedule_kind = ?,
+                    schedule_at = ?, cron_expr = ?, updated_at = ?
+              WHERE id = ?",
+        )
+        .bind(&new.title)
+        .bind(&new.body_template)
+        .bind(new.priority as i64)
+        .bind(i64::from(new.interrupting))
+        .bind(i64::from(new.repeat_count.max(1)))
+        .bind(new.repeat_interval.as_secs() as i64)
+        .bind(new.schedule.kind_str())
+        .bind(schedule_at)
+        .bind(cron_expr)
+        .bind(iso(Utc::now()))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn delete(&self, id: i64) -> Result<u64, DbError> {
         let result =
             sqlx::query("DELETE FROM messages WHERE id = ?").bind(id).execute(&self.pool).await?;
@@ -275,5 +316,51 @@ mod tests {
         let scheduled = repo.scheduled().await.unwrap();
         assert_eq!(scheduled.len(), 1, "{scheduled:?}");
         assert_eq!(scheduled[0].id, active);
+    }
+
+    #[tokio::test]
+    async fn update_changes_the_definition_but_not_queued_items() {
+        use crate::queue::{EnqueueRequest, QueueRepo};
+
+        let pool = test_pool().await;
+        let repo = MessageRepo::new(pool.clone());
+        let queue = QueueRepo::new(pool);
+        let until = Utc::now() + chrono::Duration::days(30);
+        let mut old = cron_message("stary", "0 18 * * *");
+        old.valid_until = Some(until);
+        old.source_id = Some("zrodlo-1".to_owned());
+        let id = repo.create(old).await.unwrap();
+        queue
+            .enqueue(EnqueueRequest {
+                message_id: Some(id),
+                rendered_text: "stara treść".to_owned(),
+                priority: Priority::Normal,
+                interrupting: false,
+                not_before: None,
+                expires_at: None,
+                repeat_count: 1,
+                repeat_interval: Duration::ZERO,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let mut new = cron_message("nowy", "30 6 * * *");
+        new.body_template = "nowa treść".to_owned();
+        new.priority = Priority::High;
+        assert_eq!(repo.update(id, new).await.unwrap(), 1);
+
+        let message = repo.get(id).await.unwrap().unwrap();
+        assert_eq!(message.title, "nowy");
+        assert_eq!(message.body_template, "nowa treść");
+        assert_eq!(message.priority, Priority::High);
+        assert_eq!(message.schedule, ScheduleKind::Cron("30 6 * * *".to_owned()));
+        // Pola, których formularz nie edytuje, zostają.
+        assert_eq!(message.valid_until.map(|t| t.timestamp()), Some(until.timestamp()));
+        assert_eq!(message.source_id.as_deref(), Some("zrodlo-1"));
+
+        let pending = queue.pending(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].rendered_text, "stara treść");
     }
 }

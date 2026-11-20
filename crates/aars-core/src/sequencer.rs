@@ -8,6 +8,7 @@ use crate::priority::Priority;
 use crate::ptt::PttBackend;
 use crate::sink::{AudioSink, CancelToken};
 use crate::synth::Pcm;
+use crate::watchdog::{TX_TIMEOUT_ERROR, WatchdogMarker};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SequencerConfig {
@@ -68,6 +69,7 @@ impl Sequencer {
         sink: Arc<dyn AudioSink>,
         interlocks: Arc<dyn Interlocks>,
         config: SequencerConfig,
+        watchdog: Option<WatchdogMarker>,
     ) -> SequencerHandle {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SeqCmd>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<SeqEvent>();
@@ -82,7 +84,16 @@ impl Sequencer {
                         SeqCmd::Shutdown => break,
                         SeqCmd::Transmit(request) => {
                             let id = request.id;
-                            if let Err(reason) = interlocks.check(request.priority) {
+                            // Strażnik pyta się pierwszy: binarka przenosi
+                            // jego flagę do interlocków z opóźnieniem, a po
+                            // interwencji nie wolno nadać ani jednej sekundy.
+                            let poisoned = watchdog.as_ref().is_some_and(|w| w.is_poisoned());
+                            let verdict = if poisoned {
+                                Err(RefusalReason::Poisoned)
+                            } else {
+                                interlocks.check(request.priority)
+                            };
+                            if let Err(reason) = verdict {
                                 tracing::warn!(id, ?reason, "nadanie odrzucone przez interlock");
                                 let _ = event_tx.send(SeqEvent::Refused { id, reason });
                                 continue;
@@ -98,6 +109,7 @@ impl Sequencer {
                                 &request,
                                 &config,
                                 &cancel,
+                                watchdog.as_ref(),
                                 &event_tx,
                             );
 
@@ -117,9 +129,10 @@ impl Sequencer {
 }
 
 /// Strażnik RAII: każde wyjście z nadania — sukces, błąd, panika —
-/// opuszcza PTT (spec §4.2).
+/// opuszcza PTT (spec §4.2) i dopiero potem zdejmuje znacznik watchdoga.
 struct PttGuard<'a> {
     ptt: &'a dyn PttBackend,
+    watchdog: Option<&'a WatchdogMarker>,
 }
 
 impl Drop for PttGuard<'_> {
@@ -127,6 +140,9 @@ impl Drop for PttGuard<'_> {
         if let Err(err) = self.ptt.unkey() {
             tracing::error!(%err, "unkey zawiódł, wymuszam opuszczenie PTT");
             self.ptt.force_unkey();
+        }
+        if let Some(watchdog) = self.watchdog {
+            watchdog.mark_unkeyed();
         }
     }
 }
@@ -140,6 +156,7 @@ fn transmit_one(
     request: &TransmitRequest,
     config: &SequencerConfig,
     cancel: &CancelToken,
+    watchdog: Option<&WatchdogMarker>,
     event_tx: &mpsc::UnboundedSender<SeqEvent>,
 ) -> (TxOutcome, Duration) {
     let full = match assemble(request, config) {
@@ -153,10 +170,18 @@ fn transmit_one(
         ptt.force_unkey();
         return (TxOutcome::Failed(err.to_string()), Duration::ZERO);
     }
-    let _guard = PttGuard { ptt };
+    // Guard powstaje przed znacznikiem: gdyby cokolwiek dalej spanikowało,
+    // PTT i tak opadnie, a znacznik zostanie zdjęty.
+    let _guard = PttGuard { ptt, watchdog };
+    let started = Instant::now();
+    if let Some(watchdog) = watchdog {
+        watchdog.mark_keyed();
+    }
+    // Twardy limit liczony od podniesienia PTT, sprawdzany przez wyjście
+    // audio co bufor — jak przerwanie (spec §4.3). Watchdog jest drugą linią.
+    cancel.expire_at(started + config.tx_max_duration);
     let _ = event_tx.send(SeqEvent::Started { id: request.id });
 
-    let started = Instant::now();
     std::thread::sleep(config.tx_tail);
 
     let report = match sink.play(&full, cancel) {
@@ -166,6 +191,19 @@ fn transmit_one(
             return (TxOutcome::Failed(err.to_string()), started.elapsed());
         }
     };
+
+    if cancel.is_expired() {
+        // Powrót z wyjścia po terminie to przekroczenie limitu, nawet gdy
+        // wyjście nie zgłosiło anulowania (zawieszony sink). Limit ma też
+        // pierwszeństwo przed przerwaniem: nadanie, które go przekracza,
+        // przekroczy go i po ponownym wstawieniu do kolejki.
+        tracing::error!(
+            id = request.id,
+            limit_s = config.tx_max_duration.as_secs(),
+            "nadanie ucięte na twardym limicie czasu"
+        );
+        return (TxOutcome::Failed(TX_TIMEOUT_ERROR.to_owned()), report.played);
+    }
 
     std::thread::sleep(config.tx_tail);
 
@@ -251,7 +289,9 @@ mod tests {
     use super::*;
     use crate::interlock::InMemoryInterlocks;
     use crate::ptt::{FakePtt, PttEvent};
-    use crate::sink::FakeSink;
+    use crate::sink::{FakeSink, PlayReport, SinkError};
+    use crate::watchdog::{Watchdog, WatchdogHandle};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     struct Rig {
@@ -273,8 +313,71 @@ mod tests {
                 tx_max_duration: Duration::from_secs(10),
                 id_interval: Duration::from_secs(600),
             },
+            None,
         );
         Rig { handle, ptt, interlocks }
+    }
+
+    /// Wyjście, które zapamiętuje, co strażnik widział w chwili grania,
+    /// i na życzenie zawodzi zamiast grać.
+    struct ProbeSink {
+        inner: FakeSink,
+        marker: WatchdogMarker,
+        fail: bool,
+        keyed_while_playing: Mutex<Vec<bool>>,
+    }
+
+    impl AudioSink for ProbeSink {
+        fn play(&self, pcm: &Pcm, cancel: &CancelToken) -> Result<PlayReport, SinkError> {
+            self.keyed_while_playing.lock().unwrap().push(self.marker.is_keyed());
+            if self.fail {
+                return Err(SinkError::Device("urządzenie zniknęło".to_owned()));
+            }
+            self.inner.play(pcm, cancel)
+        }
+    }
+
+    struct GuardedRig {
+        handle: SequencerHandle,
+        ptt: Arc<FakePtt>,
+        sink: Arc<ProbeSink>,
+        marker: WatchdogMarker,
+        watchdog: WatchdogHandle,
+    }
+
+    /// Sekwencer ze strażnikiem. Strażnik ma limit z dużym zapasem, żeby w
+    /// tych testach nigdy nie interweniował — sprawdzamy tylko znakowanie.
+    fn guarded_rig(tx_max: Duration, fail: bool) -> GuardedRig {
+        let ptt = Arc::new(FakePtt::new());
+        let watchdog = Watchdog::spawn(ptt.clone(), tx_max + Duration::from_secs(30));
+        let marker = watchdog.marker();
+        let sink = Arc::new(ProbeSink {
+            inner: FakeSink::new(),
+            marker: marker.clone(),
+            fail,
+            keyed_while_playing: Mutex::new(Vec::new()),
+        });
+        let handle = Sequencer::spawn(
+            ptt.clone(),
+            sink.clone(),
+            Arc::new(InMemoryInterlocks::permissive()),
+            SequencerConfig {
+                tx_tail: Duration::from_millis(1),
+                tx_max_duration: tx_max,
+                id_interval: Duration::from_secs(600),
+            },
+            Some(marker.clone()),
+        );
+        GuardedRig { handle, ptt, sink, marker, watchdog }
+    }
+
+    async fn finished(handle: &mut SequencerHandle) -> SeqEvent {
+        loop {
+            let event = handle.next_event().await.expect("sekwencer żyje");
+            if !matches!(event, SeqEvent::Started { .. }) {
+                return event;
+            }
+        }
     }
 
     fn request(id: i64, priority: Priority) -> TransmitRequest {
@@ -435,5 +538,171 @@ mod tests {
             matches!(finished, SeqEvent::Finished { id: 1, outcome: TxOutcome::Ok, .. }),
             "nadanie o wyższym priorytecie musi dojść do końca: {finished:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_transmission_longer_than_the_limit_is_cut_and_reported_as_timeout() {
+        let mut rig = guarded_rig(Duration::from_secs(1), false);
+        let mut long = request(1, Priority::Normal);
+        long.body = Pcm::silence(48_000, Duration::from_secs(3));
+        long.id_audio = None;
+
+        let began = Instant::now();
+        rig.handle.transmit(long).await.unwrap();
+        let event = finished(&mut rig.handle).await;
+        let took = began.elapsed();
+
+        let SeqEvent::Finished { id: 1, outcome, played } = event else {
+            panic!("oczekiwano Finished, dostano {event:?}");
+        };
+        assert_eq!(outcome, TxOutcome::Failed(TX_TIMEOUT_ERROR.to_owned()));
+        assert!(played < Duration::from_millis(1500), "grało {played:?} mimo limitu 1 s");
+        assert!(took < Duration::from_millis(1500), "nadanie trwało {took:?} mimo limitu 1 s");
+        assert!(!rig.ptt.is_keyed(), "po ucięciu PTT musi opaść");
+        assert_eq!(rig.ptt.events(), vec![PttEvent::Key, PttEvent::Unkey]);
+        assert!(!rig.marker.is_keyed());
+        assert!(
+            !rig.marker.is_poisoned(),
+            "sekwencer uciął sam — strażnik nie miał powodu interweniować"
+        );
+        rig.watchdog.stop();
+    }
+
+    #[tokio::test]
+    async fn the_watchdog_marker_sees_key_and_unkey() {
+        let mut rig = guarded_rig(Duration::from_secs(10), false);
+
+        rig.handle.transmit(request(1, Priority::Normal)).await.unwrap();
+        let event = finished(&mut rig.handle).await;
+
+        assert!(matches!(event, SeqEvent::Finished { outcome: TxOutcome::Ok, .. }), "{event:?}");
+        assert_eq!(
+            *rig.sink.keyed_while_playing.lock().unwrap(),
+            vec![true],
+            "w trakcie grania strażnik musi wiedzieć, że nadajemy"
+        );
+        assert!(!rig.marker.is_keyed(), "po nadaniu strażnik musi widzieć „nie nadaje”");
+        rig.watchdog.stop();
+    }
+
+    #[tokio::test]
+    async fn ptt_is_released_and_the_marker_cleared_when_playback_fails() {
+        let mut rig = guarded_rig(Duration::from_secs(10), true);
+
+        rig.handle.transmit(request(1, Priority::Normal)).await.unwrap();
+        let event = finished(&mut rig.handle).await;
+
+        assert!(
+            matches!(&event, SeqEvent::Finished { outcome: TxOutcome::Failed(err), .. }
+                if err != TX_TIMEOUT_ERROR),
+            "{event:?}"
+        );
+        assert_eq!(*rig.sink.keyed_while_playing.lock().unwrap(), vec![true]);
+        assert!(!rig.ptt.is_keyed());
+        assert!(!rig.marker.is_keyed(), "błąd audio nie może zostawić znacznika podniesienia");
+        rig.watchdog.stop();
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_watchdog_refuses_the_next_transmission_without_touching_ptt() {
+        let ptt = Arc::new(FakePtt::new());
+        let watchdog = Watchdog::spawn(ptt.clone(), Duration::from_millis(50));
+        let marker = watchdog.marker();
+        // Zawieszone nadanie spoza sekwencera: strażnik musi interweniować.
+        ptt.key().unwrap();
+        marker.mark_keyed();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(marker.is_poisoned());
+        let before = ptt.events();
+
+        // Interlocki jeszcze o niczym nie wiedzą (binarka przenosi flagę co
+        // sekundę) — sekwencer i tak nie może nadać.
+        let mut handle = Sequencer::spawn(
+            ptt.clone(),
+            Arc::new(FakeSink::new()),
+            Arc::new(InMemoryInterlocks::permissive()),
+            SequencerConfig {
+                tx_tail: Duration::from_millis(1),
+                tx_max_duration: Duration::from_secs(10),
+                id_interval: Duration::from_secs(600),
+            },
+            Some(marker),
+        );
+        handle.transmit(request(1, Priority::Emergency)).await.unwrap();
+        let event = handle.next_event().await.unwrap();
+
+        assert!(
+            matches!(event, SeqEvent::Refused { id: 1, reason: RefusalReason::Poisoned }),
+            "{event:?}"
+        );
+        assert_eq!(ptt.events(), before, "PTT nie może drgnąć przy odmowie");
+        watchdog.stop();
+    }
+
+    /// Wyjście, które się zawiesza: ignoruje anulowanie i termin, śpi długo
+    /// po limicie — model zawieszonego sekwencera. Zapamiętuje, czy PTT było
+    /// jeszcze podniesione, gdy w końcu wróciło.
+    struct HangingSink {
+        hang: Duration,
+        ptt: Arc<FakePtt>,
+        keyed_on_return: Mutex<Option<bool>>,
+    }
+
+    impl AudioSink for HangingSink {
+        fn play(&self, _pcm: &Pcm, _cancel: &CancelToken) -> Result<PlayReport, SinkError> {
+            std::thread::sleep(self.hang);
+            *self.keyed_on_return.lock().unwrap() = Some(self.ptt.is_keyed());
+            Ok(PlayReport { played: self.hang, cancelled: false })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hung_sequencer_is_forced_down_by_the_watchdog_and_the_next_transmission_refused() {
+        let ptt = Arc::new(FakePtt::new());
+        // Limit sekwencera 200 ms, watchdog 300 ms; sink wisi 1,5 s.
+        let watchdog = Watchdog::spawn(ptt.clone(), Duration::from_millis(300));
+        let marker = watchdog.marker();
+        let sink = Arc::new(HangingSink {
+            hang: Duration::from_millis(1500),
+            ptt: ptt.clone(),
+            keyed_on_return: Mutex::new(None),
+        });
+        let mut handle = Sequencer::spawn(
+            ptt.clone(),
+            sink.clone(),
+            Arc::new(InMemoryInterlocks::permissive()),
+            SequencerConfig {
+                tx_tail: Duration::from_millis(1),
+                tx_max_duration: Duration::from_millis(200),
+                id_interval: Duration::from_secs(600),
+            },
+            Some(marker.clone()),
+        );
+
+        handle.transmit(request(1, Priority::Normal)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        // Sekwencer wciąż wisi w sinku, a nadajnik już jest zdjęty z anteny.
+        assert!(!ptt.is_keyed(), "watchdog musi opuścić PTT zawieszonego sekwencera");
+        assert!(ptt.events().contains(&PttEvent::ForceUnkey), "{:?}", ptt.events());
+        assert!(marker.is_poisoned());
+
+        let event = finished(&mut handle).await;
+        assert_eq!(*sink.keyed_on_return.lock().unwrap(), Some(false));
+        assert!(
+            matches!(&event, SeqEvent::Finished { id: 1, outcome: TxOutcome::Failed(err), .. }
+                if err == TX_TIMEOUT_ERROR),
+            "nadanie po terminie to timeout, nawet gdy sink udaje sukces: {event:?}"
+        );
+
+        let keys_before = ptt.events().iter().filter(|e| **e == PttEvent::Key).count();
+        handle.transmit(request(2, Priority::Emergency)).await.unwrap();
+        let event = handle.next_event().await.unwrap();
+        assert!(
+            matches!(event, SeqEvent::Refused { id: 2, reason: RefusalReason::Poisoned }),
+            "{event:?}"
+        );
+        let keys_after = ptt.events().iter().filter(|e| **e == PttEvent::Key).count();
+        assert_eq!(keys_before, keys_after, "po interwencji PTT nie może się podnieść");
+        watchdog.stop();
     }
 }

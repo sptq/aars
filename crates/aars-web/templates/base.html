@@ -12,10 +12,15 @@
   <h1>AARS — stacja ostrzegawcza</h1>
   <nav>
     <a href="/">Pulpit</a>
-    {% if can_operate %}<a href="/compose">Nadaj</a>{% endif %}
-    <span class="badge warn">{{ username }} · {{ role }}</span>
+    {% if chrome.can_operate %}<a href="/compose">Nadaj</a>
+    <a href="/messages">Komunikaty</a>
+    <a href="/queue">Kolejka</a>{% endif %}
+    <a href="/logs">Dzienniki</a>
+    {% if chrome.is_admin %}<a href="/settings">Ustawienia</a>
+    <a href="/users">Użytkownicy</a>{% endif %}
+    <span class="badge warn">{{ chrome.username }} · {{ chrome.role }}</span>
     <form method="post" action="/logout" style="margin:0">
-      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
       <button class="ghost" type="submit">Wyloguj</button>
     </form>
   </nav>

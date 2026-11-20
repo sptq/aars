@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}AARS — dzienniki{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Ostatnie nadania</h2>
+  {% if transmissions.is_empty() %}
+  <p style="color:var(--muted)">Nic jeszcze nie nadano.</p>
+  {% else %}
+  <table>
+    <thead><tr><th>Czas</th><th>Wynik</th><th>Długość</th><th>Treść</th></tr></thead>
+    <tbody>
+      {% for row in transmissions %}
+      <tr><td>{{ row.at }}</td><td>{{ row.result }}</td><td>{{ row.seconds }} s</td><td>{{ row.text }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+<div class="card">
+  <h2>Dziennik audytu</h2>
+  {% if audit.is_empty() %}
+  <p style="color:var(--muted)">Brak wpisów.</p>
+  {% else %}
+  <table>
+    <thead><tr><th>Czas</th><th>Użytkownik</th><th>Akcja</th><th>Szczegóły</th></tr></thead>
+    <tbody>
+      {% for row in audit %}
+      <tr><td>{{ row.at }}</td><td>{{ row.user }}</td><td>{{ row.action }}</td><td>{{ row.detail }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+{% endblock %}

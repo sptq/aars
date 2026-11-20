@@ -9,6 +9,7 @@ use crate::wav::{read_wav_mono, write_wav_mono};
 /// Cache audio adresowany treścią: ten sam tekst i te same parametry głosu
 /// dają ten sam plik, więc podgląd w panelu i nadanie na pasmo korzystają z
 /// jednego WAV-a (spec §4.1).
+#[derive(Clone)]
 pub struct AudioCache {
     pool: SqlitePool,
     dir: PathBuf,
@@ -50,8 +51,10 @@ impl AudioCache {
 
         if let Some(path) = existing {
             let path = PathBuf::from(path);
-            if path.exists() {
-                let pcm = read_wav_mono(&path)?;
+            // Bez osobnego `exists()`: `prune` (np. z podglądu) może usunąć
+            // plik między sprawdzeniem a odczytem. Każdy nieudany odczyt —
+            // brak pliku czy uszkodzony plik — to chybienie, nie błąd.
+            if let Ok(pcm) = read_wav_mono(&path) {
                 sqlx::query(
                     "UPDATE audio_cache SET last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE hash = ?",
                 )
@@ -61,7 +64,7 @@ impl AudioCache {
                 .map_err(|e| SynthError::Engine(format!("aktualizacja cache: {e}")))?;
                 return Ok((path, pcm));
             }
-            // Wpis bez pliku: ktoś wyczyścił katalog pod nami. Syntezujemy ponownie.
+            // Wpis bez czytelnego pliku: ktoś wyczyścił katalog pod nami.
             tracing::warn!(%key, path = %path.display(), "wpis cache bez pliku, ponowna synteza");
             sqlx::query("DELETE FROM audio_cache WHERE hash = ?")
                 .bind(&key)
@@ -189,6 +192,28 @@ mod tests {
 
         let (again, _) = cache.render(&synth, "test", &voice).await.unwrap();
         assert!(again.exists());
+        assert_eq!(synth.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_cache_file_that_cannot_be_read_is_a_miss_not_an_error() {
+        // Tak wygląda wyścig z `prune`: plik istniał przy sprawdzeniu, ale
+        // odczyt się nie udał. Uszkodzony plik daje ten sam odczyt deterministycznie.
+        let pool = aars_core::db::test_pool().await;
+        let dir = tmp_dir("unreadable");
+        let cache = AudioCache::new(pool, dir.0.clone(), 10 * 1024 * 1024);
+        let synth = FakeSynth::new(48_000);
+        let voice = VoiceParams::default();
+
+        let (path, first) = cache.render(&synth, "test", &voice).await.unwrap();
+        std::fs::write(&path, b"to nie jest WAV").unwrap();
+
+        let (again, pcm) = cache.render(&synth, "test", &voice).await.unwrap();
+        assert_eq!(again, path);
+        assert_eq!(pcm, first);
+        assert_eq!(synth.requests().len(), 2, "nieczytelny wpis syntezujemy ponownie");
+        // Wpis jest znów poprawny: trzecie wywołanie trafia w cache.
+        cache.render(&synth, "test", &voice).await.unwrap();
         assert_eq!(synth.requests().len(), 2);
     }
 

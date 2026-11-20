@@ -5,11 +5,14 @@ use std::time::Duration;
 
 use chrono::Utc;
 
+use crate::interlock::RefusalReason;
 use crate::priority::Priority;
 use crate::queue::{QueueItem, QueueRepo};
 use crate::sequencer::{SeqEvent, SequencerHandle, TransmitRequest, TxOutcome};
 use crate::sink::CancelToken;
 use crate::synth::Pcm;
+use crate::txlog::{TxLogEntry, TxLogRepo};
+use crate::watchdog::TX_TIMEOUT_ERROR;
 
 pub type RenderFuture<'a> = Pin<Box<dyn Future<Output = Result<Pcm, String>> + Send + 'a>>;
 
@@ -26,16 +29,25 @@ pub trait Renderer: Send + Sync {
 pub struct DispatcherConfig {
     /// Jak często zaglądać do kolejki, gdy nic nie leci.
     pub tick: Duration,
+    /// Nazwa backendu PTT zapisywana w dzienniku nadań.
+    pub ptt_backend: &'static str,
 }
 
 /// Spina kolejkę z sekwencerem: bierze zadanie, syntezuje, nadaje, zapisuje
 /// wynik. Jedyne miejsce, które decyduje o przerwaniu trwającego nadania.
 pub struct Dispatcher {
     queue: Arc<QueueRepo>,
+    tx_log: TxLogRepo,
     renderer: Arc<dyn Renderer>,
     sequencer: SequencerHandle,
     config: DispatcherConfig,
+    /// Odstęp ponownej próby po odmowie przez interlock.
+    hold_retry: Duration,
 }
+
+/// Odstęp ponownej próby po odmowie: po włączeniu nadawania komunikat idzie
+/// szybko, a dyspozytor nie kręci się w pętli.
+const HOLD_RETRY: Duration = Duration::from_secs(30);
 
 impl Dispatcher {
     pub fn new(
@@ -44,7 +56,14 @@ impl Dispatcher {
         sequencer: SequencerHandle,
         config: DispatcherConfig,
     ) -> Self {
-        Self { queue, renderer, sequencer, config }
+        let tx_log = TxLogRepo::new(queue.pool().clone());
+        Self { queue, tx_log, renderer, sequencer, config, hold_retry: HOLD_RETRY }
+    }
+
+    /// Skraca odstęp ponownej próby po odmowie (testy).
+    pub fn with_hold_retry(mut self, hold_retry: Duration) -> Self {
+        self.hold_retry = hold_retry;
+        self
     }
 
     pub async fn run(mut self, shutdown: CancelToken) {
@@ -119,13 +138,15 @@ impl Dispatcher {
                         Some(SeqEvent::Started { .. }) => continue,
                         Some(SeqEvent::Refused { id: refused, reason }) => {
                             tracing::warn!(id = refused, ?reason, "nadanie odrzucone, wracam do kolejki");
-                            // Odmowa nie gubi komunikatu: wraca z powodem i
-                            // odstępem, żeby nie kręcić się w kółko.
-                            let retry_at = Utc::now() + chrono::Duration::seconds(30);
+                            // Odmowa nie gubi komunikatu: wraca wstrzymany, z powodem
+                            // i odstępem, bez zużycia próby.
+                            let retry_at = Utc::now()
+                                + chrono::Duration::from_std(self.hold_retry)
+                                    .unwrap_or_else(|_| chrono::Duration::seconds(30));
                             if let Err(err) =
-                                self.queue.requeue(refused, &format!("{reason:?}"), retry_at).await
+                                self.queue.hold(refused, hold_reason(reason), retry_at).await
                             {
-                                tracing::error!(id = refused, %err, "zwrot zadania do kolejki zawiódł");
+                                tracing::error!(id = refused, %err, "wstrzymanie zadania zawiodło");
                             }
                             if refused == id {
                                 return;
@@ -150,6 +171,24 @@ impl Dispatcher {
     }
 
     async fn record_outcome(&self, id: i64, outcome: TxOutcome, played: Duration) {
+        // Dziennik nadań jest dodatkiem: jego awaria jest tylko logowana
+        // i nie rusza aktualizacji stanu kolejki.
+        let ended_at = Utc::now();
+        let played_for =
+            chrono::Duration::from_std(played).unwrap_or_else(|_| chrono::Duration::zero());
+        let (tx_result, note) = tx_result(&outcome);
+        let entry = TxLogEntry {
+            queue_item_id: id,
+            started_at: ended_at - played_for,
+            ended_at,
+            ptt_backend: self.config.ptt_backend.to_owned(),
+            result: tx_result,
+            note,
+        };
+        if let Err(err) = self.tx_log.record(entry).await {
+            tracing::error!(id, %err, "zapis do dziennika nadań zawiódł");
+        }
+
         let result = match outcome {
             TxOutcome::Ok => {
                 tracing::info!(id, played_ms = played.as_millis(), "nadanie zakończone");
@@ -157,7 +196,7 @@ impl Dispatcher {
             }
             TxOutcome::Aborted => {
                 tracing::warn!(id, "nadanie przerwane, zadanie wraca do kolejki");
-                self.queue.requeue(id, "przerwane pilniejszym komunikatem", Utc::now()).await
+                self.queue.interrupted(id, "przerwane pilniejszym komunikatem").await
             }
             TxOutcome::Failed(err) => {
                 tracing::error!(id, %err, "nadanie nieudane");
@@ -217,6 +256,30 @@ impl Dispatcher {
             tracing::error!(id = claimed.id, %err, "sekwencer nie przyjął komunikatu przerywającego");
             let _ = self.queue.mark_failed(claimed.id, &err).await;
         }
+    }
+}
+
+/// Powód wstrzymania pokazywany w panelu. Prefiks `wstrzymane:` odróżnia go
+/// od błędów (UI pokazuje tylko wstrzymania).
+pub const HELD_PREFIX: &str = "wstrzymane:";
+
+fn hold_reason(reason: RefusalReason) -> &'static str {
+    match reason {
+        RefusalReason::TxDisabled => "wstrzymane: nadawanie wyłączone",
+        RefusalReason::Poisoned => "wstrzymane: blokada watchdoga",
+        RefusalReason::QuietHours => "wstrzymane: okno ciszy",
+        RefusalReason::Inhibited => "wstrzymane: blokada sprzętowa",
+        RefusalReason::ChannelBusy => "wstrzymane: kanał zajęty",
+    }
+}
+
+/// Wynik do `tx_log` i notatka (treść błędu) dla zakończonego nadania.
+fn tx_result(outcome: &TxOutcome) -> (&'static str, Option<String>) {
+    match outcome {
+        TxOutcome::Ok => ("ok", None),
+        TxOutcome::Aborted => ("aborted", None),
+        TxOutcome::Failed(err) if err == TX_TIMEOUT_ERROR => ("timeout", Some(err.clone())),
+        TxOutcome::Failed(err) => ("failed", Some(err.clone())),
     }
 }
 
@@ -283,7 +346,135 @@ mod tests {
                 tx_max_duration: Duration::from_secs(30),
                 id_interval: Duration::from_secs(600),
             },
+            None,
         )
+    }
+
+    struct InterlockHarness {
+        repo: Arc<QueueRepo>,
+        interlocks: Arc<InMemoryInterlocks>,
+        shutdown: CancelToken,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn harness_with_interlocks() -> InterlockHarness {
+        let repo = Arc::new(QueueRepo::new(test_pool().await));
+        let interlocks = Arc::new(InMemoryInterlocks::permissive());
+        let sequencer = Sequencer::spawn(
+            Arc::new(FakePtt::new()),
+            Arc::new(FakeSink::new()),
+            interlocks.clone(),
+            SequencerConfig {
+                tx_tail: Duration::from_millis(1),
+                tx_max_duration: Duration::from_secs(30),
+                id_interval: Duration::from_secs(600),
+            },
+            None,
+        );
+        let shutdown = CancelToken::new();
+        let dispatcher = Dispatcher::new(
+            repo.clone(),
+            Arc::new(FakeRenderer::new(48_000, 2)),
+            sequencer,
+            DispatcherConfig { tick: Duration::from_millis(10), ptt_backend: "fake" },
+        )
+        .with_hold_retry(Duration::from_millis(50));
+        let task = tokio::spawn(dispatcher.run(shutdown.clone()));
+        InterlockHarness { repo, interlocks, shutdown, task }
+    }
+
+    impl InterlockHarness {
+        async fn finish(self) {
+            self.shutdown.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(5), self.task).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_item_waits_instead_of_failing() {
+        let h = harness_with_interlocks().await;
+        h.interlocks.set_tx_enabled(false);
+        let id = h.repo.enqueue(req("czeka", Priority::Normal, false)).await.unwrap()[0];
+
+        // Dużo więcej niż MAX_ATTEMPTS cykli odmowy (co 50 ms). Próbkujemy
+        // stan, bo element chwilowo bywa `transmitting` między claimem
+        // a zwrotem do kolejki.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(700);
+        let mut seen_pending = None;
+        while tokio::time::Instant::now() < deadline {
+            let row: (String, i64, Option<String>) =
+                sqlx::query_as("SELECT state, attempt, error FROM queue_items WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(h.repo.pool())
+                    .await
+                    .unwrap();
+            assert_ne!(row.0, "failed", "odmowa nie może kończyć się porażką");
+            if row.0 == "pending" {
+                seen_pending = Some(row);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (state, attempt, error) = seen_pending.expect("element musi czekać jako pending");
+        assert_eq!(state, "pending", "odmowa nie może kończyć się porażką");
+        assert_eq!(attempt, 0, "odmowa nie liczy się jako próba");
+        assert_eq!(error.as_deref(), Some("wstrzymane: nadawanie wyłączone"));
+
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_held_item_goes_out_after_transmitting_is_enabled_again() {
+        let h = harness_with_interlocks().await;
+        h.interlocks.set_tx_enabled(false);
+        let id = h.repo.enqueue(req("czeka", Priority::Normal, false)).await.unwrap()[0];
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        h.interlocks.set_tx_enabled(true);
+
+        assert!(
+            wait_for_state(h.repo.pool(), id, "done", Duration::from_secs(5)).await,
+            "wstrzymany komunikat musi zostać nadany po włączeniu nadawania"
+        );
+        let error: Option<String> = sqlx::query_scalar("SELECT error FROM queue_items WHERE id = ?")
+            .bind(id)
+            .fetch_one(h.repo.pool())
+            .await
+            .unwrap();
+        assert_eq!(error, None, "nadany element nie niesie powodu wstrzymania");
+
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_real_failure_still_counts_attempts() {
+        let h = harness(2).await;
+        let id = h.repo.enqueue(req("FAIL", Priority::Normal, false)).await.unwrap()[0];
+        assert!(h.wait_for_state(id, "failed", Duration::from_secs(5)).await);
+
+        let attempt: i64 = sqlx::query_scalar("SELECT attempt FROM queue_items WHERE id = ?")
+            .bind(id)
+            .fetch_one(h.repo.pool())
+            .await
+            .unwrap();
+        assert_eq!(attempt, 1, "prawdziwa porażka liczy próbę");
+
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_held_item_still_expires() {
+        let h = harness_with_interlocks().await;
+        h.interlocks.set_tx_enabled(false);
+        let mut r = req("przedawni się", Priority::Normal, false);
+        r.expires_at = Some(Utc::now() + chrono::Duration::milliseconds(300));
+        let id = h.repo.enqueue(r).await.unwrap()[0];
+
+        assert!(
+            wait_for_state(h.repo.pool(), id, "expired", Duration::from_secs(5)).await,
+            "wstrzymany komunikat wygasa przez expires_at"
+        );
+
+        h.finish().await;
     }
 
     struct Harness {
@@ -303,7 +494,7 @@ mod tests {
             repo.clone(),
             Arc::new(FakeRenderer::new(48_000, ms_per_char)),
             spawn_sequencer(ptt.clone()),
-            DispatcherConfig { tick: Duration::from_millis(10) },
+            DispatcherConfig { tick: Duration::from_millis(10), ptt_backend: "fake" },
         );
         let task = tokio::spawn(dispatcher.run(shutdown.clone()));
 
@@ -446,7 +637,7 @@ mod tests {
             repo.clone(),
             Arc::new(FakeRenderer::new(48_000, 2)),
             spawn_sequencer(Arc::new(FakePtt::new())),
-            DispatcherConfig { tick: Duration::from_millis(10) },
+            DispatcherConfig { tick: Duration::from_millis(10), ptt_backend: "fake" },
         );
         let task = tokio::spawn(dispatcher.run(shutdown.clone()));
 
@@ -457,5 +648,64 @@ mod tests {
 
         shutdown.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    async fn tx_log_rows(repo: &QueueRepo) -> Vec<crate::txlog::TxLogRow> {
+        crate::txlog::TxLogRepo::new(repo.pool().clone()).recent(10).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_finished_transmission_is_written_to_the_tx_log() {
+        let h = harness(2).await;
+        let id = h.repo.enqueue(req("komunikat", Priority::Normal, false)).await.unwrap()[0];
+        assert!(h.wait_for_state(id, "done", Duration::from_secs(5)).await);
+
+        let rows = tx_log_rows(&h.repo).await;
+
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].queue_item_id, id);
+        assert_eq!(rows[0].result, "ok");
+        assert_eq!(rows[0].ptt_backend, "fake");
+        assert!(rows[0].duration_ms > 0, "{:?}", rows[0]);
+        assert_eq!(rows[0].text.as_deref(), Some("komunikat"));
+
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_transmission_is_logged_as_aborted() {
+        let h = harness(40).await;
+        let slow = h
+            .repo
+            .enqueue(req("dlugi komunikat zwyczajny", Priority::Normal, false))
+            .await
+            .unwrap()[0];
+        assert!(h.wait_for_state(slow, "transmitting", Duration::from_secs(5)).await);
+        let urgent = h.repo.enqueue(req("alarm", Priority::Emergency, true)).await.unwrap()[0];
+        assert!(h.wait_for_state(urgent, "done", Duration::from_secs(10)).await);
+
+        let rows = tx_log_rows(&h.repo).await;
+
+        assert!(
+            rows.iter().any(|r| r.queue_item_id == slow && r.result == "aborted"),
+            "{rows:?}"
+        );
+
+        h.finish().await;
+    }
+
+    #[test]
+    fn only_the_watchdog_message_maps_to_a_timeout() {
+        use crate::watchdog::TX_TIMEOUT_ERROR;
+        assert_eq!(tx_result(&TxOutcome::Ok), ("ok", None));
+        assert_eq!(tx_result(&TxOutcome::Aborted), ("aborted", None));
+        assert_eq!(
+            tx_result(&TxOutcome::Failed(TX_TIMEOUT_ERROR.to_owned())),
+            ("timeout", Some(TX_TIMEOUT_ERROR.to_owned()))
+        );
+        assert_eq!(
+            tx_result(&TxOutcome::Failed("inny błąd".to_owned())),
+            ("failed", Some("inny błąd".to_owned()))
+        );
     }
 }
