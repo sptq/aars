@@ -12,5 +12,6 @@ pub mod scheduler;
 pub mod sequencer;
 pub mod sink;
 pub mod synth;
+pub mod txlog;
 pub mod watchdog;
 pub mod user;

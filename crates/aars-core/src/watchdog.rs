@@ -22,6 +22,10 @@ struct Shared {
 
 /// Niezależny strażnik czasu nadawania. Osobny wątek OS i monotoniczny
 /// zegar, bo musi opuścić PTT nawet gdy runtime tokio stanie (spec D7).
+/// Treść błędu, którym kończy się nadanie ucięte twardym limitem czasu.
+/// Dyspozytor rozpoznaje po niej wynik `timeout` w `tx_log`.
+pub const TX_TIMEOUT_ERROR: &str = "przekroczony twardy limit czasu nadawania";
+
 pub struct Watchdog;
 
 pub struct WatchdogHandle {

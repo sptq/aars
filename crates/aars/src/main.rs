@@ -279,7 +279,14 @@ async fn main() -> Result<()> {
                 queue.clone(),
                 renderer,
                 stack.sequencer,
-                DispatcherConfig { tick: std::time::Duration::from_millis(500) },
+                DispatcherConfig {
+                    tick: std::time::Duration::from_millis(500),
+                    ptt_backend: match config.ptt.backend {
+                        aars_core::config::PttBackendKind::Gpio => "gpio",
+                        aars_core::config::PttBackendKind::Serial => "serial",
+                        aars_core::config::PttBackendKind::Vox => "vox",
+                    },
+                },
             );
             let scheduler = aars_core::scheduler::Scheduler::new(
                 aars_core::message::MessageRepo::new(pool.clone()),

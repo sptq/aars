@@ -2,6 +2,7 @@ pub mod account;
 pub mod assets;
 pub mod auth;
 pub mod chrome;
+pub mod logs;
 pub mod messages;
 pub mod preview;
 pub mod queue_page;
@@ -376,6 +377,7 @@ pub fn router(state: AppState) -> Router {
         .route("/queue/{id}/cancel", post(cancel_item))
         .route("/fragments/queue", get(queue_fragment))
         .route("/queue", get(queue_page::page_view))
+        .route("/logs", get(logs::page_view))
         .route("/queue/group/{group}/cancel", post(queue_page::cancel_group))
         .route("/healthz", get(|| async { "ok" }))
         .route("/assets/{*path}", get(assets::serve))
@@ -1167,5 +1169,59 @@ mod tests {
         let response =
             post_form(&app, &cookie, "/messages/9999/send", format!("csrf={csrf}")).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_viewer_sees_transmissions_and_audit_entries() {
+        let (app, op_cookie, csrf, state) = logged_in(Role::Operator).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/compose")
+                    .header(header::COOKIE, op_cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("csrf={csrf}&text=komunikat+dziennika&priority=normal")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let id = state.queue.pending(10).await.unwrap()[0].id;
+        let now = chrono::Utc::now();
+        aars_core::txlog::TxLogRepo::new(state.pool.clone())
+            .record(aars_core::txlog::TxLogEntry {
+                queue_item_id: id,
+                started_at: now - chrono::Duration::seconds(7),
+                ended_at: now,
+                ptt_backend: "gpio".to_owned(),
+                result: "ok",
+                note: None,
+            })
+            .await
+            .unwrap();
+
+        UserRepo::new(state.pool.clone()).create("v", "haslo", Role::Viewer).await.unwrap();
+        let (viewer_cookie, _) = login(&app, "v", "haslo").await;
+        let html = get_body(app, &viewer_cookie, "/logs").await;
+
+        assert!(html.contains("nadane"), "{html}");
+        assert!(html.contains("komunikat dziennika"), "{html}");
+        assert!(html.contains("compose"), "{html}");
+        assert!(html.contains("UTC"), "{html}");
+        assert!(html.contains("lokalnie"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn anonymous_visitors_are_sent_to_login() {
+        let response = router(state().await)
+            .oneshot(Request::builder().uri("/logs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/login");
     }
 }
