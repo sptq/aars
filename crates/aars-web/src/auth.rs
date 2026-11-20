@@ -21,6 +21,8 @@ pub enum AuthRejection {
     Anonymous,
     Forbidden,
     CsrfMismatch,
+    /// Konto ma hasło tymczasowe: do czasu zmiany wolno tylko formularz zmiany.
+    MustChangePassword,
 }
 
 impl IntoResponse for AuthRejection {
@@ -30,6 +32,7 @@ impl IntoResponse for AuthRejection {
             Self::Forbidden => {
                 (StatusCode::FORBIDDEN, "brak uprawnień do tej operacji").into_response()
             }
+            Self::MustChangePassword => Redirect::to("/account/password").into_response(),
             Self::CsrfMismatch => {
                 (StatusCode::FORBIDDEN, "niepoprawny token formularza").into_response()
             }
@@ -46,7 +49,18 @@ pub fn session_id_from_cookies(header_value: Option<&str>) -> Option<String> {
 }
 
 fn session_id_from(parts: &Parts) -> Option<String> {
-    session_id_from_cookies(parts.headers.get(header::COOKIE).and_then(|v| v.to_str().ok()))
+    session_id_from_cookies(
+        parts
+            .headers
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+
+/// Ścieżki dostępne przy niezmienionym haśle tymczasowym. `/assets/*` i
+/// `/login` nie używają `CurrentUser`, więc nie wymagają wyjątku.
+fn allowed_while_password_unchanged(path: &str) -> bool {
+    matches!(path, "/account/password" | "/logout")
 }
 
 impl FromRequestParts<AppState> for CurrentUser {
@@ -65,6 +79,9 @@ impl FromRequestParts<AppState> for CurrentUser {
                 AuthRejection::Anonymous
             })?
             .ok_or(AuthRejection::Anonymous)?;
+        if user.must_change_password && !allowed_while_password_unchanged(parts.uri.path()) {
+            return Err(AuthRejection::MustChangePassword);
+        }
         Ok(CurrentUser { user, csrf_token })
     }
 }
