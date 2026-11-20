@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 
+use crate::interlock::RefusalReason;
 use crate::priority::Priority;
 use crate::queue::{QueueItem, QueueRepo};
 use crate::sequencer::{SeqEvent, SequencerHandle, TransmitRequest, TxOutcome};
@@ -40,7 +41,13 @@ pub struct Dispatcher {
     renderer: Arc<dyn Renderer>,
     sequencer: SequencerHandle,
     config: DispatcherConfig,
+    /// Odstęp ponownej próby po odmowie przez interlock.
+    hold_retry: Duration,
 }
+
+/// Odstęp ponownej próby po odmowie: po włączeniu nadawania komunikat idzie
+/// szybko, a dyspozytor nie kręci się w pętli.
+const HOLD_RETRY: Duration = Duration::from_secs(30);
 
 impl Dispatcher {
     pub fn new(
@@ -50,7 +57,13 @@ impl Dispatcher {
         config: DispatcherConfig,
     ) -> Self {
         let tx_log = TxLogRepo::new(queue.pool().clone());
-        Self { queue, tx_log, renderer, sequencer, config }
+        Self { queue, tx_log, renderer, sequencer, config, hold_retry: HOLD_RETRY }
+    }
+
+    /// Skraca odstęp ponownej próby po odmowie (testy).
+    pub fn with_hold_retry(mut self, hold_retry: Duration) -> Self {
+        self.hold_retry = hold_retry;
+        self
     }
 
     pub async fn run(mut self, shutdown: CancelToken) {
@@ -125,13 +138,15 @@ impl Dispatcher {
                         Some(SeqEvent::Started { .. }) => continue,
                         Some(SeqEvent::Refused { id: refused, reason }) => {
                             tracing::warn!(id = refused, ?reason, "nadanie odrzucone, wracam do kolejki");
-                            // Odmowa nie gubi komunikatu: wraca z powodem i
-                            // odstępem, żeby nie kręcić się w kółko.
-                            let retry_at = Utc::now() + chrono::Duration::seconds(30);
+                            // Odmowa nie gubi komunikatu: wraca wstrzymany, z powodem
+                            // i odstępem, bez zużycia próby.
+                            let retry_at = Utc::now()
+                                + chrono::Duration::from_std(self.hold_retry)
+                                    .unwrap_or_else(|_| chrono::Duration::seconds(30));
                             if let Err(err) =
-                                self.queue.requeue(refused, &format!("{reason:?}"), retry_at).await
+                                self.queue.hold(refused, hold_reason(reason), retry_at).await
                             {
-                                tracing::error!(id = refused, %err, "zwrot zadania do kolejki zawiódł");
+                                tracing::error!(id = refused, %err, "wstrzymanie zadania zawiodło");
                             }
                             if refused == id {
                                 return;
@@ -244,6 +259,20 @@ impl Dispatcher {
     }
 }
 
+/// Powód wstrzymania pokazywany w panelu. Prefiks `wstrzymane:` odróżnia go
+/// od błędów (UI pokazuje tylko wstrzymania).
+pub const HELD_PREFIX: &str = "wstrzymane:";
+
+fn hold_reason(reason: RefusalReason) -> &'static str {
+    match reason {
+        RefusalReason::TxDisabled => "wstrzymane: nadawanie wyłączone",
+        RefusalReason::Poisoned => "wstrzymane: blokada watchdoga",
+        RefusalReason::QuietHours => "wstrzymane: okno ciszy",
+        RefusalReason::Inhibited => "wstrzymane: blokada sprzętowa",
+        RefusalReason::ChannelBusy => "wstrzymane: kanał zajęty",
+    }
+}
+
 /// Wynik do `tx_log` i notatka (treść błędu) dla zakończonego nadania.
 fn tx_result(outcome: &TxOutcome) -> (&'static str, Option<String>) {
     match outcome {
@@ -319,6 +348,127 @@ mod tests {
             },
             None,
         )
+    }
+
+    struct InterlockHarness {
+        repo: Arc<QueueRepo>,
+        interlocks: Arc<InMemoryInterlocks>,
+        shutdown: CancelToken,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn harness_with_interlocks() -> InterlockHarness {
+        let repo = Arc::new(QueueRepo::new(test_pool().await));
+        let interlocks = Arc::new(InMemoryInterlocks::permissive());
+        let sequencer = Sequencer::spawn(
+            Arc::new(FakePtt::new()),
+            Arc::new(FakeSink::new()),
+            interlocks.clone(),
+            SequencerConfig {
+                tx_tail: Duration::from_millis(1),
+                tx_max_duration: Duration::from_secs(30),
+                id_interval: Duration::from_secs(600),
+            },
+            None,
+        );
+        let shutdown = CancelToken::new();
+        let dispatcher = Dispatcher::new(
+            repo.clone(),
+            Arc::new(FakeRenderer::new(48_000, 2)),
+            sequencer,
+            DispatcherConfig { tick: Duration::from_millis(10), ptt_backend: "fake" },
+        )
+        .with_hold_retry(Duration::from_millis(50));
+        let task = tokio::spawn(dispatcher.run(shutdown.clone()));
+        InterlockHarness { repo, interlocks, shutdown, task }
+    }
+
+    impl InterlockHarness {
+        async fn finish(self) {
+            self.shutdown.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(5), self.task).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_item_waits_instead_of_failing() {
+        let h = harness_with_interlocks().await;
+        h.interlocks.set_tx_enabled(false);
+        let id = h.repo.enqueue(req("czeka", Priority::Normal, false)).await.unwrap()[0];
+
+        // Dużo więcej niż MAX_ATTEMPTS cykli odmowy (co 50 ms). Próbkujemy
+        // stan, bo element chwilowo bywa `transmitting` między claimem
+        // a zwrotem do kolejki.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(700);
+        let mut seen_pending = None;
+        while tokio::time::Instant::now() < deadline {
+            let row: (String, i64, Option<String>) =
+                sqlx::query_as("SELECT state, attempt, error FROM queue_items WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(h.repo.pool())
+                    .await
+                    .unwrap();
+            assert_ne!(row.0, "failed", "odmowa nie może kończyć się porażką");
+            if row.0 == "pending" {
+                seen_pending = Some(row);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (state, attempt, error) = seen_pending.expect("element musi czekać jako pending");
+        assert_eq!(state, "pending", "odmowa nie może kończyć się porażką");
+        assert_eq!(attempt, 0, "odmowa nie liczy się jako próba");
+        assert_eq!(error.as_deref(), Some("wstrzymane: nadawanie wyłączone"));
+
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_held_item_goes_out_after_transmitting_is_enabled_again() {
+        let h = harness_with_interlocks().await;
+        h.interlocks.set_tx_enabled(false);
+        let id = h.repo.enqueue(req("czeka", Priority::Normal, false)).await.unwrap()[0];
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        h.interlocks.set_tx_enabled(true);
+
+        assert!(
+            wait_for_state(h.repo.pool(), id, "done", Duration::from_secs(5)).await,
+            "wstrzymany komunikat musi zostać nadany po włączeniu nadawania"
+        );
+
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_real_failure_still_counts_attempts() {
+        let h = harness(2).await;
+        let id = h.repo.enqueue(req("FAIL", Priority::Normal, false)).await.unwrap()[0];
+        assert!(h.wait_for_state(id, "failed", Duration::from_secs(5)).await);
+
+        let attempt: i64 = sqlx::query_scalar("SELECT attempt FROM queue_items WHERE id = ?")
+            .bind(id)
+            .fetch_one(h.repo.pool())
+            .await
+            .unwrap();
+        assert_eq!(attempt, 1, "prawdziwa porażka liczy próbę");
+
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_held_item_still_expires() {
+        let h = harness_with_interlocks().await;
+        h.interlocks.set_tx_enabled(false);
+        let mut r = req("przedawni się", Priority::Normal, false);
+        r.expires_at = Some(Utc::now() + chrono::Duration::milliseconds(300));
+        let id = h.repo.enqueue(r).await.unwrap()[0];
+
+        assert!(
+            wait_for_state(h.repo.pool(), id, "expired", Duration::from_secs(5)).await,
+            "wstrzymany komunikat wygasa przez expires_at"
+        );
+
+        h.finish().await;
     }
 
     struct Harness {

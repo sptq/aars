@@ -15,7 +15,8 @@
       <td>{{ item.priority }}{% if item.interrupting %} ·
           <span class="badge warn">przerywa</span>{% endif %}</td>
       <td>{{ item.not_before }}</td>
-      <td>{{ item.text }}</td>
+      <td>{{ item.text }}{% if let Some(held) = item.held %}
+          <br><span class="badge warn">{{ held }}</span>{% endif %}</td>
       <td>{{ item.repeat_label }}</td>
       {% if chrome.can_operate %}
       <td><button class="ghost" hx-post="/queue/{{ item.id }}/cancel{% if full %}?full=1{% endif %}"
