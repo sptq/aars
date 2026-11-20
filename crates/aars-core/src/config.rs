@@ -27,6 +27,21 @@ pub struct SourcesConfig {
     pub imgw_meteo_url: String,
 }
 
+impl SourcesConfig {
+    /// Adres musi być URL-em http(s); literówka ma wyjść przy starcie, nie
+    /// jako wieczna porażka odpytywania.
+    fn validate(&self) -> Result<(), ConfigError> {
+        let url = self.imgw_meteo_url.as_str();
+        let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
+        match rest {
+            Some(rest) if !rest.is_empty() && !rest.starts_with('/') && !url.contains(char::is_whitespace) => Ok(()),
+            _ => Err(ConfigError::Invalid(Box::new(figment::Error::from(format!(
+                "sources.imgw_meteo_url: „{url}” nie jest adresem http:// ani https://"
+            ))))),
+        }
+    }
+}
+
 impl Default for SourcesConfig {
     fn default() -> Self {
         Self {
@@ -183,10 +198,12 @@ impl Config {
             figment = figment.merge(Toml::file(path));
         }
 
-        figment
+        let config: Config = figment
             .merge(Env::prefixed("AARS_").split("__"))
             .extract()
-            .map_err(|e| ConfigError::Invalid(Box::new(e)))
+            .map_err(|e| ConfigError::Invalid(Box::new(e)))?;
+        config.sources.validate()?;
+        Ok(config)
     }
 }
 
@@ -223,6 +240,18 @@ mod tests {
             assert_eq!(cfg.sources.imgw_meteo_url, "http://127.0.0.1:9/x");
             Ok(())
         });
+    }
+
+    #[test]
+    fn a_malformed_imgw_url_is_a_config_error() {
+        for bad in ["", "ftp://x/y", "danepubliczne.imgw.pl", "http://", "https:// x"] {
+            figment::Jail::expect_with(|jail| {
+                jail.set_env("AARS_SOURCES__IMGW_METEO_URL", bad);
+                let err = Config::load(None).unwrap_err().to_string();
+                assert!(err.contains("imgw_meteo_url"), "{bad:?}: {err}");
+                Ok(())
+            });
+        }
     }
 
     // Każdy test dotykający konfiguracji pracuje w `figment::Jail`, który
