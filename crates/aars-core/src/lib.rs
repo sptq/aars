@@ -3,6 +3,7 @@ pub mod config;
 pub mod db;
 pub mod dispatcher;
 pub mod error;
+pub mod hardware;
 pub mod ident;
 pub mod interlock;
 pub mod message;
