@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use aars_audio::cache::AudioCache;
+use aars_audio::resample::apply_gain_db;
 use aars_core::dispatcher::{RenderFuture, Renderer};
 use aars_core::ident::{IdMode, MorseParams, morse_pcm};
 use aars_core::synth::{Pcm, Synthesizer, VoiceParams};
@@ -13,6 +14,8 @@ pub struct PiperRenderer {
     cache: AudioCache,
     synth: Arc<dyn Synthesizer>,
     ident: Option<Pcm>,
+    /// Poziom szczytowy w dBFS; nakładany po cache (w cache leży PCM bez niego).
+    gain_db: f32,
 }
 
 impl PiperRenderer {
@@ -22,6 +25,7 @@ impl PiperRenderer {
         callsign: &str,
         id_mode: IdMode,
         sample_rate: u32,
+        gain_db: f32,
     ) -> Self {
         let ident = if callsign.is_empty() {
             tracing::warn!("znak wywoławczy nieustawiony — nadania bez identyfikacji");
@@ -42,10 +46,12 @@ impl PiperRenderer {
             }
         };
 
+        let ident = ident.map(|pcm| apply_gain_db(&pcm, gain_db));
         Self {
             cache,
             synth,
             ident,
+            gain_db,
         }
     }
 }
@@ -56,7 +62,7 @@ impl Renderer for PiperRenderer {
             self.cache
                 .render(self.synth.as_ref(), text, &VoiceParams::default())
                 .await
-                .map(|(_, pcm)| pcm)
+                .map(|(_, pcm)| apply_gain_db(&pcm, self.gain_db))
                 .map_err(|e| e.to_string())
         })
     }
@@ -75,14 +81,16 @@ pub struct PiperPreview {
     /// Jeden podgląd naraz: synteza to osobny proces i CPU, a panel nie może
     /// przez nią zagłodzić nadawania.
     permit: Arc<Semaphore>,
+    gain_db: f32,
 }
 
 impl PiperPreview {
-    pub fn new(cache: AudioCache, synth: Arc<dyn Synthesizer>) -> Self {
+    pub fn new(cache: AudioCache, synth: Arc<dyn Synthesizer>, gain_db: f32) -> Self {
         Self {
             cache,
             synth,
             permit: Arc::new(Semaphore::new(1)),
+            gain_db,
         }
     }
 }
@@ -113,7 +121,7 @@ impl PreviewRenderer for PiperPreview {
             if pcm.samples.is_empty() {
                 return Err("brak treści do odczytania po normalizacji".to_owned());
             }
-            aars_audio::wav::wav_bytes_mono(&pcm).map_err(|e| e.to_string())
+            aars_audio::wav::wav_bytes_mono(&apply_gain_db(&pcm, self.gain_db)).map_err(|e| e.to_string())
         })
     }
 }
@@ -141,7 +149,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let cache = AudioCache::new(aars_core::db::test_pool().await, dir.clone(), 1 << 20);
-        (PiperPreview::new(cache, synth), dir)
+        (PiperPreview::new(cache, synth, -3.0), dir)
     }
 
     /// Unikalny w procesie: na macOS dwa testy potrafią dostać te same
@@ -149,6 +157,56 @@ mod tests {
     fn rand_suffix() -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn peak(pcm: &Pcm) -> f32 {
+        f32::from(pcm.samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0))
+    }
+
+    async fn renderer(gain_db: f32, mode: IdMode) -> (PiperRenderer, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("aars-rend-{}-{}", std::process::id(), rand_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = AudioCache::new(aars_core::db::test_pool().await, dir.clone(), 1 << 20);
+        let r = PiperRenderer::new(cache, Arc::new(FakeSynth::new(22_050)), "SP7TQ", mode, 22_050, gain_db);
+        (r, dir)
+    }
+
+    #[tokio::test]
+    async fn the_output_level_follows_gain_db() {
+        let (quiet, d1) = renderer(-6.0, IdMode::Voice).await;
+        let (loud, d2) = renderer(-3.0, IdMode::Voice).await;
+        let q = peak(&quiet.render("Uwaga").await.unwrap());
+        let l = peak(&loud.render("Uwaga").await.unwrap());
+        let want = 32_767.0 * 10f32.powf(-6.0 / 20.0);
+        assert!((q - want).abs() <= want * 0.01, "{q} vs {want}");
+        assert!(l > q);
+        // identyfikacja głosowa też idzie przez wzmocnienie
+        let ident = peak(&quiet.ident().unwrap());
+        assert!((ident - want).abs() <= want * 0.01, "{ident}");
+        std::fs::remove_dir_all(d1).ok();
+        std::fs::remove_dir_all(d2).ok();
+    }
+
+    #[tokio::test]
+    async fn the_cw_ident_follows_gain_db_too() {
+        let (r, dir) = renderer(-6.0, IdMode::Cw).await;
+        let want = 32_767.0 * 10f32.powf(-6.0 / 20.0);
+        let p = peak(&r.ident().unwrap());
+        assert!((p - want).abs() <= want * 0.01, "{p} vs {want}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_preview_follows_gain_db() {
+        let dir = std::env::temp_dir().join(format!("aars-prevg-{}-{}", std::process::id(), rand_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = AudioCache::new(aars_core::db::test_pool().await, dir.clone(), 1 << 20);
+        let p = PiperPreview::new(cache, Arc::new(FakeSynth::new(22_050)), -6.0);
+        let bytes = p.render_wav("Uwaga").await.unwrap();
+        let peak = bytes[44..].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]).unsigned_abs()).max().unwrap();
+        let want = 32_767.0 * 10f32.powf(-6.0 / 20.0);
+        assert!((f32::from(peak) - want).abs() <= want * 0.01, "{peak}");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test(flavor = "multi_thread")]

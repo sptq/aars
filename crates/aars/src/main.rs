@@ -263,13 +263,14 @@ async fn main() -> Result<()> {
                 config.storage.cache_dir.clone(),
                 config.storage.cache_max_bytes,
             );
-            let preview = Arc::new(render::PiperPreview::new(cache.clone(), synth.clone()));
+            let preview = Arc::new(render::PiperPreview::new(cache.clone(), synth.clone(), config.audio.gain_db));
             let renderer = Arc::new(render::PiperRenderer::new(
                 cache,
                 synth,
                 &callsign,
                 id_mode,
                 config.audio.sample_rate,
+                config.audio.gain_db,
             ));
 
             let misfire_grace_s: u64 = sqlx::query_scalar::<_, String>(

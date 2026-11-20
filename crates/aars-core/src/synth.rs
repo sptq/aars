@@ -57,6 +57,12 @@ impl Default for VoiceParams {
 
 pub trait Synthesizer: Send + Sync {
     fn synthesize(&self, text: &str, voice: &VoiceParams) -> Result<Pcm, SynthError>;
+
+    /// Tożsamość syntezatora (model, częstotliwość) wchodzi do klucza cache,
+    /// żeby zmiana głosu albo częstotliwości nie oddała starego audio (R19).
+    fn identity(&self) -> String {
+        String::new()
+    }
 }
 
 /// Syntezator testowy: deterministyczny ton o długości proporcjonalnej do
@@ -64,11 +70,18 @@ pub trait Synthesizer: Send + Sync {
 pub struct FakeSynth {
     sample_rate: u32,
     requests: Mutex<Vec<String>>,
+    identity: String,
 }
 
 impl FakeSynth {
     pub fn new(sample_rate: u32) -> Self {
-        Self { sample_rate, requests: Mutex::new(Vec::new()) }
+        Self { sample_rate, requests: Mutex::new(Vec::new()), identity: String::new() }
+    }
+
+    /// Tożsamość do klucza cache (testy zmiany głosu).
+    pub fn with_identity(mut self, id: &str) -> Self {
+        self.identity = id.to_owned();
+        self
     }
 
     /// Teksty, o których syntezę ktoś poprosił, w kolejności.
@@ -78,6 +91,10 @@ impl FakeSynth {
 }
 
 impl Synthesizer for FakeSynth {
+    fn identity(&self) -> String {
+        self.identity.clone()
+    }
+
     fn synthesize(&self, text: &str, _voice: &VoiceParams) -> Result<Pcm, SynthError> {
         self.requests.lock().expect("mutex fake'a").push(text.to_owned());
 
