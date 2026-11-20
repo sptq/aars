@@ -284,3 +284,44 @@ fn source_preview_reports_a_malformed_area_as_invalid() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn hardware_reset_clears_panel_overrides() {
+    let dir = std::env::temp_dir().join(format!("aars-hw-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("hw.db");
+    let _ = std::fs::remove_file(&db);
+
+    let migrate = aars().env("AARS_STORAGE__DB_PATH", &db).arg("migrate").output().unwrap();
+    assert!(migrate.status.success(), "{}", String::from_utf8_lossy(&migrate.stderr));
+
+    let set = std::process::Command::new("sqlite3")
+        .arg(&db)
+        .arg(
+            "INSERT INTO settings (key, value) VALUES ('hw:audio.device', 'hw:1,0'), \
+             ('hw_good:audio.device', 'hw:1,0'), ('hw_state:origin', 'panel');",
+        )
+        .status()
+        .unwrap();
+    assert!(set.success());
+
+    let show = aars().env("AARS_STORAGE__DB_PATH", &db).args(["hardware", "show"]).output().unwrap();
+    assert!(show.status.success(), "{}", String::from_utf8_lossy(&show.stderr));
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(stdout.contains("audio.device = hw:1,0  (panel)"), "{stdout}");
+
+    let out = aars().env("AARS_STORAGE__DB_PATH", &db).args(["hardware", "reset"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("aars.toml"), "{stdout}");
+    assert!(stdout.contains("usunięto 3"), "{stdout}");
+
+    let left = std::process::Command::new("sqlite3")
+        .arg(&db)
+        .arg("SELECT COUNT(*) FROM settings WHERE key LIKE 'hw%:%';")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "0");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -11,6 +11,8 @@ use aars_core::sequencer::{Sequencer, SequencerConfig, SequencerHandle};
 use aars_core::sink::CancelToken;
 use aars_core::watchdog::{Watchdog, WatchdogHandle, WatchdogMarker};
 
+use crate::station::HardwareFactory;
+
 /// O ile watchdog czeka dłużej niż sekwencer (ponad `tx_tail`). Sekwencer
 /// ucina nadanie na `tx_max_duration` sam; strażnik z tym samym limitem
 /// ścigałby się z nim o kilkadziesiąt milisekund i zatruwał stację przy
@@ -45,15 +47,9 @@ async fn read_setting(pool: &SqlitePool, key: &str) -> Result<String> {
     Ok(value)
 }
 
-pub async fn build_stack(config: &Config, pool: &SqlitePool) -> Result<RadioStack> {
-    let ptt = aars_ptt::build(&config.ptt).context("budowa backendu PTT")?;
-    let sink: Arc<dyn aars_core::sink::AudioSink> = Arc::new(
-        aars_audio::output::CpalSink::open(&config.audio.device, config.audio.sample_rate)
-            .context("otwarcie urządzenia audio")?,
-    );
-
-    let tx_max_s: u64 = read_setting(pool, "tx_max_duration_s").await?.parse().unwrap_or(180);
-    let id_interval_s: u64 = read_setting(pool, "id_interval_s").await?.parse().unwrap_or(600);
+/// Interlocki odtworzone z tabeli `settings`: wyłącznik i lepka blokada
+/// strażnika przetrwują restart. Okno ciszy ustawia `quiet_hours_task`.
+pub async fn load_interlocks(pool: &SqlitePool) -> Result<Arc<InMemoryInterlocks>> {
     let tx_enabled = read_setting(pool, "tx_enabled").await? == "true";
     let poisoned = read_setting(pool, "poisoned").await? == "true";
     let quiet_min: i64 = read_setting(pool, "quiet_min_priority").await?.parse().unwrap_or(0);
@@ -62,6 +58,33 @@ pub async fn build_stack(config: &Config, pool: &SqlitePool) -> Result<RadioStac
     interlocks.set_tx_enabled(tx_enabled);
     interlocks.set_poisoned(poisoned);
     interlocks.set_quiet(false, Priority::from_i64(quiet_min).unwrap_or(Priority::Emergency));
+    Ok(interlocks)
+}
+
+/// Jedyne miejsce, które otwiera PTT i wyjście audio (D2), przez fabrykę,
+/// żeby testy podmieniły sprzęt. Ustawienia czytamy przed otwarciem sprzętu;
+/// gdy wyjście audio zawiedzie po udanym PTT, PTT ginie razem z tą funkcją,
+/// zanim ktokolwiek spróbuje następnego kandydata.
+pub async fn build_stack(
+    config: &Config,
+    pool: &SqlitePool,
+    factory: &dyn HardwareFactory,
+) -> Result<RadioStack> {
+    let tx_max_s: u64 = read_setting(pool, "tx_max_duration_s").await?.parse().unwrap_or(180);
+    let id_interval_s: u64 = read_setting(pool, "id_interval_s").await?.parse().unwrap_or(600);
+    let interlocks = load_interlocks(pool).await?;
+
+    let ptt = factory
+        .ptt(&config.ptt)
+        .map_err(anyhow::Error::msg)
+        .context("budowa backendu PTT")?;
+    let sink = match factory.sink(&config.audio) {
+        Ok(sink) => sink,
+        Err(err) => {
+            drop(ptt);
+            return Err(anyhow::Error::msg(err).context("otwarcie urządzenia audio"));
+        }
+    };
 
     let tx_tail = Duration::from_millis(config.ptt.tx_tail_ms);
     let watchdog =

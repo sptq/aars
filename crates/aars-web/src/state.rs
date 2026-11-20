@@ -1,10 +1,34 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::preview::PreviewRenderer;
 
+use aars_core::dispatcher::{StationTest, TestOutcome};
+use aars_core::hardware::{ApplyStatus, HardwareSettings};
 use aars_core::interlock::InMemoryInterlocks;
 use aars_core::queue::QueueRepo;
+use aars_core::settings::StationSettings;
 use sqlx::SqlitePool;
+
+pub type TestFuture<'a> = Pin<Box<dyn Future<Output = TestOutcome> + Send + 'a>>;
+
+/// Odpowiedź na test, gdy stacja działa bez stosu nadawczego (R6).
+pub const NO_RADIO: &str = "stacja działa bez sprzętu nadawczego — popraw ustawienia sprzętu";
+
+/// Panel o działającej stacji (etap 9): z jakiej konfiguracji wstała, czym
+/// nadaje, żądanie restartu w procesie (R4) i testy sprzętu (R10, R11).
+/// Implementacja żyje w binarce, bo tylko ona zna stos nadawczy.
+pub trait StationControl: Send + Sync {
+    fn apply_status(&self) -> ApplyStatus;
+    /// Sprzęt, którym stacja nadaje; `None` = praca bez nadawania.
+    fn running_hardware(&self) -> Option<HardwareSettings>;
+    /// Ustawienia stacji wczytane przy starcie (lista „czeka na restart”).
+    fn running_station(&self) -> StationSettings;
+    fn request_restart(&self);
+    /// Bez stosu nadawczego: `TestOutcome::Unsupported(NO_RADIO)`.
+    fn run_test(&self, test: StationTest) -> TestFuture<'_>;
+}
 
 /// Wszystko, czego panel potrzebuje od rdzenia. Panel nie trzyma uchwytu do
 /// sekwencera — tylko wkłada zadania do kolejki (spec §10).

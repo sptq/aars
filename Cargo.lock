@@ -18,6 +18,7 @@ dependencies = [
  "croner",
  "sqlx",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
