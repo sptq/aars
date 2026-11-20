@@ -66,7 +66,10 @@ const POSTS: &[(&str, u8)] = &[
     ("/settings/hardware", ADMIN),
     ("/settings/hardware/test-ptt", ADMIN),
     ("/settings/hardware/test-audio", ADMIN),
+    ("/settings/position", ADMIN),
     ("/station/restart", ADMIN),
+    ("/modules/scheduler/enabled", ADMIN),
+    ("/modules/imgw-meteo/settings", ADMIN),
     ("/users", ADMIN),
     ("/users/1/role", ADMIN),
     ("/users/1/disabled", ADMIN),
@@ -169,6 +172,7 @@ async fn every_get_route_enforces_its_minimum_role() {
         },
         get("/queue", OPERATOR),
         get("/sources", OPERATOR),
+        get("/modules", OPERATOR),
         get("/settings", ADMIN),
         get("/settings/hardware", ADMIN),
         get("/users", ADMIN),
@@ -312,7 +316,12 @@ async fn every_post_route_enforces_its_role_with_a_valid_csrf_token() {
         // Brak potwierdzenia w ciele: 400 przed sprawdzeniem stacji.
         ("/settings/hardware/test-ptt", ADMIN, 400),
         ("/settings/hardware/test-audio", ADMIN, 503),
+        // Ciało nie ma pól pozycji: wszystkie puste kasują pozycję.
+        ("/settings/position", ADMIN, 303),
         ("/station/restart", ADMIN, 503),
+        ("/modules/scheduler/enabled", ADMIN, 303),
+        // `interval_s=5` jest poza zakresem 60–3600.
+        ("/modules/imgw-meteo/settings", ADMIN, 400),
         ("/users", ADMIN, 200),
         ("/users/999/role", ADMIN, 404),
         ("/users/999/disabled", ADMIN, 404),

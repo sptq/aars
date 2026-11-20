@@ -1,39 +1,47 @@
 # Skopiuj do aars.toml i dostosuj. Każde pole można nadpisać zmienną
-# środowiskową, np. AARS_SERVER__BIND=127.0.0.1:8080
-
-[server]
-bind = "0.0.0.0:8080"
-
-[audio]
-device = "default"
-sample_rate = 48000
-gain_db = -3.0
-
-[ptt]
-backend = "vox"         # gpio | serial | vox
-channel_busy = "none"
-tx_tail_ms = 250
-
-[ptt.gpio]
-chip = "/dev/gpiochip0"
-line = 17
-active_low = false
-# inhibit_line = 27
-
-[ptt.serial]
-port = "/dev/ttyUSB0"
-line = "dtr"            # dtr | rts
-
-[tts]
-piper_bin = "piper"
-model = "/var/lib/aars/voices/pl_PL-darkman-medium.onnx"
+# środowiskową, np. AARS_STORAGE__DB_PATH=/var/lib/aars/aars.db
+#
+# Na świeżej instalacji wystarczą ścieżki poniżej. Sprzęt (PTT, audio, głos,
+# adres panelu) ustawia administrator w panelu: Ustawienia → Sprzęt.
 
 [storage]
 db_path = "var/aars.db"
 cache_dir = "var/cache"
 cache_max_bytes = 536870912
 
+[tts]
+piper_bin = "piper"
+# Katalog z głosami: panel pokazuje pliki *.onnx, które mają obok *.onnx.json.
+voices_dir = "/var/lib/aars/voices"
+# Ustawiane w panelu (Ustawienia → Sprzęt). Wartości tutaj są tylko startowe; panel ma pierwszeństwo.
+# model = "/var/lib/aars/voices/pl_PL-darkman-medium.onnx"
+
 [sources]
 # Adres API ostrzeżeń meteo IMGW. Włączanie źródła, obszar i interwał ustawia
-# się w panelu (/sources); źródło po instalacji jest wyłączone.
+# się w panelu (/modules); źródło po instalacji jest wyłączone.
 imgw_meteo_url = "https://danepubliczne.imgw.pl/api/data/warningsmeteo"
+
+# Ustawiane w panelu (Ustawienia → Sprzęt). Wartości tutaj są tylko startowe; panel ma pierwszeństwo.
+#
+# [server]
+# bind = "0.0.0.0:8080"
+#
+# [audio]
+# device = "default"
+# sample_rate = 48000
+# gain_db = -3.0
+#
+# [ptt]
+# backend = "vox"         # gpio | serial | vox
+# channel_busy = "none"
+# tx_tail_ms = 250
+#
+# [ptt.gpio]
+# chip = "/dev/gpiochip0"
+# line = 17
+# active_low = false
+# inhibit_line = 27
+#
+# [ptt.serial]
+# port = "/dev/ttyUSB0"
+# line = "dtr"            # dtr | rts

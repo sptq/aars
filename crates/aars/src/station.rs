@@ -1278,4 +1278,215 @@ mod tests {
         assert!(matches!(exit, Exit::Stop));
         assert_eq!(get(&pool, "poisoned").await.as_deref(), Some("true"));
     }
+
+    // --- Kryterium wyjścia etapu 9 ---------------------------------------
+
+    fn form_encode(text: &str) -> String {
+        text.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+
+    async fn send(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        body: String,
+    ) -> (axum::http::StatusCode, Option<String>, String) {
+        use axum::http::{Request, header};
+        use tower::ServiceExt;
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, cookie);
+        }
+        if method == "POST" {
+            request = request.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(axum::body::Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(';').next().unwrap_or_default().to_owned());
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, cookie, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    async fn audit_count(pool: &SqlitePool, action: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = ?")
+            .bind(action)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Świeża instalacja: w konfiguracji tylko ścieżki, a administrator
+    /// ustawia z panelu PTT, wyjście audio, głos, pozycję i moduły. Stacja
+    /// buduje się potem z tych ustawień (kryterium wyjścia etapu 9).
+    #[tokio::test]
+    async fn a_fresh_install_is_configured_entirely_from_the_panel() -> Result<()> {
+        use aars_core::geo::PositionRepo;
+        use aars_core::hardware::probe::{FakeProbe, GpioChipInfo};
+        use aars_core::message::MessageRepo;
+        use aars_core::scheduler::{Scheduler, SchedulerConfig};
+        use aars_core::user::{Role, UserRepo};
+        use aars_web::state::AppState;
+        use aars_web::state::testing::FakeStation;
+        use axum::http::StatusCode;
+        use chrono::Utc;
+
+        let dir = std::env::temp_dir().join(format!("aars-fresh-install-{}", std::process::id()));
+        let voices = dir.join("voices");
+        std::fs::create_dir_all(&voices)?;
+        let model = voices.join("pl_PL-test.onnx");
+        std::fs::write(&model, b"model")?;
+        std::fs::write(voices.join("pl_PL-test.onnx.json"), b"{}")?;
+        let mut base = Config::default();
+        base.storage.db_path = dir.join("aars.db");
+        base.storage.cache_dir = dir.join("cache");
+        base.tts.voices_dir = voices.clone();
+
+        let pool = aars_core::db::test_pool().await;
+        let mut descriptors = aars_core::module::builtin();
+        descriptors.extend(aars_sources::modules().into_iter().map(|m| m.descriptor));
+        let registry = Arc::new(ModuleRegistry::new(descriptors));
+        ModuleRepo::new(pool.clone()).register(&registry).await?;
+        let probe = FakeProbe {
+            audio: Ok(vec!["default".to_owned(), "hw:1,0".to_owned()]),
+            serial: Ok(vec![]),
+            gpio: Ok(vec![GpioChipInfo {
+                path: "/dev/gpiochip0".to_owned(),
+                label: "pinctrl".to_owned(),
+                lines: 28,
+            }]),
+        };
+        let station = FakeStation::new(Some(HardwareSettings::from_config(&base)));
+        let state = AppState::for_tests(pool.clone())
+            .with_modules(registry)
+            .with_probe(Arc::new(probe))
+            .with_station(Arc::new(station))
+            .with_base_config(Arc::new(base.clone()));
+        UserRepo::new(pool.clone())
+            .create("admin", "haslo", Role::Admin)
+            .await?;
+        let app = aars_web::router(state);
+
+        let (_, cookie, _) = send(
+            &app,
+            "POST",
+            "/login",
+            None,
+            "username=admin&password=haslo".to_owned(),
+        )
+        .await;
+        let cookie = cookie.expect("logowanie ustawia cookie");
+        let (_, _, dashboard) = send(&app, "GET", "/", Some(&cookie), String::new()).await;
+        let csrf = dashboard
+            .split("name=\"csrf\" value=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("token CSRF na pulpicie")
+            .to_owned();
+
+        let hardware_form = [
+            ("bind", "0.0.0.0:8080".to_owned()),
+            ("audio_device", "hw:1,0".to_owned()),
+            ("sample_rate", "48000".to_owned()),
+            ("gain_db", "-3".to_owned()),
+            ("ptt_backend", "gpio".to_owned()),
+            ("tx_tail_ms", "200".to_owned()),
+            ("gpio_chip", "gpiochip0".to_owned()),
+            ("gpio_line", "17".to_owned()),
+            ("gpio_inhibit_line", String::new()),
+            ("serial_port", "/dev/ttyUSB0".to_owned()),
+            ("serial_line", "rts".to_owned()),
+            ("voice_model", model.display().to_string()),
+        ]
+        .iter()
+        .map(|(k, v)| format!("{k}={}", form_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+        for (uri, fields, expected) in [
+            ("/settings/hardware", hardware_form, StatusCode::SEE_OTHER),
+            ("/settings/position", "locator=JO91RS".to_owned(), StatusCode::SEE_OTHER),
+            (
+                "/modules/imgw-meteo/settings",
+                "area=10&interval_s=300".to_owned(),
+                StatusCode::SEE_OTHER,
+            ),
+            ("/modules/imgw-meteo/enabled", "enabled=1".to_owned(), StatusCode::SEE_OTHER),
+            ("/modules/scheduler/enabled", "enabled=0".to_owned(), StatusCode::SEE_OTHER),
+        ] {
+            let (status, _, body) = send(
+                &app,
+                "POST",
+                uri,
+                Some(&cookie),
+                format!("csrf={csrf}&{fields}"),
+            )
+            .await;
+            assert_eq!(status, expected, "POST {uri}: {body}");
+        }
+
+        // Stacja buduje się z tego, co zapisał panel.
+        let hardware = FakeHardware::new(&[]);
+        let (cands, _) = candidates(
+            &base,
+            &HardwareRepo::new(pool.clone()).overrides().await?,
+            &BTreeMap::new(),
+        );
+        let (built, errors) = build_first(cands, &hardware, &pool).await;
+        let (stack, used) = built.expect("stos z ustawień panelu");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(used.origin, ConfigOrigin::Panel);
+        assert_eq!(
+            hardware.seen(),
+            vec![(PttBackendKind::Gpio, "hw:1,0".to_owned())]
+        );
+        assert_eq!(used.config.ptt.gpio.line, 17);
+        assert_eq!(used.config.audio.sample_rate, 48000);
+        assert_eq!(used.config.server.bind, "0.0.0.0:8080");
+        assert!(used.config.tts.model.ends_with("pl_PL-test.onnx"));
+        close(stack);
+
+        assert_eq!(
+            PositionRepo::new(pool.clone()).load().await?.unwrap().locator,
+            "JO91RS"
+        );
+        let imgw = SourceStateRepo::new(pool.clone())
+            .config("imgw-meteo")
+            .await?
+            .unwrap();
+        assert!(imgw.enabled);
+        assert_eq!(imgw.area.len(), 1);
+        let queue = Arc::new(QueueRepo::new(pool.clone()));
+        let scheduler = Scheduler::new(
+            MessageRepo::new(pool.clone()),
+            queue,
+            SchedulerConfig {
+                misfire_grace: Duration::from_secs(300),
+                tick: Duration::from_secs(1),
+            },
+        );
+        assert!(scheduler.tick(Utc::now()).await?.disabled);
+        for action in ["hardware", "position", "module_settings", "module_enabled"] {
+            assert!(audit_count(&pool, action).await >= 1, "{action}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 }

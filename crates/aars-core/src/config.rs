@@ -238,6 +238,29 @@ mod tests {
         Figment::from(Toml::string(toml)).extract().unwrap()
     }
 
+    /// `aars.example.toml` ma tylko ścieżki (etap 9): reszta to wartości
+    /// domyślne, nadpisywane z panelu.
+    #[test]
+    fn the_paths_only_example_config_loads() {
+        let example =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../aars.example.toml");
+        let text = std::fs::read_to_string(&example).unwrap();
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("aars.toml", &text)?;
+            let cfg = Config::load(Some(std::path::Path::new("aars.toml"))).unwrap();
+            let defaults = Config::default();
+            assert_eq!(cfg.server, defaults.server);
+            assert_eq!(cfg.audio, defaults.audio);
+            assert_eq!(cfg.ptt, defaults.ptt);
+            assert_eq!(cfg.tts.model, defaults.tts.model);
+            assert_eq!(
+                cfg.tts.voices_dir,
+                std::path::PathBuf::from("/var/lib/aars/voices")
+            );
+            Ok(())
+        });
+    }
+
     #[test]
     fn a_config_without_sources_uses_the_imgw_default() {
         figment::Jail::expect_with(|jail| {
