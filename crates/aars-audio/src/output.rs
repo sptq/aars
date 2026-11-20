@@ -13,6 +13,20 @@ pub struct CpalSink {
     sample_rate: u32,
 }
 
+/// Nazwy wyjść, takie same jak te, które porównuje [`CpalSink::open`].
+/// Tylko listuje; żadne urządzenie nie jest otwierane.
+pub fn output_device_names() -> Result<Vec<String>, SinkError> {
+    let devices = cpal::default_host()
+        .output_devices()
+        .map_err(|e| SinkError::Device(format!("lista urządzeń: {e}")))?;
+    let mut names: Vec<String> = devices
+        .filter_map(|d| d.description().ok().map(|desc| desc.name().to_owned()))
+        .collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
 impl CpalSink {
     pub fn open(device_name: &str, sample_rate: u32) -> Result<Self, SinkError> {
         let host = cpal::default_host();

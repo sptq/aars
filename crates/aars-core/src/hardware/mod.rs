@@ -12,6 +12,8 @@ use crate::config::{Config, PttBackendKind, SerialPttLine};
 use crate::error::DbError;
 use crate::settings::SettingsRepo;
 
+pub mod probe;
+
 pub const HW_PREFIX: &str = "hw:";
 pub const HW_GOOD_PREFIX: &str = "hw_good:";
 pub const HW_STATE_PREFIX: &str = "hw_state:";

@@ -1,4 +1,7 @@
 mod cli;
+// Podłączane w kolejnych zadaniach etapu 9 (panel sprzętu).
+#[allow(dead_code)]
+mod probe;
 mod radio;
 mod render;
 
