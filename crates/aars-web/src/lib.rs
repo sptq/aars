@@ -7,6 +7,7 @@ pub mod messages;
 pub mod preview;
 pub mod queue_page;
 pub mod render;
+pub mod settings_page;
 pub mod state;
 
 use aars_core::interlock::Interlocks;
@@ -418,6 +419,7 @@ pub fn router(state: AppState) -> Router {
         .route("/fragments/queue", get(queue_fragment))
         .route("/queue", get(queue_page::page_view))
         .route("/logs", get(logs::page_view))
+        .route("/settings", get(settings_page::page_view).post(settings_page::submit))
         .route("/queue/group/{group}/cancel", post(queue_page::cancel_group))
         .route("/healthz", get(|| async { "ok" }))
         .route("/assets/{*path}", get(assets::serve))
