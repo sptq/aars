@@ -44,7 +44,9 @@ pub fn parse_warnings(body: &[u8]) -> Result<ParsedWarnings, SourceError> {
             }
             Ok(parsed)
         }
-        _ => Err(SourceError::Parse("to nie jest lista ostrzeżeń IMGW".into())),
+        _ => Err(SourceError::Parse(
+            "to nie jest lista ostrzeżeń IMGW".into(),
+        )),
     }
 }
 
@@ -83,7 +85,8 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
 
-    const BRAK: &[u8] = include_bytes!("../../tests/fixtures/imgw/warningsmeteo-2026-11-20-brak.json");
+    const BRAK: &[u8] =
+        include_bytes!("../../tests/fixtures/imgw/warningsmeteo-2026-11-20-brak.json");
     const JULY: &[u8] = include_bytes!("../../tests/fixtures/imgw/warningsmeteo-2026-07-23.json");
 
     #[test]
@@ -98,12 +101,19 @@ mod tests {
         let parsed = parse_warnings(JULY).unwrap();
         assert_eq!(parsed.warnings.len(), 5);
         assert_eq!(parsed.skipped, 0);
-        let w = parsed.warnings.iter().find(|w| w.id == "Sk20260722203344412").unwrap();
+        let w = parsed
+            .warnings
+            .iter()
+            .find(|w| w.id == "Sk20260722203344412")
+            .unwrap();
         assert_eq!(w.level, Some(1));
         assert_eq!(w.probability, Some(80));
         assert_eq!(
             w.valid_from,
-            NaiveDate::from_ymd_opt(2026, 7, 23).unwrap().and_hms_opt(10, 0, 0).unwrap()
+            NaiveDate::from_ymd_opt(2026, 7, 23)
+                .unwrap()
+                .and_hms_opt(10, 0, 0)
+                .unwrap()
         );
         assert!(w.teryt.iter().any(|t| t == "1061"));
     }
@@ -134,9 +144,15 @@ mod tests {
             parse_warnings(b"<html><body>Przerwa techniczna</body></html>"),
             Err(SourceError::Parse(_))
         ));
-        assert!(matches!(parse_warnings(&JULY[..JULY.len() / 2]), Err(SourceError::Parse(_))));
+        assert!(matches!(
+            parse_warnings(&JULY[..JULY.len() / 2]),
+            Err(SourceError::Parse(_))
+        ));
         assert!(matches!(parse_warnings(b""), Err(SourceError::Parse(_))));
-        assert!(matches!(parse_warnings(b"{\"inne\":1}"), Err(SourceError::Parse(_))));
+        assert!(matches!(
+            parse_warnings(b"{\"inne\":1}"),
+            Err(SourceError::Parse(_))
+        ));
         assert!(matches!(parse_warnings(b"42"), Err(SourceError::Parse(_))));
     }
 }
