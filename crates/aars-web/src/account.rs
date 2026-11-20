@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::audit;
-use crate::auth::{AuthRejection, CurrentUser, require_csrf};
+use crate::auth::{AuthRejection, CurrentUser, require_csrf, session_cookie};
 use crate::chrome::Chrome;
 use crate::render::page;
 use crate::state::AppState;
@@ -22,7 +22,8 @@ struct PasswordPage {
     error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+// Bez `Debug`: formularz niesie hasła jawnym tekstem.
+#[derive(Deserialize)]
 pub struct PasswordForm {
     csrf: String,
     current: String,
@@ -96,7 +97,26 @@ pub async fn password_submit(
     )
     .await;
 
-    Ok((StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response())
+    // Po zmianie hasła stare sesje (też cudze, np. przejęte) przestają działać;
+    // bieżący użytkownik dostaje świeżą sesję z nowym tokenem CSRF.
+    if let Err(err) = repo.end_all_sessions(current.user.id).await {
+        tracing::error!(%err, "kończenie sesji po zmianie hasła zawiodło");
+        return Ok((StatusCode::INTERNAL_SERVER_ERROR, "błąd sesji").into_response());
+    }
+    match repo.start_session(current.user.id, None).await {
+        Ok(session) => Ok((
+            StatusCode::SEE_OTHER,
+            [
+                (header::LOCATION, "/".to_owned()),
+                (header::SET_COOKIE, session_cookie(&session.id, state.secure_cookies)),
+            ],
+        )
+            .into_response()),
+        Err(err) => {
+            tracing::error!(%err, "utworzenie sesji po zmianie hasła zawiodło");
+            Ok((StatusCode::INTERNAL_SERVER_ERROR, "błąd sesji").into_response())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -237,13 +257,16 @@ mod tests {
         assert_eq!(status, StatusCode::SEE_OTHER);
         assert_eq!(location.as_deref(), Some("/"));
 
+        // Stara sesja jest zakończona; po zalogowaniu nowym hasłem brak przekierowania.
         let (status, _, _) = send(&app, get("/", &cookie)).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::SEE_OTHER);
 
         let (status, _) = login(&app, "stare-haslo").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let (status, _) = login(&app, "nowe-haslo-123").await;
+        let (status, fresh) = login(&app, "nowe-haslo-123").await;
         assert_eq!(status, StatusCode::SEE_OTHER);
+        let (status, _, _) = send(&app, get("/", &fresh.unwrap())).await;
+        assert_eq!(status, StatusCode::OK);
 
         let audited: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'password_change'")
@@ -316,5 +339,41 @@ mod tests {
         let (status, location, _) = send(&app, req).await;
         assert_eq!(status, StatusCode::SEE_OTHER);
         assert_eq!(location.as_deref(), Some("/login"));
+    }
+
+    #[tokio::test]
+    async fn changing_the_password_ends_every_old_session_and_issues_a_fresh_one() {
+        let (app, _) = setup(true).await;
+        let (cookie_a, csrf_a) = session(&app).await;
+        let (_, cookie_b) = login(&app, "stare-haslo").await;
+        let cookie_b = cookie_b.unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/account/password")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::COOKIE, &cookie_a)
+            .body(Body::from(format!(
+                "csrf={csrf_a}&current=stare-haslo&new=nowe-haslo-123&confirm=nowe-haslo-123"
+            )))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .expect("zmiana hasła musi ustawić nową sesję")
+            .to_owned();
+        let new_cookie = set_cookie.split(';').next().unwrap().to_owned();
+        assert_ne!(new_cookie, cookie_a);
+
+        let (status, _, _) = send(&app, get("/", &new_cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        for old in [&cookie_a, &cookie_b] {
+            let (status, location, _) = send(&app, get("/", old)).await;
+            assert_eq!(status, StatusCode::SEE_OTHER);
+            assert_eq!(location.as_deref(), Some("/login"));
+        }
     }
 }
