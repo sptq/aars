@@ -15,3 +15,4 @@ tracing.workspace = true
 [dev-dependencies]
 aars-core = { path = "../aars-core", features = ["testing"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
+sqlx.workspace = true

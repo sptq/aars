@@ -14,6 +14,7 @@ CREATE TABLE source_items (
     valid_until   TEXT,
     state         TEXT    NOT NULL CHECK (state IN ('active','cancelled','expired','replaced','dropped')),
     misses        INTEGER NOT NULL DEFAULT 0,
+    aired         INTEGER NOT NULL DEFAULT 0,  -- czy komunikat poszedł na antenę (lepkie)
     first_seen_at TEXT    NOT NULL,
     last_seen_at  TEXT    NOT NULL,
     queue_item_id INTEGER REFERENCES queue_items(id) ON DELETE SET NULL,

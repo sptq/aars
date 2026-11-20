@@ -37,7 +37,10 @@ impl SourceStatus {
     /// sukcesu liczy się tylko, gdy były próby.
     pub fn is_stale(&self, interval_s: u64, now: DateTime<Utc>) -> bool {
         let limit_s = interval_s.saturating_mul(3).max(1800);
-        let limit = chrono::Duration::seconds(i64::try_from(limit_s).unwrap_or(i64::MAX / 1000));
+        let limit = i64::try_from(limit_s)
+            .ok()
+            .and_then(chrono::Duration::try_seconds)
+            .unwrap_or(chrono::Duration::MAX);
         match self.last_success_at {
             Some(at) => now.signed_duration_since(at) > limit,
             None => self.last_run_at.is_some(),
@@ -92,6 +95,8 @@ pub struct TrackedItem {
     pub valid_until: Option<DateTime<Utc>>,
     pub state: TrackedState,
     pub misses: i64,
+    /// Czy komunikat o tej pozycji poszedł na antenę (lepkie).
+    pub aired: bool,
     pub first_seen_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub queue_item_id: Option<i64>,
@@ -109,6 +114,7 @@ pub struct NewTracked {
     pub priority: Priority,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_until: Option<DateTime<Utc>>,
+    pub aired: bool,
     pub first_seen_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub queue_item_id: Option<i64>,
@@ -139,6 +145,7 @@ fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> TrackedItem {
         valid_until: opt("valid_until"),
         state: TrackedState::parse(&row.get::<String, _>("state")).unwrap_or(TrackedState::Dropped),
         misses: row.get("misses"),
+        aired: row.get::<i64, _>("aired") != 0,
         first_seen_at: req("first_seen_at"),
         last_seen_at: req("last_seen_at"),
         queue_item_id: row.get("queue_item_id"),
@@ -146,7 +153,7 @@ fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> TrackedItem {
 }
 
 const ITEM_COLUMNS: &str = "id, source_id, item_key, topic, fingerprint, area, summary, cancel_text, \
-    priority, valid_from, valid_until, state, misses, first_seen_at, last_seen_at, queue_item_id";
+    priority, valid_from, valid_until, state, misses, aired, first_seen_at, last_seen_at, queue_item_id";
 
 #[derive(Clone)]
 pub struct SourceStateRepo {
@@ -288,13 +295,13 @@ impl SourceStateRepo {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO source_items
                (source_id, item_key, topic, fingerprint, area, summary, cancel_text, priority,
-                valid_from, valid_until, state, misses, first_seen_at, last_seen_at, queue_item_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?)
+                valid_from, valid_until, state, misses, aired, first_seen_at, last_seen_at, queue_item_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?)
              ON CONFLICT(source_id, item_key) DO UPDATE SET
                topic = excluded.topic, fingerprint = excluded.fingerprint, area = excluded.area,
                summary = excluded.summary, cancel_text = excluded.cancel_text,
                priority = excluded.priority, valid_from = excluded.valid_from,
-               valid_until = excluded.valid_until, state = 'active', misses = 0,
+               valid_until = excluded.valid_until, state = 'active', misses = 0, aired = excluded.aired,
                last_seen_at = ?, queue_item_id = excluded.queue_item_id
              RETURNING id",
         )
@@ -308,6 +315,7 @@ impl SourceStateRepo {
         .bind(item.priority as i64)
         .bind(item.valid_from.map(iso))
         .bind(item.valid_until.map(iso))
+        .bind(i64::from(item.aired))
         .bind(iso(item.first_seen_at))
         .bind(iso(item.last_seen_at))
         .bind(item.queue_item_id)
@@ -330,6 +338,14 @@ impl SourceStateRepo {
     pub async fn set_misses(&self, row: i64, misses: i64) -> Result<(), DbError> {
         sqlx::query("UPDATE source_items SET misses = ? WHERE id = ?")
             .bind(misses)
+            .bind(row)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_aired(&self, row: i64) -> Result<(), DbError> {
+        sqlx::query("UPDATE source_items SET aired = 1 WHERE id = ?")
             .bind(row)
             .execute(&self.pool)
             .await?;
@@ -376,6 +392,7 @@ mod tests {
             priority: Priority::Normal,
             valid_from: Some(at("2026-07-23T08:00:00Z")),
             valid_until: Some(at("2026-07-23T20:00:00Z")),
+            aired: false,
             first_seen_at: at("2026-07-23T08:01:00Z"),
             last_seen_at: at("2026-07-23T08:01:00Z"),
             queue_item_id: None,
