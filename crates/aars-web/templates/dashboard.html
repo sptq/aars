@@ -28,8 +28,12 @@
 
 <div class="card">
   <h2>Kolejka</h2>
+  {% if let Some(note) = queue_error %}
+  <p class="error">{{ note }}</p>
+  {% else %}
   <div id="queue" hx-get="/fragments/queue" hx-trigger="every 3s" hx-swap="innerHTML">
     {% include "queue_fragment.html" %}
   </div>
+  {% endif %}
 </div>
 {% endblock %}
