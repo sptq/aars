@@ -8,8 +8,18 @@ use chrono_tz::Europe::Warsaw;
 use super::parse::MeteoWarning;
 
 pub const MONTHS_GENITIVE: [&str; 12] = [
-    "stycznia", "lutego", "marca", "kwietnia", "maja", "czerwca", "lipca", "sierpnia",
-    "września", "października", "listopada", "grudnia",
+    "stycznia",
+    "lutego",
+    "marca",
+    "kwietnia",
+    "maja",
+    "czerwca",
+    "lipca",
+    "sierpnia",
+    "września",
+    "października",
+    "listopada",
+    "grudnia",
 ];
 
 /// Czas IMGW to `Europe/Warsaw` (R11): niejednoznaczny → wcześniejszy,
@@ -22,7 +32,10 @@ pub fn warsaw_to_utc(t: NaiveDateTime) -> Option<DateTime<Utc>> {
 }
 
 fn day_month(t: NaiveDateTime) -> String {
-    let month = MONTHS_GENITIVE.get(t.month0() as usize).copied().unwrap_or("");
+    let month = MONTHS_GENITIVE
+        .get(t.month0() as usize)
+        .copied()
+        .unwrap_or("");
     format!("{} {month}", t.day())
 }
 
@@ -37,7 +50,11 @@ pub fn validity(from: NaiveDateTime, until: NaiveDateTime) -> String {
     if from.date() == end_day.date() {
         format!("{} od {start_time} do {end_time}", day_month(from))
     } else {
-        format!("od {start_time} {} do {end_time} {}", day_month(from), day_month(end_day))
+        format!(
+            "od {start_time} {} do {end_time} {}",
+            day_month(from),
+            day_month(end_day)
+        )
     }
 }
 
@@ -59,7 +76,10 @@ fn trim_text(text: &str) -> String {
     if text.chars().count() <= MAX_TEXT_CHARS {
         return text.to_owned();
     }
-    let cut = text.char_indices().nth(MAX_TEXT_CHARS).map_or(text.len(), |(i, _)| i);
+    let cut = text
+        .char_indices()
+        .nth(MAX_TEXT_CHARS)
+        .map_or(text.len(), |(i, _)| i);
     let head = text.get(..cut).unwrap_or(text);
     if let Some(dot) = head.rfind('.') {
         return head.get(..=dot).unwrap_or(head).to_owned();
@@ -117,23 +137,33 @@ mod tests {
     use chrono::NaiveDate;
 
     fn dt(y: i32, m: u32, d: u32, h: u32, mi: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, mi, 0).unwrap()
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, mi, 0)
+            .unwrap()
     }
 
     fn july_lodz() -> MeteoWarning {
         let body = include_bytes!("../../tests/fixtures/imgw/warningsmeteo-2026-07-23.json");
         let parsed = parse_warnings(body).unwrap();
-        parsed.warnings.into_iter().find(|w| w.id == "Sk20260722203344412").unwrap()
+        parsed
+            .warnings
+            .into_iter()
+            .find(|w| w.id == "Sk20260722203344412")
+            .unwrap()
     }
 
     #[test]
     fn july_storm_for_lodz_reads_like_this() {
         let w = july_lodz();
         let text = announcement(&w, "Łódź");
-        assert!(text.starts_with(
-            "Ostrzeżenie meteorologiczne pierwszego stopnia: Burze. Obszar: Łódź. \
+        assert!(
+            text.starts_with(
+                "Ostrzeżenie meteorologiczne pierwszego stopnia: Burze. Obszar: Łódź. \
              Obowiązuje 23 lipca od 10:00 do 22:00. Prawdopodobieństwo 80 %. Prognozowane"
-        ), "{text}");
+            ),
+            "{text}"
+        );
         assert!(text.ends_with(" Źródło: IMGW."), "{text}");
         assert!(text.contains(w.text.trim()), "{text}");
         let spoken = aars_audio::text::normalize(&text);
@@ -212,15 +242,27 @@ mod tests {
     #[test]
     fn warsaw_time_is_converted_with_daylight_saving() {
         let utc = |t| warsaw_to_utc(t).map(|d| d.format("%Y-%m-%d %H:%MZ").to_string());
-        assert_eq!(utc(dt(2026, 7, 23, 10, 0)).as_deref(), Some("2026-07-23 08:00Z"));
-        assert_eq!(utc(dt(2024, 12, 30, 2, 0)).as_deref(), Some("2024-12-30 01:00Z"));
+        assert_eq!(
+            utc(dt(2026, 7, 23, 10, 0)).as_deref(),
+            Some("2026-07-23 08:00Z")
+        );
+        assert_eq!(
+            utc(dt(2024, 12, 30, 2, 0)).as_deref(),
+            Some("2024-12-30 01:00Z")
+        );
         assert_eq!(utc(dt(2026, 3, 29, 2, 30)), None);
         // niejednoznaczna chwila: wcześniejsza (czas letni)
-        assert_eq!(utc(dt(2026, 10, 25, 2, 30)).as_deref(), Some("2026-10-25 00:30Z"));
+        assert_eq!(
+            utc(dt(2026, 10, 25, 2, 30)).as_deref(),
+            Some("2026-10-25 00:30Z")
+        );
     }
 
     #[test]
     fn month_names_match_the_normalizer() {
-        assert_eq!(MONTHS_GENITIVE, aars_audio::text::normalize::MONTHS_GENITIVE);
+        assert_eq!(
+            MONTHS_GENITIVE,
+            aars_audio::text::normalize::MONTHS_GENITIVE
+        );
     }
 }
