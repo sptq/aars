@@ -1,4 +1,33 @@
-use super::numbers::{PluralForm, cardinal, hour_ordinal, plural_form};
+use super::numbers::{
+    PluralForm, cardinal, day_ordinal_genitive, hour_ordinal, hour_ordinal_genitive, plural_form,
+};
+
+/// Nazwy miesięcy w dopełniaczu — po dniu („23 lipca"). Używa ich też `imgw_meteo::speech`.
+pub const MONTHS_GENITIVE: [&str; 12] = [
+    "stycznia", "lutego", "marca", "kwietnia", "maja", "czerwca", "lipca", "sierpnia",
+    "września", "października", "listopada", "grudnia",
+];
+
+/// Przypadek godziny wymagany przez poprzedzający przyimek.
+#[derive(Clone, Copy)]
+enum HourCase {
+    Nominative,
+    Genitive,
+    Locative,
+}
+
+fn hour_case(previous_core: Option<&str>) -> HourCase {
+    match previous_core.map(str::to_lowercase).as_deref() {
+        Some("od" | "do" | "po" | "około") => HourCase::Genitive,
+        Some("o") => HourCase::Locative,
+        _ => HourCase::Nominative,
+    }
+}
+
+fn is_month(core: &str) -> bool {
+    let lower = core.to_lowercase();
+    MONTHS_GENITIVE.contains(&lower.as_str())
+}
 
 /// Jednostka w trzech formach: po 1, po 2–4, po pozostałych liczbach.
 struct Unit {
@@ -78,7 +107,8 @@ pub fn normalize(input: &str) -> String {
     while idx < parts.len() {
         let (lead, core, trail) = parts[idx];
 
-        if let Some(spoken) = spoken_time(core) {
+        let previous_core = idx.checked_sub(1).map(|p| parts[p].1);
+        if let Some(spoken) = spoken_time(core, hour_case(previous_core)) {
             push_word(&mut out, lead, &spoken, trail);
             idx += 1;
             continue;
@@ -105,6 +135,19 @@ pub fn normalize(input: &str) -> String {
             {
                 push_word(&mut out, lead, &spoken_number(&value), "");
                 push_word(&mut out, "", unit_form(rest, &value), trail);
+                idx += 1;
+                continue;
+            }
+
+            // Dzień przed nazwą miesiąca: „23 lipca"
+            if rest.is_empty()
+                && value.fraction.is_none()
+                && let Some(&(_, next_core, _)) = parts.get(idx + 1)
+                && is_month(next_core)
+                && let Ok(day) = value.integer.parse::<u8>()
+                && let Some(ordinal) = day_ordinal_genitive(day)
+            {
+                push_word(&mut out, lead, ordinal, trail);
                 idx += 1;
                 continue;
             }
@@ -217,19 +260,25 @@ fn unit_form(text: &str, value: &NumberText) -> &'static str {
     }
 }
 
-/// „18:00" → „godzina osiemnasta"; „06:30" → „godzina szósta trzydzieści".
-fn spoken_time(token: &str) -> Option<String> {
+/// „18:00" → „godzina osiemnasta"; „06:30" → „godzina szósta trzydzieści";
+/// po „od/do/po/około" → „godziny …", po „o" → „godzinie …". „24:00" jest
+/// poprawne (koniec doby), „24:30" już nie.
+fn spoken_time(token: &str, case: HourCase) -> Option<String> {
     let (h, m) = token.split_once(':')?;
     if h.is_empty() || m.len() != 2 {
         return None;
     }
     let hour: u8 = h.parse().ok()?;
     let minute: u8 = m.parse().ok()?;
-    if hour > 23 || minute > 59 {
+    if hour > 24 || minute > 59 || (hour == 24 && minute != 0) {
         return None;
     }
 
-    let mut spoken = format!("godzina {}", hour_ordinal(hour));
+    let mut spoken = match case {
+        HourCase::Nominative => format!("godzina {}", hour_ordinal(hour)),
+        HourCase::Genitive => format!("godziny {}", hour_ordinal_genitive(hour)),
+        HourCase::Locative => format!("godzinie {}", hour_ordinal_genitive(hour)),
+    };
     if minute > 0 {
         if minute < 10 {
             spoken.push_str(&format!(" zero {}", cardinal(minute as i64)));
@@ -270,9 +319,36 @@ mod tests {
 
     #[test]
     fn clock_times_become_spoken_hours() {
-        assert_eq!(n("od 18:00"), "od godzina osiemnasta");
-        assert_eq!(n("do 06:30"), "do godzina szósta trzydzieści");
-        assert_eq!(n("o 23:05"), "o godzina dwudziesta trzecia zero pięć");
+        assert_eq!(n("od 18:00"), "od godziny osiemnastej");
+        assert_eq!(n("do 06:30"), "do godziny szóstej trzydzieści");
+        assert_eq!(n("o 23:05"), "o godzinie dwudziestej trzeciej zero pięć");
+    }
+
+    #[test]
+    fn clock_times_take_the_case_their_preposition_needs() {
+        assert_eq!(n("od 18:00"), "od godziny osiemnastej");
+        assert_eq!(n("do 06:30"), "do godziny szóstej trzydzieści");
+        assert_eq!(n("o 23:05"), "o godzinie dwudziestej trzeciej zero pięć");
+        assert_eq!(n("Od 10:00"), "Od godziny dziesiątej");
+        assert_eq!(n("18:00"), "godzina osiemnasta");
+        assert_eq!(n("do 24:00"), "do godziny dwudziestej czwartej");
+        assert_eq!(n("24:30"), "24:30", "po 24:00 nie ma minut");
+    }
+
+    #[test]
+    fn days_before_a_month_become_genitive_ordinals() {
+        assert_eq!(n("23 lipca"), "dwudziestego trzeciego lipca");
+        assert_eq!(n("1 stycznia,"), "pierwszego stycznia,");
+        assert_eq!(
+            n("30 grudnia od 02:00 do 10:00."),
+            "trzydziestego grudnia od godziny drugiej do godziny dziesiątej."
+        );
+        assert_eq!(n("32 lipca"), "trzydzieści dwa lipca", "poza 1–31 zostaje liczebnik główny");
+        assert_eq!(
+            n("od 15 mm do 25 mm"),
+            "od piętnaście milimetrów do dwadzieścia pięć milimetrów",
+            "jednostki bez zmian"
+        );
     }
 
     #[test]
@@ -303,7 +379,7 @@ mod tests {
             "wiatr dwadzieścia dwa metry na sekundę, temperatura minus pięć stopni Celsjusza, \
              ciśnienie tysiąc trzynaście hektopaskali."
         );
-        assert_eq!(n("od 18:00 do 06:30,"), "od godzina osiemnasta do godzina szósta trzydzieści,");
+        assert_eq!(n("od 18:00 do 06:30,"), "od godziny osiemnastej do godziny szóstej trzydzieści,");
         assert_eq!(n("kierunek SW,"), "kierunek południowo-zachodni,");
         assert_eq!(n("stopień 2."), "stopień dwa.");
         assert_eq!(n("(12 m/s)"), "(dwanaście metrów na sekundę)");
