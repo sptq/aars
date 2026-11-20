@@ -174,6 +174,13 @@ mod tests {
             "{spoken}"
         );
         assert!(spoken.contains("osiemdziesiąt procent"), "{spoken}");
+        for part in [
+            "od piętnastu milimetrów do dwudziestu pięciu milimetrów",
+            "punktowo do trzydziestu milimetrów",
+            "porywy wiatru do siedemdziesięciu pięciu kilometrów na godzinę",
+        ] {
+            assert!(spoken.contains(part), "{spoken}");
+        }
         assert_eq!(change(&w, "Łódź"), format!("Zmiana ostrzeżenia. {text}"));
     }
 

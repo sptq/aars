@@ -31,7 +31,14 @@ pub fn parse_warnings(body: &[u8]) -> Result<ParsedWarnings, SourceError> {
         serde_json::from_slice(body).map_err(|e| SourceError::Parse(e.to_string()))?;
     match value {
         // Brak ostrzeżeń IMGW zgłasza obiektem, nie pustą tablicą.
-        serde_json::Value::Object(map) if map.contains_key("message") => {
+        // Tylko komunikat IMGW „Brak ostrzeżeń…”; inny obiekt (np. błąd
+        // serwera z kodem 200) to błąd, nie brak ostrzeżeń.
+        serde_json::Value::Object(map)
+            if map
+                .get("message")
+                .and_then(|m| m.as_str())
+                .is_some_and(|m| m.trim().starts_with("Brak ostrzeżeń")) =>
+        {
             Ok(ParsedWarnings::default())
         }
         serde_json::Value::Array(entries) => {
@@ -136,6 +143,22 @@ mod tests {
         assert_eq!(parsed.skipped, 1);
         assert_eq!(parsed.warnings.len(), 4);
         assert_eq!(parsed.warnings[0].level, None);
+    }
+
+    #[test]
+    fn only_the_no_warnings_message_is_an_empty_success() {
+        let ok = parse_warnings("{\"message\":\" Brak ostrzeżeń meteorologicznych\"}".as_bytes());
+        assert!(ok.unwrap().warnings.is_empty());
+        for body in [
+            r#"{"message":"Service unavailable"}"#,
+            r#"{"message":"brak ostrzeżeń"}"#,
+            r#"{"message":42}"#,
+        ] {
+            assert!(
+                matches!(parse_warnings(body.as_bytes()), Err(SourceError::Parse(_))),
+                "{body}"
+            );
+        }
     }
 
     #[test]

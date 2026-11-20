@@ -1,41 +1,213 @@
 const ONES: [&str; 20] = [
-    "zero", "jeden", "dwa", "trzy", "cztery", "pięć", "sześć", "siedem", "osiem", "dziewięć",
-    "dziesięć", "jedenaście", "dwanaście", "trzynaście", "czternaście", "piętnaście",
-    "szesnaście", "siedemnaście", "osiemnaście", "dziewiętnaście",
+    "zero",
+    "jeden",
+    "dwa",
+    "trzy",
+    "cztery",
+    "pięć",
+    "sześć",
+    "siedem",
+    "osiem",
+    "dziewięć",
+    "dziesięć",
+    "jedenaście",
+    "dwanaście",
+    "trzynaście",
+    "czternaście",
+    "piętnaście",
+    "szesnaście",
+    "siedemnaście",
+    "osiemnaście",
+    "dziewiętnaście",
 ];
 
 const TENS: [&str; 10] = [
-    "", "", "dwadzieścia", "trzydzieści", "czterdzieści", "pięćdziesiąt", "sześćdziesiąt",
-    "siedemdziesiąt", "osiemdziesiąt", "dziewięćdziesiąt",
+    "",
+    "",
+    "dwadzieścia",
+    "trzydzieści",
+    "czterdzieści",
+    "pięćdziesiąt",
+    "sześćdziesiąt",
+    "siedemdziesiąt",
+    "osiemdziesiąt",
+    "dziewięćdziesiąt",
 ];
 
 const HUNDREDS: [&str; 10] = [
-    "", "sto", "dwieście", "trzysta", "czterysta", "pięćset", "sześćset", "siedemset",
-    "osiemset", "dziewięćset",
+    "",
+    "sto",
+    "dwieście",
+    "trzysta",
+    "czterysta",
+    "pięćset",
+    "sześćset",
+    "siedemset",
+    "osiemset",
+    "dziewięćset",
 ];
 
+const ONES_GENITIVE: [&str; 20] = [
+    "zera",
+    "jednego",
+    "dwóch",
+    "trzech",
+    "czterech",
+    "pięciu",
+    "sześciu",
+    "siedmiu",
+    "ośmiu",
+    "dziewięciu",
+    "dziesięciu",
+    "jedenastu",
+    "dwunastu",
+    "trzynastu",
+    "czternastu",
+    "piętnastu",
+    "szesnastu",
+    "siedemnastu",
+    "osiemnastu",
+    "dziewiętnastu",
+];
+
+const TENS_GENITIVE: [&str; 10] = [
+    "",
+    "",
+    "dwudziestu",
+    "trzydziestu",
+    "czterdziestu",
+    "pięćdziesięciu",
+    "sześćdziesięciu",
+    "siedemdziesięciu",
+    "osiemdziesięciu",
+    "dziewięćdziesięciu",
+];
+
+const HUNDREDS_GENITIVE: [&str; 10] = [
+    "",
+    "stu",
+    "dwustu",
+    "trzystu",
+    "czterystu",
+    "pięciuset",
+    "sześciuset",
+    "siedmiuset",
+    "ośmiuset",
+    "dziewięciuset",
+];
+
+/// Liczebnik główny w dopełniaczu („do piętnastu", „od stu dwudziestu").
+/// Tylko 0–999; większe liczby `None` (wołający zostaje przy mianowniku).
+pub fn cardinal_genitive(n: i64) -> Option<String> {
+    if !(0..=999).contains(&n) {
+        return None;
+    }
+    let n = n as usize;
+    if n == 0 {
+        return Some(ONES_GENITIVE[0].to_owned());
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    if n >= 100 {
+        parts.push(HUNDREDS_GENITIVE[n / 100]);
+    }
+    let rest = n % 100;
+    if rest >= 20 {
+        parts.push(TENS_GENITIVE[rest / 10]);
+        if rest % 10 > 0 {
+            parts.push(ONES_GENITIVE[rest % 10]);
+        }
+    } else if rest > 0 {
+        parts.push(ONES_GENITIVE[rest]);
+    }
+    Some(parts.join(" "))
+}
+
 const HOURS: [&str; 24] = [
-    "dwudziesta czwarta", "pierwsza", "druga", "trzecia", "czwarta", "piąta", "szósta",
-    "siódma", "ósma", "dziewiąta", "dziesiąta", "jedenasta", "dwunasta", "trzynasta",
-    "czternasta", "piętnasta", "szesnasta", "siedemnasta", "osiemnasta", "dziewiętnasta",
-    "dwudziesta", "dwudziesta pierwsza", "dwudziesta druga", "dwudziesta trzecia",
+    "dwudziesta czwarta",
+    "pierwsza",
+    "druga",
+    "trzecia",
+    "czwarta",
+    "piąta",
+    "szósta",
+    "siódma",
+    "ósma",
+    "dziewiąta",
+    "dziesiąta",
+    "jedenasta",
+    "dwunasta",
+    "trzynasta",
+    "czternasta",
+    "piętnasta",
+    "szesnasta",
+    "siedemnasta",
+    "osiemnasta",
+    "dziewiętnasta",
+    "dwudziesta",
+    "dwudziesta pierwsza",
+    "dwudziesta druga",
+    "dwudziesta trzecia",
 ];
 
 const HOURS_GENITIVE: [&str; 24] = [
-    "dwudziestej czwartej", "pierwszej", "drugiej", "trzeciej", "czwartej", "piątej", "szóstej",
-    "siódmej", "ósmej", "dziewiątej", "dziesiątej", "jedenastej", "dwunastej", "trzynastej",
-    "czternastej", "piętnastej", "szesnastej", "siedemnastej", "osiemnastej", "dziewiętnastej",
-    "dwudziestej", "dwudziestej pierwszej", "dwudziestej drugiej", "dwudziestej trzeciej",
+    "dwudziestej czwartej",
+    "pierwszej",
+    "drugiej",
+    "trzeciej",
+    "czwartej",
+    "piątej",
+    "szóstej",
+    "siódmej",
+    "ósmej",
+    "dziewiątej",
+    "dziesiątej",
+    "jedenastej",
+    "dwunastej",
+    "trzynastej",
+    "czternastej",
+    "piętnastej",
+    "szesnastej",
+    "siedemnastej",
+    "osiemnastej",
+    "dziewiętnastej",
+    "dwudziestej",
+    "dwudziestej pierwszej",
+    "dwudziestej drugiej",
+    "dwudziestej trzeciej",
 ];
 
 const DAYS_GENITIVE: [&str; 31] = [
-    "pierwszego", "drugiego", "trzeciego", "czwartego", "piątego", "szóstego", "siódmego",
-    "ósmego", "dziewiątego", "dziesiątego", "jedenastego", "dwunastego", "trzynastego",
-    "czternastego", "piętnastego", "szesnastego", "siedemnastego", "osiemnastego",
-    "dziewiętnastego", "dwudziestego", "dwudziestego pierwszego", "dwudziestego drugiego",
-    "dwudziestego trzeciego", "dwudziestego czwartego", "dwudziestego piątego",
-    "dwudziestego szóstego", "dwudziestego siódmego", "dwudziestego ósmego",
-    "dwudziestego dziewiątego", "trzydziestego", "trzydziestego pierwszego",
+    "pierwszego",
+    "drugiego",
+    "trzeciego",
+    "czwartego",
+    "piątego",
+    "szóstego",
+    "siódmego",
+    "ósmego",
+    "dziewiątego",
+    "dziesiątego",
+    "jedenastego",
+    "dwunastego",
+    "trzynastego",
+    "czternastego",
+    "piętnastego",
+    "szesnastego",
+    "siedemnastego",
+    "osiemnastego",
+    "dziewiętnastego",
+    "dwudziestego",
+    "dwudziestego pierwszego",
+    "dwudziestego drugiego",
+    "dwudziestego trzeciego",
+    "dwudziestego czwartego",
+    "dwudziestego piątego",
+    "dwudziestego szóstego",
+    "dwudziestego siódmego",
+    "dwudziestego ósmego",
+    "dwudziestego dziewiątego",
+    "trzydziestego",
+    "trzydziestego pierwszego",
 ];
 
 /// Forma gramatyczna rzeczownika po liczebniku.
@@ -169,7 +341,10 @@ mod tests {
             (2000, "dwa tysiące"),
             (5000, "pięć tysięcy"),
             (22000, "dwadzieścia dwa tysiące"),
-            (123456, "sto dwadzieścia trzy tysiące czterysta pięćdziesiąt sześć"),
+            (
+                123456,
+                "sto dwadzieścia trzy tysiące czterysta pięćdziesiąt sześć",
+            ),
         ];
         for (n, expected) in cases {
             assert_eq!(cardinal(n), expected, "liczba {n}");
@@ -190,7 +365,11 @@ mod tests {
         assert_eq!(plural_form(4), PluralForm::PluralNominative);
         assert_eq!(plural_form(5), PluralForm::PluralGenitive);
         assert_eq!(plural_form(11), PluralForm::PluralGenitive);
-        assert_eq!(plural_form(12), PluralForm::PluralGenitive, "dwanaście metrów, nie metry");
+        assert_eq!(
+            plural_form(12),
+            PluralForm::PluralGenitive,
+            "dwanaście metrów, nie metry"
+        );
         assert_eq!(plural_form(14), PluralForm::PluralGenitive);
         assert_eq!(plural_form(21), PluralForm::PluralGenitive);
         assert_eq!(plural_form(22), PluralForm::PluralNominative);
