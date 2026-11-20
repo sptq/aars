@@ -67,6 +67,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aars-sources"
+version = "0.1.0"
+dependencies = [
+ "aars-core",
+ "chrono",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aars-web"
 version = "0.1.0"
 dependencies = [
