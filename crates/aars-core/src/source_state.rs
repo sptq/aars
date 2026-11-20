@@ -100,6 +100,20 @@ pub struct TrackedItem {
     pub first_seen_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub queue_item_id: Option<i64>,
+    /// Wcześniejsze elementy kolejki tej pozycji, zastąpione, gdy były
+    /// wzięte do nadania. Jeśli któryś skończy jako `done`, pozycja
+    /// poszła na antenę.
+    pub superseded: Vec<i64>,
+    /// Pozycja odwołana, ale nie wiadomo jeszcze, czy oryginał poszedł na
+    /// antenę: odwołanie nadamy, jeśli któryś element skończy jako `done`.
+    pub cancel_pending: bool,
+}
+
+impl TrackedItem {
+    /// Wszystkie elementy kolejki, których nadanie oznacza „poszło na antenę”.
+    pub fn queue_ids(&self) -> impl Iterator<Item = i64> + '_ {
+        self.queue_item_id.into_iter().chain(self.superseded.iter().copied())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +132,7 @@ pub struct NewTracked {
     pub first_seen_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub queue_item_id: Option<i64>,
+    pub superseded: Vec<i64>,
 }
 
 fn iso(at: DateTime<Utc>) -> String {
@@ -126,6 +141,14 @@ fn iso(at: DateTime<Utc>) -> String {
 
 fn parse_iso(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value).ok().map(|dt| dt.with_timezone(&Utc))
+}
+
+fn parse_ids(text: &str) -> Vec<i64> {
+    text.split(',').filter_map(|part| part.trim().parse().ok()).collect()
+}
+
+fn ids_text(ids: &[i64]) -> String {
+    ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
 }
 
 fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> TrackedItem {
@@ -149,11 +172,14 @@ fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> TrackedItem {
         first_seen_at: req("first_seen_at"),
         last_seen_at: req("last_seen_at"),
         queue_item_id: row.get("queue_item_id"),
+        superseded: parse_ids(&row.get::<String, _>("superseded_queue_ids")),
+        cancel_pending: row.get::<i64, _>("cancel_pending") != 0,
     }
 }
 
 const ITEM_COLUMNS: &str = "id, source_id, item_key, topic, fingerprint, area, summary, cancel_text, \
-    priority, valid_from, valid_until, state, misses, aired, first_seen_at, last_seen_at, queue_item_id";
+    priority, valid_from, valid_until, state, misses, aired, first_seen_at, last_seen_at, queue_item_id, \
+    superseded_queue_ids, cancel_pending";
 
 #[derive(Clone)]
 pub struct SourceStateRepo {
@@ -295,14 +321,16 @@ impl SourceStateRepo {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO source_items
                (source_id, item_key, topic, fingerprint, area, summary, cancel_text, priority,
-                valid_from, valid_until, state, misses, aired, first_seen_at, last_seen_at, queue_item_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?)
+                valid_from, valid_until, state, misses, aired, first_seen_at, last_seen_at, queue_item_id,
+                superseded_queue_ids)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?)
              ON CONFLICT(source_id, item_key) DO UPDATE SET
                topic = excluded.topic, fingerprint = excluded.fingerprint, area = excluded.area,
                summary = excluded.summary, cancel_text = excluded.cancel_text,
                priority = excluded.priority, valid_from = excluded.valid_from,
                valid_until = excluded.valid_until, state = 'active', misses = 0, aired = excluded.aired,
-               last_seen_at = ?, queue_item_id = excluded.queue_item_id
+               last_seen_at = ?, queue_item_id = excluded.queue_item_id,
+               superseded_queue_ids = excluded.superseded_queue_ids, cancel_pending = 0
              RETURNING id",
         )
         .bind(&item.source_id)
@@ -319,6 +347,7 @@ impl SourceStateRepo {
         .bind(iso(item.first_seen_at))
         .bind(iso(item.last_seen_at))
         .bind(item.queue_item_id)
+        .bind(ids_text(&item.superseded))
         .bind(iso(now))
         .fetch_one(&self.pool)
         .await?;
@@ -361,6 +390,28 @@ impl SourceStateRepo {
         Ok(())
     }
 
+    /// Odwołane pozycje, które czekają na rozstrzygnięcie, czy oryginał
+    /// poszedł na antenę.
+    pub async fn awaiting_cancellation(&self, id: &str) -> Result<Vec<TrackedItem>, DbError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {ITEM_COLUMNS} FROM source_items
+              WHERE source_id = ? AND state = 'cancelled' AND cancel_pending = 1 ORDER BY id"
+        ))
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_item).collect())
+    }
+
+    pub async fn set_cancel_pending(&self, row: i64, pending: bool) -> Result<(), DbError> {
+        sqlx::query("UPDATE source_items SET cancel_pending = ? WHERE id = ?")
+            .bind(i64::from(pending))
+            .bind(row)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn set_queue_item(&self, row: i64, queue_item_id: i64) -> Result<(), DbError> {
         sqlx::query("UPDATE source_items SET queue_item_id = ? WHERE id = ?")
             .bind(queue_item_id)
@@ -396,6 +447,7 @@ mod tests {
             first_seen_at: at("2026-07-23T08:01:00Z"),
             last_seen_at: at("2026-07-23T08:01:00Z"),
             queue_item_id: None,
+            superseded: Vec::new(),
         }
     }
 
@@ -481,6 +533,26 @@ mod tests {
         assert_eq!(active[0].misses, 0);
         assert_eq!(active[0].state, TrackedState::Active);
         assert_eq!(active[0].valid_until, Some(at("2026-07-23T20:00:00Z")));
+    }
+
+    #[tokio::test]
+    async fn superseded_ids_round_trip_and_reactivation_clears_a_pending_cancellation() {
+        let repo = SourceStateRepo::new(test_pool().await);
+        let now = at("2026-07-23T09:00:00Z");
+        let row = repo.upsert_active(&NewTracked { superseded: vec![3, 7], ..tracked("a") }, now).await.unwrap();
+        assert_eq!(repo.active_items("imgw-meteo").await.unwrap()[0].superseded, vec![3, 7]);
+
+        repo.set_state(row, TrackedState::Cancelled).await.unwrap();
+        repo.set_cancel_pending(row, true).await.unwrap();
+        let waiting = repo.awaiting_cancellation("imgw-meteo").await.unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert!(waiting[0].cancel_pending);
+
+        repo.upsert_active(&tracked("a"), now).await.unwrap();
+        assert!(repo.awaiting_cancellation("imgw-meteo").await.unwrap().is_empty());
+        let active = repo.active_items("imgw-meteo").await.unwrap();
+        assert!(active[0].superseded.is_empty());
+        assert!(!active[0].cancel_pending);
     }
 
     #[tokio::test]

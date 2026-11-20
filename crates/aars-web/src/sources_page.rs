@@ -379,6 +379,7 @@ mod tests {
                     first_seen_at: at,
                     last_seen_at: at,
                     queue_item_id: None,
+                    superseded: Vec::new(),
                 },
                 at,
             )
