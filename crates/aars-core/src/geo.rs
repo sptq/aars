@@ -29,9 +29,15 @@ pub fn locator_from(lat: f64, lon: f64, len: usize) -> Result<String, String> {
     if !(-180.0..=180.0).contains(&lon) {
         return Err(MSG_LON.to_owned());
     }
-    // Komórki najdrobniejszego poziomu: 1/120° w długości, 1/240° w szerokości.
-    let lon_cells = (((lon + 180.0) * 120.0).floor() as u64).min(360 * 120 - 1);
-    let lat_cells = (((lat + 90.0) * 240.0).floor() as u64).min(180 * 240 - 1);
+    // Rachunek w liczbach całkowitych: pozycja w jednostkach 1e-5° (zaokrąglona),
+    // komórka najdrobniejszego poziomu to 1/120° w długości i 1/240° w
+    // szerokości, czyli indeks = n * 120 / 100_000 = n * 3 / 2500 (długość)
+    // i n * 3 / 1250 (szerokość). Dzięki temu okrągłe wartości dziesiętne,
+    // leżące dokładnie na krawędzi komórki, nie spadają o jedną komórkę w dół.
+    let lon_units = ((lon + 180.0) * 1e5).round() as u64;
+    let lat_units = ((lat + 90.0) * 1e5).round() as u64;
+    let lon_cells = (lon_units * 3 / 2500).min(360 * 120 - 1);
+    let lat_cells = (lat_units * 3 / 1250).min(180 * 240 - 1);
     let letter = |base: u8, n: u64| char::from(base + n as u8);
     let digit = |n: u64| char::from(b'0' + n as u8);
 
@@ -88,7 +94,8 @@ pub fn locator_center(locator: &str) -> Result<(f64, f64), String> {
 fn parse_coord(text: &str, lo: f64, hi: f64, msg: &str) -> Result<f64, String> {
     let v: f64 = text.trim().replace(',', ".").parse().map_err(|_| msg.to_owned())?;
     if v.is_finite() && (lo..=hi).contains(&v) {
-        Ok((v * 1e5).round() / 1e5)
+        // `+ 0.0` zamienia -0.0 na 0.0
+        Ok((v * 1e5).round() / 1e5 + 0.0)
     } else {
         Err(msg.to_owned())
     }
@@ -164,7 +171,9 @@ impl PositionRepo {
                 kv.kv_put("station:locator", &p.locator).await?;
             }
             None => {
-                kv.kv_delete_prefix("station:").await?;
+                for key in ["station:lat", "station:lon", "station:locator"] {
+                    kv.kv_delete_prefix(key).await?;
+                }
             }
         }
         Ok(())
@@ -265,5 +274,42 @@ mod tests {
         let kv = SettingsRepo::new(pool.clone());
         kv.kv_put("station:lat", "xx").await.unwrap();
         assert_eq!(PositionRepo::new(pool).load().await.unwrap(), None);
+    }
+
+    #[test]
+    fn round_decimal_degrees_land_in_the_cell_that_contains_them() {
+        // Krawędzie komórek 8-znakowych (1/120°, 1/240°) leżą na okrągłych
+        // wartościach dziesiętnych; sprawdzamy, że wejście mieści się w
+        // komórce wyliczonego lokatora: |środek - wejście| < połowa komórki
+        // (z lewym końcem włączonym).
+        let (hl, ha) = (1.0 / 240.0, 1.0 / 480.0);
+        for i in -1799..=1799 {
+            let lon = f64::from(i) / 10.0;
+            for j in [-899, -450, -1, 0, 1, 450, 899] {
+                let lat = f64::from(j) / 10.0;
+                let loc = locator_from(lat, lon, 8).unwrap();
+                let (clat, clon) = locator_center(&loc).unwrap();
+                let eps = 2e-5;
+                assert!(lon >= clon - hl - eps && lon < clon + hl + eps, "{lat} {lon} {loc}");
+                assert!(lat >= clat - ha - eps && lat < clat + ha + eps, "{lat} {lon} {loc}");
+            }
+        }
+        for j in -899..=899 {
+            let lat = f64::from(j) / 10.0;
+            let loc = locator_from(lat, -179.9, 8).unwrap();
+            let (clat, _) = locator_center(&loc).unwrap();
+            assert!(lat >= clat - ha - 2e-5 && lat < clat + ha + 2e-5, "{lat} {loc}");
+        }
+    }
+
+    #[test]
+    fn a_typed_8_char_locator_survives_parse_position() {
+        for loc in ["JO91RS42", "AA00AA00", "RR99XX99", "JN58TD00"] {
+            let (lat, lon) = locator_center(loc).unwrap();
+            let p = parse_position(&lat.to_string(), &lon.to_string(), loc).unwrap().unwrap();
+            assert_eq!(p.locator, loc);
+        }
+        let p = parse_position("-0", "0", "").unwrap().unwrap();
+        assert_eq!(format!("{:.5}", p.lat), "0.00000");
     }
 }
