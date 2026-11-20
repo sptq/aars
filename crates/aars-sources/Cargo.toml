@@ -1,0 +1,17 @@
+[package]
+name = "aars-sources"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aars-core = { path = "../aars-core" }
+chrono.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+aars-core = { path = "../aars-core", features = ["testing"] }
+tokio = { workspace = true, features = ["rt", "macros"] }
