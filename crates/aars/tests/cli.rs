@@ -51,7 +51,7 @@ fn say_dry_run_prints_the_normalized_text_without_synthesizing() {
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("wiatr dwanaście metrów na sekundę o godzina osiemnasta"),
+        stdout.contains("wiatr dwanaście metrów na sekundę o godzinie osiemnastej"),
         "stdout: {stdout}"
     );
 }

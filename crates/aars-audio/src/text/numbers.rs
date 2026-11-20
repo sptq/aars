@@ -21,6 +21,23 @@ const HOURS: [&str; 24] = [
     "dwudziesta", "dwudziesta pierwsza", "dwudziesta druga", "dwudziesta trzecia",
 ];
 
+const HOURS_GENITIVE: [&str; 24] = [
+    "dwudziestej czwartej", "pierwszej", "drugiej", "trzeciej", "czwartej", "piątej", "szóstej",
+    "siódmej", "ósmej", "dziewiątej", "dziesiątej", "jedenastej", "dwunastej", "trzynastej",
+    "czternastej", "piętnastej", "szesnastej", "siedemnastej", "osiemnastej", "dziewiętnastej",
+    "dwudziestej", "dwudziestej pierwszej", "dwudziestej drugiej", "dwudziestej trzeciej",
+];
+
+const DAYS_GENITIVE: [&str; 31] = [
+    "pierwszego", "drugiego", "trzeciego", "czwartego", "piątego", "szóstego", "siódmego",
+    "ósmego", "dziewiątego", "dziesiątego", "jedenastego", "dwunastego", "trzynastego",
+    "czternastego", "piętnastego", "szesnastego", "siedemnastego", "osiemnastego",
+    "dziewiętnastego", "dwudziestego", "dwudziestego pierwszego", "dwudziestego drugiego",
+    "dwudziestego trzeciego", "dwudziestego czwartego", "dwudziestego piątego",
+    "dwudziestego szóstego", "dwudziestego siódmego", "dwudziestego ósmego",
+    "dwudziestego dziewiątego", "trzydziestego", "trzydziestego pierwszego",
+];
+
 /// Forma gramatyczna rzeczownika po liczebniku.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluralForm {
@@ -111,6 +128,16 @@ pub fn hour_ordinal(h: u8) -> &'static str {
     HOURS[(h % 24) as usize]
 }
 
+/// Godzina w dopełniaczu („od godziny osiemnastej"); 0 i 24 to „dwudziestej czwartej".
+pub fn hour_ordinal_genitive(h: u8) -> &'static str {
+    HOURS_GENITIVE[(h % 24) as usize]
+}
+
+/// Dzień miesiąca jako porządkowy w dopełniaczu („dwudziestego trzeciego"); poza 1–31 `None`.
+pub fn day_ordinal_genitive(d: u8) -> Option<&'static str> {
+    DAYS_GENITIVE.get((d as usize).checked_sub(1)?).copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +206,26 @@ mod tests {
         assert_eq!(hour_ordinal(12), "dwunasta");
         assert_eq!(hour_ordinal(18), "osiemnasta");
         assert_eq!(hour_ordinal(23), "dwudziesta trzecia");
+    }
+
+    #[test]
+    fn hour_genitive_ordinals() {
+        assert_eq!(hour_ordinal_genitive(1), "pierwszej");
+        assert_eq!(hour_ordinal_genitive(12), "dwunastej");
+        assert_eq!(hour_ordinal_genitive(22), "dwudziestej drugiej");
+        assert_eq!(hour_ordinal_genitive(0), "dwudziestej czwartej");
+        assert_eq!(hour_ordinal_genitive(24), "dwudziestej czwartej");
+    }
+
+    #[test]
+    fn day_genitive_ordinals() {
+        assert_eq!(day_ordinal_genitive(1), Some("pierwszego"));
+        assert_eq!(day_ordinal_genitive(2), Some("drugiego"));
+        assert_eq!(day_ordinal_genitive(13), Some("trzynastego"));
+        assert_eq!(day_ordinal_genitive(20), Some("dwudziestego"));
+        assert_eq!(day_ordinal_genitive(21), Some("dwudziestego pierwszego"));
+        assert_eq!(day_ordinal_genitive(31), Some("trzydziestego pierwszego"));
+        assert_eq!(day_ordinal_genitive(0), None);
+        assert_eq!(day_ordinal_genitive(32), None);
     }
 }
