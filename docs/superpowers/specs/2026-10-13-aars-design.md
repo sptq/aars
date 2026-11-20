@@ -163,6 +163,9 @@ i `AtomicU64` ze znacznikiem podniesienia PTT ustawianym przez sekwencer.
 Gdy `now - keyed_at > tx_max_duration` → `force_unkey()` + ustawienie flagi
 `poisoned`, którą sekwencer sprawdza przed każdym kolejnym nadaniem i która
 wymaga ręcznego zdjęcia w panelu. Limit domyślny 180 s, konfigurowalny.
+Watchdog działa z zapasem `WATCHDOG_GRACE` = 2 s ponad `tx_max_duration`, bo
+sekwencer sam ucina nadanie na limicie; watchdog jest drugą linią obrony na
+wypadek zawieszenia sekwencera.
 
 Flaga `poisoned` jest celowo lepka: jeśli watchdog musiał interweniować, coś
 jest fundamentalnie zepsute i dalsze automatyczne nadawanie byłoby
