@@ -97,7 +97,9 @@ fn message_row(message: &Message, now: DateTime<Utc>) -> MessageRow {
         title: message.title.clone(),
         priority: priority_label(message.priority).to_owned(),
         schedule: schedule_label(&message.schedule),
+        // Wyłączona definicja nie odpali, więc nie ma „następnego nadania”.
         next: next_fire(&message.schedule, now)
+            .filter(|_| message.enabled)
             .map(both_times_now)
             .unwrap_or_else(|| "—".to_owned()),
         enabled: message.enabled,
@@ -502,6 +504,28 @@ mod tests {
             Ok(ScheduleKind::Immediate)
         );
         assert!(parse_schedule("co-tydzien", "", "", now, &Utc).is_err());
+    }
+
+    #[test]
+    fn a_disabled_definition_shows_no_next_fire() {
+        let now = at("2026-11-20T10:00:00Z");
+        let mut message = Message {
+            id: 1,
+            title: "biuletyn".to_owned(),
+            body_template: "treść".to_owned(),
+            priority: aars_core::priority::Priority::Normal,
+            interrupting: false,
+            repeat_count: 1,
+            repeat_interval: Duration::ZERO,
+            schedule: ScheduleKind::Cron("0 18 * * *".to_owned()),
+            valid_from: None,
+            valid_until: None,
+            source_id: None,
+            enabled: true,
+        };
+        assert_ne!(message_row(&message, now).next, "—");
+        message.enabled = false;
+        assert_eq!(message_row(&message, now).next, "—");
     }
 
     #[test]

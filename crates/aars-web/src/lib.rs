@@ -27,7 +27,7 @@ use serde::Deserialize;
 
 use crate::auth::{AuthRejection, CurrentUser, require_csrf, require_role};
 use crate::chrome::{Chrome, both_times_now, parse_priority, priority_label};
-use crate::render::page;
+use crate::render::{db_error, page};
 pub use crate::state::AppState;
 
 #[derive(Template)]
@@ -90,18 +90,19 @@ fn queue_row(item: QueueItem, sizes: &HashMap<String, i64>) -> QueueRow {
     }
 }
 
-async fn queue_rows(state: &AppState, limit: i64) -> Vec<QueueRow> {
-    let sizes = state.queue.group_sizes().await.unwrap_or_else(|err| {
-        tracing::error!(%err, "odczyt rozmiarów serii zawiódł");
-        HashMap::new()
-    });
-    match state.queue.pending(limit).await {
-        Ok(items) => items.into_iter().map(|item| queue_row(item, &sizes)).collect(),
-        Err(err) => {
-            tracing::error!(%err, "odczyt kolejki zawiódł");
-            Vec::new()
-        }
-    }
+/// Wiersze kolejki; `Err` to gotowa odpowiedź 500 (błąd już w logu).
+async fn queue_rows(state: &AppState, limit: i64) -> Result<Vec<QueueRow>, Response> {
+    let sizes = state
+        .queue
+        .group_sizes()
+        .await
+        .map_err(|err| db_error("odczyt rozmiarów serii zawiódł", &err))?;
+    let items = state
+        .queue
+        .pending(limit)
+        .await
+        .map_err(|err| db_error("odczyt kolejki zawiódł", &err))?;
+    Ok(items.into_iter().map(|item| queue_row(item, &sizes)).collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,12 +204,16 @@ async fn logout(
 
 async fn dashboard(State(state): State<AppState>, current: CurrentUser) -> Response {
     let interlocks = state.interlocks.snapshot();
+    let pending = match queue_rows(&state, 50).await {
+        Ok(rows) => rows,
+        Err(response) => return response,
+    };
 
     page(&DashboardPage {
         chrome: Chrome::from(&current),
         tx_enabled: interlocks.tx_enabled,
         poisoned: interlocks.poisoned,
-        pending: queue_rows(&state, 50).await,
+        pending,
         full: false,
     })
 }
@@ -364,8 +369,15 @@ async fn cancel_item(
 /// `?full=1` oznacza fragment strony `/queue` (limit 200 zamiast 50).
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct ViewQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "flag")]
     pub(crate) full: bool,
+}
+
+/// Flaga z adresu: szablony wysyłają `?full=1`, a serde dla `bool`
+/// przyjmuje tylko `true`/`false` (bez tego fragment pełnej kolejki to 400).
+fn flag<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(matches!(value.as_str(), "1" | "true" | "on"))
 }
 
 pub(crate) async fn queue_fragment_response(
@@ -373,8 +385,12 @@ pub(crate) async fn queue_fragment_response(
     current: &CurrentUser,
     full: bool,
 ) -> Response {
+    let pending = match queue_rows(state, if full { 200 } else { 50 }).await {
+        Ok(rows) => rows,
+        Err(response) => return response,
+    };
     page(&QueueFragment {
-        pending: queue_rows(state, if full { 200 } else { 50 }).await,
+        pending,
         chrome: Chrome::from(current),
         full,
     })
@@ -1136,6 +1152,70 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn the_full_queue_fragment_accepts_full_1_from_the_templates() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Operator).await;
+        let (status, html) = get_html(&app, &cookie, "/fragments/queue?full=1").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+    }
+
+    #[tokio::test]
+    async fn a_broken_queue_table_is_a_500_not_an_empty_queue() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+        sqlx::query("ALTER TABLE queue_items RENAME TO queue_items_gone")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        for uri in ["/", "/fragments/queue", "/fragments/queue?full=1", "/queue"] {
+            let (status, html) = get_html(&app, &cookie, uri).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}");
+            assert!(!html.contains("Kolejka pusta"), "{uri}: {html}");
+        }
+    }
+
+    #[tokio::test]
+    async fn broken_log_tables_are_a_500_not_empty_logs() {
+        for table in ["tx_log", "audit_log"] {
+            let (app, cookie, _csrf, state) = logged_in(Role::Viewer).await;
+            sqlx::query(&format!("ALTER TABLE {table} RENAME TO {table}_gone"))
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            let (status, html) = get_html(&app, &cookie, "/logs").await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{table}");
+            assert!(!html.contains("Nic jeszcze nie nadano"), "{table}: {html}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_header_badge_and_the_audit_log_speak_polish() {
+        let (app, cookie, csrf, _state) = logged_in(Role::Operator).await;
+        let response = post_form(
+            &app,
+            &cookie,
+            "/compose",
+            format!("csrf={csrf}&text=uwaga&priority=normal&repeat=1&every=0"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let (status, html) = get_html(&app, &cookie, "/logs").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("u · Operator"), "{html}");
+        assert!(html.contains("<td>nowe nadanie</td>"), "{html}");
+        assert!(!html.contains("<td>compose</td>"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn links_use_the_panel_accent_colour() {
+        let css = String::from_utf8(
+            crate::assets::Assets::get("app.css").unwrap().data.into_owned(),
+        )
+        .unwrap();
+        assert!(css.contains("a, a:visited { color: var(--accent); }"), "{css}");
+        assert!(css.contains("a:hover"), "{css}");
+    }
+
+    #[tokio::test]
     async fn an_invalid_cron_is_refused_and_nothing_is_saved() {
         let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
 
@@ -1329,7 +1409,7 @@ pub(crate) mod tests {
 
         assert!(html.contains("nadane"), "{html}");
         assert!(html.contains("komunikat dziennika"), "{html}");
-        assert!(html.contains("compose"), "{html}");
+        assert!(html.contains("nowe nadanie"), "{html}");
         assert!(html.contains("UTC"), "{html}");
         assert!(html.contains("lokalnie"), "{html}");
     }
@@ -1448,13 +1528,13 @@ pub(crate) mod tests {
     async fn the_dashboard_offers_the_watchdog_reset_only_to_an_admin() {
         let (app, cookie, _, _, _) = poisoned_as(Role::Admin).await;
         let html = dashboard_html(app, &cookie).await;
-        assert!(html.contains("watchdog — wymaga reset"));
+        assert!(html.contains("watchdog — wymaga resetu"));
         assert!(html.contains("action=\"/watchdog/clear\""), "{html}");
         assert!(html.contains("Zdejmij blokadę watchdoga"));
 
         let (app, cookie, _, _, _) = poisoned_as(Role::Operator).await;
         let html = dashboard_html(app, &cookie).await;
-        assert!(html.contains("watchdog — wymaga reset"), "operator widzi blokadę");
+        assert!(html.contains("watchdog — wymaga resetu"), "operator widzi blokadę");
         assert!(!html.contains("/watchdog/clear"), "operator nie dostaje przycisku");
     }
 }

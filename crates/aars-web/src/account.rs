@@ -64,6 +64,10 @@ pub async fn password_submit(
     if form.new != form.confirm {
         return Ok(refuse("Powtórzone hasło różni się od nowego."));
     }
+    // Wymuszona zmiana, która zostawia to samo hasło, nic nie zmienia.
+    if form.new == form.current {
+        return Ok(refuse("Nowe hasło musi być inne niż obecne."));
+    }
 
     let repo = UserRepo::new(state.pool.clone());
     match repo
@@ -290,6 +294,11 @@ mod tests {
         let (status, location, _) = send(&app, get("/", &cookie)).await;
         assert_eq!(status, StatusCode::SEE_OTHER);
         assert_eq!(location.as_deref(), Some("/account/password"));
+    }
+
+    #[tokio::test]
+    async fn the_new_password_must_differ_from_the_current_one() {
+        assert_refused("stare-haslo", "stare-haslo", "stare-haslo").await;
     }
 
     #[tokio::test]

@@ -25,9 +25,13 @@ pub async fn page_view(
     current: CurrentUser,
 ) -> Result<Response, AuthRejection> {
     require_role(&current.user, Role::Operator)?;
+    let pending = match queue_rows(&state, 200).await {
+        Ok(rows) => rows,
+        Err(response) => return Ok(response),
+    };
     Ok(page(&QueuePage {
         chrome: Chrome::from(&current),
-        pending: queue_rows(&state, 200).await,
+        pending,
         full: true,
     }))
 }
