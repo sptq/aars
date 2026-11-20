@@ -4,10 +4,13 @@ pub mod auth;
 pub mod chrome;
 pub mod messages;
 pub mod preview;
+pub mod queue_page;
 pub mod render;
 pub mod state;
 
 use aars_core::interlock::Interlocks;
+use std::collections::HashMap;
+
 use aars_core::queue::{EnqueueRequest, QueueItem};
 use aars_core::user::{AuthError, Role, UserRepo};
 use askama::Template;
@@ -19,8 +22,8 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 
-use crate::chrome::{Chrome, both_times_now, parse_priority, priority_label};
 use crate::auth::{AuthRejection, CurrentUser, require_csrf, require_role};
+use crate::chrome::{Chrome, both_times_now, parse_priority, priority_label};
 use crate::render::page;
 pub use crate::state::AppState;
 
@@ -37,6 +40,7 @@ struct DashboardPage {
     tx_enabled: bool,
     poisoned: bool,
     pending: Vec<QueueRow>,
+    full: bool,
 }
 
 #[derive(Template)]
@@ -50,19 +54,29 @@ struct ComposePage {
 struct QueueFragment {
     pending: Vec<QueueRow>,
     chrome: Chrome,
+    /// Pełna strona kolejki: przyciski i odświeżanie zostają przy limicie 200.
+    full: bool,
 }
 
-struct QueueRow {
+pub(crate) struct QueueRow {
     id: i64,
+    group: Option<String>,
+    repeat_label: String,
     priority: String,
     not_before: String,
     text: String,
     interrupting: bool,
 }
 
-fn queue_row(item: QueueItem) -> QueueRow {
+fn queue_row(item: QueueItem, sizes: &HashMap<String, i64>) -> QueueRow {
+    let repeat_label = match item.repeat_group.as_ref().and_then(|g| sizes.get(g)) {
+        Some(size) => format!("{}/{}", item.repeat_index + 1, size),
+        None => String::new(),
+    };
     QueueRow {
         id: item.id,
+        group: item.repeat_group,
+        repeat_label,
         priority: priority_label(item.priority).to_owned(),
         not_before: both_times_now(item.not_before),
         text: item.rendered_text,
@@ -70,9 +84,13 @@ fn queue_row(item: QueueItem) -> QueueRow {
     }
 }
 
-async fn queue_rows(state: &AppState) -> Vec<QueueRow> {
-    match state.queue.pending(50).await {
-        Ok(items) => items.into_iter().map(queue_row).collect(),
+async fn queue_rows(state: &AppState, limit: i64) -> Vec<QueueRow> {
+    let sizes = state.queue.group_sizes().await.unwrap_or_else(|err| {
+        tracing::error!(%err, "odczyt rozmiarów serii zawiódł");
+        HashMap::new()
+    });
+    match state.queue.pending(limit).await {
+        Ok(items) => items.into_iter().map(|item| queue_row(item, &sizes)).collect(),
         Err(err) => {
             tracing::error!(%err, "odczyt kolejki zawiódł");
             Vec::new()
@@ -161,9 +179,9 @@ async fn logout(
 ) -> Result<Response, AuthRejection> {
     require_csrf(&current.csrf_token, Some(&form.csrf))?;
 
-    if let Some(session_id) = auth::session_id_from_cookies(
-        headers.get(header::COOKIE).and_then(|v| v.to_str().ok()),
-    ) {
+    if let Some(session_id) =
+        auth::session_id_from_cookies(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()))
+    {
         let _ = UserRepo::new(state.pool.clone()).end_session(&session_id).await;
     }
 
@@ -184,15 +202,14 @@ async fn dashboard(State(state): State<AppState>, current: CurrentUser) -> Respo
         chrome: Chrome::from(&current),
         tx_enabled: interlocks.tx_enabled,
         poisoned: interlocks.poisoned,
-        pending: queue_rows(&state).await,
+        pending: queue_rows(&state, 50).await,
+        full: false,
     })
 }
 
 async fn compose_page(current: CurrentUser) -> Result<Response, AuthRejection> {
     require_role(&current.user, Role::Operator)?;
-    Ok(page(&ComposePage {
-        chrome: Chrome::from(&current),
-    }))
+    Ok(page(&ComposePage { chrome: Chrome::from(&current) }))
 }
 
 async fn compose_submit(
@@ -206,9 +223,7 @@ async fn compose_submit(
     let text = form.text.trim().to_owned();
     if text.is_empty() {
         // Puste nadanie to wejście na pasmo z ciszą — odmawiamy.
-        return Ok(
-            (StatusCode::BAD_REQUEST, "treść komunikatu nie może być pusta").into_response()
-        );
+        return Ok((StatusCode::BAD_REQUEST, "treść komunikatu nie może być pusta").into_response());
     }
 
     let Some(priority) = parse_priority(&form.priority) else {
@@ -270,13 +285,8 @@ async fn set_tx_enabled(
     }
 
     tracing::warn!(user = %current.user.username, enabled, "zmiana stanu nadawania z panelu");
-    audit(
-        &state,
-        current.user.id,
-        "tx_enabled",
-        if enabled { "włączone" } else { "wyłączone" },
-    )
-    .await;
+    audit(&state, current.user.id, "tx_enabled", if enabled { "włączone" } else { "wyłączone" })
+        .await;
 
     Ok(Redirect::to("/").into_response())
 }
@@ -286,13 +296,11 @@ async fn cancel_item(
     current: CurrentUser,
     headers: header::HeaderMap,
     axum::extract::Path(id): axum::extract::Path<i64>,
+    axum::extract::Query(view): axum::extract::Query<ViewQuery>,
 ) -> Result<Response, AuthRejection> {
     require_role(&current.user, Role::Operator)?;
     // HTMX wysyła token nagłówkiem, bo przycisk nie jest formularzem.
-    require_csrf(
-        &current.csrf_token,
-        headers.get("x-csrf-token").and_then(|v| v.to_str().ok()),
-    )?;
+    require_csrf(&current.csrf_token, headers.get("x-csrf-token").and_then(|v| v.to_str().ok()))?;
 
     match state.queue.cancel(id).await {
         Ok(count) => {
@@ -303,17 +311,34 @@ async fn cancel_item(
     }
 
     // Odpowiadamy fragmentem, więc HTMX podmienia tabelę bez przeładowania.
-    Ok(page(&QueueFragment {
-        pending: queue_rows(&state).await,
-        chrome: Chrome::from(&current),
-    }))
+    Ok(queue_fragment_response(&state, &current, view.full).await)
 }
 
-async fn queue_fragment(State(state): State<AppState>, current: CurrentUser) -> Response {
+/// `?full=1` oznacza fragment strony `/queue` (limit 200 zamiast 50).
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct ViewQuery {
+    #[serde(default)]
+    pub(crate) full: bool,
+}
+
+pub(crate) async fn queue_fragment_response(
+    state: &AppState,
+    current: &CurrentUser,
+    full: bool,
+) -> Response {
     page(&QueueFragment {
-        pending: queue_rows(&state).await,
-        chrome: Chrome::from(&current),
+        pending: queue_rows(state, if full { 200 } else { 50 }).await,
+        chrome: Chrome::from(current),
+        full,
     })
+}
+
+async fn queue_fragment(
+    State(state): State<AppState>,
+    current: CurrentUser,
+    axum::extract::Query(view): axum::extract::Query<ViewQuery>,
+) -> Response {
+    queue_fragment_response(&state, &current, view.full).await
 }
 
 /// Zapis do dziennika audytu: kto kazał i co (spec §5).
@@ -335,10 +360,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(dashboard))
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", post(logout))
-        .route(
-            "/account/password",
-            get(account::password_page).post(account::password_submit),
-        )
+        .route("/account/password", get(account::password_page).post(account::password_submit))
         .route("/compose", get(compose_page).post(compose_submit))
         .route("/messages", get(messages::list).post(messages::create))
         .route("/messages/new", get(messages::new_page))
@@ -353,6 +375,8 @@ pub fn router(state: AppState) -> Router {
         .route("/tx-enabled", post(set_tx_enabled))
         .route("/queue/{id}/cancel", post(cancel_item))
         .route("/fragments/queue", get(queue_fragment))
+        .route("/queue", get(queue_page::page_view))
+        .route("/queue/group/{group}/cancel", post(queue_page::cancel_group))
         .route("/healthz", get(|| async { "ok" }))
         .route("/assets/{*path}", get(assets::serve))
         .with_state(state)
@@ -633,7 +657,9 @@ mod tests {
                     .uri("/compose")
                     .header(header::COOKIE, cookie)
                     .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(format!("csrf={csrf}&text=proba&priority=normal&repeat=1&every=0")))
+                    .body(Body::from(format!(
+                        "csrf={csrf}&text=proba&priority=normal&repeat=1&every=0"
+                    )))
                     .unwrap(),
             )
             .await
@@ -654,7 +680,9 @@ mod tests {
                     .uri("/compose")
                     .header(header::COOKIE, cookie)
                     .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from("csrf=podrobiony&text=atak&priority=emergency&repeat=1&every=0"))
+                    .body(Body::from(
+                        "csrf=podrobiony&text=atak&priority=emergency&repeat=1&every=0",
+                    ))
                     .unwrap(),
             )
             .await
@@ -678,7 +706,9 @@ mod tests {
                     .uri("/compose")
                     .header(header::COOKIE, cookie)
                     .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(format!("csrf={csrf}&text=+++&priority=normal&repeat=1&every=0")))
+                    .body(Body::from(format!(
+                        "csrf={csrf}&text=+++&priority=normal&repeat=1&every=0"
+                    )))
                     .unwrap(),
             )
             .await
@@ -740,6 +770,106 @@ mod tests {
 
         assert!(response.status().is_success(), "{:?}", response.status());
         assert!(state.queue.pending(10).await.unwrap().is_empty());
+    }
+
+    fn repeated(state: &AppState) -> EnqueueRequest {
+        let mut request = enqueue(state, "seria");
+        request.repeat_count = 3;
+        request.repeat_interval = std::time::Duration::from_secs(60);
+        request
+    }
+
+    async fn post_cancel(app: Router, cookie: &str, csrf: Option<&str>, uri: String) -> StatusCode {
+        let mut builder = Request::builder().method("POST").uri(uri).header(header::COOKIE, cookie);
+        if let Some(csrf) = csrf {
+            builder = builder.header("x-csrf-token", csrf);
+        }
+        app.oneshot(builder.body(Body::empty()).unwrap()).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_group_removes_all_remaining_repeats() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+        state.queue.enqueue(repeated(&state)).await.unwrap();
+        let group = state.queue.pending(10).await.unwrap()[0].repeat_group.clone().unwrap();
+
+        let status =
+            post_cancel(app, &cookie, Some(&csrf), format!("/queue/group/{group}/cancel")).await;
+
+        assert!(status.is_success(), "{status:?}");
+        assert!(state.queue.pending(10).await.unwrap().is_empty());
+        let logged: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'queue_cancel_group'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(logged, 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_repeat_keeps_the_others() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+        let ids = state.queue.enqueue(repeated(&state)).await.unwrap();
+
+        let status =
+            post_cancel(app, &cookie, Some(&csrf), format!("/queue/{}/cancel", ids[0])).await;
+
+        assert!(status.is_success(), "{status:?}");
+        assert_eq!(state.queue.pending(10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_queue_page_shows_repeat_position() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+        state.queue.enqueue(repeated(&state)).await.unwrap();
+
+        let html = get_body(app, &cookie, "/queue").await;
+
+        assert!(html.contains("1/3"), "{html}");
+        assert!(html.contains("3/3"), "{html}");
+        assert!(html.contains("Anuluj serię"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn a_viewer_cannot_open_the_queue_page() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Viewer).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/queue")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn group_cancel_without_csrf_is_refused() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+        state.queue.enqueue(repeated(&state)).await.unwrap();
+        let group = state.queue.pending(10).await.unwrap()[0].repeat_group.clone().unwrap();
+
+        let status = post_cancel(app, &cookie, None, format!("/queue/group/{group}/cancel")).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(state.queue.pending(10).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_viewer_cannot_cancel_a_group() {
+        let (app, cookie, csrf, state) = logged_in(Role::Viewer).await;
+        state.queue.enqueue(repeated(&state)).await.unwrap();
+        let group = state.queue.pending(10).await.unwrap()[0].repeat_group.clone().unwrap();
+
+        let status =
+            post_cancel(app, &cookie, Some(&csrf), format!("/queue/group/{group}/cancel")).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(state.queue.pending(10).await.unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -978,15 +1108,13 @@ mod tests {
     async fn send_now_puts_the_definition_on_the_queue() {
         let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
         create_message(&app, &cookie, &csrf).await;
-        let id = aars_core::message::MessageRepo::new(state.pool.clone())
-            .list()
-            .await
-            .unwrap()[0]
-            .id;
+        let id =
+            aars_core::message::MessageRepo::new(state.pool.clone()).list().await.unwrap()[0].id;
 
         let response =
             post_form(&app, &cookie, &format!("/messages/{id}/send"), format!("csrf={csrf}")).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/queue");
 
         let pending = state.queue.pending(10).await.unwrap();
         assert_eq!(pending.len(), 2, "{pending:?}");
