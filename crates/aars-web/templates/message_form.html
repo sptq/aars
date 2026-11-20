@@ -1,5 +1,34 @@
 {% extends "base.html" %}
-{% block title %}AARS — komunikat{% endblock %}
+{% block title %}AARS — komunikat
+<script>
+(function () {
+  var btn = document.getElementById('preview-btn');
+  if (!btn) return;
+  var audio = document.getElementById('preview-audio');
+  var note = document.getElementById('preview-note');
+  btn.addEventListener('click', function () {
+    var form = btn.form;
+    var body = new URLSearchParams();
+    body.set('text', form.elements['text'].value);
+    body.set('csrf', form.elements['csrf'].value);
+    note.textContent = 'Synteza…';
+    fetch('/preview', { method: 'POST', body: body })
+      .then(function (r) {
+        if (!r.ok) return r.text().then(function (t) { throw new Error(t); });
+        return r.blob();
+      })
+      .then(function (blob) {
+        note.textContent = '';
+        if (audio.dataset.url) URL.revokeObjectURL(audio.dataset.url);
+        audio.dataset.url = URL.createObjectURL(blob);
+        audio.src = audio.dataset.url;
+        audio.play();
+      })
+      .catch(function (e) { note.textContent = e.message; });
+  });
+})();
+</script>
+{% endblock %}
 {% block content %}
 <div class="card">
   <h2>{% if id.is_some() %}Edycja komunikatu{% else %}Nowy komunikat{% endif %}</h2>
@@ -59,8 +88,42 @@
     <p id="next-hint" style="color:var(--muted)"
        hx-get="/messages/next" hx-include="#message-form"
        hx-trigger="load, input from:#message-form, change from:#message-form"></p>
+    <div style="margin-bottom:1rem">
+      <button type="button" class="ghost" id="preview-btn">Odsłuchaj</button>
+      <span id="preview-note" style="color:var(--muted)"></span>
+      <audio id="preview-audio" controls style="width:100%;margin-top:0.5rem"></audio>
+    </div>
     <button type="submit">Zapisz</button>
     <a href="/messages">Anuluj</a>
   </form>
 </div>
+
+<script>
+(function () {
+  var btn = document.getElementById('preview-btn');
+  if (!btn) return;
+  var audio = document.getElementById('preview-audio');
+  var note = document.getElementById('preview-note');
+  btn.addEventListener('click', function () {
+    var form = btn.form;
+    var body = new URLSearchParams();
+    body.set('text', form.elements['text'].value);
+    body.set('csrf', form.elements['csrf'].value);
+    note.textContent = 'Synteza…';
+    fetch('/preview', { method: 'POST', body: body })
+      .then(function (r) {
+        if (!r.ok) return r.text().then(function (t) { throw new Error(t); });
+        return r.blob();
+      })
+      .then(function (blob) {
+        note.textContent = '';
+        if (audio.dataset.url) URL.revokeObjectURL(audio.dataset.url);
+        audio.dataset.url = URL.createObjectURL(blob);
+        audio.src = audio.dataset.url;
+        audio.play();
+      })
+      .catch(function (e) { note.textContent = e.message; });
+  });
+})();
+</script>
 {% endblock %}

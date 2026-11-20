@@ -20,6 +20,7 @@
         <td>{{ row.next }}</td>
         <td>{% if row.enabled %}<span class="badge on">włączony</span>{% else %}<span class="badge off">wyłączony</span>{% endif %}</td>
         <td style="white-space:nowrap">
+          <button type="button" class="ghost" onclick="var a=document.getElementById('preview-audio');a.src='/messages/{{ row.id }}/preview.wav';a.play()">Odsłuchaj</button>
           <form method="post" action="/messages/{{ row.id }}/send" style="display:inline">
             <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
             <button type="submit">Nadaj teraz</button>
@@ -40,5 +41,6 @@
     </tbody>
   </table>
   {% endif %}
+  <audio id="preview-audio" controls style="width:100%;margin-top:1rem"></audio>
 </div>
 {% endblock %}
