@@ -23,7 +23,7 @@ const WATCHDOG_GRACE: Duration = Duration::from_secs(2);
 /// Limit strażnika: PTT trzyma `tx_tail` przed audio i do `tx_max` audio,
 /// więc strażnik musi dać obu, plus zapas. Bez `tx_tail` długi ogon radia
 /// zatruwałby stację na zwykłym komunikacie o maksymalnej długości.
-fn watchdog_limit(tx_max: Duration, tx_tail: Duration) -> Duration {
+pub(crate) fn watchdog_limit(tx_max: Duration, tx_tail: Duration) -> Duration {
     tx_max + tx_tail + WATCHDOG_GRACE
 }
 

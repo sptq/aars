@@ -1,0 +1,21 @@
+# Reset kont admina plikiem z partycji boot (R13). Właściciel kładzie pusty
+# plik aars-reset-admin na partycji boot karty; przy starcie ta usługa
+# przekazuje prośbę usłudze aars (plik obok bazy) i usuwa plik z partycji.
+# Kont nie wyłącza tu root: robi to aars przy starcie, w trybie kreatora,
+# więc baza nie dostaje plików roota.
+[Unit]
+Description=AARS — prośba o reset kont admina z partycji boot
+ConditionPathExists=/boot/firmware/aars-reset-admin
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=aars.service
+
+[Service]
+Type=oneshot
+User=aars
+Group=aars
+ExecStart=/usr/bin/touch /var/lib/aars/aars-reset-admin
+# Usunięcie z partycji boot (vfat roota) wymaga roota: tylko ta linia.
+ExecStart=+/usr/bin/rm -f /boot/firmware/aars-reset-admin
+
+[Install]
+WantedBy=multi-user.target

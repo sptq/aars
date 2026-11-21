@@ -343,8 +343,9 @@ pub async fn run_once(
 /// Zapas drenażu ponad limit strażnika TX: zamknięcie strumienia, join
 /// wątku sekwencera i zapis wyniku. W testach krótszy, żeby test
 /// zawieszonego drenażu nie trwał pół minuty.
+const SERVICE_DRAIN_MARGIN: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
-const DRAIN_MARGIN: Duration = Duration::from_secs(30);
+const DRAIN_MARGIN: Duration = SERVICE_DRAIN_MARGIN;
 #[cfg(test)]
 const DRAIN_MARGIN: Duration = Duration::from_secs(2);
 
@@ -943,6 +944,34 @@ mod tests {
 
     use crate::service::{FakeNotifier, Notifier, ReadyOnce};
     use crate::update::control::UpdateTarget;
+
+    /// `TimeoutStopSec` w `aars.service` musi objąć najdłuższe nadanie: po
+    /// SIGTERM sekwencer zwykle opuszcza PTT w ~150 ms, ale po panice
+    /// dyspozytora stacja czeka na strażnika TX, a drenaż ma zapas
+    /// `SERVICE_DRAIN_MARGIN`. SIGKILL wcześniej zostawiłby PTT jądru.
+    /// Górne granice z walidacji panelu: `tx_max_duration_s` ≤ 600
+    /// (`settings.rs`), `ptt.tx_tail_ms` ≤ 2000 (`hardware/mod.rs`).
+    #[test]
+    fn the_service_stop_timeout_covers_the_longest_transmission() {
+        let unit = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/systemd/aars.service"
+        ))
+        .unwrap();
+        let stop: u64 = unit
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("TimeoutStopSec="))
+            .expect("TimeoutStopSec w aars.service")
+            .parse()
+            .expect("TimeoutStopSec w sekundach");
+        let longest = radio::watchdog_limit(Duration::from_secs(600), Duration::from_millis(2000))
+            + SERVICE_DRAIN_MARGIN;
+        assert!(
+            Duration::from_secs(stop) >= longest,
+            "TimeoutStopSec={stop} < {} s",
+            longest.as_secs()
+        );
+    }
 
     struct FakeHardware {
         fail_devices: Vec<String>,
