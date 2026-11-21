@@ -675,7 +675,11 @@ async fn run_station(
         tokio::time::sleep(CONTROL_POLL).await;
     };
     health.set_dispatcher_alive(false);
-    if matches!(exit, Exit::Stop) {
+    // `STOPPING=1` tylko przy zatrzymaniu na żądanie (Ctrl-C, SIGTERM).
+    // Panika dyspozytora i werdykt „zła wersja” kończą proces błędem, który
+    // systemd ma podnieść, więc nie udają zatrzymania (przegląd 1–4, M-2).
+    let stop_requested = || stop.is_cancelled() && health.fatal().is_none();
+    if matches!(exit, Exit::Stop) && !dispatcher_failed && stop_requested() {
         notifier.stopping();
     }
 
@@ -703,7 +707,9 @@ async fn run_station(
                 }
                 () = tokio::time::sleep(CONTROL_POLL) => {
                     if stop.is_cancelled() && !shutdown.is_cancelled() {
-                        notifier.stopping();
+                        if stop_requested() {
+                            notifier.stopping();
+                        }
                         shutdown.cancel();
                     }
                     if !stop.is_cancelled() && tokio::time::Instant::now() >= give_up {
@@ -1878,6 +1884,35 @@ mod tests {
                 "STOPPING=1".to_owned(),
             ]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unhealthy_exit_does_not_announce_stopping() {
+        // Werdykt „zła wersja” kończy proces błędem przez ten sam `stop`.
+        // systemd nie może dostać `STOPPING=1`, bo to nie jest zatrzymanie
+        // na żądanie (przegląd 1–4, M-2).
+        let pool = aars_core::db::test_pool().await;
+        let fake = Arc::new(FakeNotifier::default());
+        let health = Arc::new(HealthCell::default());
+        let stop = CancelToken::new();
+        let (task, _handle) = start_full(
+            station_config("fatal-no-stopping"),
+            pool,
+            Arc::new(FakeHardware::new(&[])),
+            stop.clone(),
+            fake.clone(),
+            health.clone(),
+        )
+        .await;
+        health.set_fatal("nadawanie nie wstało".to_owned());
+        stop.cancel();
+        let exit = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Stop));
+        assert_eq!(fake.events(), vec!["READY=1".to_owned()]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
