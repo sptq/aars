@@ -135,6 +135,13 @@ pub struct TtsConfig {
     pub piper_bin: String,
     /// Ścieżka do modelu głosu .onnx (obok musi leżeć .onnx.json).
     pub model: String,
+    /// Katalog z modelami głosów. Tylko w pliku: panel go nie zmienia.
+    #[serde(default = "default_voices_dir")]
+    pub voices_dir: PathBuf,
+}
+
+fn default_voices_dir() -> PathBuf {
+    PathBuf::from("/var/lib/aars/voices")
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -172,6 +179,7 @@ impl Default for Config {
             tts: TtsConfig {
                 piper_bin: "piper".to_owned(),
                 model: "/var/lib/aars/voices/pl_PL-darkman-medium.onnx".to_owned(),
+                voices_dir: default_voices_dir(),
             },
             storage: StorageConfig {
                 db_path: PathBuf::from("var/aars.db"),
@@ -218,6 +226,40 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_config_without_voices_dir_uses_the_default() {
+        let old: TtsConfig =
+            parse_tts("piper_bin = \"piper\"\nmodel = \"/x/v.onnx\"\n");
+        assert_eq!(old.voices_dir, PathBuf::from("/var/lib/aars/voices"));
+    }
+
+    fn parse_tts(toml: &str) -> TtsConfig {
+        Figment::from(Toml::string(toml)).extract().unwrap()
+    }
+
+    /// `aars.example.toml` ma tylko ścieżki (etap 9): reszta to wartości
+    /// domyślne, nadpisywane z panelu.
+    #[test]
+    fn the_paths_only_example_config_loads() {
+        let example =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../aars.example.toml");
+        let text = std::fs::read_to_string(&example).unwrap();
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("aars.toml", &text)?;
+            let cfg = Config::load(Some(std::path::Path::new("aars.toml"))).unwrap();
+            let defaults = Config::default();
+            assert_eq!(cfg.server, defaults.server);
+            assert_eq!(cfg.audio, defaults.audio);
+            assert_eq!(cfg.ptt, defaults.ptt);
+            assert_eq!(cfg.tts.model, defaults.tts.model);
+            assert_eq!(
+                cfg.tts.voices_dir,
+                std::path::PathBuf::from("/var/lib/aars/voices")
+            );
+            Ok(())
+        });
+    }
 
     #[test]
     fn a_config_without_sources_uses_the_imgw_default() {

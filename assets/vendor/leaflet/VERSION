@@ -1,0 +1,6 @@
+leaflet 1.9.4
+źródło: https://registry.npmjs.org/leaflet/-/leaflet-1.9.4.tgz (pliki z package/dist/ i package/LICENSE, bez zmian)
+sha256 leaflet-1.9.4.tgz: 84c65a256e50657896f54c33bd857b6849ebe94c817803be818bf32a3dde0b77
+integrity (npm): sha512-nxS1ynzJOmOlHp+iL3FyWqK89GtNL8U8rvlMOsQdTTssxZwCXh8N2NB3GDQOL+YR3XnWyZAxwQixURb+FA74PA==
+licencja: BSD-2-Clause (LICENSE)
+pominięte: leaflet.js.map, leaflet-src*.js, images/layers*.png (kontrolka warstw nieużywana)

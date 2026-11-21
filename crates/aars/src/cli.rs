@@ -61,6 +61,19 @@ pub enum Command {
     },
     /// Uruchamia stację: harmonogram i dyspozytor pracują aż do przerwania.
     Run,
+    /// Ustawienia sprzętu z panelu: podgląd i ratunek bez panelu.
+    Hardware {
+        #[command(subcommand)]
+        action: HardwareAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HardwareAction {
+    /// Konfiguracja efektywna z pochodzeniem każdego klucza i stan zastosowania.
+    Show,
+    /// Kasuje ustawienia sprzętu z panelu; przy następnym starcie obowiązuje aars.toml.
+    Reset,
 }
 
 #[derive(Debug, Subcommand)]

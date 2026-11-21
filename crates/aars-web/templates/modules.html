@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}AARS — moduły{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Moduły stacji</h2>
+  <p style="color:var(--muted)">Włączenie lub wyłączenie modułu działa od razu: źródło od następnego cyklu, harmonogram od następnego tiku. Wyłączenie nie kasuje kolejki — to, co już czeka, anulujesz w <a href="/queue">Kolejce</a>.{% if !chrome.is_admin %} Zmiany wprowadza administrator.{% endif %}</p>
+</div>
+{% for m in modules %}
+<div class="card" id="{{ m.id }}">
+  <h2>{{ m.name }} <span class="badge {{ m.css }}">{{ m.state }}</span>{% if let Some((css, text)) = m.health %} <span class="badge {{ css }}">{{ text }}</span>{% endif %}</h2>
+  <p style="color:var(--muted)">{{ m.kind }}</p>
+  <p>{{ m.description }}</p>
+  {% if let Some(message) = m.error %}<p class="error">{{ message }}</p>{% endif %}
+  {% if let Some(callsign) = m.ident %}
+  {% if callsign.is_empty() %}<p class="error">Uwaga: bez znaku wywoławczego stacja nadaje bez identyfikacji.</p>{% else %}<p>Znak stacji: <strong>{{ callsign }}</strong></p>{% endif %}
+  {% endif %}
+  <p>
+    {% if m.is_source %}<a href="/sources">Stan źródła i aktywne ostrzeżenia</a>{% endif %}
+    {% if let Some((text, href)) = m.see_also %}{% if m.is_source %} · {% endif %}<a href="{{ href }}">{{ text }}</a>{% endif %}
+  </p>
+  {% if chrome.is_admin %}
+  {% if m.switchable %}
+  <form method="post" action="/modules/{{ m.id }}/enabled" style="margin-bottom:0.8rem">
+    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+    <input type="hidden" name="enabled" value="{% if m.enabled %}0{% else %}1{% endif %}">
+    <button type="submit" class="{% if m.enabled %}danger{% endif %}">{% if m.enabled %}Wyłącz{% else %}Włącz{% endif %}</button>
+  </form>
+  {% endif %}
+  {% if !m.fields.is_empty() %}
+  <h3 style="margin-top:1rem">Ustawienia</h3>
+  <form method="post" action="/modules/{{ m.id }}/settings">
+    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+    {% for f in m.fields %}
+    <div style="margin-bottom:0.8rem">
+      {% if f.kind == "integer" %}
+      <label for="{{ m.id }}-{{ f.key }}">{{ f.label }} ({{ f.min }}–{{ f.max }})</label>
+      <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="number" min="{{ f.min }}" max="{{ f.max }}" value="{{ f.value }}" required>
+      {% else if f.kind == "area" %}
+      <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
+      <textarea id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" rows="5" placeholder="1061 Łódź&#10;10">{{ f.value }}</textarea>
+      {% else if f.kind == "choice" %}
+      <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
+      <select id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}">
+        {% for (value, label) in f.options %}<option value="{{ value }}" {% if f.value == *value %}selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+      {% else %}
+      <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
+      <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" value="{{ f.value }}" maxlength="{{ f.max_len }}">
+      {% endif %}
+      {% if !f.help.is_empty() %}<small style="color:var(--muted)">{{ f.help }}</small>{% endif %}
+    </div>
+    {% endfor %}
+    <button type="submit">Zapisz</button>
+  </form>
+  {% endif %}
+  {% endif %}
+</div>
+{% endfor %}
+{% endblock %}

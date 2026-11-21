@@ -26,3 +26,4 @@ testing = []
 aars-core = { path = "../aars-core", features = ["testing"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 tower.workspace = true
+tempfile = "3"

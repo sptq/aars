@@ -1,0 +1,784 @@
+//! Strona „Moduły” (etap 9, R13–R15): stan każdego modułu z rejestru, a dla
+//! administratora włączanie i formularz ustawień generowany ze schematu.
+//! Operator widzi tylko stan. Panel nie zna crate'a źródeł — źródło budzi
+//! `AppState::source_refresh`.
+
+use std::collections::{BTreeMap, HashMap};
+
+use aars_core::error::DbError;
+use aars_core::module::{
+    ModuleDescriptor, ModuleError, ModuleKind, ModuleRepo, SettingKind, Toggle,
+};
+use aars_core::settings::SettingsRepo;
+use aars_core::source_state::SourceStateRepo;
+use aars_core::user::Role;
+use askama::Template;
+use axum::Form;
+use axum::extract::{Path, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use chrono::Utc;
+use serde::Deserialize;
+
+use crate::audit;
+use crate::auth::{AuthRejection, CurrentUser, require_csrf, require_role};
+use crate::chrome::Chrome;
+use crate::render::{db_error, page};
+use crate::sources_page::health;
+use crate::state::AppState;
+
+/// Pole formularza ustawień wygenerowane z `SettingSpec`.
+pub(crate) struct FieldView {
+    pub(crate) key: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) help: &'static str,
+    /// `text` | `integer` | `area` | `choice`
+    pub(crate) kind: &'static str,
+    pub(crate) value: String,
+    pub(crate) max_len: usize,
+    pub(crate) min: i64,
+    pub(crate) max: i64,
+    /// (wartość, etykieta)
+    pub(crate) options: Vec<(&'static str, &'static str)>,
+}
+
+pub(crate) struct ModuleView {
+    pub(crate) id: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) kind: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) css: &'static str,
+    pub(crate) state: String,
+    pub(crate) switchable: bool,
+    pub(crate) enabled: bool,
+    pub(crate) is_source: bool,
+    /// Plakietka zdrowia źródła z etapu 8: (klasa CSS, tekst).
+    pub(crate) health: Option<(&'static str, String)>,
+    pub(crate) see_also: Option<(&'static str, &'static str)>,
+    pub(crate) fields: Vec<FieldView>,
+    /// Tylko `auto-id`: bieżący znak (pusty = brak).
+    pub(crate) ident: Option<String>,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "modules.html")]
+struct ModulesPage {
+    chrome: Chrome,
+    modules: Vec<ModuleView>,
+}
+
+fn kind_name(kind: SettingKind) -> &'static str {
+    match kind {
+        SettingKind::Text { .. } => "text",
+        SettingKind::Integer { .. } => "integer",
+        SettingKind::Area => "area",
+        SettingKind::Choice(_) => "choice",
+    }
+}
+
+fn field_view(spec: &aars_core::module::SettingSpec, value: String) -> FieldView {
+    let (max_len, min, max, options) = match spec.kind {
+        SettingKind::Text { max_len } => (max_len, 0, 0, Vec::new()),
+        SettingKind::Integer { min, max } => (0, min, max, Vec::new()),
+        SettingKind::Area => (0, 0, 0, Vec::new()),
+        SettingKind::Choice(options) => (0, 0, 0, options.to_vec()),
+    };
+    FieldView {
+        key: spec.key,
+        label: spec.label,
+        help: spec.help,
+        kind: kind_name(spec.kind),
+        value,
+        max_len,
+        min,
+        max,
+        options,
+    }
+}
+
+async fn module_view(
+    state: &AppState,
+    m: &ModuleDescriptor,
+    callsign: &str,
+) -> Result<ModuleView, DbError> {
+    let repo = ModuleRepo::new(state.pool.clone());
+    let enabled = repo.is_enabled(m).await?;
+    let (css, state_text) = match m.toggle {
+        Toggle::Switchable if enabled => ("on", "włączony".to_owned()),
+        Toggle::Switchable => ("off", "wyłączony".to_owned()),
+        Toggle::AlwaysOn(reason) => ("on", format!("zawsze włączony — {reason}")),
+        Toggle::Planned(when) => ("warn", format!("planowany — {when}")),
+    };
+    let health = if m.kind == ModuleKind::Source {
+        let sources = SourceStateRepo::new(state.pool.clone());
+        let status = sources
+            .statuses()
+            .await?
+            .into_iter()
+            .find(|s| s.source_id == m.id);
+        match (status, sources.config(m.id).await?) {
+            (Some(status), Some(cfg)) => Some(health(&status, &cfg, Utc::now())),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let values = repo.settings(m).await?;
+    let fields = m
+        .settings
+        .iter()
+        .map(|spec| field_view(spec, values.get(spec.key).cloned().unwrap_or_default()))
+        .collect();
+    Ok(ModuleView {
+        id: m.id,
+        name: m.name,
+        kind: m.kind.label(),
+        description: m.description,
+        css,
+        state: state_text,
+        switchable: m.toggle == Toggle::Switchable,
+        enabled,
+        is_source: m.kind == ModuleKind::Source,
+        health,
+        see_also: m.see_also,
+        fields,
+        ident: (m.kind == ModuleKind::Ident).then(|| callsign.to_owned()),
+        error: None,
+    })
+}
+
+async fn load_views(state: &AppState) -> Result<Vec<ModuleView>, DbError> {
+    let callsign = SettingsRepo::new(state.pool.clone()).load().await?.callsign;
+    let mut views = Vec::new();
+    for m in state.modules.iter() {
+        views.push(module_view(state, m, &callsign).await?);
+    }
+    Ok(views)
+}
+
+/// Strona z błędem w karcie modułu `id`; `entered` zastępuje wartości pól.
+async fn page_with_error(
+    state: &AppState,
+    current: &CurrentUser,
+    id: &str,
+    message: String,
+    entered: Option<&BTreeMap<String, String>>,
+) -> Response {
+    let mut modules = match load_views(state).await {
+        Ok(views) => views,
+        Err(err) => return db_error("odczyt modułów zawiódł", &err),
+    };
+    if let Some(view) = modules.iter_mut().find(|v| v.id == id) {
+        if let Some(entered) = entered {
+            for field in &mut view.fields {
+                if let Some(value) = entered.get(field.key) {
+                    field.value = value.clone();
+                }
+            }
+        }
+        view.error = Some(message);
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        page(&ModulesPage {
+            chrome: Chrome::from(current),
+            modules,
+        }),
+    )
+        .into_response()
+}
+
+/// `GET /modules` (operator: stan; admin: także przełączniki i ustawienia).
+pub async fn page_view(
+    State(state): State<AppState>,
+    current: CurrentUser,
+) -> Result<Response, AuthRejection> {
+    require_role(&current.user, Role::Operator)?;
+    match load_views(&state).await {
+        Ok(modules) => Ok(page(&ModulesPage {
+            chrome: Chrome::from(&current),
+            modules,
+        })),
+        Err(err) => Ok(db_error("odczyt modułów zawiódł", &err)),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EnabledForm {
+    #[serde(default)]
+    csrf: String,
+    #[serde(default)]
+    enabled: String,
+}
+
+fn unknown_module() -> Response {
+    (StatusCode::NOT_FOUND, "nie ma takiego modułu").into_response()
+}
+
+fn see_other(location: String) -> Response {
+    (StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response()
+}
+
+/// `POST /modules/{id}/enabled` (admin, R15). Włączone źródło jest od razu
+/// budzone; harmonogram zauważa zmianę przy następnym tiku (R3).
+pub async fn set_enabled(
+    State(state): State<AppState>,
+    current: CurrentUser,
+    Path(id): Path<String>,
+    Form(form): Form<EnabledForm>,
+) -> Result<Response, AuthRejection> {
+    require_role(&current.user, Role::Admin)?;
+    require_csrf(&current.csrf_token, Some(&form.csrf))?;
+
+    let Some(m) = state.modules.get(&id).copied() else {
+        return Ok(unknown_module());
+    };
+    let enabled = matches!(form.enabled.as_str(), "1" | "true" | "on");
+    match ModuleRepo::new(state.pool.clone())
+        .set_enabled(&m, enabled)
+        .await
+    {
+        Ok(()) => {}
+        Err(err @ (ModuleError::AlwaysOn(_) | ModuleError::Planned(_))) => {
+            return Ok(page_with_error(&state, &current, m.id, err.to_string(), None).await);
+        }
+        Err(ModuleError::Db(err)) => return Ok(db_error("zmiana stanu modułu zawiodła", &err)),
+    }
+    // Włączenie modułu zawsze włączonego niczego nie zmienia, więc nie ma wpisu.
+    if m.toggle == Toggle::Switchable {
+        audit(
+            &state,
+            current.user.id,
+            "module_enabled",
+            &format!(
+                "{}: {}",
+                m.id,
+                if enabled { "włączony" } else { "wyłączony" }
+            ),
+        )
+        .await;
+    }
+    if enabled
+        && m.kind == ModuleKind::Source
+        && let Some(refresh) = &state.source_refresh
+    {
+        refresh(m.id);
+    }
+    Ok(see_other("/modules".to_owned()))
+}
+
+/// `POST /modules/{id}/settings` (admin). Brane są tylko klucze ze schematu;
+/// brak pola znaczy „bez zmiany”.
+pub async fn save_settings(
+    State(state): State<AppState>,
+    current: CurrentUser,
+    Path(id): Path<String>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Result<Response, AuthRejection> {
+    require_role(&current.user, Role::Admin)?;
+    require_csrf(&current.csrf_token, form.get("csrf").map(String::as_str))?;
+
+    let Some(m) = state.modules.get(&id).copied() else {
+        return Ok(unknown_module());
+    };
+    if m.settings.is_empty() {
+        return Ok(unknown_module());
+    }
+    let repo = ModuleRepo::new(state.pool.clone());
+    let stored = match repo.settings(&m).await {
+        Ok(stored) => stored,
+        Err(err) => return Ok(db_error("odczyt ustawień modułu zawiódł", &err)),
+    };
+    let mut input = stored.clone();
+    for spec in m.settings {
+        if let Some(value) = form.get(spec.key) {
+            input.insert(spec.key.to_owned(), value.clone());
+        }
+    }
+    let values = match m.validate(&input) {
+        Ok(values) => values,
+        Err(message) => {
+            return Ok(page_with_error(&state, &current, m.id, message, Some(&input)).await);
+        }
+    };
+    let changed: Vec<&str> = m
+        .settings
+        .iter()
+        .filter(|spec| stored.get(spec.key) != values.get(spec.key))
+        .map(|spec| spec.key)
+        .collect();
+    if changed.is_empty() {
+        return Ok(see_other(format!("/modules#{}", m.id)));
+    }
+    if let Err(err) = repo.save_settings(&m, &values).await {
+        return Ok(db_error("zapis ustawień modułu zawiódł", &err));
+    }
+    audit(
+        &state,
+        current.user.id,
+        "module_settings",
+        &format!("{}: {}", m.id, changed.join(", ")),
+    )
+    .await;
+    if m.kind == ModuleKind::Source
+        && let Some(refresh) = &state.source_refresh
+    {
+        refresh(m.id);
+    }
+    Ok(see_other(format!("/modules#{}", m.id)))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::AppState;
+    use crate::router;
+    use crate::tests::{login, state};
+    use aars_core::source_state::SourceStateRepo;
+    use aars_core::user::{Role, UserRepo};
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
+
+    async fn app_as(role: Role, state: AppState) -> (Router, String, String, AppState) {
+        UserRepo::new(state.pool.clone())
+            .create("u", "haslo", role)
+            .await
+            .unwrap();
+        let app = router(state.clone());
+        let (cookie, csrf) = login(&app, "u", "haslo").await;
+        (app, cookie, csrf, state)
+    }
+
+    async fn get(app: &Router, cookie: &str, path: &str) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    async fn post(
+        app: &Router,
+        cookie: &str,
+        csrf: &str,
+        path: &str,
+        fields: &str,
+    ) -> (StatusCode, Option<String>, String) {
+        let body = format!("csrf={csrf}&{fields}");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::COOKIE, cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, location, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn encode(text: &str) -> String {
+        text.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => (b as char).to_string(),
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+
+    async fn audit_details(state: &AppState, action: &str) -> Vec<String> {
+        sqlx::query_scalar("SELECT detail FROM audit_log WHERE action = ? ORDER BY id")
+            .bind(action)
+            .fetch_all(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn setting(state: &AppState, key: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn imgw(state: &AppState) -> aars_core::source_state::SourceConfig {
+        SourceStateRepo::new(state.pool.clone())
+            .config("imgw-meteo")
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn counting_refresh(state: AppState) -> (AppState, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let state = state.with_source_refresh(Arc::new(move |id| {
+            assert_eq!(id, "imgw-meteo");
+            seen.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        (state, calls)
+    }
+
+    #[tokio::test]
+    async fn an_operator_sees_modules_without_forms() {
+        let (app, cookie, _, _) = app_as(Role::Operator, state().await).await;
+        let (status, html) = get(&app, &cookie, "/modules").await;
+        assert_eq!(status, StatusCode::OK);
+        for needle in [
+            "Harmonogram",
+            "Ostrzeżenia meteorologiczne IMGW",
+            "planowany — etap 11",
+            "zawsze włączony — identyfikacja stacji jest obowiązkowa",
+            "źródło danych",
+            "href=\"/sources\"",
+            "href=\"/settings\"",
+        ] {
+            assert!(html.contains(needle), "brak {needle}: {html}");
+        }
+        assert!(!html.contains("action=\"/modules/"), "{html}");
+        // Kolejność rejestru: wbudowane, potem źródło.
+        let scheduler = html.find("Harmonogram").unwrap();
+        let source = html.find("Ostrzeżenia meteorologiczne IMGW").unwrap();
+        assert!(scheduler < source, "{html}");
+    }
+
+    #[tokio::test]
+    async fn an_admin_sees_toggles_and_forms_generated_from_the_schema() {
+        let (app, cookie, _, _) = app_as(Role::Admin, state().await).await;
+        let (_, html) = get(&app, &cookie, "/modules").await;
+        for needle in [
+            "action=\"/modules/scheduler/enabled\"",
+            "action=\"/modules/imgw-meteo/enabled\"",
+            "action=\"/modules/imgw-meteo/settings\"",
+            "<textarea",
+            "name=\"area\"",
+            "name=\"interval_s\" type=\"number\" min=\"60\" max=\"3600\" value=\"300\"",
+            "id=\"imgw-meteo\"",
+            "Uwaga: bez znaku wywoławczego stacja nadaje bez identyfikacji.",
+        ] {
+            assert!(html.contains(needle), "brak {needle}: {html}");
+        }
+        for absent in [
+            "action=\"/modules/auto-id/enabled\"",
+            "action=\"/modules/bulletin/enabled\"",
+            "action=\"/modules/scheduler/settings\"",
+        ] {
+            assert!(!html.contains(absent), "{absent}: {html}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_ident_card_shows_the_callsign() {
+        let (app, cookie, _, state) = app_as(Role::Operator, state().await).await;
+        sqlx::query("UPDATE settings SET value = 'SP7TQ' WHERE key = 'callsign'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let (_, html) = get(&app, &cookie, "/modules").await;
+        assert!(html.contains("SP7TQ"), "{html}");
+        assert!(!html.contains("bez znaku wywoławczego"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn an_admin_disables_the_scheduler_and_it_is_audited() {
+        let (app, cookie, csrf, state) = app_as(Role::Admin, state().await).await;
+        let (status, location, _) = post(
+            &app,
+            &cookie,
+            &csrf,
+            "/modules/scheduler/enabled",
+            "enabled=0",
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(location.as_deref(), Some("/modules"));
+        assert_eq!(
+            setting(&state, "module:scheduler:enabled").await.as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            audit_details(&state, "module_enabled").await,
+            vec!["scheduler: wyłączony".to_owned()]
+        );
+        let (_, html) = get(&app, &cookie, "/modules").await;
+        assert!(html.contains("wyłączony"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn auto_id_cannot_be_disabled() {
+        let (app, cookie, csrf, state) = app_as(Role::Admin, state().await).await;
+        let (status, _, body) = post(
+            &app,
+            &cookie,
+            &csrf,
+            "/modules/auto-id/enabled",
+            "enabled=0",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("obowiązkowa"), "{body}");
+        assert!(audit_details(&state, "module_enabled").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_bulletin_cannot_be_enabled() {
+        let (app, cookie, csrf, state) = app_as(Role::Admin, state().await).await;
+        let (status, _, body) = post(
+            &app,
+            &cookie,
+            &csrf,
+            "/modules/bulletin/enabled",
+            "enabled=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("etap 11"), "{body}");
+        assert!(audit_details(&state, "module_enabled").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enabling_a_source_module_writes_source_state_and_wakes_it() {
+        let (state, calls) = counting_refresh(state().await);
+        let (app, cookie, csrf, state) = app_as(Role::Admin, state).await;
+        let (status, _, _) = post(
+            &app,
+            &cookie,
+            &csrf,
+            "/modules/imgw-meteo/enabled",
+            "enabled=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(imgw(&state).await.enabled);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            audit_details(&state, "module_enabled").await,
+            vec!["imgw-meteo: włączony".to_owned()]
+        );
+        // Wyłączenie nie budzi źródła.
+        post(
+            &app,
+            &cookie,
+            &csrf,
+            "/modules/imgw-meteo/enabled",
+            "enabled=0",
+        )
+        .await;
+        assert!(!imgw(&state).await.enabled);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_admin_saves_imgw_area_through_the_module_form() {
+        let (state, calls) = counting_refresh(state().await);
+        let (app, cookie, csrf, state) = app_as(Role::Admin, state).await;
+        let fields = format!("area={}&interval_s=600", encode("1061 Łódź\n10"));
+        let (status, location, body) = post(
+            &app,
+            &cookie,
+            &csrf,
+            "/modules/imgw-meteo/settings",
+            &fields,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+        assert_eq!(location.as_deref(), Some("/modules#imgw-meteo"));
+        let cfg = imgw(&state).await;
+        assert_eq!(cfg.area.len(), 2);
+        assert_eq!(cfg.interval_s, 600);
+        assert_eq!(
+            audit_details(&state, "module_settings").await,
+            vec!["imgw-meteo: area, interval_s".to_owned()]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_missing_field_keeps_its_current_value() {
+        let (app, cookie, csrf, state) = app_as(Role::Admin, state().await).await;
+        post(
+            &app,
+            &cookie,
+            &csrf,
+            "/modules/imgw-meteo/settings",
+            "interval_s=900",
+        )
+        .await;
+        post(
+            &app,
+            &cookie,
+            &csrf,
+            "/modules/imgw-meteo/settings",
+            "area=10",
+        )
+        .await;
+        let cfg = imgw(&state).await;
+        assert_eq!(cfg.interval_s, 900);
+        assert_eq!(cfg.area.len(), 1);
+        assert_eq!(
+            audit_details(&state, "module_settings").await,
+            vec![
+                "imgw-meteo: interval_s".to_owned(),
+                "imgw-meteo: area".to_owned()
+            ]
+        );
+        // Bez zmian nie ma wpisu.
+        post(
+            &app,
+            &cookie,
+            &csrf,
+            "/modules/imgw-meteo/settings",
+            "area=10",
+        )
+        .await;
+        assert_eq!(audit_details(&state, "module_settings").await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_county_without_a_name_is_refused_and_nothing_changes() {
+        let (app, cookie, csrf, state) = app_as(Role::Admin, state().await).await;
+        let (status, _, body) = post(
+            &app,
+            &cookie,
+            &csrf,
+            "/modules/imgw-meteo/settings",
+            "area=1061&interval_s=600",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("1061"), "wpisana wartość zostaje: {body}");
+        let cfg = imgw(&state).await;
+        assert_eq!(cfg.area_text, "");
+        assert_eq!(cfg.interval_s, 300);
+        assert!(audit_details(&state, "module_settings").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_interval_out_of_range_is_refused() {
+        let (app, cookie, csrf, state) = app_as(Role::Admin, state().await).await;
+        let fields = format!("area={}&interval_s=30", encode("10"));
+        let (status, _, body) = post(
+            &app,
+            &cookie,
+            &csrf,
+            "/modules/imgw-meteo/settings",
+            &fields,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("60–3600"), "{body}");
+        let cfg = imgw(&state).await;
+        assert_eq!(cfg.area_text, "");
+        assert_eq!(cfg.interval_s, 300);
+    }
+
+    #[tokio::test]
+    async fn an_operator_cannot_change_module_settings() {
+        let (state, calls) = counting_refresh(state().await);
+        let (app, cookie, csrf, state) = app_as(Role::Operator, state).await;
+        let fields = format!("area={}&interval_s=600", encode("10"));
+        let (status, _, _) = post(
+            &app,
+            &cookie,
+            &csrf,
+            "/modules/imgw-meteo/settings",
+            &fields,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _, _) = post(
+            &app,
+            &cookie,
+            &csrf,
+            "/modules/scheduler/enabled",
+            "enabled=0",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(imgw(&state).await.area_text, "");
+        assert_eq!(
+            setting(&state, "module:scheduler:enabled").await.as_deref(),
+            Some("true")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_csrf_token_changes_nothing() {
+        let (app, cookie, _, state) = app_as(Role::Admin, state().await).await;
+        let (status, _, _) = post(
+            &app,
+            &cookie,
+            "zly",
+            "/modules/scheduler/enabled",
+            "enabled=0",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _, _) = post(
+            &app,
+            &cookie,
+            "zly",
+            "/modules/imgw-meteo/settings",
+            "area=10",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            setting(&state, "module:scheduler:enabled").await.as_deref(),
+            Some("true")
+        );
+        assert_eq!(imgw(&state).await.area_text, "");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_module_is_404() {
+        let (app, cookie, csrf, _) = app_as(Role::Admin, state().await).await;
+        for path in ["/modules/nie-ma/enabled", "/modules/nie-ma/settings"] {
+            let (status, _, _) = post(&app, &cookie, &csrf, path, "enabled=1&area=10").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        }
+        // Moduł bez ustawień nie ma formularza.
+        let (status, _, _) = post(&app, &cookie, &csrf, "/modules/scheduler/settings", "x=1").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_viewer_cannot_open_modules() {
+        let (app, cookie, _, _) = app_as(Role::Viewer, state().await).await;
+        assert_eq!(
+            get(&app, &cookie, "/modules").await.0,
+            StatusCode::FORBIDDEN
+        );
+    }
+}

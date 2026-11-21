@@ -10,7 +10,7 @@
     <thead><tr><th>Czas</th><th>Wynik</th><th>Długość</th><th>Treść</th></tr></thead>
     <tbody>
       {% for row in transmissions %}
-      <tr><td>{{ row.at }}</td><td>{{ row.result }}</td><td>{{ row.seconds }} s</td><td>{{ row.text }}</td></tr>
+      <tr><td>{{ row.at }}</td><td>{{ row.result }}</td><td>{{ row.seconds }} s</td><td>{% if row.without_item %}<em style="color:var(--muted)">{{ row.text }}</em>{% else %}{{ row.text }}{% endif %}</td></tr>
       {% endfor %}
     </tbody>
   </table>

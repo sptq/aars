@@ -4,6 +4,7 @@ use aars_core::config::{PttBackendKind, PttConfig};
 use aars_core::ptt::{PttBackend, PttError};
 
 pub mod gpio;
+pub mod probe;
 pub mod serial;
 pub mod vox;
 

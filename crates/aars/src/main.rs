@@ -1,6 +1,8 @@
 mod cli;
+mod probe;
 mod radio;
 mod render;
+mod station;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -40,6 +42,20 @@ async fn main() -> Result<()> {
             tracing::info!(path = %config.storage.db_path.display(), "migracje nałożone");
         }
         cli::Command::Info => {
+            // Z panelem, jeśli baza już istnieje: CLI pokazuje sprzęt, którym
+            // stacja spróbuje nadawać jako pierwszym. Bez bazy — sam plik.
+            let (config, origin) = if config.storage.db_path.exists() {
+                match cli_candidate(&config).await {
+                    Ok(cand) => (cand.config, cand.origin),
+                    Err(err) => {
+                        eprintln!("ustawienia sprzętu z panelu niedostępne ({err:#}), pokazuję plik");
+                        (config, aars_core::hardware::ConfigOrigin::File)
+                    }
+                }
+            } else {
+                (config, aars_core::hardware::ConfigOrigin::File)
+            };
+            println!("sprzęt z:    {}", origin.label());
             println!("bind:        {}", config.server.bind);
             println!("baza:        {}", config.storage.db_path.display());
             println!("cache:       {}", config.storage.cache_dir.display());
@@ -90,7 +106,9 @@ async fn main() -> Result<()> {
             let pool = db::connect(&config.storage.db_path).await.context("otwieranie bazy")?;
             db::migrate(&pool).await.context("nakładanie migracji")?;
 
-            let mut stack = radio::build_stack(&config, &pool).await?;
+            // Ten sam sprzęt, którym nadaje stacja (panel, jeśli jest).
+            let config = station::first_candidate(&config, &pool).await?.config;
+            let mut stack = radio::build_stack(&config, &pool, &station::RealHardware).await?;
 
             // Interlocki sprawdzamy tu, zanim wydamy czas na syntezę: odmowa
             // ma być szybka i czytelna, a sekwencer sprawdzi je i tak.
@@ -154,6 +172,7 @@ async fn main() -> Result<()> {
                     event,
                     aars_core::sequencer::SeqEvent::Finished { .. }
                         | aars_core::sequencer::SeqEvent::Refused { .. }
+                        | aars_core::sequencer::SeqEvent::Skipped { .. }
                 ) {
                     break;
                 }
@@ -226,202 +245,56 @@ async fn main() -> Result<()> {
             cli::SourceAction::Preview => source_preview(&config).await?,
         },
         cli::Command::Run => {
-            use aars_core::dispatcher::{Dispatcher, DispatcherConfig};
-            use aars_core::ident::IdMode;
-            use aars_core::queue::QueueRepo;
             use aars_core::sink::CancelToken;
             use std::sync::Arc;
 
             let pool = db::connect(&config.storage.db_path).await.context("otwieranie bazy")?;
             db::migrate(&pool).await.context("nakładanie migracji")?;
 
-            let stack = radio::build_stack(&config, &pool).await?;
-
-            let callsign: String =
-                sqlx::query_scalar("SELECT value FROM settings WHERE key = 'callsign'")
-                    .fetch_one(&pool)
-                    .await
-                    .context("odczyt znaku wywoławczego")?;
-            let id_mode: String =
-                sqlx::query_scalar("SELECT value FROM settings WHERE key = 'id_mode'")
-                    .fetch_one(&pool)
-                    .await
-                    .context("odczyt trybu identyfikacji")?;
-            let id_mode = if id_mode == "cw" { IdMode::Cw } else { IdMode::Voice };
-
-            let synth: Arc<dyn aars_core::synth::Synthesizer> =
-                Arc::new(aars_audio::piper::PiperSynth::new(
-                    &config.tts.piper_bin,
-                    &config.tts.model,
-                    config.audio.sample_rate,
-                ));
-            let cache = aars_audio::cache::AudioCache::new(
-                pool.clone(),
-                config.storage.cache_dir.clone(),
-                config.storage.cache_max_bytes,
-            );
-            let preview = Arc::new(render::PiperPreview::new(cache.clone(), synth.clone()));
-            let renderer = Arc::new(render::PiperRenderer::new(
-                cache,
-                synth,
-                &callsign,
-                id_mode,
-                config.audio.sample_rate,
-            ));
-
-            let misfire_grace_s: u64 = sqlx::query_scalar::<_, String>(
-                "SELECT value FROM settings WHERE key = 'misfire_grace_s'",
-            )
-            .fetch_one(&pool)
-            .await
-            .context("odczyt misfire_grace_s")?
-            .parse()
-            .unwrap_or(600);
-
-            // Jedno repozytorium kolejki dla obu zadań: harmonogram wstawia,
-            // dyspozytor bierze.
-            let queue = Arc::new(QueueRepo::new(pool.clone()));
-
-            let shutdown = CancelToken::new();
-            let watchdog_marker = stack.watchdog.marker();
-            let dispatcher = Dispatcher::new(
-                queue.clone(),
-                renderer,
-                stack.sequencer,
-                DispatcherConfig {
-                    tick: std::time::Duration::from_millis(500),
-                    ptt_backend: match config.ptt.backend {
-                        aars_core::config::PttBackendKind::Gpio => "gpio",
-                        aars_core::config::PttBackendKind::Serial => "serial",
-                        aars_core::config::PttBackendKind::Vox => "vox",
-                    },
-                },
-            );
-            let scheduler = aars_core::scheduler::Scheduler::new(
-                aars_core::message::MessageRepo::new(pool.clone()),
-                queue.clone(),
-                aars_core::scheduler::SchedulerConfig {
-                    misfire_grace: std::time::Duration::from_secs(misfire_grace_s),
-                    tick: std::time::Duration::from_secs(1),
-                },
-            );
-
-            let users = aars_core::user::UserRepo::new(pool.clone());
-            if let Some(password) = users.ensure_bootstrap_admin().await.context("konto startowe")? {
-                // Jedyny moment, w którym to hasło jest widoczne.
-                println!("== konto startowe: admin / {password}");
-                println!("== zmień je po pierwszym logowaniu");
-            }
-            if let Err(err) = users.purge_expired_sessions().await {
-                tracing::error!(%err, "czyszczenie wygasłych sesji zawiodło");
-            }
-
-            // Źródło jest odizolowane: błąd budowy klienta HTTP wyłącza tylko je.
-            let source_runner =
-                match aars_sources::imgw_meteo::ImgwMeteo::new(&config.sources.imgw_meteo_url) {
-                    Ok(source) => Some(aars_sources::SourceRunner::new(
-                        Arc::new(source),
-                        aars_core::source_state::SourceStateRepo::new(pool.clone()),
-                        queue.clone(),
-                    )),
-                    Err(err) => {
-                        source_start_failed(
-                            &aars_core::source_state::SourceStateRepo::new(pool.clone()),
-                            &err.to_string(),
-                        )
-                        .await;
-                        None
+            // Jeden `stop` na cały proces: Ctrl-C kończy także stację, która
+            // właśnie czeka na koniec nadania przed restartem.
+            let stop = CancelToken::new();
+            let on_signal = stop.clone();
+            tokio::spawn(async move {
+                match tokio::signal::ctrl_c().await {
+                    Ok(()) => {
+                        tracing::info!("zatrzymuję stację");
+                        on_signal.cancel();
                     }
-                };
-            let source_refresh: Option<aars_web::state::SourceRefresh> =
-                source_runner.as_ref().map(|runner| {
-                    let notify = runner.refresh_handle();
-                    Arc::new(move |id: &str| {
-                        if id == "imgw-meteo" {
-                            notify.notify_one();
-                            true
-                        } else {
-                            false
-                        }
-                    }) as aars_web::state::SourceRefresh
-                });
-
-            let clear_marker = watchdog_marker.clone();
-            let mut state = aars_web::AppState::new(
-                pool.clone(),
-                queue.clone(),
-                stack.interlocks.clone(),
-                false,
-            )
-            .with_preview(preview)
-            .with_hardware(vec![
-                ("Urządzenie audio".to_owned(), config.audio.device.clone()),
-                (
-                    "Częstotliwość próbkowania".to_owned(),
-                    format!("{} Hz", config.audio.sample_rate),
-                ),
-                (
-                    "Backend PTT".to_owned(),
-                    config.ptt.backend.label().to_owned(),
-                ),
-                ("Model głosu".to_owned(), config.tts.model.clone()),
-            ])
-            .with_watchdog_clear(Arc::new(move || clear_marker.clear_poison()));
-            if let Some(refresh) = source_refresh {
-                state = state.with_source_refresh(refresh);
-            }
-            let app = aars_web::router(state);
-            let listener = tokio::net::TcpListener::bind(&config.server.bind)
-                .await
-                .with_context(|| format!("nasłuch na {}", config.server.bind))?;
-
-            let quiet_task = tokio::spawn(radio::quiet_hours_task(
-                pool.clone(),
-                stack.interlocks.clone(),
-                shutdown.clone(),
-            ));
-            let dispatcher_task = tokio::spawn(dispatcher.run(shutdown.clone()));
-            let scheduler_task = tokio::spawn(scheduler.run(shutdown.clone()));
-            let poison_task = tokio::spawn(radio::watch_poison(
-                watchdog_marker,
-                stack.interlocks.clone(),
-                pool.clone(),
-                shutdown.clone(),
-            ));
-
-            let source_task =
-                source_runner.map(|runner| tokio::spawn(runner.run(shutdown.clone())));
-
-            let server_shutdown = shutdown.clone();
-            let server_task = tokio::spawn(async move {
-                let graceful = axum::serve(listener, app).with_graceful_shutdown(async move {
-                    while !server_shutdown.is_cancelled() {
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    }
-                });
-                if let Err(err) = graceful.await {
-                    tracing::error!(%err, "serwer panelu zakończył się błędem");
+                    Err(err) => tracing::error!(%err, "oczekiwanie na Ctrl-C zawiodło"),
                 }
             });
 
-            tracing::info!(
-                bind = %config.server.bind,
-                misfire_grace_s,
-                "stacja uruchomiona, Ctrl-C kończy"
-            );
-
-            tokio::signal::ctrl_c().await.context("oczekiwanie na sygnał")?;
-            tracing::info!("zatrzymuję stację");
-            shutdown.cancel();
-            let _ = dispatcher_task.await;
-            let _ = scheduler_task.await;
-            let _ = server_task.await;
-            let _ = poison_task.await;
-            let _ = quiet_task.await;
-            if let Some(task) = source_task {
-                let _ = task.await;
+            let factory: Arc<dyn station::HardwareFactory> = Arc::new(station::RealHardware);
+            let probe: Arc<dyn aars_core::hardware::probe::HardwareProbe> = Arc::new(probe::HostProbe);
+            while let station::Exit::Restart =
+                station::run_once(&config, &pool, factory.clone(), probe.clone(), stop.clone())
+                    .await?
+            {
+                tracing::info!("restart stacji w procesie");
             }
-            stack.watchdog.stop();
+        }
+        cli::Command::Hardware { action } => {
+            use aars_core::hardware::HardwareRepo;
+
+            let pool = db::connect(&config.storage.db_path).await.context("otwieranie bazy")?;
+            db::migrate(&pool).await.context("nakładanie migracji")?;
+            let repo = HardwareRepo::new(pool);
+            match action {
+                cli::HardwareAction::Show => {
+                    let panel = repo.overrides().await.context("odczyt ustawień sprzętu")?;
+                    let status = repo.apply_status().await.context("odczyt stanu zastosowania")?;
+                    for line in station::hardware_show_lines(&config, &panel, status.as_ref()) {
+                        println!("{line}");
+                    }
+                }
+                cli::HardwareAction::Reset => {
+                    let n = repo.clear().await.context("kasowanie ustawień sprzętu")?;
+                    println!(
+                        "usunięto {n} wpisów sprzętu (ustawienia z panelu, ostatnia działająca, stan zastosowania); przy następnym starcie obowiązuje aars.toml"
+                    );
+                }
+            }
         }
         cli::Command::Message { action } => {
             use aars_core::message::{MessageRepo, NewMessage, ScheduleKind};
@@ -516,14 +389,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Źródła nie udało się zbudować: ślad w `source_state`, żeby panel pokazał je
-/// jako awaryjne, a nie „włączone” bez prób.
-async fn source_start_failed(state: &aars_core::source_state::SourceStateRepo, reason: &str) {
-    tracing::error!(%reason, "źródło imgw-meteo nie wystartuje");
-    let message = format!("klient HTTP: {reason}");
-    if let Err(err) = state.record_failure("imgw-meteo", chrono::Utc::now(), &message).await {
-        tracing::error!(%err, "nie udało się zapisać porażki źródła");
-    }
+/// Pierwszy kandydat konfiguracji dla CLI, z bazy, która już istnieje.
+async fn cli_candidate(config: &Config) -> Result<station::Candidate> {
+    let pool = db::connect(&config.storage.db_path).await.context("otwieranie bazy")?;
+    db::migrate(&pool).await.context("nakładanie migracji")?;
+    station::first_candidate(config, &pool).await
 }
 
 /// `aars source preview`: jedno pobranie, bez zapisu i bez kolejki.
@@ -560,6 +430,8 @@ async fn source_preview(config: &Config) -> Result<()> {
     let ctx = aars_sources::SourceCtx {
         now: chrono::Utc::now(),
         area,
+        position: None,
+        settings: std::collections::BTreeMap::new(),
     };
     let output = source
         .fetch(&ctx)
@@ -593,7 +465,7 @@ mod tests {
     async fn a_source_that_cannot_start_is_recorded_as_failing() {
         let pool = aars_core::db::test_pool().await;
         let repo = aars_core::source_state::SourceStateRepo::new(pool);
-        super::source_start_failed(&repo, "boom").await;
+        crate::station::source_start_failed(&repo, "imgw-meteo", "boom").await;
 
         let statuses = repo.statuses().await.unwrap();
         let status = statuses.iter().find(|s| s.source_id == "imgw-meteo").unwrap();

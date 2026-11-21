@@ -21,15 +21,19 @@ impl AudioCache {
         Self { pool, dir, max_bytes }
     }
 
-    /// Klucz zawiera tekst i parametry głosu — zmiana któregokolwiek z nich
-    /// daje inne audio, więc musi dać inny wpis.
-    pub fn cache_key(text: &str, voice: &VoiceParams) -> String {
+    /// Klucz zawiera tekst, parametry głosu i tożsamość syntezatora (model,
+    /// częstotliwość) — zmiana któregokolwiek z nich daje inne audio, więc
+    /// musi dać inny wpis. Tożsamość jest hashowana zawsze, także pusta, więc
+    /// wpisy sprzed tej zmiany (bez niej) nigdy nie pasują do nowego klucza.
+    pub fn cache_key(text: &str, voice: &VoiceParams, identity: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(text.as_bytes());
         hasher.update([0u8]);
         hasher.update(voice.voice.as_deref().unwrap_or("").as_bytes());
         hasher.update([0u8]);
         hasher.update(format!("{:.3}", voice.rate).as_bytes());
+        hasher.update([0u8]);
+        hasher.update(identity.as_bytes());
         hex::encode(hasher.finalize())
     }
 
@@ -40,7 +44,7 @@ impl AudioCache {
         text: &str,
         voice: &VoiceParams,
     ) -> Result<(PathBuf, Pcm), SynthError> {
-        let key = Self::cache_key(text, voice);
+        let key = Self::cache_key(text, voice, &synth.identity());
 
         let existing: Option<String> =
             sqlx::query_scalar("SELECT path FROM audio_cache WHERE hash = ?")
@@ -177,6 +181,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(synth.requests().len(), 2, "inne tempo to inne audio");
+    }
+
+    #[tokio::test]
+    async fn changing_the_model_does_not_reuse_cached_audio() {
+        let pool = aars_core::db::test_pool().await;
+        let dir = tmp_dir("model");
+        let cache = AudioCache::new(pool, dir.0.clone(), 10 * 1024 * 1024);
+        let a = FakeSynth::new(48_000).with_identity("a");
+        let b = FakeSynth::new(48_000).with_identity("b");
+        let voice = VoiceParams::default();
+
+        cache.render(&a, "test", &voice).await.unwrap();
+        cache.render(&b, "test", &voice).await.unwrap();
+
+        assert_eq!(a.requests().len(), 1);
+        assert_eq!(b.requests().len(), 1, "inny model to nowa synteza");
+    }
+
+    #[tokio::test]
+    async fn cached_audio_follows_the_sample_rate() {
+        let pool = aars_core::db::test_pool().await;
+        let dir = tmp_dir("rate");
+        let cache = AudioCache::new(pool, dir.0.clone(), 10 * 1024 * 1024);
+        let low = FakeSynth::new(22_050).with_identity("piper|m|22050");
+        let high = FakeSynth::new(48_000).with_identity("piper|m|48000");
+        let voice = VoiceParams::default();
+
+        let (_, first) = cache.render(&low, "test", &voice).await.unwrap();
+        let (_, second) = cache.render(&high, "test", &voice).await.unwrap();
+
+        assert_eq!(first.sample_rate, 22_050);
+        assert_eq!(second.sample_rate, 48_000);
     }
 
     #[tokio::test]

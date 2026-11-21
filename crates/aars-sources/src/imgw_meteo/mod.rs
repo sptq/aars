@@ -6,12 +6,41 @@ pub mod speech;
 
 use std::time::Duration;
 
+use aars_core::module::{ModuleDescriptor, ModuleKind, SettingKind, SettingSpec, Toggle};
+
 use crate::source::{DataSource, FetchFuture, SourceCtx, SourceError, SourceItem, SourceOutput};
 use parse::ParsedWarnings;
 
 pub const DEFAULT_URL: &str = "https://danepubliczne.imgw.pl/api/data/warningsmeteo";
 pub const MAX_BODY: usize = 2 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Opis modułu dla panelu (R13): klucze `source:imgw-meteo:*` jak w etapie 8.
+pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
+    id: "imgw-meteo",
+    name: "Ostrzeżenia meteorologiczne IMGW",
+    description: "Ostrzeżenia meteorologiczne IMGW dla obszaru stacji, ogłaszane po zmianie.",
+    kind: ModuleKind::Source,
+    toggle: Toggle::Switchable,
+    default_enabled: false,
+    settings: &[
+        SettingSpec {
+            key: "area",
+            label: "Obszar",
+            help: "Jedna linia (albo wpis po średniku) na obszar: dwucyfrowy kod województwa (np. 10) albo czterocyfrowy kod powiatu z nazwą, którą stacja ma wypowiadać (np. 1061 Łódź). Najwyżej 40 wpisów; puste pole to brak obszaru — źródło nic nie ogłasza.",
+            kind: SettingKind::Area,
+            default: "",
+        },
+        SettingSpec {
+            key: "interval_s",
+            label: "Interwał odpytywania (s)",
+            help: "Jak często odpytywać źródło.",
+            kind: SettingKind::Integer { min: 60, max: 3600 },
+            default: "300",
+        },
+    ],
+    see_also: None,
+};
 
 pub struct ImgwMeteo {
     client: reqwest::Client,
@@ -116,11 +145,27 @@ mod tests {
         SourceCtx {
             now: Utc::now(),
             area: parse_area(area).unwrap(),
+            position: None,
+            settings: Default::default(),
         }
     }
 
     fn run(body: &[u8], area: &str) -> SourceOutput {
         to_output(parse::parse_warnings(body).unwrap(), &ctx(area))
+    }
+
+    #[test]
+    fn the_descriptor_matches_the_stage_8_keys_and_ranges() {
+        let d = &DESCRIPTOR;
+        assert_eq!((d.id, d.name), ("imgw-meteo", "Ostrzeżenia meteorologiczne IMGW"));
+        assert_eq!(d.kind, ModuleKind::Source);
+        assert_eq!(d.toggle, Toggle::Switchable);
+        assert!(!d.default_enabled);
+        assert_eq!(d.setting_key("area"), "source:imgw-meteo:area");
+        assert_eq!(d.setting_key("interval_s"), "source:imgw-meteo:interval_s");
+        assert_eq!(d.settings[1].kind, SettingKind::Integer { min: 60, max: 3600 });
+        assert_eq!(d.settings[1].default, "300");
+        assert!(d.settings[0].help.contains("1061 Łódź"));
     }
 
     #[test]
