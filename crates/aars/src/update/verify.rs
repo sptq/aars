@@ -17,6 +17,9 @@ pub const NO_KEY: &str = "Brak klucza wydań w tej kompilacji — aktualizacja z
 /// Najdłuższy podpis, jaki czytamy (R5).
 pub const MAX_SIGNATURE: usize = 4 * 1024;
 
+/// Największe archiwum binarki, jakie przyjmujemy (R5).
+pub const MAX_ARCHIVE: u64 = 64 * 1024 * 1024;
+
 /// Klucz publiczny, któremu ufamy przy sprawdzaniu manifestu.
 #[derive(Clone)]
 pub struct TrustedKey(minisign_verify::PublicKey);
@@ -77,6 +80,12 @@ pub fn verify_manifest(
         return Err(format!(
             "wydanie na inną platformę: {} (stacja: {TARGET})",
             parsed.target
+        ));
+    }
+    if parsed.binary().size > MAX_ARCHIVE {
+        return Err(format!(
+            "archiwum binarki za duże: {} B (limit {MAX_ARCHIVE} B)",
+            parsed.binary().size
         ));
     }
     Ok(parsed)
@@ -182,6 +191,19 @@ mod tests {
 
         let err = verify_manifest(&key.trusted(), &bytes, &sig).unwrap_err();
         assert!(err.contains("x86_64-unknown-linux-gnu"), "{err}");
+    }
+
+    #[test]
+    fn a_binary_over_the_size_limit_is_refused() {
+        let key = TestKey::generate();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&manifest_for("0.11.0", b"x")).unwrap();
+        value["assets"][0]["size"] = serde_json::json!(MAX_ARCHIVE + 1);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let sig = key.sign(&bytes, "aars 0.11.0");
+
+        let err = verify_manifest(&key.trusted(), &bytes, &sig).unwrap_err();
+        assert!(err.contains("za duże"), "{err}");
     }
 
     #[test]

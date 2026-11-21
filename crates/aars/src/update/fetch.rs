@@ -9,7 +9,7 @@ use aars_core::update::{
     MANIFEST_NAME, Manifest, SIGNATURE_NAME, UpdateRefusal, binary_archive_name, is_newer,
 };
 
-use super::verify::{MAX_SIGNATURE, TrustedKey, check_asset, verify_manifest};
+use super::verify::{MAX_ARCHIVE, MAX_SIGNATURE, TrustedKey, check_asset, verify_manifest};
 
 /// Limity rozmiaru pobieranych plików (R5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +24,7 @@ impl Default for Limits {
         Self {
             manifest: 64 * 1024,
             signature: MAX_SIGNATURE as u64,
-            archive: 64 * 1024 * 1024,
+            archive: MAX_ARCHIVE,
         }
     }
 }
@@ -125,6 +125,10 @@ impl ReleaseClient {
                 "archiwum binarki nazywa się {}, a powinno {expected}",
                 asset.name
             ));
+        }
+
+        if asset.size > self.limits.archive {
+            return Err(too_big(&asset.name, self.limits.archive));
         }
 
         let staging = state_dir.join("staging");
@@ -514,8 +518,9 @@ mod tests {
             ..Limits::default()
         };
         let big = vec![7u8; 1024 * 1024 + 1];
-        // Manifest podaje taki rozmiar jak serwer: odcina limit, nie rozmiar.
-        let manifest = manifest_for("0.11.0", &big);
+        // Manifest mieści się w limicie, a serwer śle więcej: odcina limit
+        // w trakcie strumienia, nie sprawdzenie rozmiaru po pobraniu.
+        let manifest = manifest_for("0.11.0", &big[..1024 * 1024]);
         let signed = SignedManifest {
             manifest: Manifest::parse(&manifest).unwrap(),
             signature: key.sign(&manifest, "aars 0.11.0"),

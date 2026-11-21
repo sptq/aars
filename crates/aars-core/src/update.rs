@@ -108,8 +108,16 @@ impl Manifest {
     }
 }
 
+/// Nazwa pliku wydania: trafia do URL-a i do ścieżki w `staging/`, więc
+/// tylko biała lista `[A-Za-z0-9._+-]`, bez wiodącej kropki i minusa,
+/// najwyżej 255 bajtów.
 fn safe_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.starts_with(['.', '-'])
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
 }
 
 fn is_sha256_hex(value: &str) -> bool {
@@ -128,7 +136,10 @@ fn parse_version(value: &str) -> Result<semver::Version, String> {
 pub fn is_newer(candidate: &str, current: &str) -> Result<bool, String> {
     let candidate = parse_version(candidate)?;
     let current = parse_version(current)?;
-    Ok(candidate.pre.is_empty() && candidate > current)
+    // `cmp_precedence` pomija metadane budowy: `0.10.0+1` to ta sama wersja
+    // co `0.10.0` (SemVer §10), a `Ord` z crate'a semver by je porównał.
+    Ok(candidate.pre.is_empty()
+        && candidate.cmp_precedence(&current) == std::cmp::Ordering::Greater)
 }
 
 /// Nazwa archiwum binarki w wydaniu.
@@ -273,7 +284,23 @@ mod tests {
             "bez binarki",
             manifest_json(vec![asset("x.img.xz", "image")]),
         ));
-        for name in ["../aars", "a/b", "..", "", "a\\b"] {
+        let long = "a".repeat(256);
+        for name in [
+            "../aars",
+            "a/b",
+            "..",
+            "",
+            "a\\b",
+            "aars?x",
+            "a#b",
+            "%2e%2e%2faars",
+            "a\nb",
+            "a b",
+            ".ukryty",
+            "-opcja",
+            "zażółć",
+            long.as_str(),
+        ] {
             cases.push(("nazwa", manifest_json(vec![asset(name, "binary")])));
         }
         let mut short = full();
@@ -306,6 +333,18 @@ mod tests {
     }
 
     #[test]
+    fn asset_names_follow_the_allow_list() {
+        for name in [
+            "aars-0.10.0-aarch64-linux-gnu.tar.gz",
+            "piper_tts-1.8.0.tar.gz",
+            "aars-0.10.0+rpi.img.xz",
+            &"a".repeat(255),
+        ] {
+            assert!(safe_name(name), "{name}");
+        }
+    }
+
+    #[test]
     fn newer_is_semver_not_string_order() {
         assert_eq!(is_newer("0.10.0", "0.9.9"), Ok(true));
         assert_eq!(is_newer("0.10.0", "0.10.0"), Ok(false));
@@ -313,6 +352,10 @@ mod tests {
         assert_eq!(is_newer("0.10.1", "0.10.0"), Ok(true));
         // R5: wydanie przedpremierowe nigdy.
         assert_eq!(is_newer("0.11.0-rc.1", "0.10.0"), Ok(false));
+        // Metadane budowy nie czynią wersji nowszą.
+        assert_eq!(is_newer("0.10.0+1", "0.10.0"), Ok(false));
+        assert_eq!(is_newer("0.10.0+rpi2", "0.10.0+rpi1"), Ok(false));
+        assert_eq!(is_newer("0.10.1+1", "0.10.0"), Ok(true));
         assert!(is_newer("abc", "0.10.0").is_err());
         assert!(is_newer("0.10.0", "abc").is_err());
     }
