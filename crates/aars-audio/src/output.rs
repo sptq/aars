@@ -22,6 +22,9 @@ pub struct ConfigRange {
     pub channels: u16,
     pub min_rate: u32,
     pub max_rate: u32,
+    /// Konfiguracja z próbkami `i16`, czyli w formacie, w którym
+    /// [`CpalSink`] buduje strumień (przegląd 1–4, M-5).
+    pub is_i16: bool,
 }
 
 /// Ile kanałów otworzyć przy danej częstotliwości (R16): mono, gdy karta je
@@ -29,13 +32,21 @@ pub struct ConfigRange {
 /// bez `plug` często mają tylko stereo. Gdy żadna konfiguracja nie ma tej
 /// częstotliwości, błąd wymienia, co karta obsługuje — wychodzi przy budowie
 /// stosu, więc taka konfiguracja nie zostaje „ostatnią działającą”.
+///
+/// Strumień jest zawsze `i16`, a ALSA podaje osobne zakresy dla każdego
+/// formatu próbek. Dlatego najpierw liczą się zakresy `i16`, a dopiero gdy
+/// żaden nie pasuje (CoreAudio podaje zwykle tylko F32 i sam konwertuje),
+/// wszystkie (przegląd 1–4, M-5).
 pub fn choose_channels(ranges: &[ConfigRange], rate: u32) -> Result<u16, String> {
     // Mono, potem stereo, potem najmniej kanałów — to po prostu minimum.
+    let fits = |r: &&ConfigRange| r.channels >= 1 && r.min_rate <= rate && rate <= r.max_rate;
     ranges
         .iter()
-        .filter(|r| r.channels >= 1 && r.min_rate <= rate && rate <= r.max_rate)
+        .filter(|r| r.is_i16)
+        .filter(fits)
         .map(|r| r.channels)
         .min()
+        .or_else(|| ranges.iter().filter(fits).map(|r| r.channels).min())
         .ok_or_else(|| {
             let offered: Vec<String> = ranges
                 .iter()
@@ -101,6 +112,7 @@ impl CpalSink {
                         channels: c.channels(),
                         min_rate: c.min_sample_rate(),
                         max_rate: c.max_sample_rate(),
+                        is_i16: c.sample_format() == cpal::SampleFormat::I16,
                     })
                     .collect();
                 choose_channels(&ranges, sample_rate)
@@ -204,7 +216,28 @@ mod tests {
             channels,
             min_rate,
             max_rate,
+            is_i16: true,
         }
+    }
+
+    fn range_f32(channels: u16, min_rate: u32, max_rate: u32) -> ConfigRange {
+        ConfigRange {
+            is_i16: false,
+            ..range(channels, min_rate, max_rate)
+        }
+    }
+
+    #[test]
+    fn i16_ranges_win_because_the_stream_is_i16() {
+        // `hw:` z mono tylko w S32 i stereo w S16: strumień `i16` dostaje 2.
+        let ranges = [range_f32(1, 8_000, 48_000), range(2, 8_000, 48_000)];
+        assert_eq!(choose_channels(&ranges, 48_000), Ok(2));
+        // Bez `i16` przy tej częstotliwości liczą się wszystkie zakresy
+        // (CoreAudio podaje tylko F32).
+        let ranges = [range_f32(2, 44_100, 48_000), range(1, 8_000, 16_000)];
+        assert_eq!(choose_channels(&ranges, 48_000), Ok(2));
+        let ranges = [range_f32(1, 8_000, 192_000)];
+        assert_eq!(choose_channels(&ranges, 48_000), Ok(1));
     }
 
     #[test]
