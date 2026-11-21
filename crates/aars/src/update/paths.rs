@@ -110,13 +110,14 @@ pub fn open_regular_nofollow(path: &Path) -> std::io::Result<Option<std::fs::Fil
 }
 
 /// Czy plik z katalogu usługi wolno czytać rootowi: jedno dowiązanie i
-/// właściciel katalogu albo root (pliki zapisane przez strażnika).
+/// właściciel taki jak katalogu. Pliki, które strażnik zapisuje do katalogu
+/// usługi, dostają właściciela katalogu w `write_atomic_nofollow`, więc
+/// wyjątku dla roota nie ma.
 /// `O_NOFOLLOW` nie łapie twardych dowiązań: usługa mogłaby podpiąć plik
 /// roota z tego samego systemu plików (np. `/etc/shadow`) pod nazwę ze
-/// swojego katalogu — wtedy `nlink` ≥ 2. Pliku roota z `nlink` 1 usługa do
-/// swojego katalogu nie przeniesie, bo nie może pisać w katalogach roota.
+/// swojego katalogu — wtedy `nlink` ≥ 2.
 pub fn service_file_ok(nlink: u64, file_uid: u32, dir_uid: u32) -> bool {
-    nlink == 1 && (file_uid == dir_uid || file_uid == 0)
+    nlink == 1 && file_uid == dir_uid
 }
 
 /// Plik z katalogu usługi (`state_dir`, baza): jak `open_regular_nofollow`,
@@ -220,10 +221,16 @@ fn temp_name(path: &Path) -> PathBuf {
 }
 
 /// Zapis atomowy: plik tymczasowy `O_CREAT|O_EXCL|O_NOFOLLOW` obok, potem
-/// `rename`. `rename` zastępuje podłożone dowiązanie, nie jego cel.
+/// `rename`. `rename` zastępuje podłożone dowiązanie, nie jego cel. Jako
+/// root plik dostaje (przez `fchown` na deskryptorze, przed `rename`)
+/// właściciela katalogu: wynik strażnika w katalogu usługi przechodzi potem
+/// zwykły warunek `service_file_ok`. Bez roota plik i tak należy do nas.
 pub fn write_atomic_nofollow(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    real_parent(path)?;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let parent = real_parent(path)?;
+    let dir = std::fs::symlink_metadata(parent)?;
+    // SAFETY: `geteuid` nie ma warunków wstępnych.
+    let as_root = unsafe { libc::geteuid() } == 0;
     let tmp = temp_name(path);
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
@@ -232,6 +239,9 @@ pub fn write_atomic_nofollow(path: &Path, data: &[u8]) -> std::io::Result<()> {
             .mode(0o644)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp)?;
+        if as_root {
+            std::os::unix::fs::fchown(&file, Some(dir.uid()), Some(dir.gid()))?;
+        }
         file.write_all(data)?;
         file.sync_all()?;
         std::fs::rename(&tmp, path)
@@ -314,9 +324,12 @@ mod tests {
     }
 
     #[test]
-    fn service_files_need_one_link_and_the_directory_owner_or_root() {
+    fn service_files_need_one_link_and_the_directory_owner() {
         assert!(service_file_ok(1, 1000, 1000));
-        assert!(service_file_ok(1, 0, 1000), "plik zapisany przez strażnika");
+        assert!(
+            !service_file_ok(1, 0, 1000),
+            "plik roota w katalogu usługi (np. baza)"
+        );
         assert!(!service_file_ok(2, 1000, 1000), "twarde dowiązanie");
         assert!(
             !service_file_ok(2, 0, 1000),
