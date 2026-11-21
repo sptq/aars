@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::UpdateAction;
 use crate::service::VERSION;
-use paths::{UpdatePaths, installed_version, is_working, read_small_nofollow};
+use paths::{UpdatePaths, installed_version, is_working, read_service_file, read_small_nofollow};
 
 /// Trwająca próba z `trial.json`, jeśli jest czytelna.
 pub fn read_trial(p: &UpdatePaths) -> Option<Trial> {
@@ -28,7 +28,7 @@ pub fn read_trial(p: &UpdatePaths) -> Option<Trial> {
 
 /// Ostatni wynik z `last-result.json`, jeśli jest czytelny.
 pub fn read_last_result(p: &UpdatePaths) -> Option<LastResult> {
-    let text = read_small_nofollow(&p.last_result(), install::SMALL_FILE).ok()??;
+    let text = read_service_file(&p.last_result(), install::SMALL_FILE).ok()??;
     serde_json::from_str(&text).ok()
 }
 

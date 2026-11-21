@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 
 use super::fetch::Limits;
 use super::paths::{
-    UpdatePaths, installed_version, open_regular_nofollow, read_small_bytes_nofollow,
+    UpdatePaths, installed_version, open_service_file, read_service_bytes, read_service_file,
     read_small_nofollow, swap_link, write_atomic_nofollow,
 };
 use super::verify::{MAX_ARCHIVE, TrustedKey, check_asset, verify_manifest};
@@ -181,7 +181,7 @@ pub fn radio_was_up(db_path: &Path) -> bool {
 
 /// Wersja zapisana w `request` przez usługę.
 pub fn requested_version(p: &UpdatePaths) -> Result<Option<String>, String> {
-    read_small_nofollow(&p.request(), SMALL_FILE)
+    read_service_file(&p.request(), SMALL_FILE)
         .map(|text| text.map(|t| t.trim().to_owned()))
         .map_err(|e| format!("odczyt żądania: {e}"))
 }
@@ -206,24 +206,11 @@ pub fn install_requested(
     semver::Version::parse(&version)
         .map_err(|_| format!("nieczytelna wersja w żądaniu: {version:?}"))?;
 
-    // Przerwa w prądzie po przełączeniu, przed zapisem próby: wersja już
-    // stoi, więc zakładamy próbę, zamiast instalować drugi raz. Tylko ze
-    // znacznikiem roota sprzed przełączenia — inaczej żądanie tej samej
-    // wersji otwierałoby nową próbę potwierdzonej wersji i pozwalało
-    // wymusić powrót do starszej.
+    // Ta sama wersja nigdy nie dostaje nowej próby: żądanie bieżącej wersji
+    // pozwalałoby wymusić powrót do starszej. Przerwaną instalację kończy
+    // `finish_interrupted` ze znacznika roota, bez żądania usługi.
     if version == current {
-        let interrupted = std::fs::read_to_string(switching_marker(p))
-            .is_ok_and(|marker| marker.trim() == version);
-        if !interrupted {
-            return Err(format!("wersja {version} już działa"));
-        }
-        let previous = installed_version(&p.previous())
-            .filter(|prev| prev != current)
-            .ok_or_else(|| format!("wersja {version} już działa"))?;
-        let trial = new_trial(&version, &previous, radio_was_up, now);
-        write_trial(p, &trial)?;
-        let _ = std::fs::remove_file(switching_marker(p));
-        return Ok(trial);
+        return Err(format!("wersja {version} już działa"));
     }
     if !is_newer(&version, current)? {
         return Err(format!("wersja {version} nie jest nowsza od {current}"));
@@ -269,25 +256,74 @@ pub fn install_requested(
         return Err(err);
     }
 
-    // Znacznik roota: przełączenie trwa (przerwa w prądzie do zapisu próby).
-    write_atomic_nofollow(&switching_marker(p), version.as_bytes())
-        .map_err(|e| io_err(&switching_marker(p), e))?;
-    // Przełączenie: najpierw `previous` na działającą, potem `current`.
+    // Znacznik roota z oczekiwaną próbą: gdy prąd zniknie między
+    // przełączeniem a zapisem próby, następny przebieg strażnika zamieni go
+    // w próbę (`finish_interrupted`). Każde inne wyjście z tej funkcji
+    // znacznik usuwa (strażnik zakresu), więc nie zostaje nieaktualny.
+    let trial = new_trial(&version, current, radio_was_up, now);
+    let marker = MarkerGuard::write(p, &trial)?;
     let old_target = std::fs::read_link(p.current()).map_err(|e| io_err(&p.current(), e))?;
+    // Przełączenie: najpierw `previous` na działającą, potem `current`.
     swap_link(&p.previous(), &old_target).map_err(|e| io_err(&p.previous(), e))?;
     swap_link(&p.current(), &relative_release(&version)).map_err(|e| io_err(&p.current(), e))?;
-
-    let trial = new_trial(&version, current, radio_was_up, now);
     write_trial(p, &trial)?;
-    let _ = std::fs::remove_file(switching_marker(p));
+    drop(marker);
     prune_releases(p);
     let _ = std::fs::remove_dir_all(p.staging());
     Ok(trial)
 }
 
-/// `guard_dir/switching`: wersja, na którą strażnik właśnie przełącza.
-fn switching_marker(p: &UpdatePaths) -> PathBuf {
+/// `guard_dir/switching`: próba, którą strażnik zakłada przy przełączeniu.
+pub fn switching_marker(p: &UpdatePaths) -> PathBuf {
     p.guard_dir.join("switching")
+}
+
+/// Znacznik przełączenia usuwany przy każdym wyjściu z instalacji. Przerwa
+/// w prądzie (bez `Drop`) zostawia go dla `finish_interrupted`.
+struct MarkerGuard(PathBuf);
+
+impl MarkerGuard {
+    fn write(p: &UpdatePaths, trial: &Trial) -> Result<Self, String> {
+        let path = switching_marker(p);
+        let json = serde_json::to_vec(trial).map_err(|e| e.to_string())?;
+        write_atomic_nofollow(&path, &json).map_err(|e| io_err(&path, e))?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for MarkerGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Znacznik przełączenia z poprzedniego przebiegu (R8, przerwa w prądzie).
+/// Gdy `current` stoi już na wersji ze znacznika, a próby nie ma, znacznik
+/// staje się próbą. W każdym innym przypadku (próba jest, przełączenie się
+/// nie odbyło, znacznik zepsuty) znacznik po prostu znika. Zwraca założoną
+/// próbę.
+pub fn finish_interrupted(p: &UpdatePaths, trial_exists: bool) -> Option<Trial> {
+    let path = switching_marker(p);
+    let text = match read_small_nofollow(&path, SMALL_FILE) {
+        Ok(Some(text)) => text,
+        Ok(None) => return None,
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    };
+    let _ = std::fs::remove_file(&path);
+    if trial_exists {
+        return None;
+    }
+    let trial: Trial = serde_json::from_str(&text).ok()?;
+    if installed_version(&p.current()).as_deref() != Some(trial.version.as_str())
+        || installed_version(&p.previous()).as_deref() != Some(trial.previous.as_str())
+    {
+        return None;
+    }
+    write_trial(p, &trial).ok()?;
+    Some(trial)
 }
 
 fn new_trial(version: &str, previous: &str, radio_was_up: bool, now: DateTime<Utc>) -> Trial {
@@ -346,7 +382,7 @@ fn io_err(path: &Path, err: std::io::Error) -> String {
 fn read_signed_manifest(staged: &Path, key: &TrustedKey) -> Result<Manifest, String> {
     let limits = Limits::default();
     let read = |name: &str, max: u64| {
-        read_small_bytes_nofollow(&staged.join(name), max as usize)
+        read_service_bytes(&staged.join(name), max as usize)
             .map_err(|e| format!("{name}: {e}"))?
             .ok_or_else(|| format!("{name}: brak pliku w staging"))
     };
@@ -366,7 +402,7 @@ fn copy_to_incoming(
     let _ = std::fs::remove_dir_all(&incoming);
     std::fs::create_dir_all(&incoming).map_err(|e| io_err(&incoming, e))?;
     let source = staged.join(&asset.name);
-    let file = open_regular_nofollow(&source)
+    let file = open_service_file(&source)
         .map_err(|e| io_err(&source, e))?
         .ok_or_else(|| format!("{}: brak archiwum w staging", asset.name))?;
     let dest = incoming.join(&asset.name);
@@ -497,7 +533,7 @@ fn snapshot_database(p: &UpdatePaths, current: &str) -> Result<(), String> {
         (p.db_path.clone(), target.clone()),
         (sidecar(&p.db_path, "-wal"), sidecar(&target, "-wal")),
     ] {
-        let Some(mut file) = open_regular_nofollow(&source).map_err(|e| io_err(&source, e))? else {
+        let Some(mut file) = open_service_file(&source).map_err(|e| io_err(&source, e))? else {
             continue;
         };
         let mut out = std::fs::OpenOptions::new()

@@ -7,11 +7,11 @@ use aars_core::update::{LastResult, MAX_ATTEMPTS, ResultKind, Trial};
 use chrono::{DateTime, Utc};
 
 use super::install::{
-    Owner, SMALL_FILE, SmokeTest, install_requested, radio_was_up, requested_version,
-    restore_database, write_trial,
+    Owner, SMALL_FILE, SmokeTest, finish_interrupted, install_requested, radio_was_up,
+    requested_version, restore_database, write_trial,
 };
 use super::paths::{
-    UpdatePaths, installed_version, is_working, read_small_nofollow, swap_link,
+    UpdatePaths, installed_version, is_working, read_service_file, read_small_nofollow, swap_link,
     write_atomic_nofollow,
 };
 use super::verify::{NO_KEY, TrustedKey};
@@ -65,20 +65,48 @@ pub fn run_guard(
         actions.push(GuardAction::Healed);
     }
 
-    // 2. Trwająca próba.
-    let trial = read_trial(p);
-    if let Some(trial) = trial {
-        actions.push(judge_trial(p, owner, trial, now));
-    } else {
-        // 3. Instalacja tylko poza próbą.
-        match requested_version(p) {
-            Ok(Some(version)) => actions.push(install(p, key, smoke, &version, now)),
-            Ok(None) => {}
-            Err(err) => {
-                // Treści nieczytelnego żądania nie przepisujemy do wyniku:
-                // mógłby to być cudzy plik podpięty przez usługę.
-                tracing::error!(%err, "żądanie instalacji nieczytelne — usuwam");
-                let _ = std::fs::remove_file(p.request());
+    // 2. Trwająca próba. Znacznik przełączenia z przerwanego przebiegu
+    // staje się próbą albo znika.
+    let state = read_trial(p);
+    let trial_exists = !matches!(state, TrialFile::Missing);
+    if let Some(trial) = finish_interrupted(p, trial_exists) {
+        let _ = std::fs::remove_file(p.request());
+        record(
+            p,
+            ResultKind::Installed,
+            &trial.version,
+            &trial.previous,
+            "",
+            now,
+        );
+        actions.push(GuardAction::Installed(trial.version));
+        return actions;
+    }
+    match state {
+        TrialFile::Present(trial) => actions.push(judge_trial(p, owner, trial, now)),
+        TrialFile::Broken(why) => {
+            // Bez czytelnej próby nie wiemy, czy nowa wersja jest sprawdzona:
+            // bezpieczniej wrócić do poprzedniej, niż porzucić próbę.
+            set_aside(p);
+            if is_working(&p.previous()) {
+                let reason = format!("plik próby nieczytelny ({why})");
+                actions.push(match rollback(p, owner, &reason, now) {
+                    Ok(version) => GuardAction::RolledBack(version),
+                    Err(err) => GuardAction::InstallFailed(format!("powrót zawiódł: {err}")),
+                });
+            }
+        }
+        TrialFile::Missing => {
+            // 3. Instalacja tylko poza próbą.
+            match requested_version(p) {
+                Ok(Some(version)) => actions.push(install(p, key, smoke, &version, now)),
+                Ok(None) => {}
+                Err(err) => {
+                    // Treści nieczytelnego żądania nie przepisujemy do wyniku:
+                    // mógłby to być cudzy plik podpięty przez usługę.
+                    tracing::error!(%err, "żądanie instalacji nieczytelne — usuwam");
+                    let _ = std::fs::remove_file(p.request());
+                }
             }
         }
     }
@@ -89,30 +117,36 @@ pub fn run_guard(
     actions
 }
 
-/// `trial.json` albo `None`. Zepsuty plik idzie na bok jako `trial.json.bad`,
-/// żeby nie blokował każdego kolejnego startu.
-fn read_trial(p: &UpdatePaths) -> Option<Trial> {
+enum TrialFile {
+    Missing,
+    Present(Trial),
+    /// Plik jest, ale nie da się go odczytać albo jest zepsuty.
+    Broken(String),
+}
+
+/// `trial.json` (katalog roota, bez warunku właściciela).
+fn read_trial(p: &UpdatePaths) -> TrialFile {
     let text = match read_small_nofollow(&p.trial(), SMALL_FILE) {
         Ok(Some(text)) => text,
-        Ok(None) => return None,
+        Ok(None) => return TrialFile::Missing,
         Err(err) => {
-            tracing::error!(%err, "trial.json nieczytelny — odkładam na bok");
-            set_aside(p);
-            return None;
+            tracing::error!(%err, "trial.json nieczytelny");
+            return TrialFile::Broken(err.to_string());
         }
     };
     match serde_json::from_str::<Trial>(&text) {
-        Ok(trial) => Some(trial),
+        Ok(trial) => TrialFile::Present(trial),
         Err(err) => {
-            tracing::error!(%err, "trial.json zepsuty — odkładam na bok");
-            set_aside(p);
-            None
+            tracing::error!(%err, "trial.json zepsuty");
+            TrialFile::Broken(err.to_string())
         }
     }
 }
 
+/// Zepsuty `trial.json` idzie na bok jako `trial.json.bad` (do diagnozy).
 fn set_aside(p: &UpdatePaths) {
     let bad = p.guard_dir.join("trial.json.bad");
+    let _ = std::fs::remove_file(&bad);
     if std::fs::rename(p.trial(), &bad).is_err() {
         let _ = std::fs::remove_file(p.trial());
     }
@@ -121,7 +155,7 @@ fn set_aside(p: &UpdatePaths) {
 /// Treść małego pliku z katalogu usługi, przycięta; dowiązanie albo błąd
 /// odczytu to „brak” (O_NOFOLLOW).
 fn service_file(path: &std::path::Path) -> Option<String> {
-    match read_small_nofollow(path, SMALL_FILE) {
+    match read_service_file(path, SMALL_FILE) {
         Ok(text) => text.map(|t| t.trim().to_owned()),
         Err(err) => {
             tracing::warn!(path = %path.display(), %err, "plik usługi pominięty");
@@ -829,21 +863,98 @@ mod tests {
     fn a_power_cut_after_the_switch_still_starts_the_trial() {
         let st = station();
         st.installed("0.11.0");
-        // Przełączenie było, zapisu próby nie: znacznik strażnika i żądanie
-        // wciąż leżą.
+        // Przełączenie było, zapisu próby nie: został tylko znacznik roota.
+        let trial = st.trial().unwrap();
         std::fs::remove_file(st.paths.trial()).unwrap();
-        std::fs::write(st.paths.guard_dir.join("switching"), "0.11.0").unwrap();
-        std::fs::write(st.paths.request(), "0.11.0").unwrap();
+        std::fs::write(
+            crate::update::install::switching_marker(&st.paths),
+            serde_json::to_vec(&trial).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(
             st.guard(),
             vec![GuardAction::Installed("0.11.0".to_owned())]
         );
-        let trial = st.trial().unwrap();
-        assert_eq!(
-            (trial.version.as_str(), trial.previous.as_str()),
-            ("0.11.0", "0.10.0")
+        assert_eq!(st.trial(), Some(trial), "znacznik zamieniony w próbę");
+        assert!(!crate::update::install::switching_marker(&st.paths).exists());
+        assert_eq!(st.guard(), vec![GuardAction::Counted(1)]);
+    }
+
+    #[test]
+    fn a_stale_switching_marker_is_dropped() {
+        let marker = |st: &Station| crate::update::install::switching_marker(&st.paths);
+        // Przełączenie się nie odbyło: `current` to wciąż stara wersja.
+        let st = station();
+        std::fs::create_dir_all(&st.paths.guard_dir).unwrap();
+        let trial = Trial {
+            format: 1,
+            version: "0.11.0".to_owned(),
+            previous: "0.10.0".to_owned(),
+            installed_at: String::new(),
+            attempts: 0,
+            radio_was_up: false,
+        };
+        std::fs::write(marker(&st), serde_json::to_vec(&trial).unwrap()).unwrap();
+        assert_eq!(st.guard(), vec![GuardAction::Nothing]);
+        assert!(!marker(&st).exists());
+        assert!(st.trial().is_none());
+
+        // Próba trwa: znacznik nic nie zmienia i znika.
+        let st = station();
+        st.installed("0.11.0");
+        std::fs::write(marker(&st), serde_json::to_vec(&trial).unwrap()).unwrap();
+        assert_eq!(st.guard(), vec![GuardAction::Counted(1)]);
+        assert!(!marker(&st).exists());
+
+        // Zepsuty znacznik też znika.
+        std::fs::write(marker(&st), "śmieci").unwrap();
+        assert_eq!(st.guard(), vec![GuardAction::Counted(2)]);
+        assert!(!marker(&st).exists());
+    }
+
+    #[test]
+    fn a_failed_switch_leaves_no_marker_and_no_downgrade_path() {
+        let st = station();
+        st.stage("0.11.0", &good_archive("0.11.0"));
+        // Przełączenie się nie uda (po zapisie znacznika): w miejscu
+        // dowiązania `previous` stoi niepusty katalog.
+        std::fs::create_dir_all(st.paths.previous().join("blokada")).unwrap();
+
+        let actions = st.guard();
+
+        assert!(
+            matches!(&actions[..], [GuardAction::InstallFailed(_)]),
+            "{actions:?}"
         );
+        assert!(!crate::update::install::switching_marker(&st.paths).exists());
+        assert_eq!(st.current().as_deref(), Some("0.10.0"));
+        std::fs::remove_dir_all(st.paths.previous()).unwrap();
+        // Żądanie bieżącej wersji nie otwiera próby.
+        std::fs::write(st.paths.request(), st.current().unwrap()).unwrap();
+        let actions = st.guard();
+        assert!(
+            matches!(&actions[..], [GuardAction::InstallFailed(e)] if e.contains("już działa")),
+            "{actions:?}"
+        );
+        assert!(st.trial().is_none());
+    }
+
+    #[test]
+    fn an_unreadable_trial_file_rolls_back() {
+        let st = station();
+        st.installed("0.11.0");
+        // Plik próby podmieniony na dowiązanie: odczyt pada (O_NOFOLLOW).
+        let real = st.paths.guard_dir.join("gdzie-indziej.json");
+        std::fs::rename(st.paths.trial(), &real).unwrap();
+        std::os::unix::fs::symlink(&real, st.paths.trial()).unwrap();
+
+        assert_eq!(
+            st.guard(),
+            vec![GuardAction::RolledBack("0.10.0".to_owned())]
+        );
+        assert_eq!(st.current().as_deref(), Some("0.10.0"));
+        assert_eq!(st.last().kind, ResultKind::RolledBack);
     }
 
     #[test]

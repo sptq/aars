@@ -91,33 +91,48 @@ fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// Zwykły plik otwarty bez podążania za dowiązaniem; `None`, gdy go nie ma.
-/// Dowiązanie daje błąd (`ELOOP`), FIFO, urządzenie czy katalog — błąd
-/// „nie zwykły plik”, a twarde dowiązanie albo plik innego właściciela niż
-/// katalog — odmowę.
+/// Dowiązanie daje błąd (`ELOOP`), a FIFO, urządzenie czy katalog — błąd
+/// „nie zwykły plik”. Dla plików roota (`guard_dir`); pliki z katalogu
+/// usługi czyta `open_service_file`.
 pub fn open_regular_nofollow(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     let file = match open_nofollow(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
-    let meta = file.metadata()?;
-    if !meta.is_file() {
+    if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("{} nie jest zwykłym plikiem", path.display()),
         ));
     }
-    // `O_NOFOLLOW` nie łapie twardych dowiązań: usługa mogłaby podpiąć plik
-    // roota z tego samego systemu plików (np. `/etc/shadow`) pod nazwę ze
-    // swojego katalogu. Przyjmujemy więc tylko plik z jednym dowiązaniem,
-    // którego właściciel jest właścicielem katalogu.
+    Ok(Some(file))
+}
+
+/// Czy plik z katalogu usługi wolno czytać rootowi: jedno dowiązanie i
+/// właściciel katalogu albo root (pliki zapisane przez strażnika).
+/// `O_NOFOLLOW` nie łapie twardych dowiązań: usługa mogłaby podpiąć plik
+/// roota z tego samego systemu plików (np. `/etc/shadow`) pod nazwę ze
+/// swojego katalogu — wtedy `nlink` ≥ 2. Pliku roota z `nlink` 1 usługa do
+/// swojego katalogu nie przeniesie, bo nie może pisać w katalogach roota.
+pub fn service_file_ok(nlink: u64, file_uid: u32, dir_uid: u32) -> bool {
+    nlink == 1 && (file_uid == dir_uid || file_uid == 0)
+}
+
+/// Plik z katalogu usługi (`state_dir`, baza): jak `open_regular_nofollow`,
+/// a do tego `service_file_ok`.
+pub fn open_service_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     use std::os::unix::fs::MetadataExt;
+    let Some(file) = open_regular_nofollow(path)? else {
+        return Ok(None);
+    };
+    let meta = file.metadata()?;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let dir_uid = std::fs::symlink_metadata(parent)?.uid();
-    if meta.nlink() != 1 || meta.uid() != dir_uid {
+    if !service_file_ok(meta.nlink(), meta.uid(), dir_uid) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
@@ -131,9 +146,12 @@ pub fn open_regular_nofollow(path: &Path) -> std::io::Result<Option<std::fs::Fil
     Ok(Some(file))
 }
 
-/// Mały plik jako bajty, najwyżej `max`; dłuższy to błąd.
-pub fn read_small_bytes_nofollow(path: &Path, max: usize) -> std::io::Result<Option<Vec<u8>>> {
-    let Some(file) = open_regular_nofollow(path)? else {
+fn read_limited(
+    file: Option<std::fs::File>,
+    path: &Path,
+    max: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let Some(file) = file else {
         return Ok(None);
     };
     let mut data = Vec::new();
@@ -147,9 +165,8 @@ pub fn read_small_bytes_nofollow(path: &Path, max: usize) -> std::io::Result<Opt
     Ok(Some(data))
 }
 
-/// Mały plik tekstowy (O_NOFOLLOW, limit `max`); `None`, gdy go nie ma.
-pub fn read_small_nofollow(path: &Path, max: usize) -> std::io::Result<Option<String>> {
-    match read_small_bytes_nofollow(path, max)? {
+fn utf8(path: &Path, data: Option<Vec<u8>>) -> std::io::Result<Option<String>> {
+    match data {
         None => Ok(None),
         Some(data) => String::from_utf8(data).map(Some).map_err(|_| {
             std::io::Error::new(
@@ -158,6 +175,21 @@ pub fn read_small_nofollow(path: &Path, max: usize) -> std::io::Result<Option<St
             )
         }),
     }
+}
+
+/// Mały plik roota (O_NOFOLLOW, limit `max`); `None`, gdy go nie ma.
+pub fn read_small_nofollow(path: &Path, max: usize) -> std::io::Result<Option<String>> {
+    utf8(path, read_limited(open_regular_nofollow(path)?, path, max)?)
+}
+
+/// Mały plik z katalogu usługi jako bajty (`open_service_file`, limit `max`).
+pub fn read_service_bytes(path: &Path, max: usize) -> std::io::Result<Option<Vec<u8>>> {
+    read_limited(open_service_file(path)?, path, max)
+}
+
+/// Mały plik tekstowy z katalogu usługi (`open_service_file`, limit `max`).
+pub fn read_service_file(path: &Path, max: usize) -> std::io::Result<Option<String>> {
+    utf8(path, read_service_bytes(path, max)?)
 }
 
 /// Katalog nadrzędny musi być prawdziwym katalogiem, nie dowiązaniem.
@@ -264,10 +296,14 @@ mod tests {
         // systemu plików) nie jest czytane.
         let hard = dir.path().join("twarde");
         std::fs::hard_link(&file, &hard).unwrap();
-        assert!(read_small_nofollow(&hard, 64).is_err(), "nlink 2");
+        assert!(read_service_file(&hard, 64).is_err(), "nlink 2");
         assert!(
-            read_small_nofollow(&file, 64).is_err(),
+            read_service_file(&file, 64).is_err(),
             "oryginał też ma nlink 2"
+        );
+        assert!(
+            read_small_nofollow(&hard, 64).is_ok(),
+            "pliki roota bez tego warunku"
         );
         std::fs::remove_file(&hard).unwrap();
 
@@ -275,6 +311,27 @@ mod tests {
         let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
         assert!(read_small_nofollow(&fifo, 64).is_err(), "FIFO bez czekania");
+    }
+
+    #[test]
+    fn service_files_need_one_link_and_the_directory_owner_or_root() {
+        assert!(service_file_ok(1, 1000, 1000));
+        assert!(service_file_ok(1, 0, 1000), "plik zapisany przez strażnika");
+        assert!(!service_file_ok(2, 1000, 1000), "twarde dowiązanie");
+        assert!(
+            !service_file_ok(2, 0, 1000),
+            "twarde dowiązanie do pliku roota"
+        );
+        assert!(!service_file_ok(1, 1001, 1000), "cudzy plik");
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plik");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(read_service_file(&file, 8).unwrap().as_deref(), Some("x"));
+        assert_eq!(
+            read_service_file(&dir.path().join("brak"), 8).unwrap(),
+            None
+        );
     }
 
     #[test]
