@@ -10,6 +10,7 @@ pub mod preview;
 pub mod queue_page;
 pub mod render;
 pub mod settings_page;
+pub mod setup_page;
 pub mod sources_page;
 pub mod state;
 pub mod update_page;
@@ -151,6 +152,10 @@ struct TxEnabledForm {
 }
 
 async fn login_page(State(state): State<AppState>) -> Response {
+    // R12: bez admina w trybie `wizard` logować się nie ma kim.
+    if let Some(redirect) = setup_page::wizard_redirect(&state).await {
+        return redirect;
+    }
     page(&LoginPage {
         error: None,
         version: state.version,
@@ -222,7 +227,19 @@ async fn logout(
         .into_response())
 }
 
-async fn dashboard(State(state): State<AppState>, current: CurrentUser) -> Response {
+async fn dashboard(
+    State(state): State<AppState>,
+    current: Result<CurrentUser, AuthRejection>,
+) -> Response {
+    // R12: w trybie `wizard` bez admina pulpit prowadzi do kreatora, także
+    // bez sesji (dlatego `Result`, a nie samo `CurrentUser`).
+    if let Some(redirect) = setup_page::wizard_redirect(&state).await {
+        return redirect;
+    }
+    let current = match current {
+        Ok(current) => current,
+        Err(rejection) => return rejection.into_response(),
+    };
     let interlocks = state.interlocks.snapshot();
     // Błąd kolejki nie może zabrać wyłącznika nadawania: notka zamiast tabeli.
     let (pending, queue_error) = match queue_rows(&state, 50).await {
@@ -476,6 +493,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(dashboard))
         .route("/login", get(login_page).post(login_submit))
+        // Kreator pierwszego konta: bez sesji, z własnymi warunkami (R12).
+        .route("/setup", get(setup_page::page_view).post(setup_page::submit))
         .route("/logout", post(logout))
         .route("/account/password", get(account::password_page).post(account::password_submit))
         .route("/compose", get(compose_page).post(compose_submit))

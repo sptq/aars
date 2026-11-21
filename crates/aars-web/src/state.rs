@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use crate::preview::PreviewRenderer;
 
-use aars_core::config::Config;
+use aars_core::config::{Config, FirstAdmin};
 use aars_core::dispatcher::{StationTest, TestOutcome};
 use aars_core::hardware::probe::HardwareProbe;
 use aars_core::hardware::{ApplyStatus, HardwareSettings};
 use aars_core::interlock::InMemoryInterlocks;
 use aars_core::module::ModuleRegistry;
+use aars_core::netlocal::LocalNet;
 use aars_core::queue::QueueRepo;
 use aars_core::settings::StationSettings;
 use aars_core::update::{Available, UpdateRefusal, UpdateStatus};
@@ -76,6 +77,10 @@ pub struct AppState {
     pub version: &'static str,
     /// Aktualizacja z panelu (etap 10); `None` = panel bez stacji.
     pub update: Option<Arc<dyn UpdateControl>>,
+    /// Jak powstaje pierwsze konto admina (R12); `Wizard` włącza `/setup`.
+    pub first_admin: FirstAdmin,
+    /// Adresy interfejsów stacji do sprawdzania „sieci lokalnej” (R12).
+    pub local_nets: Arc<Vec<LocalNet>>,
 }
 
 /// „Odśwież teraz” dla źródła: `true`, gdy źródło o tym id istnieje i zostało
@@ -106,11 +111,23 @@ impl AppState {
             source_refresh: None,
             version: "0.0.0",
             update: None,
+            first_admin: FirstAdmin::Console,
+            local_nets: Arc::new(Vec::new()),
         }
     }
 
     pub fn with_version(mut self, version: &'static str) -> Self {
         self.version = version;
+        self
+    }
+
+    pub fn with_first_admin(mut self, mode: FirstAdmin) -> Self {
+        self.first_admin = mode;
+        self
+    }
+
+    pub fn with_local_nets(mut self, nets: Vec<LocalNet>) -> Self {
+        self.local_nets = Arc::new(nets);
         self
     }
 
@@ -179,6 +196,8 @@ impl AppState {
             source_refresh: None,
             version: "0.0.0-test",
             update: None,
+            first_admin: FirstAdmin::Console,
+            local_nets: Arc::new(Vec::new()),
         }
     }
 }

@@ -9,6 +9,7 @@ pub mod ident;
 pub mod interlock;
 pub mod message;
 pub mod module;
+pub mod netlocal;
 pub mod priority;
 pub mod ptt;
 pub mod queue;

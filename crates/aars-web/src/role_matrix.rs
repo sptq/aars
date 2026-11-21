@@ -388,3 +388,28 @@ async fn a_post_without_the_csrf_field_is_refused_and_changes_nothing() {
         .len();
     assert_eq!(count, 1, "brak tokenu nie może utworzyć definicji");
 }
+
+/// Wyjątek od macierzy: `/setup` (kreator pierwszego konta, R12) działa bez
+/// sesji, więc nie ma go w listach wyżej. Chronią go własne warunki: tryb
+/// `wizard`, brak włączonego admina, sieć lokalna i CSRF double-submit
+/// (testy w `setup_page`). W domyślnym trybie `console` i przy istniejącym
+/// adminie nie istnieje dla nikogo — także dla zalogowanego admina.
+#[tokio::test]
+async fn setup_is_outside_the_session_matrix_and_hidden_by_default() {
+    let (app, _state, cookies, _id) = sessions().await;
+    for (name, level) in ROLES {
+        let cookie = cookies
+            .iter()
+            .find(|(l, _)| *l == level)
+            .and_then(|(_, c)| c.as_ref().map(|(cookie, _)| cookie.clone()));
+        for method in ["GET", "POST"] {
+            let (status, location) =
+                request(&app, method, "/setup", cookie.as_deref(), "zly", POST_BODY).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{method} /setup jako {name}: {location:?}"
+            );
+        }
+    }
+}

@@ -34,6 +34,7 @@ flate2 = "1"
 tar = { version = "0.4", default-features = false }
 libc = "0.2"
 semver = "1"
+if-addrs = "0.15"
 
 [dev-dependencies]
 aars-core = { path = "../aars-core", features = ["testing"] }

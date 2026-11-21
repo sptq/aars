@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 use tokio::sync::{Notify, oneshot};
 
-use aars_core::config::{AudioConfig, Config, PttBackendKind, PttConfig};
+use aars_core::config::{AudioConfig, Config, FirstAdmin, PttBackendKind, PttConfig};
 use aars_core::dispatcher::{
     Dispatcher, DispatcherConfig, DispatcherControl, StationTest, TestOutcome,
 };
@@ -345,6 +345,60 @@ const DRAIN_MARGIN: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const DRAIN_MARGIN: Duration = Duration::from_secs(2);
 
+/// Adresy interfejsów stacji dla kreatora `/setup` (R12). Błąd listy daje
+/// pustą listę: zostają stałe sieci lokalne (RFC 1918, link-local, ULA).
+fn local_nets() -> Vec<aars_core::netlocal::LocalNet> {
+    match if_addrs::get_if_addrs() {
+        Ok(interfaces) => interfaces
+            .into_iter()
+            .map(|iface| {
+                let prefix = match &iface.addr {
+                    if_addrs::IfAddr::V4(v4) => v4.prefixlen,
+                    if_addrs::IfAddr::V6(v6) => v6.prefixlen,
+                };
+                aars_core::netlocal::LocalNet {
+                    addr: iface.ip(),
+                    prefix,
+                }
+            })
+            .collect(),
+        Err(err) => {
+            tracing::warn!(%err, "lista interfejsów sieci niedostępna — kreator zna tylko stałe sieci lokalne");
+            Vec::new()
+        }
+    }
+}
+
+/// Nazwa hosta do komunikatu o kreatorze; `aars` (R14), gdy nieznana.
+fn local_host_name() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: bufor ma podaną długość, a `gethostname` pisze najwyżej tyle.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            if let Ok(name) = std::str::from_utf8(&buf[..end])
+                && !name.is_empty()
+            {
+                return name.to_owned();
+            }
+        }
+    }
+    "aars".to_owned()
+}
+
+/// Adres kreatora do logu i `STATUS=`: przy nasłuchu na wszystkich adresach
+/// `http://{host}.local:{port}/setup` (avahi, R14), inaczej sam adres.
+fn setup_url(bound: std::net::SocketAddr, host: &str) -> String {
+    if bound.ip().is_unspecified() {
+        let host = host.trim_end_matches(".local");
+        format!("http://{host}.local:{}/setup", bound.port())
+    } else {
+        format!("http://{bound}/setup")
+    }
+}
+
 /// Stan dla systemd, gdy stacja działa bez stosu nadawczego (R6).
 const RADIO_LESS_STATUS: &str =
     "stacja działa bez nadawania — żadna konfiguracja sprzętu nie wstała";
@@ -423,6 +477,7 @@ async fn run_station(
     let bound = listener
         .local_addr()
         .map_or_else(|_| config.server.bind.clone(), |a| a.to_string());
+    let setup_url = listener.local_addr().ok().map(|a| setup_url(a, &local_host_name()));
 
     let mut status = ApplyStatus {
         origin,
@@ -469,10 +524,14 @@ async fn run_station(
     let update = CancelToken::new();
 
     let users = aars_core::user::UserRepo::new(pool.clone());
-    if let Some(password) = users
-        .ensure_bootstrap_admin()
-        .await
-        .context("konto startowe")?
+    // R12: tryb pierwszego konta tylko z pliku (`base`). W trybie `wizard`
+    // hasła na konsoli nie ma — konto zakłada kreator `/setup`.
+    let wizard = base.setup.first_admin == FirstAdmin::Wizard;
+    if !wizard
+        && let Some(password) = users
+            .ensure_bootstrap_admin()
+            .await
+            .context("konto startowe")?
     {
         // Jedyny moment, w którym to hasło jest widoczne.
         println!("== konto startowe: admin / {password}");
@@ -597,6 +656,8 @@ async fn run_station(
         .with_preview(preview)
         .with_station(handle.clone())
         .with_update(update_control)
+        .with_first_admin(base.setup.first_admin)
+        .with_local_nets(local_nets())
         .with_probe(probe)
         .with_modules(registry.clone())
         .with_base_config(Arc::new(base.clone()))
@@ -633,7 +694,9 @@ async fn run_station(
     );
     let server_shutdown = shutdown.clone();
     tasks.push(tokio::spawn(async move {
-        let graceful = axum::serve(listener, app).with_graceful_shutdown(async move {
+        // Adres klienta dla kreatora `/setup` (sieć lokalna, R12).
+        let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+        let graceful = axum::serve(listener, service).with_graceful_shutdown(async move {
             while !server_shutdown.is_cancelled() {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -655,6 +718,14 @@ async fn run_station(
     health.mark_ready();
     if radio_less {
         notifier.status(RADIO_LESS_STATUS);
+    }
+    if wizard && !users.has_enabled_admin().await.unwrap_or(true) {
+        let text = format!(
+            "brak konta administratora — otwórz {} w sieci lokalnej",
+            setup_url.as_deref().unwrap_or("/setup")
+        );
+        tracing::warn!("{text}");
+        notifier.status(&text);
     }
     if let Some(ready) = ready {
         let _ = ready.send(handle.clone());
@@ -1927,6 +1998,50 @@ mod tests {
             .unwrap();
         assert!(matches!(exit, Exit::Stop));
         assert_eq!(fake.events(), vec!["READY=1".to_owned()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wizard_mode_prints_no_password_and_points_to_setup() {
+        let pool = aars_core::db::test_pool().await;
+        let fake = Arc::new(FakeNotifier::default());
+        let mut config = station_config("wizard");
+        config.setup.first_admin = FirstAdmin::Wizard;
+        let stop = CancelToken::new();
+        let (task, _handle) = start_with(
+            config,
+            pool.clone(),
+            Arc::new(FakeHardware::new(&[])),
+            stop.clone(),
+            fake.clone(),
+        )
+        .await;
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(users, 0, "w trybie wizard nie ma konta startowego");
+        let status = fake
+            .events()
+            .into_iter()
+            .find(|e| e.starts_with("STATUS=brak konta administratora"))
+            .expect("STATUS z adresem kreatora");
+        assert!(status.contains("http://127.0.0.1:"), "{status}");
+        assert!(status.ends_with("/setup w sieci lokalnej"), "{status}");
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn the_setup_url_names_the_host_when_listening_everywhere() {
+        let any: std::net::SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        assert_eq!(setup_url(any, "aars"), "http://aars.local:8080/setup");
+        assert_eq!(setup_url(any, "stacja.local"), "http://stacja.local:8080/setup");
+        let one: std::net::SocketAddr = "192.168.1.2:8080".parse().unwrap();
+        assert_eq!(setup_url(one, "aars"), "http://192.168.1.2:8080/setup");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
