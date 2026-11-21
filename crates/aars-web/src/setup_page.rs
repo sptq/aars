@@ -26,6 +26,9 @@ pub const SETUP_COOKIE: &str = "aars_setup";
 const SETUP_COOKIE_MAX_AGE_S: u32 = 15 * 60;
 
 pub const NOT_LOCAL: &str = "Kreator pierwszego konta działa tylko z sieci lokalnej stacji.";
+pub const WRONG_HOST: &str =
+    "Kreator otwórz pod adresem stacji (IP albo nazwa stacji), nie przez obcą domenę.";
+pub const CROSS_ORIGIN: &str = "Formularz kreatora przyszedł z innej strony — odmowa.";
 pub const EXPIRED: &str = "Sesja kreatora wygasła — odśwież stronę.";
 pub const ALREADY_CREATED: &str = "Konto administratora już założono.";
 const NAME_RULE: &str = "nazwa: 3–32 znaki: małe litery, cyfry, . _ -";
@@ -127,7 +130,78 @@ async fn wizard_open(state: &AppState) -> Result<bool, Response> {
 
 /// Warunki wspólne dla GET i POST: `404` poza kreatorem, `403` spoza sieci
 /// lokalnej. Zwraca adres klienta.
-async fn guard(state: &AppState, extensions: &Extensions) -> Result<IpAddr, Response> {
+/// Nazwa hosta z `Host` (albo z adresu żądania przy HTTP/2), bez portu,
+/// małymi literami i bez kropki na końcu. IPv6 bez nawiasów.
+fn request_host(headers: &HeaderMap, uri: &axum::http::Uri) -> Option<String> {
+    let raw = match headers.get(header::HOST) {
+        Some(value) => value.to_str().ok()?.trim().to_owned(),
+        None => uri.authority()?.as_str().to_owned(),
+    };
+    let host = if let Some(rest) = raw.strip_prefix('[') {
+        // `[v6]` albo `[v6]:port`.
+        let (inside, after) = rest.split_once(']')?;
+        if !(after.is_empty() || after.strip_prefix(':').is_some_and(is_port)) {
+            return None;
+        }
+        inside.to_owned()
+    } else {
+        match raw.rsplit_once(':') {
+            Some((name, port)) if is_port(port) && !name.contains(':') => name.to_owned(),
+            Some(_) => return None,
+            None => raw,
+        }
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+fn is_port(port: &str) -> bool {
+    !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Obrona przed DNS rebinding: obca domena przepięta na adres stacji ma
+/// w `Host` swoją nazwę. Przechodzą tylko literały IP, `localhost` i nazwy
+/// stacji z `AppState::host_names` (nazwa hosta, `{nazwa}.local`, host z
+/// `server.bind`).
+pub fn host_allowed(host: &str, names: &[String]) -> bool {
+    host.parse::<IpAddr>().is_ok()
+        || host == "localhost"
+        || names.iter().any(|n| n.trim_end_matches('.').eq_ignore_ascii_case(host))
+}
+
+/// `POST` z innej strony: `Sec-Fetch-Site: cross-site` albo `Origin`, który
+/// nie wskazuje tego samego hosta i portu co `Host`.
+fn cross_origin(headers: &HeaderMap) -> bool {
+    let header_str = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if header_str("sec-fetch-site").is_some_and(|v| v.eq_ignore_ascii_case("cross-site")) {
+        return true;
+    }
+    let Some(origin) = header_str("origin") else {
+        return false;
+    };
+    let authority = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"));
+    match (authority, header_str("host")) {
+        (Some(authority), Some(host)) => !authority.eq_ignore_ascii_case(host.trim()),
+        // `Origin: null` albo bez `Host`: nie da się potwierdzić tej samej strony.
+        _ => true,
+    }
+}
+
+async fn guard(
+    state: &AppState,
+    extensions: &Extensions,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+) -> Result<IpAddr, Response> {
+    match request_host(headers, uri) {
+        Some(host) if host_allowed(&host, &state.host_names) => {}
+        other => {
+            tracing::warn!(host = ?other, "kreator pierwszego konta: obca nazwa w Host");
+            return Err((StatusCode::MISDIRECTED_REQUEST, WRONG_HOST).into_response());
+        }
+    }
     if !wizard_open(state).await? {
         return Err(not_found());
     }
@@ -157,8 +231,13 @@ fn form_page(status: StatusCode, page_data: &SetupPage) -> Response {
     response
 }
 
-pub async fn page_view(State(state): State<AppState>, extensions: Extensions) -> Response {
-    if let Err(response) = guard(&state, &extensions).await {
+pub async fn page_view(
+    State(state): State<AppState>,
+    extensions: Extensions,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    if let Err(response) = guard(&state, &extensions, &headers, &uri).await {
         return response;
     }
     let token = random_token();
@@ -200,12 +279,17 @@ pub async fn submit(
     State(state): State<AppState>,
     extensions: Extensions,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     Form(form): Form<SetupForm>,
 ) -> Response {
-    let ip = match guard(&state, &extensions).await {
+    let ip = match guard(&state, &extensions, &headers, &uri).await {
         Ok(ip) => ip,
         Err(response) => return response,
     };
+    if cross_origin(&headers) {
+        tracing::warn!(%ip, "kreator pierwszego konta: formularz z innej strony");
+        return (StatusCode::FORBIDDEN, CROSS_ORIGIN).into_response();
+    }
     let cookie = cookie_value(&headers, SETUP_COOKIE).unwrap_or_default();
     if !tokens_match(&cookie, &form.csrf) {
         tracing::warn!(%ip, "kreator pierwszego konta: brak albo zły token");
@@ -281,6 +365,94 @@ mod tests {
                 addr: "192.168.1.2".parse().unwrap(),
                 prefix: 24,
             }])
+            .with_host_names(vec!["aars".to_owned(), "aars.local".to_owned()])
+    }
+
+    #[test]
+    fn host_header_parsing_and_the_allow_list() {
+        let names = vec!["aars".to_owned(), "aars.local".to_owned()];
+        let host = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, value.parse().unwrap());
+            request_host(&headers, &axum::http::Uri::from_static("/setup"))
+        };
+        let allowed = |value: &str| host(value).is_some_and(|h| host_allowed(&h, &names));
+        for ok in [
+            "192.168.1.10",
+            "192.168.1.10:8080",
+            "[fe80::1]:8080",
+            "[2a01:110::5]",
+            "aars.local",
+            "AARS.local.:8080",
+            "aars",
+            "localhost:8080",
+        ] {
+            assert!(allowed(ok), "{ok}");
+        }
+        for bad in [
+            "evil.example",
+            "evil.example:8080",
+            "aars.local.evil.example",
+            "192.168.1.10.nip.io",
+            "aars.local:80:80",
+            "[fe80::1]x",
+            "",
+        ] {
+            assert!(!allowed(bad), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rebound_foreign_host_is_refused() {
+        let state = wizard_state().await;
+        let app = app_from(&state, "192.168.1.10:5555");
+        for method in ["GET", "POST"] {
+            let reply = send_with(&app, method, "/setup", None, "", &[("host", "evil.example")]).await;
+            assert_eq!(reply.status, StatusCode::MISDIRECTED_REQUEST, "{method}");
+            assert!(reply.cookies.is_empty());
+        }
+        // Brak `Host` też odpada.
+        let reply = send_with(&app, "GET", "/setup", None, "", &[]).await;
+        assert_eq!(reply.status, StatusCode::MISDIRECTED_REQUEST);
+        for host in ["192.168.1.10:8080", "aars.local", "aars.local:8080"] {
+            let reply = send_with(&app, "GET", "/setup", None, "", &[("host", host)]).await;
+            assert_eq!(reply.status, StatusCode::OK, "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cross_origin_post_is_refused() {
+        let state = wizard_state().await;
+        let app = app_from(&state, "192.168.1.10:5555");
+        let (cookie, token) = open(&app).await;
+        let form = body(&token, "szef", "dlugie-haslo", "dlugie-haslo");
+        for extra in [
+            vec![("host", "192.168.1.2:8080"), ("origin", "http://evil.example")],
+            vec![("host", "192.168.1.2:8080"), ("origin", "null")],
+            vec![("host", "192.168.1.2:8080"), ("origin", "http://192.168.1.2:9999")],
+            vec![("host", "192.168.1.2:8080"), ("sec-fetch-site", "cross-site")],
+        ] {
+            let reply = send_with(&app, "POST", "/setup", Some(&cookie), &form, &extra).await;
+            assert_eq!(reply.status, StatusCode::FORBIDDEN, "{extra:?}");
+            assert_eq!(reply.body, CROSS_ORIGIN);
+        }
+        assert_eq!(user_count(&state).await, 0);
+        // Ta sama strona: `Origin` zgodny z `Host` i `same-origin` przechodzą.
+        let reply = send_with(
+            &app,
+            "POST",
+            "/setup",
+            Some(&cookie),
+            &form,
+            &[
+                ("host", "192.168.1.2:8080"),
+                ("origin", "http://192.168.1.2:8080"),
+                ("sec-fetch-site", "same-origin"),
+            ],
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+        assert_eq!(user_count(&state).await, 1);
     }
 
     fn app_from(state: &AppState, client: &str) -> Router {
@@ -296,7 +468,21 @@ mod tests {
     }
 
     async fn send(app: &Router, method: &str, uri: &str, cookie: Option<&str>, body: &str) -> Reply {
+        send_with(app, method, uri, cookie, body, &[("host", "192.168.1.2:8080")]).await
+    }
+
+    async fn send_with(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        body: &str,
+        extra: &[(&str, &str)],
+    ) -> Reply {
         let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in extra {
+            builder = builder.header(*name, *value);
+        }
         if let Some(cookie) = cookie {
             builder = builder.header(header::COOKIE, cookie);
         }

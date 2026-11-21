@@ -369,6 +369,26 @@ fn local_nets() -> Vec<aars_core::netlocal::LocalNet> {
     }
 }
 
+/// Nazwy, pod którymi panel jest stacją (`Host` kreatora, obrona przed DNS
+/// rebinding): nazwa hosta, `{nazwa}.local` i nazwy hostów z adresów
+/// nasłuchu. Literały IP sprawdza panel sam.
+fn station_host_names(host: &str, binds: &[&str]) -> Vec<String> {
+    let base = host.trim_end_matches('.').trim_end_matches(".local").to_ascii_lowercase();
+    let mut names = vec![base.clone(), format!("{base}.local")];
+    for bind in binds {
+        let name = match bind.rsplit_once(':') {
+            Some((name, _)) => name.trim_start_matches('[').trim_end_matches(']'),
+            None => bind,
+        };
+        if !name.is_empty() && name.parse::<std::net::IpAddr>().is_err() {
+            names.push(name.to_ascii_lowercase());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Nazwa hosta do komunikatu o kreatorze; `aars` (R14), gdy nieznana.
 fn local_host_name() -> String {
     #[cfg(unix)]
@@ -658,6 +678,10 @@ async fn run_station(
         .with_update(update_control)
         .with_first_admin(base.setup.first_admin)
         .with_local_nets(local_nets())
+        .with_host_names(station_host_names(
+            &local_host_name(),
+            &[&base.server.bind, &config.server.bind],
+        ))
         .with_probe(probe)
         .with_modules(registry.clone())
         .with_base_config(Arc::new(base.clone()))
@@ -2033,6 +2057,18 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn station_host_names_cover_the_hostname_mdns_and_the_bind_host() {
+        assert_eq!(
+            station_host_names("Stacja", &["0.0.0.0:8080", "panel.lan:8080"]),
+            vec!["panel.lan", "stacja", "stacja.local"]
+        );
+        assert_eq!(
+            station_host_names("aars.local", &["[::]:8080"]),
+            vec!["aars", "aars.local"]
+        );
     }
 
     #[test]

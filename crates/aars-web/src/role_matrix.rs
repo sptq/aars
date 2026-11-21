@@ -92,7 +92,11 @@ async fn request(
     csrf: &str,
     body: &str,
 ) -> (StatusCode, Option<String>) {
-    let mut builder = Request::builder().method(method).uri(path);
+    // `Host` jak z przeglądarki: kreator `/setup` odrzuca żądania bez niego.
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::HOST, "127.0.0.1:8080");
     if let Some(cookie) = cookie {
         builder = builder.header(header::COOKIE, cookie);
     }

@@ -81,6 +81,10 @@ pub struct AppState {
     pub first_admin: FirstAdmin,
     /// Adresy interfejsów stacji do sprawdzania „sieci lokalnej” (R12).
     pub local_nets: Arc<Vec<LocalNet>>,
+    /// Nazwy stacji dopuszczone w `Host` kreatora (DNS rebinding): nazwa
+    /// hosta, `{nazwa}.local`, host z `server.bind`. Literały IP i
+    /// `localhost` przechodzą zawsze.
+    pub host_names: Arc<Vec<String>>,
 }
 
 /// „Odśwież teraz” dla źródła: `true`, gdy źródło o tym id istnieje i zostało
@@ -113,6 +117,7 @@ impl AppState {
             update: None,
             first_admin: FirstAdmin::Console,
             local_nets: Arc::new(Vec::new()),
+            host_names: Arc::new(Vec::new()),
         }
     }
 
@@ -123,6 +128,11 @@ impl AppState {
 
     pub fn with_first_admin(mut self, mode: FirstAdmin) -> Self {
         self.first_admin = mode;
+        self
+    }
+
+    pub fn with_host_names(mut self, names: Vec<String>) -> Self {
+        self.host_names = Arc::new(names);
         self
     }
 
@@ -198,6 +208,7 @@ impl AppState {
             update: None,
             first_admin: FirstAdmin::Console,
             local_nets: Arc::new(Vec::new()),
+            host_names: Arc::new(Vec::new()),
         }
     }
 }
