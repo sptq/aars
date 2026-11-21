@@ -68,6 +68,8 @@ const POSTS: &[(&str, u8)] = &[
     ("/settings/hardware/test-audio", ADMIN),
     ("/settings/position", ADMIN),
     ("/station/restart", ADMIN),
+    ("/settings/update/check", ADMIN),
+    ("/settings/update/install", ADMIN),
     ("/modules/scheduler/enabled", ADMIN),
     ("/modules/imgw-meteo/enabled", ADMIN),
     ("/modules/imgw-meteo/settings", ADMIN),
@@ -176,6 +178,7 @@ async fn every_get_route_enforces_its_minimum_role() {
         get("/modules", OPERATOR),
         get("/settings", ADMIN),
         get("/settings/hardware", ADMIN),
+        get("/settings/update", ADMIN),
         get("/users", ADMIN),
     ];
     let mut failures = Vec::new();
@@ -320,6 +323,10 @@ async fn every_post_route_enforces_its_role_with_a_valid_csrf_token() {
         // Ciało nie ma pól pozycji: wszystkie puste kasują pozycję.
         ("/settings/position", ADMIN, 303),
         ("/station/restart", ADMIN, 503),
+        // Stan testowy nie ma sterownika aktualizacji.
+        ("/settings/update/check", ADMIN, 503),
+        // `confirm=b` to nie „tak”: 400 przed sprawdzeniem sterownika.
+        ("/settings/update/install", ADMIN, 400),
         ("/modules/scheduler/enabled", ADMIN, 303),
         ("/modules/imgw-meteo/enabled", ADMIN, 303),
         // `interval_s=5` jest poza zakresem 60–3600.

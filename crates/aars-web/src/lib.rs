@@ -12,6 +12,7 @@ pub mod render;
 pub mod settings_page;
 pub mod sources_page;
 pub mod state;
+pub mod update_page;
 pub mod users;
 
 use aars_core::error::DbError;
@@ -503,6 +504,9 @@ pub fn router(state: AppState) -> Router {
         .route("/settings/hardware/test-ptt", post(hardware_page::test_ptt))
         .route("/settings/hardware/test-audio", post(hardware_page::test_audio))
         .route("/station/restart", post(hardware_page::restart))
+        .route("/settings/update", get(update_page::page_view))
+        .route("/settings/update/check", post(update_page::check))
+        .route("/settings/update/install", post(update_page::install))
         .route("/users", get(users::page_view).post(users::create))
         .route("/users/{id}/role", post(users::set_role))
         .route("/users/{id}/disabled", post(users::set_disabled))

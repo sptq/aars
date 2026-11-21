@@ -47,6 +47,9 @@ pub struct SignedManifest {
 /// Pobrane i sprawdzone wydanie w `{state_dir}/staging/{wersja}`.
 #[derive(Debug, Clone)]
 pub struct Staged {
+    /// Sprawdzony manifest wydania; stacja potrzebuje dziś tylko katalogu,
+    /// a manifest czytają testy.
+    #[allow(dead_code)]
     pub manifest: Manifest,
     pub dir: PathBuf,
 }
@@ -75,6 +78,7 @@ impl ReleaseClient {
     }
 
     /// Inne limity (testy).
+    #[cfg(test)]
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
         self

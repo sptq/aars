@@ -3,9 +3,6 @@
 //! startu (`install`, `guard`). Czyste typy (manifest, próba, wynik) są w
 //! `aars_core::update`.
 
-// Do czasu, aż stacja i strażnik zaczną tego używać (zadania 6–7).
-#![allow(dead_code)]
-
 pub mod control;
 pub mod fetch;
 pub mod guard;

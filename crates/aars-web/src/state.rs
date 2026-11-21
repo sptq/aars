@@ -74,6 +74,8 @@ pub struct AppState {
     pub source_refresh: Option<SourceRefresh>,
     /// Wersja produktu do stopki i `/healthz` (R17); ustawia ją binarka.
     pub version: &'static str,
+    /// Aktualizacja z panelu (etap 10); `None` = panel bez stacji.
+    pub update: Option<Arc<dyn UpdateControl>>,
 }
 
 /// „Odśwież teraz” dla źródła: `true`, gdy źródło o tym id istnieje i zostało
@@ -103,11 +105,17 @@ impl AppState {
             base_config: Arc::new(Config::default()),
             source_refresh: None,
             version: "0.0.0",
+            update: None,
         }
     }
 
     pub fn with_version(mut self, version: &'static str) -> Self {
         self.version = version;
+        self
+    }
+
+    pub fn with_update(mut self, update: Arc<dyn UpdateControl>) -> Self {
+        self.update = Some(update);
         self
     }
 
@@ -170,6 +178,7 @@ impl AppState {
             base_config: Arc::new(Config::default()),
             source_refresh: None,
             version: "0.0.0-test",
+            update: None,
         }
     }
 }
@@ -218,6 +227,53 @@ pub mod testing {
 
         pub fn restarts(&self) -> usize {
             self.restarts.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Aktualizacja do testów panelu: stały stan, zadany wynik sprawdzenia
+    /// i instalacji, zapisane zlecenia `(wersja, kto)`.
+    pub struct FakeUpdate {
+        pub status: Mutex<UpdateStatus>,
+        pub available: Mutex<Result<Option<Available>, UpdateRefusal>>,
+        pub install_result: Mutex<Result<(), UpdateRefusal>>,
+        pub installs: Mutex<Vec<(String, String)>>,
+    }
+
+    impl FakeUpdate {
+        /// Działa `current`, bez poprzedniej, bez próby; brak nowszej wersji,
+        /// a instalacja się udaje.
+        pub fn new(current: &str) -> Self {
+            Self {
+                status: Mutex::new(UpdateStatus {
+                    current: current.to_owned(),
+                    previous: None,
+                    trial: None,
+                    unsupported: None,
+                    last: None,
+                }),
+                available: Mutex::new(Ok(None)),
+                install_result: Mutex::new(Ok(())),
+                installs: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl UpdateControl for FakeUpdate {
+        fn status(&self) -> UpdateStatus {
+            self.status.lock().unwrap().clone()
+        }
+        fn check(&self) -> UpdateFuture<'_, Result<Option<Available>, UpdateRefusal>> {
+            Box::pin(async move { self.available.lock().unwrap().clone() })
+        }
+        fn install(&self, version: &str, by: &str) -> UpdateFuture<'_, Result<(), UpdateRefusal>> {
+            let entry = (version.to_owned(), by.to_owned());
+            Box::pin(async move {
+                let result = self.install_result.lock().unwrap().clone();
+                if result.is_ok() {
+                    self.installs.lock().unwrap().push(entry);
+                }
+                result
+            })
         }
     }
 

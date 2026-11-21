@@ -134,8 +134,10 @@ impl Owner for ServiceOwner {
 }
 
 /// Bez zmiany właściciela (testy, praca bez roota).
+#[cfg(test)]
 pub struct NoOwner;
 
+#[cfg(test)]
 impl Owner for NoOwner {
     fn chown_to_service(&self, _path: &Path) -> std::io::Result<()> {
         Ok(())

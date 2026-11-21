@@ -580,9 +580,23 @@ async fn run_station(
         },
     );
 
+    // Aktualizacja z panelu (R10, R11): `releases_url` tylko z pliku, więc
+    // z `base`, a nie z konfiguracji z nadpisaniami panelu.
+    let update_control: Arc<dyn aars_web::state::UpdateControl> =
+        Arc::new(crate::update::control::UpdateHandle::new(
+            base,
+            crate::update::control::UpdateDeps {
+                pool: pool.clone(),
+                queue: queue.clone(),
+                interlocks: interlocks.clone(),
+                station: handle.clone(),
+                last: crate::update::health::stored_last_result(pool).await,
+            },
+        ));
     let mut state = aars_web::AppState::new(pool.clone(), queue.clone(), interlocks.clone(), false)
         .with_preview(preview)
         .with_station(handle.clone())
+        .with_update(update_control)
         .with_probe(probe)
         .with_modules(registry.clone())
         .with_base_config(Arc::new(base.clone()))
