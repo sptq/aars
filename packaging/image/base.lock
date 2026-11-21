@@ -1,0 +1,8 @@
+# Baza obrazu: oficjalny Raspberry Pi OS Lite 64-bit (Trixie), R2.
+# Sumy sprawdzone 2026-11-21: archiwum z pliku .sha256 obok obrazu,
+# obraz rozpakowany z os_list_imagingutility_v4.json (init_format cloudinit-rpi).
+URL=https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2026-10-06/2026-10-06-raspios-trixie-arm64-lite.img.xz
+ARCHIVE_SHA256=483db18a48da399b5b7022ffae9a07bc6d99daab30e593aedac09b69ff422843
+ARCHIVE_SIZE=550466056
+IMAGE_SHA256=b8a393dc1c3701450b5fffbfe74368a98fb6eab7415ce456cc0cead886ea8780
+IMAGE_SIZE=3078619136

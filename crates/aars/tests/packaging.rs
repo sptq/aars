@@ -226,3 +226,104 @@ fn third_party_licenses_cover_piper_and_the_voice() {
         assert!(text.contains(needle), "THIRD-PARTY.md bez {needle}");
     }
 }
+
+#[test]
+fn the_base_image_lock_pins_both_hashes() {
+    let text = read("packaging/image/base.lock");
+    let value = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("brak {key} w base.lock"))
+            .to_owned()
+    };
+    let url = value("URL");
+    assert!(url.starts_with("https://downloads.raspberrypi.com/"), "{url}");
+    assert!(url.ends_with("-raspios-trixie-arm64-lite.img.xz"), "{url}");
+    assert!(is_hex(&value("ARCHIVE_SHA256"), 64));
+    assert!(is_hex(&value("IMAGE_SHA256"), 64));
+    assert_ne!(value("ARCHIVE_SHA256"), value("IMAGE_SHA256"));
+    assert!(value("IMAGE_SIZE").parse::<u64>().unwrap() > 0);
+}
+
+#[test]
+fn the_piper_source_is_pinned() {
+    let text = read("packaging/piper/source.lock");
+    let line = text.lines().find(|l| !l.trim().is_empty() && !l.starts_with('#')).unwrap();
+    let f: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(f[0], "piper_tts-1.8.0.tar.gz");
+    assert!(f[1].starts_with("https://files.pythonhosted.org/") && f[1].ends_with(f[0]));
+    assert_eq!(f[2], "830588aded347df579c91a32703e0fc2a3685d84f1e3533b14f2de69135d4904");
+    assert!(f[3].parse::<u64>().unwrap() > 0);
+}
+
+#[test]
+fn release_workflow_does_not_sign_in_ci() {
+    let text = read(".github/workflows/release.yml");
+    assert!(!text.to_lowercase().contains("minisign"), "podpis tylko u właściciela (R4)");
+    assert!(!text.contains("secrets.MINISIGN"));
+    assert!(text.contains("--draft"));
+    assert!(text.contains("gh release create"));
+    // Tylko po wypchnięciu znacznika v*, nigdy z gałęzi.
+    let on = text.split("\non:\n").nth(1).unwrap().split("\n\n").next().unwrap();
+    assert_eq!(on.trim(), "push:\n    tags: ['v*']");
+    assert!(!text.contains("branches"));
+    for job in ["make_manifest", "build-image.sh", "aars-os-list.json", "source.lock"] {
+        assert!(text.contains(job), "release.yml bez {job}");
+    }
+}
+
+#[test]
+fn workflow_actions_are_pinned_to_commits() {
+    let text = read(".github/workflows/release.yml");
+    let uses: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.trim().trim_start_matches("- ").strip_prefix("uses: "))
+        .collect();
+    assert!(uses.len() >= 5);
+    for action in uses {
+        let (_, rev) = action.split_once('@').unwrap_or_else(|| panic!("bez wersji: {action}"));
+        assert!(is_hex(rev.trim(), 40), "akcja nieprzypięta do commita: {action}");
+    }
+}
+
+#[test]
+fn the_signing_script_uses_the_versioned_trusted_comment() {
+    let text = read("scripts/sign-release.sh");
+    assert!(text.contains("-t \"aars $VERSION\""));
+    assert!(text.contains("minisign -V -p \"$PUB\""));
+    assert!(text.contains("--draft=false"));
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_scripts_parse_and_are_executable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for script in ["packaging/image/build-image.sh", "scripts/sign-release.sh"] {
+        let path = repo(script);
+        let status = std::process::Command::new("bash").arg("-n").arg(&path).status().unwrap();
+        assert!(status.success(), "bash -n {script}");
+        let text = read(script);
+        assert!(text.starts_with("#!/usr/bin/env bash\n"), "{script}");
+        assert!(text.contains("set -euo pipefail"), "{script}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert!(mode & 0o111 != 0, "{script}: brak bitu x");
+    }
+}
+
+#[test]
+fn the_image_script_verifies_and_always_cleans_up() {
+    let text = read("packaging/image/build-image.sh");
+    for needle in [
+        "trap cleanup EXIT",
+        "check_sha256 \"$ARCHIVE\" \"$ARCHIVE_SHA256\"",
+        "check_sha256 \"$IMG\" \"$IMAGE_SHA256\"",
+        "--require-hashes",
+        "voices.lock",
+        "systemctl enable aars.service aars-reset-admin.service",
+        "zerofree",
+        "\"init_format\": \"cloudinit-rpi\"",
+    ] {
+        assert!(text.contains(needle), "build-image.sh bez {needle}");
+    }
+}

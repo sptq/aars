@@ -1,6 +1,6 @@
 [package]
 name = "aars"
-version = "0.1.0"
+version = "0.10.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -8,6 +8,11 @@ license.workspace = true
 [[bin]]
 name = "aars"
 path = "src/main.rs"
+
+# Testy przykładu chodzą w `cargo test --workspace` (R4, Task 12).
+[[example]]
+name = "make_manifest"
+test = true
 
 [dependencies]
 aars-core = { path = "../aars-core" }

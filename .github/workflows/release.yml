@@ -1,0 +1,205 @@
+# Wydanie AARS (etap 10, R1–R4, R17). Tylko po wypchnięciu znacznika v*:
+# binarka aarch64, obraz Raspberry Pi, lista dla Raspberry Pi Imager, źródło
+# Pipera i manifest z sumami. Wynikiem jest SZKIC wydania. Podpis manifestu
+# robi właściciel offline (scripts/sign-release.sh), dopiero potem wydanie
+# staje się widoczne dla stacji.
+name: Wydanie
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Akcje przypięte do commitów (sprawdzone 2026-11-21): actions/checkout v4.4.0,
+# dtolnay/rust-toolchain (gałąź stable), Swatinem/rust-cache v2.9.3,
+# actions/upload-artifact v4.6.2, actions/download-artifact v4.3.0,
+# actions/cache v4.3.0.
+jobs:
+  binary:
+    name: binarka aarch64
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Wersja ze znacznika = wersja crate'a aars
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          # Tylko semver: wartość trafia dalej do poleceń i nazw plików.
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::znacznik $tag nie ma postaci v{semver}"
+            exit 1
+          fi
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/aars/Cargo.toml | head -n 1)"
+          if [ "$version" != "$crate" ]; then
+            echo "::error::znacznik $tag, a crates/aars/Cargo.toml ma $crate"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Klucz wydań wkompilowany w binarkę
+        run: |
+          if grep -q UNSET keys/aars-release.pub; then
+            case "${GITHUB_REF_NAME}" in
+              *-*) echo "::warning::keys/aars-release.pub = UNSET: wydanie próbne bez aktualizacji z panelu" ;;
+              *) echo "::error::keys/aars-release.pub = UNSET — wydanie bez klucza nie umie się aktualizować"; exit 1 ;;
+            esac
+          fi
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+
+      - name: Pakiety systemowe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config sqlite3
+
+      - name: Testy
+        run: cargo test --workspace --locked
+
+      - name: Budowa
+        run: |
+          cargo build -p aars --release --locked
+          strip target/release/aars
+
+      - name: aars --version = znacznik
+        run: |
+          got="$(target/release/aars --version)"
+          want="aars ${{ steps.version.outputs.version }}"
+          if [ "$got" != "$want" ]; then
+            echo "::error::aars --version: \"$got\", oczekiwane \"$want\""
+            exit 1
+          fi
+
+      - name: Archiwum
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          mkdir -p stage dist
+          cp target/release/aars stage/aars
+          printf '%s\n' "$v" > stage/VERSION
+          cp LICENSE stage/LICENSE
+          chmod 0755 stage/aars
+          chmod 0644 stage/VERSION stage/LICENSE
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime="@${SOURCE_DATE_EPOCH}" -C stage -cf - aars VERSION LICENSE \
+            | gzip -n -9 > "dist/aars-${v}-aarch64-linux-gnu.tar.gz"
+          sha256sum dist/*
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: binary
+          path: dist/
+          if-no-files-found: error
+
+  image:
+    name: obraz Raspberry Pi
+    runs-on: ubuntu-24.04-arm
+    needs: binary
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: binary
+          path: dist/
+
+      - name: Cache bazy obrazu i głosów
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: .cache/image
+          key: image-${{ hashFiles('packaging/image/base.lock', 'packaging/voices.lock') }}
+
+      - name: Narzędzia
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y parted zerofree xz-utils e2fsprogs
+
+      - name: Budowa obrazu
+        run: |
+          v="${{ needs.binary.outputs.version }}"
+          sudo packaging/image/build-image.sh \
+            --version "$v" \
+            --binary "dist/aars-${v}-aarch64-linux-gnu.tar.gz" \
+            --out "out/aars-${v}-rpi.img.xz" \
+            --cache .cache/image \
+            --os-list out/aars-os-list.json \
+            --download-url "https://github.com/${{ github.repository }}/releases/download/v${v}/aars-${v}-rpi.img.xz"
+          sudo chown -R "$(id -u):$(id -g)" out .cache/image
+          ls -l out
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: image
+          path: out/
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: szkic wydania
+    runs-on: ubuntu-24.04-arm
+    needs: [binary, image]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Źródło Pipera (GPL-3.0, przypięta suma)
+        run: |
+          read -r name url sha size < <(grep -v '^[[:space:]]*\(#\|$\)' packaging/piper/source.lock)
+          curl -fL --retry 3 --proto '=https' -o "dist/$name" "$url"
+          echo "$sha  dist/$name" | sha256sum -c -
+          test "$(stat -c %s "dist/$name")" = "$size"
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+
+      - name: Pakiety systemowe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+
+      - name: Notatki z opisu znacznika i manifest
+        run: |
+          v="${{ needs.binary.outputs.version }}"
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)' > notes.txt
+          if [ ! -s notes.txt ]; then
+            echo "AARS ${v}" > notes.txt
+          fi
+          cargo run -p aars --locked --example make_manifest -- \
+            --version "$v" --notes-file notes.txt dist/* > aars-manifest.json
+          mv aars-manifest.json dist/aars-manifest.json
+          sha256sum dist/*
+
+      - name: Szkic wydania (bez podpisu — podpisuje właściciel)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ needs.binary.outputs.version }}"
+          extra=""
+          case "$v" in *-*) extra="--prerelease" ;; esac
+          gh release create "${GITHUB_REF_NAME}" --draft $extra \
+            --verify-tag --title "AARS ${v}" --notes-file notes.txt dist/*
