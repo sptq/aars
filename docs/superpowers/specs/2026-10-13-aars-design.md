@@ -446,6 +446,28 @@ kończy się czymś, co da się uruchomić i sprawdzić.
     progów (wiatr, mróz, opady) ustawianych w panelu; mapa w panelu: powiaty
     pod ostrzeżeniem IMGW kolorem stopnia + pozycja stacji (granice powiatów
     z PRG GUGiK, uproszczone). Oba API sprawdzone zapytaniem 2026-11-20.
+    Do tego etapu dochodzą źródła krytyczne z researchu 2026-11-20
+    (`reports/Publiczne API danych krytycznych.md`, poza repo):
+    - `rso`: Regionalny System Ostrzegania (`komunikaty.tvp.pl/komunikatyxml`,
+      JSON, bez klucza) — jedyny maszynowy kanał Alertów RCB, komunikatów
+      sanepidu o wodzie, testów syren i „ataku z powietrza”; filtr województwo
+      w URL, powiat/gmina dopasowane w treści; priorytet alarmowy dla Alert RCB
+      i ataku z powietrza;
+    - `swpc`: pogoda kosmiczna NOAA (`noaa-scales.json` jako wyzwalacz G/S/R,
+      `alerts.json` jako treść), format JSON po zmianie z 2026, nieznany
+      schemat to błąd źródła, nie pusty wynik;
+    - `gios-smog`: alerty smogowe GIOŚ (`/pjp-api/v1/rest/levels/getWarnings`,
+      CC BY 4.0, limit 2 zapytania/min), najbliższa stacja liczona lokalnie;
+    - `emsc`: wstrząsy z EMSC FDSN (CC BY 4.0, rozwiązania IGF PAN), próg
+      magnitudy i promienia w ustawieniach modułu (LGOM i GZW mają częste
+      wstrząsy górnicze).
+12. Źródła uzupełniające: MeteoAlarm jako zapas dla `imgw-meteo`, IMGW
+    `warningshydro` (susza tylko w biuletynie), `osmet-teryt`, PSE `pdgsz`
+    (po potwierdzeniu znaczenia wartości), Kp z GFZ, biuletyn propagacyjny
+    (hamqsl, KC2G — usługi hobbystyczne, tylko biuletyn z limitem wieku
+    danych). Później, warunkowo: awarie PGE/Tauron, TOPR, GDACS/CEMS, RSO CAP
+    (token od administratora RSO). Odrzucone: Blitzortung (zakaz użycia
+    ostrzegawczego), EFAS i EURDEP (tylko partnerzy), IBL i PERUN (brak API).
 
 (2026-11-20, właściciel: „rób od razu obraz na raspberry pi… moduł autoupdate…
 panel admina… zmienne… znak stacji… jakie funkcje uruchamiamy — system
