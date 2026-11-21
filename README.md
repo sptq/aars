@@ -5,7 +5,7 @@ Stoi przy radiotelefonie (typowo Raspberry Pi), syntezuje mowę lokalnie
 (Piper, bez internetu), nadaje komunikaty o stałych porach, jednorazowo albo
 natychmiast, a operator może wpisać i nadać własny komunikat z panelu www.
 
-**Status: w trakcie prac** (etapy 1–9 z 11, patrz `docs/superpowers/plans/README.md`).
+**Status: w trakcie prac** (etapy 1–10 z 11, patrz `docs/superpowers/plans/README.md`).
 
 ## Co działa
 
@@ -23,7 +23,10 @@ natychmiast, a operator może wpisać i nadać własny komunikat z panelu www.
   do kolejki jako polski komunikat (sekcja „Źródła danych”),
 - konfiguracja sprzętu, pozycji stacji i modułów z panelu admina, test PTT
   i test audio, restart stacji jednym przyciskiem (sekcja „Konfiguracja
-  z panelu”).
+  z panelu”),
+- gotowy obraz Raspberry Pi, kreator pierwszego konta admina i aktualizacja
+  z panelu z powrotem do poprzedniej wersji (sekcja „Raspberry Pi: obraz
+  i aktualizacja”).
 
 ## Panel
 
@@ -132,11 +135,138 @@ internetu. Podkład mapy (OpenStreetMap) pobiera przeglądarka, nie stacja; bez
 internetu mapa się nie wyświetli, ale formularz współrzędnych i lokatora
 działa w pełni. Lokator wylicza stacja przy zapisie.
 
+## Raspberry Pi: obraz i aktualizacja
+
+### Nagranie karty
+
+Każde wydanie na GitHubie ma obraz `aars-{wersja}-rpi.img.xz`: Raspberry Pi
+OS Lite 64-bit (Trixie) z AARS, Piperem 1.8.0 i polskim głosem
+`pl_PL-darkman-medium`. Obsługiwane są Raspberry Pi 3, 4, 5 i Zero 2 W
+(64-bit). Raspberry Pi OS Bookworm nie jest wspierany.
+
+1. W Raspberry Pi Imager ustaw własne repozytorium systemów (ustawienia
+   aplikacji, „Content Repository”, albo `rpi-imager --repo …`) na
+   `https://github.com/sptq/aars/releases/latest/download/aars-os-list.json`.
+   AARS pojawi się na liście systemów. Można też pobrać plik `.img.xz`
+   z wydania i wybrać **Use custom**. Personalizacja Imagera przy „Use
+   custom” nie jest jeszcze sprawdzona na sprzęcie.
+2. W personalizacji Imagera ustaw Wi-Fi, nazwę hosta (domyślnie `aars`)
+   i, jeśli chcesz, konto do SSH. Konto systemowe z Imagera **nie** jest
+   kontem panelu: import hasła z Imagera nie jest jeszcze obsługiwany.
+3. Bez Imagera: podłącz Pi kablem Ethernet albo wpisz sieć Wi-Fi do pliku
+   `network-config` na partycji boot karty (cloud-init, format sieci v2).
+4. Włóż kartę i włącz Pi. Pierwszy start trwa kilka minut (powiększenie
+   partycji, cloud-init). Monitor i SSH nie są potrzebne.
+
+### Pierwsze konto
+
+Otwórz `http://aars.local:8080` z komputera w tej samej sieci lokalnej.
+Panel przekieruje na kreator `/setup`, w którym zakładasz konto
+administratora (nazwa 3–32 znaki `a-z 0-9 . _ -`, hasło co najmniej
+10 znaków). Kreator działa tylko:
+
+- dopóki nie ma żadnego włączonego admina,
+- z sieci lokalnej stacji: pętla zwrotna, RFC 1918, link-local, ULA
+  `fc00::/7` oraz IPv6 z tym samym prefiksem `/64` co adres stacji,
+- pod nazwą albo adresem stacji (`aars.local`, nazwa hosta, adres IP).
+
+Uwaga: VPN z adresami ULA (np. Tailscale) też liczy się jako sieć lokalna.
+Nie stawiaj przed panelem reverse proxy na samym Pi: wtedy każdy klient
+przychodzi z pętli zwrotnej.
+
+**Reset konta admina.** Gdy ktoś zajął stację pierwszy albo hasło zginęło,
+wyłącz Pi, połóż na partycji boot karty pusty plik `aars-reset-admin`
+i włącz Pi. Przy starcie wszystkie konta admina zostają wyłączone, ich sesje
+zakończone, plik usunięty, a w audycie pojawia się `admin_reset`. Kreator
+`/setup` otwiera się znowu (ta sama nazwa konta dostaje nowe hasło). Konta
+operatorów i obserwatorów zostają.
+
+### Usługa
+
+AARS działa jako usługa `aars.service` użytkownika `aars` (grupy `audio`,
+`gpio`, `dialout`). Konfiguracja: `/etc/aars/aars.toml`, baza i głosy:
+`/var/lib/aars`, wydania: `/opt/aars/releases/{wersja}` z dowiązaniami
+`current` i `previous`. Na start PTT jest ustawione na VOX, więc nic nie
+kluczuje radia, dopóki admin nie wybierze sterowania w panelu.
+
+```sh
+systemctl status aars        # active (running) i STATUS= z opisem stanu
+journalctl -u aars -f
+sudo systemctl stop aars     # przerywa nadanie, PTT opada od razu
+```
+
+Panel działa po HTTP, bez HTTPS: jest przeznaczony do sieci lokalnej.
+
+### Aktualizacja z panelu
+
+**Ustawienia → Aktualizacja** (tylko admin): „Sprawdź” pobiera manifest
+najnowszego wydania i pokazuje wersję i notatki. „Zainstaluj” po
+potwierdzeniu:
+
+1. pobiera i sprawdza wydanie: podpis minisign manifestu kluczem
+   wkompilowanym w binarkę oraz sumę SHA-256 archiwum; nadawanie idzie w tym
+   czasie normalnie,
+2. odmawia, gdy w kolejce czeka komunikat `Emergency` albo `High` na
+   najbliższą minutę,
+3. czeka na koniec bieżącego nadania (nigdy nie przerywa nadania) i kończy
+   proces,
+4. strażnik startu (root, przed startem usługi) sprawdza podpis jeszcze raz,
+   robi kopię bazy, przełącza `current` na nową wersję i otwiera próbę,
+5. nowa wersja po minucie zdrowej pracy zapisuje potwierdzenie. Po trzech
+   startach bez potwierdzenia albo gdy nowa wersja nie zbuduje stosu
+   nadawczego, który stara budowała, strażnik wraca do poprzedniej wersji
+   razem z kopią bazy.
+
+**Przy powrocie przepadają dane zapisane przez nową wersję w czasie próby**
+(najwyżej kilka minut: kolejka, dziennik nadań, zmiany ustawień). Wynik
+instalacji i powrotu trafia do audytu.
+
+Aktualizacja z panelu działa tylko w obrazie (usługa systemd na Linuksie
+aarch64) i tylko w kompilacji z kluczem wydań. Pi bez zegara RTC po starcie
+bez sieci może mieć złą datę; wtedy pobieranie kończy się błędem TLS
+z podpowiedzią o NTP. Z konsoli:
+
+```sh
+aars --config /etc/aars/aars.toml update status     # wersje, próba, ostatni wynik
+aars --config /etc/aars/aars.toml update check      # najnowsze wydanie
+sudo systemctl stop aars
+sudo aars --config /etc/aars/aars.toml update rollback   # ręczny powrót z kopią bazy
+sudo systemctl start aars
+```
+
+### Licencje
+
+AARS: MIT. Piper (`piper-tts` 1.8.0, OHF-Voice/piper1-gpl) i wbudowany
+espeak-ng: GPL-3.0; AARS wywołuje Pipera jako osobny proces. onnxruntime:
+MIT. Głos `pl_PL-darkman-medium`: zbiór danych CC0. Pełna lista jest
+w obrazie w `/usr/share/doc/aars/THIRD-PARTY.md`, a źródło Pipera
+(`piper_tts-1.8.0.tar.gz`) jest dołączone do każdego wydania.
+
+### Wydawanie (dla opiekuna)
+
+1. Ustaw `version` w `crates/aars/Cargo.toml`, zatwierdź i wypchnij znacznik
+   z opisem (notatki wydania): `git tag -a v0.10.0 -m "…" && git push origin v0.10.0`.
+2. `.github/workflows/release.yml` buduje na `ubuntu-24.04-arm` binarkę,
+   obraz (z przypiętymi sumami bazy Raspberry Pi OS, kół Pipera i głosu),
+   `aars-os-list.json`, manifest i tworzy **szkic** wydania. CI niczego nie
+   podpisuje.
+3. Na swoim komputerze, z kluczem prywatnym poza GitHubem:
+   `scripts/sign-release.sh v0.10.0` (pobiera manifest, podpisuje
+   z komentarzem zaufanym `aars 0.10.0`, sprawdza kluczem
+   `keys/aars-release.pub`, dołącza podpis i publikuje wydanie).
+
+Dopóki `keys/aars-release.pub` zawiera `UNSET`, binarka nie ma klucza wydań,
+aktualizacja z panelu jest wyłączona, a `release.yml` buduje tylko wydania
+próbne (`v…-rc.N`). Wydania próbne nie są widoczne dla stacji jako nowsze.
+
+Kompilacja na Linuksa arm64 z macOS:
+`docker run --rm --platform linux/arm64 -v "$PWD:/src" -w /src rust:1.93-trixie cargo build -p aars --release`
+(potrzebne `apt-get install libasound2-dev libudev-dev pkg-config`).
+
 ## W planach
 
 Według spec §13:
 
-- etap 10: gotowy obraz Raspberry Pi i autoaktualizacja z GitHub Releases,
 - etap 11: źródła IMGW hydro i PAA z kompozytorem biuletynu, moduł pogody
   (Open-Meteo, zapasowo MET Norway) i mapa ostrzeżeń w panelu.
 

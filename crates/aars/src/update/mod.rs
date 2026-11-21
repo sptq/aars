@@ -218,6 +218,31 @@ pub mod testkit {
         }
     }
 
+    /// Archiwum wydania `version`: skrypt `aars` wypisujący `aars {version}`,
+    /// `VERSION` i `LICENSE`, jak z `release.yml`.
+    pub fn release_archive(version: &str) -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let script = format!("#!/bin/sh\necho \"aars {version}\"\n");
+        let version_file = format!("{version}\n");
+        for (name, data, mode) in [
+            ("aars", script.as_bytes(), 0o755),
+            ("VERSION", version_file.as_bytes(), 0o644),
+            ("LICENSE", b"MIT".as_slice(), 0o644),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name).unwrap();
+            header.set_mode(mode);
+            header.set_size(data.len() as u64);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            builder.append(&header, data).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
     pub fn sha256_hex(data: &[u8]) -> String {
         let digest = Sha256::digest(data);
         digest.iter().map(|b| format!("{b:02x}")).collect()

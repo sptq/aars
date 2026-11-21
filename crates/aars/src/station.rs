@@ -2311,4 +2311,229 @@ mod tests {
             .unwrap()
             .unwrap();
     }
+
+    /// Kryterium wyjścia etapu 10 (Task 13): aktualizacja zlecona w trakcie
+    /// nadania czeka na `Unkey`, strażnik instaluje, zdrowa wersja zostaje
+    /// potwierdzona, a następna, która nie zbudowała stosu nadawczego
+    /// (wcześniej działał), wraca do poprzedniej razem z kopią bazy i trafia
+    /// do audytu. Czas próby jest symulowany (`judge` z `CONFIRM_AFTER`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_installs_after_the_transmission_and_a_broken_one_rolls_back() {
+        use aars_core::update::{CONFIRM_AFTER, ResultKind};
+        use aars_web::state::UpdateControl;
+
+        use crate::update::control::{UpdateDeps, UpdateHandle};
+        use crate::update::fetch::ReleaseClient;
+        use crate::update::guard::{GuardAction, run_guard};
+        use crate::update::health::{Verdict, audit_last_result, judge};
+        use crate::update::install::{NoOwner, SmokeTest};
+        use crate::update::paths::{UpdatePaths, installed_version, swap_link, write_atomic_nofollow};
+        use crate::update::read_trial;
+        use crate::update::testkit::{TestKey, release_archive, release_server};
+
+        /// Wersja z `VERSION` obok binarki: bez uruchamiania świeżo
+        /// zapisanego pliku (ETXTBSY przy równoległych testach na Linuksie).
+        struct VersionSmoke;
+        impl SmokeTest for VersionSmoke {
+            fn version_of(&self, binary: &std::path::Path) -> Result<String, String> {
+                installed_version(binary.parent().unwrap()).ok_or_else(|| "brak VERSION".to_owned())
+            }
+        }
+
+        struct NoStation;
+        impl UpdateTarget for NoStation {
+            fn request_update(&self) {}
+        }
+
+        async fn open(path: &std::path::Path) -> SqlitePool {
+            let pool = aars_core::db::connect(path).await.unwrap();
+            aars_core::db::migrate(&pool).await.unwrap();
+            pool
+        }
+
+        async fn marker(pool: &SqlitePool) -> Option<String> {
+            SettingsRepo::new(pool.clone()).kv_get("test:marker").await.unwrap()
+        }
+
+        fn handle(
+            paths: &UpdatePaths,
+            server: &wiremock::MockServer,
+            key: &TestKey,
+            running: &str,
+            pool: &SqlitePool,
+            station: Arc<dyn UpdateTarget>,
+        ) -> UpdateHandle {
+            UpdateHandle::with_client(
+                paths.clone(),
+                Some(ReleaseClient::new(&server.uri(), key.trusted()).unwrap()),
+                running,
+                None,
+                UpdateDeps {
+                    pool: pool.clone(),
+                    queue: Arc::new(QueueRepo::new(pool.clone())),
+                    interlocks: Arc::new(aars_core::interlock::InMemoryInterlocks::permissive()),
+                    station,
+                    last: None,
+                },
+            )
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = UpdatePaths {
+            install_root: dir.path().join("opt/aars"),
+            guard_dir: dir.path().join("var/lib/aars-update"),
+            state_dir: dir.path().join("var/lib/aars/update"),
+            db_path: dir.path().join("var/lib/aars/aars.db"),
+        };
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let first = paths.releases().join("0.10.0");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::write(first.join("aars"), "#!/bin/sh\necho \"aars 0.10.0\"\n").unwrap();
+        std::fs::write(first.join("VERSION"), "0.10.0\n").unwrap();
+        swap_link(&paths.current(), std::path::Path::new("releases/0.10.0")).unwrap();
+        let now: chrono::DateTime<chrono::Utc> = "2026-11-21T12:00:00Z".parse().unwrap();
+        let key = TestKey::generate();
+        let guard = |paths: &UpdatePaths| run_guard(paths, Some(&key.trusted()), &VersionSmoke, &NoOwner, now);
+
+        // 1. Stacja 0.10.0 nadaje ~1,5 s; admin zleca 0.11.0 w trakcie.
+        let pool = open(&paths.db_path).await;
+        aars_core::user::UserRepo::new(pool.clone())
+            .create("admin", "dlugie-haslo-1", aars_core::user::Role::Admin)
+            .await
+            .unwrap();
+        let queue = QueueRepo::new(pool.clone());
+        let mut ids = Vec::new();
+        for text in ["komunikat testowy trwa sekundy", "drugi komunikat w kolejce"] {
+            ids.extend(
+                queue
+                    .enqueue(aars_core::queue::EnqueueRequest {
+                        message_id: None,
+                        rendered_text: text.to_owned(),
+                        priority: Priority::Normal,
+                        interrupting: false,
+                        not_before: None,
+                        expires_at: None,
+                        repeat_count: 1,
+                        repeat_interval: Duration::ZERO,
+                        created_by: None,
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut config = station_config("exit10");
+        config.storage.db_path = paths.db_path.clone();
+        config.update.install_root = paths.install_root.clone();
+        config.update.guard_dir = paths.guard_dir.clone();
+        config.update.state_dir = paths.state_dir.clone();
+        let hardware = Arc::new(FakeHardware::new(&[]));
+        let ptt = hardware.ptt.clone();
+        let (task, station) = start_full(
+            config,
+            pool.clone(),
+            hardware,
+            CancelToken::new(),
+            Arc::new(FakeNotifier::default()),
+            Arc::new(HealthCell::default()),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ptt.is_keyed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("zadanie musi wejść na antenę");
+        let server = release_server(&key, "0.11.0", &release_archive("0.11.0")).await;
+        let update = handle(&paths, &server, &key, "0.10.0", &pool, station.clone());
+        update.install("0.11.0", "admin").await.unwrap();
+        assert!(ptt.is_keyed(), "pobranie i sprawdzenie idą w trakcie nadania (R10d)");
+        let exit = tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .expect("aktualizacja musi zakończyć przebieg")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Update));
+        assert!(!ptt.is_keyed());
+        let transitions: Vec<PttEvent> =
+            ptt.events().into_iter().filter(|e| *e != PttEvent::ForceUnkey).collect();
+        assert_eq!(transitions, vec![PttEvent::Key, PttEvent::Unkey]);
+        let result: String = sqlx::query_scalar("SELECT result FROM tx_log WHERE queue_item_id = ?")
+            .bind(ids[0])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(result, "ok", "aktualizacja nie przerywa nadania");
+        let second: String = sqlx::query_scalar("SELECT state FROM queue_items WHERE id = ?")
+            .bind(ids[1])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(second, "pending", "drugie zadanie nie zostało wzięte");
+        drop(update);
+        pool.close().await;
+
+        // 2. Strażnik (ExecStartPre) instaluje 0.11.0 i otwiera próbę.
+        assert_eq!(guard(&paths), vec![GuardAction::Installed("0.11.0".to_owned())]);
+        assert_eq!(installed_version(&paths.current()).as_deref(), Some("0.11.0"));
+        assert_eq!(installed_version(&paths.previous()).as_deref(), Some("0.10.0"));
+        let trial = read_trial(&paths).expect("próba trwa");
+        // Pierwszy start liczy się od razu (trzy starty, przegląd 5–7 M-1).
+        assert_eq!((trial.version.as_str(), trial.attempts), ("0.11.0", 1));
+        assert!(trial.radio_was_up, "0.10.0 zbudowała stos nadawczy");
+
+        // 3. Po 60 s zdrowej pracy: potwierdzenie, strażnik zamyka próbę.
+        let healthy = HealthCell::default();
+        healthy.set_radio(true, None);
+        healthy.set_dispatcher_alive(true);
+        assert_eq!(judge(Some(&trial), "0.11.0", &healthy, CONFIRM_AFTER), Verdict::Confirm);
+        write_atomic_nofollow(&paths.confirmed(), b"0.11.0").unwrap();
+        assert_eq!(guard(&paths), vec![GuardAction::Confirmed("0.11.0".to_owned())]);
+        assert!(read_trial(&paths).is_none());
+
+        // 4. Stacja 0.11.0 nadaje (stos z panelu) i dostaje 0.12.0.
+        let pool = open(&paths.db_path).await;
+        let kv = SettingsRepo::new(pool.clone());
+        kv.kv_put("hw_state:origin", "panel").await.unwrap();
+        kv.kv_put("test:marker", "przed 0.12.0").await.unwrap();
+        let server = release_server(&key, "0.12.0", &release_archive("0.12.0")).await;
+        handle(&paths, &server, &key, "0.11.0", &pool, Arc::new(NoStation))
+            .install("0.12.0", "admin")
+            .await
+            .unwrap();
+        pool.close().await;
+        assert_eq!(guard(&paths), vec![GuardAction::Installed("0.12.0".to_owned())]);
+        let trial = read_trial(&paths).expect("próba 0.12.0");
+        assert!(trial.radio_was_up, "0.11.0 nadawała");
+
+        // 0.12.0 pisze do bazy, ale nie buduje stosu nadawczego.
+        let pool = open(&paths.db_path).await;
+        SettingsRepo::new(pool.clone()).kv_put("test:marker", "po 0.12.0").await.unwrap();
+        pool.close().await;
+        let broken = HealthCell::default();
+        broken.set_radio(false, Some("karta nie wstała".to_owned()));
+        broken.set_dispatcher_alive(true);
+        let Verdict::Bad(reason) = judge(Some(&trial), "0.12.0", &broken, CONFIRM_AFTER) else {
+            panic!("wersja bez stosu nadawczego nie może być potwierdzona");
+        };
+        assert!(reason.starts_with("bad 0.12.0: nadawanie nie wstało"), "{reason}");
+        write_atomic_nofollow(&paths.verdict(), reason.as_bytes()).unwrap();
+
+        // Strażnik wraca do 0.11.0 z kopią bazy sprzed instalacji.
+        assert_eq!(guard(&paths), vec![GuardAction::RolledBack("0.11.0".to_owned())]);
+        assert_eq!(installed_version(&paths.current()).as_deref(), Some("0.11.0"));
+        assert!(read_trial(&paths).is_none());
+        let pool = open(&paths.db_path).await;
+        assert_eq!(marker(&pool).await.as_deref(), Some("przed 0.12.0"), "baza z kopii");
+        let last = audit_last_result(&paths, &pool).await.expect("wynik powrotu");
+        assert_eq!(last.kind, ResultKind::RolledBack);
+        let audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'update_rolled_back' AND user_id IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audits, 1);
+        assert!(audit_last_result(&paths, &pool).await.is_none(), "raz");
+    }
 }

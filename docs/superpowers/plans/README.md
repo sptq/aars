@@ -16,7 +16,7 @@ uruchomić i sprawdzić, i ma własny plik planu z zadaniami w cyklu TDD.
 | 7 ✓ | `2026-11-20-etap-07-panel-reszta.md` | CRUD komunikatów, ustawienia, użytkownicy, logi | Harmonogram konfigurowalny z panelu; macierz rola × endpoint przechodzi |
 | 8 ✓ | `2026-11-20-etap-08-imgw-meteo.md` | `trait DataSource` + `imgw-meteo` | Ostrzeżenie meteo pojawia się w kolejce bez powtarzania przy każdym odpytaniu |
 | 9 ✓ | `2026-11-20-etap-09-panel-admin.md` | Panel admina: konfiguracja sprzętu i stacji (PTT, audio, głos, sieć, pozycja stacji na mapie), test PTT i audio bez anteny, moduły włącz/wyłącz z ustawieniami | Ustawienia z panelu mają pierwszeństwo przed `aars.toml` i działają po restarcie; świeża instalacja z samymi ścieżkami w `aars.toml` konfiguruje się w całości z panelu, każda zmiana w audycie; test audio nie nadaje na antenę, test PTT kluczuje najwyżej 5 s po jawnym potwierdzeniu (spec §13 pkt 9: „gdzie to możliwe”); restart nigdy w trakcie nadania |
-| 10 | `2026-11-21-etap-10-obraz-rpi.md` | Obraz Raspberry Pi (`.img`, Piper z polskim głosem, systemd), kreator pierwszego admina i autoaktualizacja z GitHub Releases (podpis minisign, strażnik startu, powrót z kopią bazy) | Świeży obraz startuje bez SSH; aktualizacja sprawdza sumę, podmienia binarkę i wraca do poprzedniej wersji, gdy nowa nie wstanie, nigdy w trakcie nadawania |
+| 10 ✓ | `2026-11-21-etap-10-obraz-rpi.md` | Obraz Raspberry Pi (`.img`, Piper z polskim głosem, systemd), kreator pierwszego admina i autoaktualizacja z GitHub Releases (podpis minisign, strażnik startu, powrót z kopią bazy) | Świeży obraz startuje bez SSH; aktualizacja sprawdza sumę, podmienia binarkę i wraca do poprzedniej wersji, gdy nowa nie wstanie, nigdy w trakcie nadawania |
 | 11 | (plan powstanie przed etapem) | `imgw-hydro`, `paa`, kompozytor biuletynu, pogoda Open-Meteo (zapasowo MET Norway), mapa ostrzeżeń w panelu | Biuletyn składa segmenty ze źródeł; źródło przestarzałe wypada z biuletynu; prognoza i komunikat po przekroczeniu progów |
 
 ## Kolejność i cięcie zakresu
@@ -49,3 +49,15 @@ wiążące i nie zmieniają się (poza zmianą podziału etapów 9–11 w spec �
   Backend PTT GPIO i urządzenia ALSA nie istnieją na macOS, więc backendy
   zależne od Linuksa są za `#[cfg(target_os = "linux")]` i feature flagami.
   Testy chodzą na fake'ach na obu platformach.
+- **§12 Wdrożenie: budowa binarki (etap 10, R1).** Spec przewiduje
+  cross-compile przez cargo-zigbuild. `cpal` potrzebuje `libasound` dla
+  aarch64, a `libsqlite3-sys` kompilatora C, więc zamiast sysrootu binarka
+  powstaje natywnie na runnerze GitHub `ubuntu-24.04-arm` (glibc 2.39). Obraz
+  bazuje na Raspberry Pi OS Lite 64-bit Trixie (glibc 2.41); Bookworm (glibc
+  2.36) nie jest wspierany. Gdyby darmowe runnery arm64 zniknęły, wraca
+  cargo-zigbuild z sysrootem Debiana (jedno zadanie CI).
+- **Etap 10, R13 (zadanie 10) przycięte.** Import hasła ustawionego
+  w Raspberry Pi Imager odpadł na razie: pierwsze konto zakłada kreator
+  `/setup`. Zostaje reset kont admina plikiem `aars-reset-admin` z partycji
+  boot, ale konta wyłącza usługa `aars` przy starcie, a nie root w osobnej
+  usłudze (`aars-reset-admin.service` tylko przekazuje prośbę).

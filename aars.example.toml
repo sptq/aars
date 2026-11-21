@@ -45,3 +45,24 @@ imgw_meteo_url = "https://danepubliczne.imgw.pl/api/data/warningsmeteo"
 # [ptt.serial]
 # port = "/dev/ttyUSB0"
 # line = "dtr"            # dtr | rts
+
+# Pierwsze konto administratora. Tylko w pliku.
+#   "console" — przy pierwszym starcie konto `admin` z hasłem wypisanym na
+#               konsoli (domyślnie, instalacja „z ręki”),
+#   "wizard"  — kreator http://{stacja}:8080/setup, tylko z sieci lokalnej,
+#               dopóki nie ma admina (obraz Raspberry Pi). W tym trybie pusty
+#               plik `aars-reset-admin` obok bazy wyłącza konta admina przy
+#               starcie i otwiera kreator znowu.
+#
+# [setup]
+# first_admin = "console"
+
+# Aktualizacja z panelu (tylko w obrazie Raspberry Pi: systemd, Linux aarch64,
+# kompilacja z kluczem wydań). Tylko w pliku: kto zmienia źródło aktualizacji,
+# ten wybiera kod do uruchomienia. Wartości domyślne:
+#
+# [update]
+# releases_url = "https://github.com/sptq/aars/releases"
+# state_dir = "/var/lib/aars/update"     # katalog roboczy usługi (użytkownik aars)
+# guard_dir = "/var/lib/aars-update"     # stan strażnika startu (root)
+# install_root = "/opt/aars"             # releases/, current, previous

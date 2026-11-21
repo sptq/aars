@@ -412,6 +412,13 @@ Cross-compile na `aarch64-unknown-linux-gnu` (cargo-zigbuild), unit systemd z
 `Restart=always`, użytkownik bez uprawnień z dostępem do grup `audio` i `gpio`.
 Baza i cache w `/var/lib/aars`. `/healthz` dla nadzoru zewnętrznego.
 
+*Dopisek (etap 10, 2026-11-21):* zamiast cargo-zigbuild binarka jest
+budowana natywnie na runnerze GitHub `ubuntu-24.04-arm` (`cpal` wymaga
+`libasound` dla aarch64, którego Zig nie ma). Obraz to oficjalny Raspberry Pi
+OS Lite 64-bit **Trixie** rozszerzony w chroocie (Piper 1.8.0 w venv, głos
+`pl_PL-darkman-medium`, `aars.service` z `Type=notify`). Bookworm nie jest
+wspierany (glibc 2.36). Szczegóły: plan etapu 10, R1–R3 i R15.
+
 ## 13. Etapy
 
 Plan implementacji w `docs/superpowers/plans/` dzieli pracę na etapy; każdy
