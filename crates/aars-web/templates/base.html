@@ -21,6 +21,7 @@
     <a href="/logs">Dzienniki</a>
     {% if chrome.is_admin %}<a href="/settings">Ustawienia</a>
     <a href="/settings/hardware">Sprzęt</a>
+    <a href="/settings/update">Aktualizacja</a>
     <a href="/users">Użytkownicy</a>{% endif %}
     <span class="badge warn">{{ chrome.username }} · {{ chrome.role }}</span>
     <form method="post" action="/logout" style="margin:0">
@@ -30,5 +31,6 @@
   </nav>
 </header>
 <main>{% block content %}{% endblock %}</main>
+<footer class="version">AARS {{ chrome.version }}</footer>
 </body>
 </html>

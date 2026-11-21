@@ -22,6 +22,25 @@ pub enum AuthError {
     Hash(String),
 }
 
+/// Założenie pierwszego admina z kreatora `/setup` (R12).
+#[derive(Debug, thiserror::Error)]
+pub enum FirstAdminError {
+    /// Włączony admin już jest (np. druga przeglądarka była szybsza).
+    #[error("konto administratora już założono")]
+    AlreadyExists,
+    /// Nazwa należy do konta innej roli.
+    #[error("nazwa zajęta przez konto innej roli")]
+    NameTaken,
+    #[error(transparent)]
+    Auth(#[from] AuthError),
+}
+
+impl From<sqlx::Error> for FirstAdminError {
+    fn from(err: sqlx::Error) -> Self {
+        Self::Auth(AuthError::Db(DbError::Sqlx(err)))
+    }
+}
+
 /// Zmiana konta, która mogłaby zostawić stację bez administratora.
 #[derive(Debug, thiserror::Error)]
 pub enum UserChangeError {
@@ -123,7 +142,7 @@ fn hash_password(password: &str) -> Result<String, AuthError> {
 }
 
 /// Losowy token o 256 bitach entropii, zapisany szesnastkowo.
-fn random_token() -> String {
+pub fn random_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -391,6 +410,96 @@ impl UserRepo {
         Ok(result.rows_affected())
     }
 
+    /// Czy istnieje choć jeden włączony administrator.
+    pub async fn has_enabled_admin(&self) -> Result<bool, DbError> {
+        let found: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM users WHERE role = 'admin' AND disabled = 0)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(found != 0)
+    }
+
+    /// Pierwszy admin z kreatora (R12): sprawdzenie i zapis w jednej
+    /// transakcji `BEGIN IMMEDIATE`, więc z dwóch równoległych żądań tylko
+    /// jedno zakłada konto, a drugie dostaje `AlreadyExists`. Hasło stałe
+    /// (`must_change_password = 0`), bo wybrał je sam admin. Nazwa wyłączonego
+    /// admina (po resecie z partycji boot, R13) dostaje nowe hasło i zostaje
+    /// włączona.
+    pub async fn create_first_admin(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<i64, FirstAdminError> {
+        // Argon2 przed transakcją: blokada zapisu trwa tylko tyle co SQL.
+        let hash = hash_password(password)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM users WHERE role = 'admin' AND disabled = 0)",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if exists != 0 {
+            return Err(FirstAdminError::AlreadyExists);
+        }
+        let existing: Option<(i64, String)> =
+            sqlx::query_as("SELECT id, role FROM users WHERE username = ?")
+                .bind(username)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let id = match existing {
+            Some((id, role)) if role == "admin" => {
+                sqlx::query(
+                    "UPDATE users SET password_hash = ?, disabled = 0, must_change_password = 0
+                      WHERE id = ?",
+                )
+                .bind(&hash)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+                // Stare sesje wyłączonego konta nie wracają razem z nim.
+                sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                id
+            }
+            Some(_) => return Err(FirstAdminError::NameTaken),
+            None => {
+                sqlx::query_scalar(
+                    "INSERT INTO users (username, password_hash, role, must_change_password)
+                     VALUES (?, ?, 'admin', 0) RETURNING id",
+                )
+                .bind(username)
+                .bind(&hash)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+        };
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// Reset z partycji boot (R13): wyłącza wszystkie konta admina i kończy
+    /// ich sesje w jednej transakcji, więc kreator `/setup` otwiera się
+    /// znowu. Konta operatorów i obserwatorów zostają nietknięte. Zwraca
+    /// liczbę wyłączonych kont. Ochrona ostatniego admina z `set_disabled`
+    /// celowo tu nie działa: to jest wyjście awaryjne właściciela.
+    pub async fn disable_all_admins(&self) -> Result<u64, DbError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE role = 'admin')",
+        )
+        .execute(&mut *tx)
+        .await?;
+        let result =
+            sqlx::query("UPDATE users SET disabled = 1 WHERE role = 'admin' AND disabled = 0")
+                .execute(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
+    }
+
     /// Przy pierwszym starcie tworzy konto `admin` z losowym hasłem i zwraca
     /// je, żeby binarka mogła je wypisać na konsolę. Gdy jakikolwiek
     /// użytkownik już istnieje, nie robi nic.
@@ -422,6 +531,109 @@ impl UserRepo {
 mod tests {
     use super::*;
     use crate::db::test_pool;
+
+    #[tokio::test]
+    async fn the_first_admin_is_created_once() {
+        let repo = UserRepo::new(test_pool().await);
+        assert!(!repo.has_enabled_admin().await.unwrap());
+        let id = repo.create_first_admin("szef", "dlugie-haslo-1").await.unwrap();
+        assert!(repo.has_enabled_admin().await.unwrap());
+        let user = repo.authenticate("szef", "dlugie-haslo-1").await.unwrap();
+        assert_eq!(user.id, id);
+        assert_eq!(user.role, Role::Admin);
+        assert!(!user.must_change_password);
+
+        let again = repo.create_first_admin("drugi", "dlugie-haslo-2").await;
+        assert!(matches!(again, Err(FirstAdminError::AlreadyExists)), "{again:?}");
+        assert!(repo.authenticate("drugi", "dlugie-haslo-2").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn disabling_all_admins_ends_their_sessions_and_spares_operators() {
+        let repo = UserRepo::new(test_pool().await);
+        let admin = repo.create_first_admin("szef", "dlugie-haslo-1").await.unwrap();
+        let operator = repo.create("op", "dlugie-haslo-2", Role::Operator).await.unwrap();
+        let admin_session = repo.start_session(admin, None).await.unwrap().id;
+        let operator_session = repo.start_session(operator, None).await.unwrap().id;
+
+        assert_eq!(repo.disable_all_admins().await.unwrap(), 1);
+        assert!(!repo.has_enabled_admin().await.unwrap());
+        assert!(repo.by_id(admin).await.unwrap().unwrap().disabled);
+        assert!(repo.session_user(&admin_session).await.unwrap().is_none());
+        assert!(!repo.by_id(operator).await.unwrap().unwrap().disabled);
+        assert!(repo.session_user(&operator_session).await.unwrap().is_some());
+
+        // Kreator przyjmuje tę samą nazwę z nowym hasłem.
+        repo.create_first_admin("szef", "nowe-haslo-123").await.unwrap();
+        assert!(repo.authenticate("szef", "nowe-haslo-123").await.is_ok());
+        assert_eq!(repo.disable_all_admins().await.unwrap(), 1);
+        assert_eq!(repo.disable_all_admins().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_admins_create_exactly_one() {
+        // Plik zamiast bazy w pamięci: kilka połączeń naraz, jak na stacji.
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::connect(&dir.path().join("aars.db")).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let repo = std::sync::Arc::new(UserRepo::new(pool.clone()));
+        let tasks: Vec<_> = (0..4)
+            .map(|i| {
+                let repo = repo.clone();
+                tokio::spawn(async move {
+                    repo.create_first_admin(&format!("admin{i}"), "dlugie-haslo-1").await
+                })
+            })
+            .collect();
+        let mut created = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => created += 1,
+                Err(FirstAdminError::AlreadyExists) => {}
+                Err(err) => panic!("nieoczekiwany błąd: {err:?}"),
+            }
+        }
+        assert_eq!(created, 1);
+        let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(admins, 1);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_admin_name_is_reused_after_a_reset() {
+        let repo = UserRepo::new(test_pool().await);
+        let old = repo.create("szef", "stare-haslo-1", Role::Admin).await.unwrap();
+        repo.start_session(old, None).await.unwrap();
+        sqlx::query("UPDATE users SET disabled = 1 WHERE id = ?")
+            .bind(old)
+            .execute(repo.pool())
+            .await
+            .unwrap();
+        assert!(!repo.has_enabled_admin().await.unwrap());
+
+        let id = repo.create_first_admin("szef", "nowe-haslo-12").await.unwrap();
+        assert_eq!(id, old);
+        assert!(repo.authenticate("szef", "stare-haslo-1").await.is_err());
+        let user = repo.authenticate("szef", "nowe-haslo-12").await.unwrap();
+        assert!(!user.disabled);
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = ?")
+            .bind(id)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap();
+        assert_eq!(sessions, 0, "sesje sprzed resetu nie wracają");
+    }
+
+    #[tokio::test]
+    async fn a_name_of_another_role_is_not_taken_over() {
+        let repo = UserRepo::new(test_pool().await);
+        repo.create("jan", "haslo-widza-1", Role::Viewer).await.unwrap();
+        let result = repo.create_first_admin("jan", "dlugie-haslo-1").await;
+        assert!(matches!(result, Err(FirstAdminError::NameTaken)), "{result:?}");
+        assert!(!repo.has_enabled_admin().await.unwrap());
+    }
 
     #[tokio::test]
     async fn a_password_is_never_stored_in_clear_text() {

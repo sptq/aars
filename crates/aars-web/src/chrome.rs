@@ -13,6 +13,8 @@ pub struct Chrome {
     pub csrf: String,
     pub can_operate: bool,
     pub is_admin: bool,
+    /// Wersja produktu w stopce (każda rola, R17).
+    pub version: &'static str,
 }
 
 impl From<&CurrentUser> for Chrome {
@@ -23,6 +25,7 @@ impl From<&CurrentUser> for Chrome {
             csrf: current.csrf_token.clone(),
             can_operate: current.user.role.can(Role::Operator),
             is_admin: current.user.role.can(Role::Admin),
+            version: current.version,
         }
     }
 }
@@ -66,6 +69,12 @@ pub fn audit_action_label(action: &str) -> &str {
         "position" => "pozycja stacji",
         "module_enabled" => "moduł wł./wył.",
         "module_settings" => "ustawienia modułu",
+        "update_install" => "aktualizacja zlecona",
+        "update_installed" => "aktualizacja zainstalowana",
+        "update_rolled_back" => "aktualizacja cofnięta",
+        "update_failed" => "aktualizacja nieudana",
+        "first_admin" => "pierwsze konto admina",
+        "admin_reset" => "reset kont admina",
         other => other,
     }
 }

@@ -66,6 +66,28 @@ pub enum Command {
         #[command(subcommand)]
         action: HardwareAction,
     },
+    /// Aktualizacja z wydań GitHub: stan, strażnik startu, powrót.
+    Update {
+        #[command(subcommand)]
+        action: UpdateAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum UpdateAction {
+    /// Wersja bieżąca i poprzednia, trwająca próba i ostatni wynik.
+    Status,
+    /// Strażnik startu (root, z `ExecStartPre` usługi); zawsze kończy się kodem 0.
+    Guard,
+    /// Ręczny powrót do poprzedniej wersji razem z kopią bazy (root).
+    Rollback {
+        /// Powrót mimo nieznanego stanu usługi (brak pliku blokady). Tylko
+        /// po sprawdzeniu, że `systemctl is-active aars` mówi `inactive`.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Sprawdza najnowsze wydanie; niczego nie pobiera poza manifestem.
+    Check,
 }
 
 #[derive(Debug, Subcommand)]

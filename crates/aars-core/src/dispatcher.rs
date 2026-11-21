@@ -2,7 +2,7 @@ use std::future::Future;
 use std::ops::RangeInclusive;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -94,9 +94,39 @@ type TestRequest = (StationTest, oneshot::Sender<TestOutcome>);
 pub struct DispatcherControl {
     tests: mpsc::Sender<TestRequest>,
     busy: Arc<AtomicBool>,
+    beat: Arc<Heartbeat>,
+}
+
+/// Puls pętli dyspozytora (etap 10, R9): ostatni obrót pętli albo jałowego
+/// czekania. W trakcie nadania nie tyka, więc stary puls trwa najwyżej tyle,
+/// ile limit nadania.
+#[derive(Debug)]
+struct Heartbeat {
+    origin: std::time::Instant,
+    last_ms: AtomicU64,
+}
+
+impl Heartbeat {
+    fn new() -> Self {
+        Self { origin: std::time::Instant::now(), last_ms: AtomicU64::new(0) }
+    }
+
+    fn beat(&self) {
+        let ms = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_ms.store(ms, Ordering::SeqCst);
+    }
+
+    fn since(&self) -> Duration {
+        self.origin.elapsed().saturating_sub(Duration::from_millis(self.last_ms.load(Ordering::SeqCst)))
+    }
 }
 
 impl DispatcherControl {
+    /// Ile minęło od ostatniego obrotu pętli dyspozytora.
+    pub fn since_beat(&self) -> Duration {
+        self.beat.since()
+    }
+
     /// Zleca test i czeka na wynik najwyżej `timeout`. Gdy stacja nadaje
     /// albo inny test czeka, odpowiada `Busy` od razu.
     pub async fn run_test(&self, test: StationTest, timeout: Duration) -> TestOutcome {
@@ -137,6 +167,7 @@ pub struct Dispatcher {
     busy: Arc<AtomicBool>,
     /// Ile po Ctrl-C czekamy na wątek sekwencera (restart czeka bez limitu).
     join_timeout: Duration,
+    beat: Arc<Heartbeat>,
 }
 
 /// Odstęp ponownej próby po odmowie: po włączeniu nadawania komunikat idzie
@@ -188,6 +219,7 @@ impl Dispatcher {
             tests_rx,
             busy: Arc::new(AtomicBool::new(false)),
             join_timeout: SHUTDOWN_JOIN,
+            beat: Arc::new(Heartbeat::new()),
         }
     }
 
@@ -205,7 +237,7 @@ impl Dispatcher {
 
     /// Uchwyt do zlecania testów stacji z panelu.
     pub fn control(&mut self) -> DispatcherControl {
-        DispatcherControl { tests: self.tests_tx.clone(), busy: self.busy.clone() }
+        DispatcherControl { tests: self.tests_tx.clone(), busy: self.busy.clone(), beat: self.beat.clone() }
     }
 
     /// Pętla dyspozytora. `drain` (restart, R4): nie bierze nic nowego,
@@ -221,6 +253,7 @@ impl Dispatcher {
         }
 
         while !shutdown.is_cancelled() && !drain.is_cancelled() {
+            self.beat.beat();
             // Najpierw jeden test z panelu, potem kolejka.
             if let Ok((test, reply)) = self.tests_rx.try_recv() {
                 if reply.is_closed() {
@@ -323,6 +356,7 @@ impl Dispatcher {
             if now >= until || shutdown.is_cancelled() || drain.is_cancelled() {
                 return;
             }
+            self.beat.beat();
             tokio::time::sleep((until - now).min(STOP_POLL)).await;
         }
     }
@@ -1032,6 +1066,29 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         false
+    }
+
+    #[tokio::test]
+    async fn the_heartbeat_ticks_while_idle_and_stops_with_the_loop() {
+        let repo = Arc::new(QueueRepo::new(test_pool().await));
+        let ptt = Arc::new(FakePtt::new());
+        let shutdown = CancelToken::new();
+        let mut dispatcher = Dispatcher::new(
+            repo,
+            Arc::new(FakeRenderer::new(48_000, 1)),
+            spawn_sequencer(ptt),
+            DispatcherConfig { tick: Duration::from_millis(10), ptt_backend: "fake", sample_rate: 48_000 },
+        );
+        let control = dispatcher.control();
+        let task = tokio::spawn(dispatcher.run(shutdown.clone(), CancelToken::new()));
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(control.since_beat() < Duration::from_millis(200), "{:?}", control.since_beat());
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(control.since_beat() >= Duration::from_millis(250), "pętla stoi, puls też");
     }
 
     #[tokio::test]

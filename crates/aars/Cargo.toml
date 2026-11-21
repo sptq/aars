@@ -1,6 +1,6 @@
 [package]
 name = "aars"
-version = "0.1.0"
+version = "0.10.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -8,6 +8,11 @@ license.workspace = true
 [[bin]]
 name = "aars"
 path = "src/main.rs"
+
+# Testy przykładu chodzą w `cargo test --workspace` (R4, Task 12).
+[[example]]
+name = "make_manifest"
+test = true
 
 [dependencies]
 aars-core = { path = "../aars-core" }
@@ -21,12 +26,27 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 croner.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+sd-notify = "0.5"
+reqwest.workspace = true
+minisign-verify = "0.3"
+sha2 = "0.10"
+serde_json.workspace = true
+serde.workspace = true
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
+libc = "0.2"
+semver = "1"
+if-addrs = "0.15"
+socket2 = "0.6"
 
 [dev-dependencies]
 aars-core = { path = "../aars-core", features = ["testing"] }
 aars-web = { path = "../aars-web", features = ["testing"] }
 tower.workspace = true
+tempfile = "3"
+minisign = "0.10"
+wiremock.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

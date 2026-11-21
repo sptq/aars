@@ -3,6 +3,9 @@
 {% block content %}
 <div class="card">
   <h2>Stan nadawania</h2>
+  {% if no_admin %}
+  <p class="error">Brak konta administratora — załóż je w kreatorze <a href="/setup">/setup</a> (tylko z sieci lokalnej stacji).</p>
+  {% endif %}
   {% if let Some(e) = tx_unavailable %}
   <p class="error">Nadawanie niedostępne: {{ e }}{% if chrome.is_admin %} <a href="/settings/hardware">Ustawienia sprzętu</a>{% endif %}</p>
   {% endif %}

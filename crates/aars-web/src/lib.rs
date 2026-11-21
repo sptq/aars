@@ -10,8 +10,10 @@ pub mod preview;
 pub mod queue_page;
 pub mod render;
 pub mod settings_page;
+pub mod setup_page;
 pub mod sources_page;
 pub mod state;
+pub mod update_page;
 pub mod users;
 
 use aars_core::error::DbError;
@@ -38,6 +40,7 @@ pub use crate::state::AppState;
 #[template(path = "login.html")]
 struct LoginPage {
     error: Option<String>,
+    version: &'static str,
 }
 
 #[derive(Template)]
@@ -57,6 +60,8 @@ struct DashboardPage {
     tx_unavailable: Option<String>,
     /// Stacja działa na ostatniej działającej konfiguracji (tylko admin).
     last_good_note: Option<String>,
+    /// Tryb kreatora bez włączonego admina (pasek dla zalogowanych).
+    no_admin: bool,
 }
 
 #[derive(Template)]
@@ -148,8 +153,20 @@ struct TxEnabledForm {
     enabled: String,
 }
 
-async fn login_page() -> Response {
-    page(&LoginPage { error: None })
+async fn login_page(State(state): State<AppState>) -> Response {
+    // R12: bez admina w trybie `wizard` logować się nie ma kim.
+    if let Some(redirect) = setup_page::wizard_redirect(&state).await {
+        return redirect;
+    }
+    page(&LoginPage {
+        error: None,
+        version: state.version,
+    })
+}
+
+/// `/healthz`: żywy panel i wersja, która go serwuje (R17).
+async fn healthz(State(state): State<AppState>) -> String {
+    format!("ok {}", state.version)
 }
 
 async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
@@ -176,6 +193,7 @@ async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>
                 StatusCode::UNAUTHORIZED,
                 page(&LoginPage {
                     error: Some("Niepoprawna nazwa użytkownika lub hasło.".to_owned()),
+                    version: state.version,
                 }),
             )
                 .into_response()
@@ -211,7 +229,23 @@ async fn logout(
         .into_response())
 }
 
-async fn dashboard(State(state): State<AppState>, current: CurrentUser) -> Response {
+async fn dashboard(
+    State(state): State<AppState>,
+    current: Result<CurrentUser, AuthRejection>,
+) -> Response {
+    // R12: w trybie `wizard` bez admina pulpit prowadzi do kreatora tylko
+    // żądania bez sesji (dlatego `Result`). Zalogowany operator zostaje na
+    // pulpicie, bo tu jest wyłącznik nadawania (przegląd 8–9 M-3).
+    let current = match current {
+        Ok(current) => current,
+        Err(rejection) => {
+            if let Some(redirect) = setup_page::wizard_redirect(&state).await {
+                return redirect;
+            }
+            return rejection.into_response();
+        }
+    };
+    let no_admin = setup_page::wizard_redirect(&state).await.is_some();
     let interlocks = state.interlocks.snapshot();
     // Błąd kolejki nie może zabrać wyłącznika nadawania: notka zamiast tabeli.
     let (pending, queue_error) = match queue_rows(&state, 50).await {
@@ -251,6 +285,7 @@ async fn dashboard(State(state): State<AppState>, current: CurrentUser) -> Respo
         chrome: Chrome::from(&current),
         tx_unavailable,
         last_good_note,
+        no_admin,
         tx_enabled: interlocks.tx_enabled,
         poisoned: interlocks.poisoned,
         pending,
@@ -465,6 +500,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(dashboard))
         .route("/login", get(login_page).post(login_submit))
+        // Kreator pierwszego konta: bez sesji, z własnymi warunkami (R12).
+        .route("/setup", get(setup_page::page_view).post(setup_page::submit))
         .route("/logout", post(logout))
         .route("/account/password", get(account::password_page).post(account::password_submit))
         .route("/compose", get(compose_page).post(compose_submit))
@@ -493,6 +530,9 @@ pub fn router(state: AppState) -> Router {
         .route("/settings/hardware/test-ptt", post(hardware_page::test_ptt))
         .route("/settings/hardware/test-audio", post(hardware_page::test_audio))
         .route("/station/restart", post(hardware_page::restart))
+        .route("/settings/update", get(update_page::page_view))
+        .route("/settings/update/check", post(update_page::check))
+        .route("/settings/update/install", post(update_page::install))
         .route("/users", get(users::page_view).post(users::create))
         .route("/users/{id}/role", post(users::set_role))
         .route("/users/{id}/disabled", post(users::set_disabled))
@@ -505,9 +545,87 @@ pub fn router(state: AppState) -> Router {
         .route("/modules", get(modules_page::page_view))
         .route("/modules/{id}/enabled", post(modules_page::set_enabled))
         .route("/modules/{id}/settings", post(modules_page::save_settings))
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz))
         .route("/assets/{*path}", get(assets::serve))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), host_check))
+        // Zewnętrzna warstwa: adres klienta przed `Host` i przed trasami.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), client_check))
         .with_state(state)
+}
+
+/// Odpowiedź dla klienta spoza sieci lokalnej (`403`, przegląd N-1).
+pub const NOT_LOCAL_PAGE: &str = "<!doctype html>
+<html lang=\"pl\"><head><meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>AARS: dostęp tylko z sieci lokalnej</title></head>
+<body style=\"font-family: sans-serif; max-width: 40em; margin: 2em auto; padding: 0 1em; line-height: 1.5\">
+<h1>Dostęp tylko z sieci lokalnej</h1>
+<p>Panel stacji odpowiada wyłącznie urządzeniom z sieci lokalnej stacji
+(adresy prywatne IPv4, link-local, ULA i ta sama sieć <code>/64</code> IPv6).
+Twój adres jest spoza tej sieci.</p>
+<p>Zdalny dostęp włącza administrator stacji: w pliku
+<code>/etc/aars/aars.toml</code> w sekcji <code>[server]</code> ustawia
+<code>allow_remote = true</code> i restartuje usługę
+(<code>sudo systemctl restart aars</code>).</p>
+<p><strong>Uwaga:</strong> panel działa po zwykłym HTTP, bez szyfrowania.
+Hasła i sesja idą jawnym tekstem, a konta operatora i administratora
+kluczują nadajnik. Nie wystawiaj panelu do internetu (przekierowanie portu,
+otwarty IPv6). Do zdalnej pracy użyj VPN do sieci stacji, np. WireGuard,
+wtedy <code>allow_remote</code> zwykle nie jest potrzebne.</p>
+</body></html>
+";
+
+/// Cały panel tylko dla sieci lokalnej (przegląd N-1): ta sama reguła co
+/// kreator `/setup`. Bez adresu klienta (serwer bez `ConnectInfo`) odmowa,
+/// a nie zgadywanie. `/healthz` też podlega kontroli; pętla zwrotna jest
+/// lokalna, więc nadzór na samej stacji działa.
+async fn client_check(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !state.lan_only {
+        return next.run(request).await;
+    }
+    match setup_page::client_ip(request.extensions()) {
+        Some(ip) if aars_core::netlocal::is_local_client(ip, &state.local_nets) => {
+            next.run(request).await
+        }
+        other => {
+            tracing::warn!(client = ?other, path = %request.uri().path(), "klient spoza sieci lokalnej — odmowa");
+            (
+                StatusCode::FORBIDDEN,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                NOT_LOCAL_PAGE,
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Odpowiedź na żądanie pod obcą nazwą (`421`).
+pub const FOREIGN_HOST: &str = "Panel stacji odpowiada tylko pod nazwą albo adresem stacji. \
+     Otwórz go pod adresem IP stacji (np. http://192.168.1.20:8080) albo dopisz tę nazwę \
+     do server.allowed_hosts w aars.toml.";
+
+/// Obrona przed DNS rebinding na całym panelu (przegląd 8–9 M-4): obca
+/// domena przepięta na adres stacji ma w `Host` swoją nazwę, więc nie
+/// dostanie ani strony logowania, ani sesji.
+async fn host_check(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !state.check_hosts {
+        return next.run(request).await;
+    }
+    match setup_page::request_host(request.headers(), request.uri()) {
+        Some(host) if setup_page::host_allowed(&host, &state.host_names) => next.run(request).await,
+        other => {
+            tracing::warn!(host = ?other, path = %request.uri().path(), "obca nazwa w Host — odmowa");
+            (StatusCode::MISDIRECTED_REQUEST, FOREIGN_HOST).into_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -615,6 +733,53 @@ pub(crate) mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_the_version() {
+        let app = router(state().await.with_version("0.10.0"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"ok 0.10.0");
+    }
+
+    #[tokio::test]
+    async fn the_footer_shows_the_version_on_login() {
+        let response = router(state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("AARS 0.0.0-test"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn the_footer_shows_the_version_to_every_role() {
+        for role in [Role::Viewer, Role::Operator, Role::Admin] {
+            let (app, cookie, _csrf, _state) = logged_in(role).await;
+            let html = get_body(app, &cookie, "/").await;
+            assert!(html.contains("AARS 0.0.0-test"), "{role:?}: {html}");
+        }
     }
 
     #[tokio::test]

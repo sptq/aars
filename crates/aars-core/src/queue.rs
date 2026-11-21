@@ -226,6 +226,33 @@ impl QueueRepo {
         Ok(row.as_ref().map(row_to_item))
     }
 
+    /// Czy czeka pilne zadanie (`Emergency` albo `High`), które wejdzie na
+    /// antenę w ciągu `horizon`. Aktualizacja go nie wyprzedza (R10c).
+    pub async fn urgent_due(&self, horizon: Duration) -> Result<bool, DbError> {
+        let now = Utc::now();
+        // Horyzont to sekundy albo minuty; absurdalnie długi przycinamy do roku.
+        let horizon = chrono::Duration::from_std(horizon)
+            .unwrap_or(chrono::Duration::days(365))
+            .min(chrono::Duration::days(365));
+        let limit = iso(now + horizon);
+        let due: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(
+                SELECT 1 FROM queue_items
+                 WHERE state = 'pending'
+                   AND cancel_requested = 0
+                   AND priority <= ?1
+                   AND (not_before IS NULL OR not_before <= ?2)
+                   AND (expires_at IS NULL OR expires_at > ?3)
+                   AND attempt < {MAX_ATTEMPTS})"
+        ))
+        .bind(Priority::High as i64)
+        .bind(&limit)
+        .bind(iso(now))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(due)
+    }
+
     /// Szuka zadania przerywającego, które bije trwające nadanie. Nie zabiera
     /// go — decyzję o przerwaniu podejmuje dyspozytor.
     pub async fn peek_interrupting(&self, current: Priority) -> Result<Option<QueueItem>, DbError> {
@@ -486,6 +513,52 @@ mod tests {
             repeat_interval: Duration::ZERO,
             created_by: None,
         }
+    }
+
+    #[tokio::test]
+    async fn urgent_due_sees_high_and_emergency_only_within_the_horizon() {
+        let horizon = Duration::from_secs(60);
+
+        let repo = QueueRepo::new(test_pool().await);
+        repo.enqueue(req("zwykły teraz", Priority::Normal))
+            .await
+            .unwrap();
+        repo.enqueue(req("niski teraz", Priority::Low))
+            .await
+            .unwrap();
+        assert!(!repo.urgent_due(horizon).await.unwrap());
+
+        let mut later = req("pilny za 10 min", Priority::Emergency);
+        later.not_before = Some(Utc::now() + chrono::Duration::minutes(10));
+        repo.enqueue(later).await.unwrap();
+        assert!(!repo.urgent_due(horizon).await.unwrap());
+
+        let mut soon = req("wysoki za 30 s", Priority::High);
+        soon.not_before = Some(Utc::now() + chrono::Duration::seconds(30));
+        repo.enqueue(soon).await.unwrap();
+        assert!(repo.urgent_due(horizon).await.unwrap());
+
+        // Teraz, ale już nie czeka: nadawane, anulowane i przeterminowane się nie liczą.
+        let repo = QueueRepo::new(test_pool().await);
+        repo.enqueue(req("nadawany", Priority::Emergency))
+            .await
+            .unwrap();
+        repo.claim_next().await.unwrap().unwrap();
+        let ids = repo
+            .enqueue(req("anulowany", Priority::High))
+            .await
+            .unwrap();
+        repo.cancel(ids[0]).await.unwrap();
+        let mut stale = req("przeterminowany", Priority::Emergency);
+        stale.not_before = Some(Utc::now() - chrono::Duration::minutes(10));
+        stale.expires_at = Some(Utc::now() - chrono::Duration::minutes(5));
+        repo.enqueue(stale).await.unwrap();
+        assert!(!repo.urgent_due(horizon).await.unwrap());
+
+        repo.enqueue(req("pilny teraz", Priority::Emergency))
+            .await
+            .unwrap();
+        assert!(repo.urgent_due(horizon).await.unwrap());
     }
 
     #[tokio::test]

@@ -1,0 +1,15 @@
+#!/bin/sh
+# Strażnik startu AARS (ExecStartPre=-+, root). W trakcie próby nowej wersji
+# woła poprzednią, sprawdzoną binarkę, bo nowa może nie wstać; w pozostałych
+# przypadkach bieżącą. Strażnik z `previous` tylko ocenia próbę: gdy ją
+# zamknie, a czeka żądanie instalacji, robi `exec` na `current/aars update
+# guard` (AARS_GUARD_HANDED_OVER=1), więc nowe wydanie zawsze sprawdza klucz
+# wydań i kod bieżącej wersji (przegląd końcowy I-1). Próby już wtedy nie
+# ma, więc przekazanie nie wraca do `previous`.
+# AARS_UPDATE_PREFIX służy wyłącznie testom.
+set -u
+P="${AARS_UPDATE_PREFIX:-}"
+if [ -e "$P/var/lib/aars-update/trial.json" ] && [ -x "$P/opt/aars/previous/aars" ]; then
+  exec "$P/opt/aars/previous/aars" update guard "$@"
+fi
+exec "$P/opt/aars/current/aars" update guard "$@"

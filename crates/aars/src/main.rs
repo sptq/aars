@@ -2,7 +2,10 @@ mod cli;
 mod probe;
 mod radio;
 mod render;
+mod service;
+mod setup;
 mod station;
+mod update;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -251,29 +254,142 @@ async fn main() -> Result<()> {
             let pool = db::connect(&config.storage.db_path).await.context("otwieranie bazy")?;
             db::migrate(&pool).await.context("nakładanie migracji")?;
 
-            // Jeden `stop` na cały proces: Ctrl-C kończy także stację, która
-            // właśnie czeka na koniec nadania przed restartem.
+            // R13: reset kont admina plikiem z partycji boot. Tylko w trybie
+            // kreatora — przy haśle z konsoli nikt nie założyłby nowego admina.
+            let reset_flag = setup::reset_flag_path(&config.storage.db_path);
+            if config.setup.first_admin == aars_core::config::FirstAdmin::Wizard {
+                match setup::reset_admins(&reset_flag, &pool).await {
+                    Ok(Some(n)) => tracing::warn!(
+                        disabled = n,
+                        "reset kont admina z partycji boot — załóż konto w kreatorze /setup"
+                    ),
+                    Ok(None) => {}
+                    Err(err) => tracing::error!("reset kont admina nie powiódł się: {err}"),
+                }
+            } else if reset_flag.exists() {
+                tracing::warn!(
+                    flag = %reset_flag.display(),
+                    "prośba o reset admina pominięta: działa tylko z setup.first_admin = \"wizard\""
+                );
+            }
+
+            // Jeden `stop` na cały proces: Ctrl-C i SIGTERM (`systemctl stop`)
+            // kończą także stację, która właśnie czeka na koniec nadania
+            // przed restartem. Bez SIGTERM systemd zabiłby proces, zanim
+            // sekwencer opuści PTT (R10e).
             let stop = CancelToken::new();
             let on_signal = stop.clone();
+            let signals = service::StopSignals::register().context("nasłuch SIGINT i SIGTERM")?;
             tokio::spawn(async move {
-                match tokio::signal::ctrl_c().await {
-                    Ok(()) => {
-                        tracing::info!("zatrzymuję stację");
-                        on_signal.cancel();
-                    }
-                    Err(err) => tracing::error!(%err, "oczekiwanie na Ctrl-C zawiodło"),
-                }
+                signals.wait().await;
+                tracing::info!("zatrzymuję stację");
+                on_signal.cancel();
             });
+
+            if service::under_systemd() {
+                tracing::info!(
+                    version = service::VERSION,
+                    "praca pod systemd — powiadomienia włączone"
+                );
+            }
+            let notifier: Arc<dyn service::Notifier> =
+                Arc::new(service::ReadyOnce::new(service::SystemdNotifier));
+            // Watchdog systemd tyka przez całe życie procesu, także podczas
+            // drenażu przed restartem: wykrywa zatrzymany runtime, nie stan
+            // nadawania (strażnik TX ma własny wątek).
+            if let Some(interval) = service::watchdog_interval() {
+                let notifier = notifier.clone();
+                tokio::spawn(async move {
+                    loop {
+                        notifier.watchdog();
+                        tokio::time::sleep(interval).await;
+                    }
+                });
+            }
 
             let factory: Arc<dyn station::HardwareFactory> = Arc::new(station::RealHardware);
             let probe: Arc<dyn aars_core::hardware::probe::HardwareProbe> = Arc::new(probe::HostProbe);
-            while let station::Exit::Restart =
-                station::run_once(&config, &pool, factory.clone(), probe.clone(), stop.clone())
+            // Wynik instalacji albo powrotu z poprzedniego startu idzie do
+            // audytu raz, zanim stacja wstanie (R18).
+            let update_paths = update::paths::UpdatePaths::from_config(&config);
+            if let Some(last) = update::health::audit_last_result(&update_paths, &pool).await {
+                tracing::info!(
+                    action = last.audit_action(),
+                    version = %last.version,
+                    "wynik aktualizacji zapisany w audycie"
+                );
+            }
+            // Działające `aars run` trzyma blokadę, więc ręczny powrót
+            // (`aars update rollback`) odmówi (przegląd 5–7 M-7).
+            // Pod systemd brak blokady kończy start: bez niej ręczny powrót
+            // nie wie, czy usługa działa (przegląd 8–9 M-5). Poza usługą
+            // (praca deweloperska) tylko ostrzeżenie; `rollback` odmówi wtedy
+            // bez `--force`.
+            let _service_lock = match update::paths::hold_service_lock(&update_paths) {
+                Ok(lock) => Some(lock),
+                Err(err) if service::under_systemd() => {
+                    anyhow::bail!("blokada usługi: {err}");
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "blokada usługi niedostępna (poza systemd)");
+                    None
+                }
+            };
+            let health = Arc::new(update::health::HealthCell::default());
+            // R9: po 60 s od gotowości próba nowej wersji dostaje
+            // potwierdzenie albo werdykt.
+            tokio::spawn(update::health::confirm_task(
+                update_paths,
+                health.clone(),
+                service::VERSION.to_owned(),
+                stop.clone(),
+            ));
+
+            let mut updating = false;
+            let run_result: Result<()> = async {
+                loop {
+                    match station::run_once(
+                        &config,
+                        &pool,
+                        factory.clone(),
+                        probe.clone(),
+                        stop.clone(),
+                        notifier.clone(),
+                        health.clone(),
+                    )
                     .await?
-            {
-                tracing::info!("restart stacji w procesie");
+                    {
+                        station::Exit::Restart => tracing::info!("restart stacji w procesie"),
+                        station::Exit::Update => {
+                            notifier.stopping();
+                            tracing::info!(
+                                "kończę proces — aktualizację zainstaluje strażnik przy starcie"
+                            );
+                            updating = true;
+                            break;
+                        }
+                        // Werdykt `bad` po bieżącym nadaniu: błąd procesu niżej.
+                        station::Exit::Unhealthy | station::Exit::Stop => break,
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            // Żądanie przeżywa proces tylko przy końcu „aktualizacja”: przy
+            // zatrzymaniu, werdykcie albo błędzie instalacja odpaliłaby się
+            // przy przypadkowym starcie, bez admina (przegląd 8–9 I-1).
+            if !updating {
+                update::discard_request(
+                    &update::paths::UpdatePaths::from_config(&config),
+                    "proces kończy się bez aktualizacji",
+                );
+            }
+            run_result?;
+            if let Some(reason) = health.fatal() {
+                anyhow::bail!("nowa wersja niezdrowa, strażnik wróci do poprzedniej: {reason}");
             }
         }
+        cli::Command::Update { action } => update::cli(&config, action).await?,
         cli::Command::Hardware { action } => {
             use aars_core::hardware::HardwareRepo;
 

@@ -68,6 +68,8 @@ const POSTS: &[(&str, u8)] = &[
     ("/settings/hardware/test-audio", ADMIN),
     ("/settings/position", ADMIN),
     ("/station/restart", ADMIN),
+    ("/settings/update/check", ADMIN),
+    ("/settings/update/install", ADMIN),
     ("/modules/scheduler/enabled", ADMIN),
     ("/modules/imgw-meteo/enabled", ADMIN),
     ("/modules/imgw-meteo/settings", ADMIN),
@@ -90,7 +92,11 @@ async fn request(
     csrf: &str,
     body: &str,
 ) -> (StatusCode, Option<String>) {
-    let mut builder = Request::builder().method(method).uri(path);
+    // `Host` jak z przeglądarki: kreator `/setup` odrzuca żądania bez niego.
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::HOST, "127.0.0.1:8080");
     if let Some(cookie) = cookie {
         builder = builder.header(header::COOKIE, cookie);
     }
@@ -176,6 +182,7 @@ async fn every_get_route_enforces_its_minimum_role() {
         get("/modules", OPERATOR),
         get("/settings", ADMIN),
         get("/settings/hardware", ADMIN),
+        get("/settings/update", ADMIN),
         get("/users", ADMIN),
     ];
     let mut failures = Vec::new();
@@ -320,6 +327,10 @@ async fn every_post_route_enforces_its_role_with_a_valid_csrf_token() {
         // Ciało nie ma pól pozycji: wszystkie puste kasują pozycję.
         ("/settings/position", ADMIN, 303),
         ("/station/restart", ADMIN, 503),
+        // Stan testowy nie ma sterownika aktualizacji.
+        ("/settings/update/check", ADMIN, 503),
+        // `confirm=b` to nie „tak”: 400 przed sprawdzeniem sterownika.
+        ("/settings/update/install", ADMIN, 400),
         ("/modules/scheduler/enabled", ADMIN, 303),
         ("/modules/imgw-meteo/enabled", ADMIN, 303),
         // `interval_s=5` jest poza zakresem 60–3600.
@@ -380,4 +391,29 @@ async fn a_post_without_the_csrf_field_is_refused_and_changes_nothing() {
         .unwrap()
         .len();
     assert_eq!(count, 1, "brak tokenu nie może utworzyć definicji");
+}
+
+/// Wyjątek od macierzy: `/setup` (kreator pierwszego konta, R12) działa bez
+/// sesji, więc nie ma go w listach wyżej. Chronią go własne warunki: tryb
+/// `wizard`, brak włączonego admina, sieć lokalna i CSRF double-submit
+/// (testy w `setup_page`). W domyślnym trybie `console` i przy istniejącym
+/// adminie nie istnieje dla nikogo — także dla zalogowanego admina.
+#[tokio::test]
+async fn setup_is_outside_the_session_matrix_and_hidden_by_default() {
+    let (app, _state, cookies, _id) = sessions().await;
+    for (name, level) in ROLES {
+        let cookie = cookies
+            .iter()
+            .find(|(l, _)| *l == level)
+            .and_then(|(_, c)| c.as_ref().map(|(cookie, _)| cookie.clone()));
+        for method in ["GET", "POST"] {
+            let (status, location) =
+                request(&app, method, "/setup", cookie.as_deref(), "zly", POST_BODY).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{method} /setup jako {name}: {location:?}"
+            );
+        }
+    }
 }

@@ -1,0 +1,41 @@
+# AARS — usługa stacji w obrazie Raspberry Pi (etap 10, R8, R9, R15).
+[Unit]
+Description=AARS — automatyczna radiowa stacja ostrzegawcza
+Documentation=https://github.com/sptq/aars
+After=network-online.target sound.target aars-reset-admin.service
+Wants=network-online.target
+# Stacja ostrzegawcza się nie poddaje: bez limitu restartów.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=aars
+Group=aars
+SupplementaryGroups=audio gpio dialout
+StateDirectory=aars
+StateDirectoryMode=0750
+# Strażnik startu jako root ("+"); jego porażka nie blokuje startu ("-").
+ExecStartPre=-+/opt/aars/bin/aars-update-guard --config /etc/aars/aars.toml
+ExecStart=/opt/aars/current/aars --config /etc/aars/aars.toml run
+Restart=always
+RestartSec=5
+# READY=1 dopiero, gdy panel nasłuchuje i stos nadawczy jest zbudowany.
+TimeoutStartSec=180
+# WATCHDOG=1 co 20 s z runtime'u tokio.
+WatchdogSec=60
+# SIGTERM działa jak Ctrl-C: sekwencer przerywa nadanie i opuszcza PTT.
+# Zwykle trwa to kilka sekund. Limit obejmuje najgorszy przypadek: najdłuższe
+# nadanie do strażnika TX (600 s + 2 s opóźnienia PTT + 2 s zapasu) i zapas
+# drenażu 30 s. SIGKILL przed nim zostawiłby linię PTT jądru.
+TimeoutStopSec=660
+# SIGTERM tylko do procesu głównego, reszta (Piper) dostaje SIGKILL po nim.
+KillMode=mixed
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/aars
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,49 @@
+# Konfiguracja AARS w obrazie Raspberry Pi (/etc/aars/aars.toml).
+#
+# Sprzęt (PTT, audio, głos, adres panelu) ustawia administrator w panelu:
+# Ustawienia → Sprzęt. Wartości [server], [audio], [ptt] i tts.model są tu
+# tylko startowe; panel ma pierwszeństwo. Ścieżki, [setup] i [update] działają
+# wyłącznie z tego pliku.
+
+[storage]
+db_path = "/var/lib/aars/aars.db"
+cache_dir = "/var/lib/aars/cache"
+cache_max_bytes = 536870912
+
+[tts]
+piper_bin = "/opt/aars/piper/bin/piper"
+voices_dir = "/var/lib/aars/voices"
+model = "/var/lib/aars/voices/pl_PL-darkman-medium.onnx"
+
+[server]
+# Port powyżej 1024: usługa działa bez uprawnień roota. Bez HTTPS — panel
+# jest dla sieci lokalnej. `[::]` to jedno gniazdo dla IPv6 i IPv4 (AARS
+# ustawia je sam, niezależnie od `net.ipv6.bindv6only`); bez IPv6 w jądrze
+# panel sam przejdzie na `0.0.0.0:8080`.
+bind = "[::]:8080"
+# `false`: cały panel odpowiada tylko klientom z sieci lokalnej (prywatne
+# IPv4, link-local, ULA, ta sama sieć /64 IPv6, pętla); z internetu 403.
+# `true` wpuszcza każdego. Panel jest bez HTTPS i bez limitu prób logowania,
+# a konta kluczują nadajnik: nie przekierowuj portu na routerze, do pracy
+# zdalnej użyj VPN. Zmiana działa po `sudo systemctl restart aars`.
+allow_remote = false
+
+[ptt]
+# Bezpieczny start: VOX niczego nie kluczuje, dopóki admin nie wybierze
+# sterowania PTT w panelu.
+backend = "vox"
+
+[setup]
+# Pierwsze konto administratora zakłada kreator http://aars.local:8080/setup
+# z sieci lokalnej.
+first_admin = "wizard"
+
+[update]
+# Źródło wydań. Kto zmienia ten adres, ten wybiera kod do uruchomienia.
+releases_url = "https://github.com/sptq/aars/releases"
+state_dir = "/var/lib/aars/update"
+guard_dir = "/var/lib/aars-update"
+install_root = "/opt/aars"
+
+[sources]
+imgw_meteo_url = "https://danepubliczne.imgw.pl/api/data/warningsmeteo"

@@ -1,0 +1,41 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # cpal potrzebuje ALSA, serialport (domyślnie z libudev) — libudev,
+      # a testy CLI — klienta sqlite3.
+      - name: Pakiety systemowe (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config sqlite3 shellcheck
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Testy
+        run: cargo test --workspace --locked
+
+      # Skrypty obrazu i strażnika dochodzą w późniejszych zadaniach etapu 10.
+      - name: Shellcheck
+        if: runner.os == 'Linux' && hashFiles('packaging/**') != ''
+        run: |
+          shopt -s globstar nullglob
+          shellcheck packaging/**/*.sh scripts/*.sh packaging/aars-update-guard
