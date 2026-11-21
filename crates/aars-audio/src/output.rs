@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use aars_core::sink::{AudioSink, CancelToken, PlayReport, SinkError};
@@ -10,10 +10,17 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 /// źródło kodu dla maszyny rozwojowej i Raspberry Pi.
 pub struct CpalSink {
     device: cpal::Device,
+    device_name: String,
     sample_rate: u32,
     /// Liczba kanałów strumienia; próbka mono idzie na każdy z nich.
-    channels: u16,
+    /// `0` znaczy „nieznana”: lista konfiguracji nie dała się pobrać przy
+    /// otwarciu, więc pytamy znowu przy następnym nadaniu (przegląd 1–4,
+    /// M-6), zamiast utrwalać mono na całe życie stosu.
+    channels: AtomicU16,
 }
+
+/// `channels` w [`CpalSink`], gdy liczba kanałów jeszcze nieznana.
+const CHANNELS_UNKNOWN: u16 = 0;
 
 /// Jedna obsługiwana konfiguracja wyjścia: liczba kanałów i przedział
 /// częstotliwości próbkowania (z `supported_output_configs`).
@@ -105,7 +112,28 @@ impl CpalSink {
                 })?
         };
 
-        let channels = match device.supported_output_configs() {
+        let sink = Self {
+            device,
+            device_name: device_name.to_owned(),
+            sample_rate,
+            channels: AtomicU16::new(CHANNELS_UNKNOWN),
+        };
+        // Karta bez tej częstotliwości to błąd przy budowie stosu (R16).
+        // Chwilowy brak listy (np. `EBUSY`, gdy kartę trzyma inny proces)
+        // zostawia liczbę kanałów nieznaną do pierwszego nadania (M-6).
+        sink.resolve_channels()?;
+        Ok(sink)
+    }
+
+    /// Liczba kanałów strumienia. Gdy jeszcze nieznana, pyta kartę o listę
+    /// konfiguracji. Pytanie otwiera i zamyka PCM bez `prepare/start`, więc
+    /// nie wysyła próbek.
+    fn resolve_channels(&self) -> Result<Option<u16>, SinkError> {
+        let known = self.channels.load(Ordering::SeqCst);
+        if known != CHANNELS_UNKNOWN {
+            return Ok(Some(known));
+        }
+        match self.device.supported_output_configs() {
             Ok(configs) => {
                 let ranges: Vec<ConfigRange> = configs
                     .map(|c| ConfigRange {
@@ -115,26 +143,21 @@ impl CpalSink {
                         is_i16: c.sample_format() == cpal::SampleFormat::I16,
                     })
                     .collect();
-                choose_channels(&ranges, sample_rate)
-                    .map_err(|e| SinkError::Device(format!("urządzenie {device_name} {e}")))?
+                let channels = choose_channels(&ranges, self.sample_rate).map_err(|e| {
+                    SinkError::Device(format!("urządzenie {} {e}", self.device_name))
+                })?;
+                self.channels.store(channels, Ordering::SeqCst);
+                Ok(Some(channels))
             }
             Err(err) => {
-                // Jak przed etapem 10: mono, a ewentualny błąd wyjdzie przy
-                // budowie strumienia.
                 tracing::warn!(
                     %err,
-                    device = device_name,
-                    "lista konfiguracji wyjścia niedostępna — próbuję mono"
+                    device = %self.device_name,
+                    "lista konfiguracji wyjścia niedostępna — spróbuję znowu przy nadaniu"
                 );
-                1
+                Ok(None)
             }
-        };
-
-        Ok(Self {
-            device,
-            sample_rate,
-            channels,
-        })
+        }
     }
 }
 
@@ -150,10 +173,15 @@ impl AudioSink for CpalSink {
             return Ok(PlayReport { played: Duration::ZERO, cancelled: false });
         }
 
+        // Liczba kanałów nieznana od otwarcia: pytamy znowu (M-6). Gdy lista
+        // dalej niedostępna, to nadanie idzie w mono jak przed etapem 10,
+        // a ewentualny błąd wyjdzie przy budowie strumienia.
+        let channels = self.resolve_channels()?.unwrap_or(1);
+
         // W cpal 0.18 `SampleRate` jest aliasem na u32, a konfiguracja idzie
         // do buildera przez wartość.
         let config = cpal::StreamConfig {
-            channels: self.channels,
+            channels,
             sample_rate: self.sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
@@ -162,7 +190,6 @@ impl AudioSink for CpalSink {
         let position = Arc::new(AtomicUsize::new(0));
         let feeder_samples = samples.clone();
         let feeder_position = position.clone();
-        let channels = self.channels;
         let frame = usize::from(channels.max(1));
 
         let stream = self
