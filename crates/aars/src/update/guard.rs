@@ -7,13 +7,24 @@ use aars_core::update::{LastResult, MAX_ATTEMPTS, ResultKind, Trial};
 use chrono::{DateTime, Utc};
 
 use super::install::{
-    Owner, SMALL_FILE, SmokeTest, finish_interrupted, install_requested, radio_was_up,
-    requested_version, restore_database, write_trial,
+    Owner, SMALL_FILE, SmokeTest, finish_interrupted, install_requested, requested_version,
+    restore_database, write_trial,
 };
 use super::paths::{
-    UpdatePaths, installed_version, is_working, read_service_file, read_small_nofollow, swap_link,
-    write_atomic_nofollow,
+    UpdatePaths, installed_version, is_working, read_service_file, read_small_nofollow,
+    remove_service_entry, swap_link, write_atomic_nofollow,
 };
+
+/// Ile razy z rzędu powrót może zawieść, zanim strażnik przestanie go
+/// próbować (przegląd 5–7 M-4).
+pub const MAX_ROLLBACK_FAILURES: u32 = 3;
+
+/// Plik z katalogu usługi usunięty przez deskryptor katalogu (M-3).
+fn unlink_service(path: &std::path::Path) {
+    if let Err(err) = remove_service_entry(path) {
+        tracing::warn!(path = %path.display(), %err, "usunięcie pliku usługi pominięte");
+    }
+}
 use super::verify::{NO_KEY, TrustedKey};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +81,7 @@ pub fn run_guard(
     let state = read_trial(p);
     let trial_exists = !matches!(state, TrialFile::Missing);
     if let Some(trial) = finish_interrupted(p, trial_exists) {
-        let _ = std::fs::remove_file(p.request());
+        unlink_service(&p.request());
         record(
             p,
             ResultKind::Installed,
@@ -92,7 +103,14 @@ pub fn run_guard(
                 let reason = format!("plik próby nieczytelny ({why})");
                 actions.push(match rollback(p, owner, &reason, now) {
                     Ok(version) => GuardAction::RolledBack(version),
-                    Err(err) => GuardAction::InstallFailed(format!("powrót zawiódł: {err}")),
+                    Err(err) => {
+                        // Próby już nie ma (odsunięta), więc to stan końcowy.
+                        let detail = format!("{reason}; powrót zawiódł: {err}");
+                        let from = installed_version(&p.current()).unwrap_or_default();
+                        let to = installed_version(&p.previous()).unwrap_or_default();
+                        record(p, ResultKind::Failed, &from, &to, &detail, now);
+                        GuardAction::InstallFailed(format!("powrót zawiódł: {err}"))
+                    }
                 });
             }
         }
@@ -105,7 +123,7 @@ pub fn run_guard(
                     // Treści nieczytelnego żądania nie przepisujemy do wyniku:
                     // mógłby to być cudzy plik podpięty przez usługę.
                     tracing::error!(%err, "żądanie instalacji nieczytelne — usuwam");
-                    let _ = std::fs::remove_file(p.request());
+                    unlink_service(&p.request());
                 }
             }
         }
@@ -181,8 +199,8 @@ fn judge_trial(
     let confirmed = service_file(&p.confirmed());
     if confirmed.as_deref() == Some(trial.version.as_str()) {
         let _ = std::fs::remove_file(p.trial());
-        let _ = std::fs::remove_file(p.confirmed());
-        let _ = std::fs::remove_file(p.verdict());
+        unlink_service(&p.confirmed());
+        unlink_service(&p.verdict());
         return GuardAction::Confirmed(trial.version);
     }
 
@@ -194,7 +212,7 @@ fn judge_trial(
             return rolled_back(p, owner, &trial, verdict, now);
         }
         // Werdykt z innej próby nie może zabić tej.
-        let _ = std::fs::remove_file(p.verdict());
+        unlink_service(&p.verdict());
     }
 
     if trial.attempts >= MAX_ATTEMPTS {
@@ -203,7 +221,11 @@ fn judge_trial(
     }
     trial.attempts += 1;
     if let Err(err) = write_trial(p, &trial) {
-        tracing::error!(%err, "zapis licznika prób zawiódł");
+        // Bez utrwalonego licznika powrót nie nastąpiłby nigdy (M-5):
+        // wracamy od razu.
+        tracing::error!(%err, "zapis licznika prób zawiódł — wracam do poprzedniej");
+        let reason = format!("nie da się zapisać licznika prób ({err})");
+        return rolled_back(p, owner, &trial, &reason, now);
     }
     GuardAction::Counted(trial.attempts)
 }
@@ -218,11 +240,53 @@ fn rolled_back(
     let reason = format!("wersja {}: {reason}", trial.version);
     match rollback(p, owner, &reason, now) {
         Ok(version) => GuardAction::RolledBack(version),
-        Err(err) => {
-            tracing::error!(%err, "powrót do poprzedniej wersji zawiódł");
-            GuardAction::InstallFailed(format!("powrót zawiódł: {err}"))
-        }
+        Err(err) => rollback_failed(p, trial, &reason, &err, now),
     }
+}
+
+fn rollback_failures_path(p: &UpdatePaths) -> std::path::PathBuf {
+    p.guard_dir.join("rollback-failures")
+}
+
+/// Nieudany powrót (M-4): licznik w katalogu roota i wynik `failed` przy
+/// każdej porażce. Po `MAX_ROLLBACK_FAILURES` strażnik zamyka próbę (stan
+/// końcowy): stacja zostaje na nowej wersji, a wynik mówi, co naprawić.
+fn rollback_failed(
+    p: &UpdatePaths,
+    trial: &Trial,
+    reason: &str,
+    err: &str,
+    now: DateTime<Utc>,
+) -> GuardAction {
+    let path = rollback_failures_path(p);
+    let failures = read_small_nofollow(&path, SMALL_FILE)
+        .ok()
+        .flatten()
+        .and_then(|t| t.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        + 1;
+    tracing::error!(%err, failures, "powrót do poprzedniej wersji zawiódł");
+    if failures >= MAX_ROLLBACK_FAILURES {
+        let _ = std::fs::remove_file(p.trial());
+        let _ = std::fs::remove_file(&path);
+        let detail = format!(
+            "{reason}; powrót do {} zawiódł {failures} razy ({err}) — strażnik przestaje \
+             próbować, stacja zostaje na wersji {}; napraw ręcznie i uruchom \
+             `aars update rollback` przy zatrzymanej usłudze",
+            trial.previous, trial.version
+        );
+        record(p, ResultKind::Failed, &trial.version, &trial.previous, &detail, now);
+        return GuardAction::InstallFailed(detail);
+    }
+    if let Err(write) = write_atomic_nofollow(&path, failures.to_string().as_bytes()) {
+        tracing::error!(%write, "zapis licznika nieudanych powrotów zawiódł");
+    }
+    let detail = format!(
+        "{reason}; powrót do {} zawiódł ({failures} z {MAX_ROLLBACK_FAILURES}): {err}",
+        trial.previous
+    );
+    record(p, ResultKind::Failed, &trial.version, &trial.previous, &detail, now);
+    GuardAction::InstallFailed(format!("powrót zawiódł: {err}"))
 }
 
 /// Powrót do `previous` z kopią bazy (R7). Zamyka próbę i zapisuje wynik
@@ -244,8 +308,8 @@ pub fn rollback(
     swap_link(&p.current(), &target).map_err(|e| format!("przełączenie current: {e}"))?;
     let _ = std::fs::remove_file(p.previous());
     let _ = std::fs::remove_file(p.trial());
-    let _ = std::fs::remove_file(p.confirmed());
-    let _ = std::fs::remove_file(p.verdict());
+    unlink_service(&p.confirmed());
+    unlink_service(&p.verdict());
 
     let mut detail = reason.to_owned();
     if restored {
@@ -253,6 +317,7 @@ pub fn rollback(
     } else {
         detail.push_str(" — brak kopii bazy, baza bez zmian");
     }
+    let _ = std::fs::remove_file(rollback_failures_path(p));
     record(p, ResultKind::RolledBack, &from, &back_to, &detail, now);
     Ok(back_to)
 }
@@ -268,16 +333,16 @@ fn install(
     let from = current.clone().unwrap_or_else(|| "?".to_owned());
     let result = match (key, current) {
         (None, _) => {
-            let _ = std::fs::remove_file(p.request());
+            unlink_service(&p.request());
             Err(NO_KEY.to_owned())
         }
         (_, None) => {
-            let _ = std::fs::remove_file(p.request());
+            unlink_service(&p.request());
             Err("brak działającej bieżącej wersji".to_owned())
         }
         (Some(key), Some(current)) => {
-            let radio = radio_was_up(&p.db_path);
-            install_requested(p, key, smoke, &current, radio, now)
+            let _ = std::fs::remove_file(rollback_failures_path(p));
+            install_requested(p, key, smoke, &current, now)
         }
     };
     match result {
@@ -545,7 +610,8 @@ mod tests {
         let trial = st.trial().expect("próba trwa");
         assert_eq!(trial.version, "0.11.0");
         assert_eq!(trial.previous, "0.10.0");
-        assert_eq!(trial.attempts, 0);
+        // Przebieg z instalacją to start nr 1 (R8, przegląd 5–7 M-1).
+        assert_eq!(trial.attempts, 1);
         assert!(!trial.radio_was_up, "baza testowa to nie SQLite");
         assert_eq!(
             std::fs::read_to_string(st.paths.snapshots().join("aars-0.10.0.db")).unwrap(),
@@ -561,7 +627,7 @@ mod tests {
         );
 
         // Drugi przebieg (pierwszy restart nowej wersji) liczy próbę.
-        assert_eq!(st.guard(), vec![GuardAction::Counted(1)]);
+        assert_eq!(st.guard(), vec![GuardAction::Counted(2)]);
     }
 
     #[test]
@@ -771,7 +837,10 @@ mod tests {
         std::fs::write(&wal, "wal").unwrap();
         std::fs::write(&shm, "shm").unwrap();
 
-        for n in 1..=3 {
+        // Start nr 1 to przebieg z instalacją; starty 2 i 3 liczy strażnik,
+        // a przy czwartym przebiegu (po trzech startach) wraca.
+        assert_eq!(st.trial().unwrap().attempts, 1);
+        for n in 2..=3 {
             assert_eq!(st.guard(), vec![GuardAction::Counted(n)]);
             assert_eq!(st.trial().unwrap().attempts, n);
         }
@@ -835,7 +904,7 @@ mod tests {
         std::fs::write(st.paths.verdict(), "bad 0.11.1: coś innego\n").unwrap();
         std::fs::write(st.paths.confirmed(), "0.11.1\n").unwrap();
 
-        assert_eq!(st.guard(), vec![GuardAction::Counted(1)]);
+        assert_eq!(st.guard(), vec![GuardAction::Counted(2)]);
         assert_eq!(st.current().as_deref(), Some("0.11.0"));
     }
 
@@ -878,7 +947,66 @@ mod tests {
         );
         assert_eq!(st.trial(), Some(trial), "znacznik zamieniony w próbę");
         assert!(!crate::update::install::switching_marker(&st.paths).exists());
-        assert_eq!(st.guard(), vec![GuardAction::Counted(1)]);
+        assert_eq!(st.guard(), vec![GuardAction::Counted(2)]);
+    }
+
+    #[test]
+    fn a_rollback_that_keeps_failing_ends_in_a_recorded_terminal_state() {
+        let st = station();
+        st.installed("0.11.0");
+        assert_eq!(st.guard(), vec![GuardAction::Counted(2)]);
+        assert_eq!(st.guard(), vec![GuardAction::Counted(3)]);
+        // Poprzednia wersja zniknęła z dysku: powrót nie ma dokąd wrócić.
+        std::fs::remove_dir_all(st.paths.releases().join("0.10.0")).unwrap();
+
+        for n in 1..MAX_ROLLBACK_FAILURES {
+            let actions = st.guard();
+            assert!(
+                matches!(actions.as_slice(), [GuardAction::InstallFailed(_)]),
+                "{actions:?}"
+            );
+            assert!(st.trial().is_some(), "próba zostaje do kolejnej próby powrotu");
+            let last = st.last();
+            assert_eq!(last.kind, ResultKind::Failed);
+            assert!(
+                last.detail.contains(&format!("({n} z {MAX_ROLLBACK_FAILURES})")),
+                "{}",
+                last.detail
+            );
+        }
+        let actions = st.guard();
+        assert!(
+            matches!(actions.as_slice(), [GuardAction::InstallFailed(d)] if d.contains("przestaje")),
+            "{actions:?}"
+        );
+        assert!(st.trial().is_none(), "stan końcowy: próba zamknięta");
+        let last = st.last();
+        assert_eq!(last.kind, ResultKind::Failed);
+        assert!(last.detail.contains("aars update rollback"), "{}", last.detail);
+        assert_eq!(st.current().as_deref(), Some("0.11.0"));
+        // Kolejne starty nic już nie próbują.
+        assert_eq!(st.guard(), vec![GuardAction::Nothing]);
+    }
+
+    #[test]
+    fn an_attempt_counter_that_cannot_be_saved_rolls_back_at_once() {
+        // SAFETY: `geteuid` nie ma warunków wstępnych.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root pisze mimo braku prawa zapisu; test ma sens tylko bez roota.
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let st = station();
+        st.installed("0.11.0");
+        let dir = st.paths.guard_dir.clone();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let actions = st.guard();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(actions, vec![GuardAction::RolledBack("0.10.0".to_owned())]);
+        assert_eq!(st.current().as_deref(), Some("0.10.0"));
+        let last = st.last();
+        assert_eq!(last.kind, ResultKind::RolledBack);
+        assert!(last.detail.contains("licznika prób"), "{}", last.detail);
     }
 
     #[test]
@@ -904,12 +1032,12 @@ mod tests {
         let st = station();
         st.installed("0.11.0");
         std::fs::write(marker(&st), serde_json::to_vec(&trial).unwrap()).unwrap();
-        assert_eq!(st.guard(), vec![GuardAction::Counted(1)]);
+        assert_eq!(st.guard(), vec![GuardAction::Counted(2)]);
         assert!(!marker(&st).exists());
 
         // Zepsuty znacznik też znika.
         std::fs::write(marker(&st), "śmieci").unwrap();
-        assert_eq!(st.guard(), vec![GuardAction::Counted(2)]);
+        assert_eq!(st.guard(), vec![GuardAction::Counted(3)]);
         assert!(!marker(&st).exists());
     }
 
@@ -1035,7 +1163,7 @@ mod tests {
         std::os::unix::fs::symlink(&victim, st.paths.last_result()).unwrap();
 
         // Dowiązanie zamiast `confirmed` nie potwierdza.
-        assert_eq!(st.guard(), vec![GuardAction::Counted(1)]);
+        assert_eq!(st.guard(), vec![GuardAction::Counted(2)]);
 
         std::fs::write(st.paths.verdict(), "bad 0.11.0: test").unwrap();
         assert_eq!(

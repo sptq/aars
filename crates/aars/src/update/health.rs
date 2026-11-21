@@ -28,6 +28,9 @@ pub const LAST_RESULT_KEY: &str = "update:last_result";
 pub struct HealthCell {
     radio_up: AtomicBool,
     dispatcher_alive: AtomicBool,
+    /// Przebieg stacji się przebudowuje albo drenuje przed restartem w
+    /// procesie: ocena czeka, zamiast uznać wersję za złą (przegląd 5–7 I-2).
+    restarting: AtomicBool,
     last_error: Mutex<Option<String>>,
     /// Powód, dla którego proces ma się zakończyć błędem (werdykt `bad`).
     fatal: Mutex<Option<String>>,
@@ -40,6 +43,7 @@ impl Default for HealthCell {
         Self {
             radio_up: AtomicBool::new(false),
             dispatcher_alive: AtomicBool::new(false),
+            restarting: AtomicBool::new(false),
             last_error: Mutex::new(None),
             fatal: Mutex::new(None),
             ready_at: std::sync::OnceLock::new(),
@@ -57,6 +61,15 @@ impl HealthCell {
     /// Dyspozytor pracuje (albo, bez stosu, nie ma czego pilnować).
     pub fn set_dispatcher_alive(&self, alive: bool) {
         self.dispatcher_alive.store(alive, Ordering::SeqCst);
+    }
+
+    /// Przebieg stacji startuje albo drenuje (`true`) lub pracuje w pętli.
+    pub fn set_restarting(&self, restarting: bool) {
+        self.restarting.store(restarting, Ordering::SeqCst);
+    }
+
+    pub fn restarting(&self) -> bool {
+        self.restarting.load(Ordering::SeqCst)
     }
 
     pub fn radio_up(&self) -> bool {
@@ -111,7 +124,7 @@ pub fn judge(
     let Some(trial) = trial.filter(|t| t.version == running) else {
         return Verdict::Wait;
     };
-    if since_ready < CONFIRM_AFTER {
+    if since_ready < CONFIRM_AFTER || cell.restarting() {
         return Verdict::Wait;
     }
     if trial.radio_was_up && !cell.radio_up() {
@@ -126,9 +139,25 @@ pub fn judge(
     Verdict::Confirm
 }
 
+/// Jak długo ocena czeka na koniec restartu w procesie (drenaż ma własny
+/// limit: limit strażnika TX + 30 s, plus budowa nowego przebiegu).
+#[cfg(not(test))]
+const RESTART_WAIT: Duration = Duration::from_secs(10 * 60);
+#[cfg(test)]
+const RESTART_WAIT: Duration = Duration::from_secs(20);
+
+/// Zapas na zakończenie przez drenaż po werdykcie `bad`; potem `stop`.
+#[cfg(not(test))]
+const FATAL_GRACE: Duration = Duration::from_secs(10 * 60);
+#[cfg(test)]
+const FATAL_GRACE: Duration = Duration::from_secs(5);
+
 /// Raz na proces: po `CONFIRM_AFTER` od `READY=1` zapisuje `confirmed` albo
-/// `verdict`. Przy `bad` zatrzymuje stację (`stop`) i oznacza proces do
-/// zakończenia błędem; strażnik przy następnym starcie wraca do poprzedniej.
+/// `verdict`. W trakcie restartu w procesie czeka (I-2). Przy `bad` oznacza
+/// proces do zakończenia błędem: stacja kończy go drenażem, czyli po
+/// bieżącym nadaniu, a nie przez `stop` (to przerwałoby nadanie). `stop`
+/// idzie dopiero awaryjnie, gdy drenaż nie skończył procesu w `FATAL_GRACE`.
+/// Strażnik przy następnym starcie wraca do poprzedniej.
 pub async fn confirm_task(
     paths: UpdatePaths,
     cell: Arc<HealthCell>,
@@ -138,7 +167,7 @@ pub async fn confirm_task(
     confirm_after(paths, cell, running, stop, CONFIRM_AFTER).await;
 }
 
-async fn confirm_after(
+pub(crate) async fn confirm_after(
     paths: UpdatePaths,
     cell: Arc<HealthCell>,
     running: String,
@@ -165,8 +194,25 @@ async fn confirm_after(
         tokio::time::sleep(Duration::from_millis(200).min(deadline - Instant::now())).await;
     }
     // `judge` mierzy od gotowości; tu czas już minął, więc podajemy pełny.
-    let since = ready_at.elapsed().max(CONFIRM_AFTER);
-    match judge(Some(&trial), &running, &cell, since) {
+    let give_up = Instant::now() + RESTART_WAIT;
+    let verdict = loop {
+        if stop.is_cancelled() {
+            return;
+        }
+        let since = ready_at.elapsed().max(CONFIRM_AFTER);
+        let verdict = judge(Some(&trial), &running, &cell, since);
+        if verdict != Verdict::Wait || !cell.restarting() {
+            break verdict;
+        }
+        if Instant::now() >= give_up {
+            break Verdict::Bad(format!(
+                "bad {running}: stacja nie wstała po restarcie w {} s",
+                RESTART_WAIT.as_secs()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    match verdict {
         Verdict::Confirm => {
             if let Err(err) = write_atomic_nofollow(&paths.confirmed(), running.as_bytes()) {
                 tracing::error!(%err, "zapis potwierdzenia nowej wersji zawiódł");
@@ -180,7 +226,12 @@ async fn confirm_after(
                 tracing::error!(%err, "zapis werdyktu zawiódł");
             }
             cell.set_fatal(reason);
-            stop.cancel();
+            // Stacja widzi `fatal` w swojej pętli i kończy przez drenaż.
+            tokio::time::sleep(FATAL_GRACE).await;
+            if !stop.is_cancelled() {
+                tracing::error!("drenaż po werdykcie nie skończył procesu — zatrzymuję stację");
+                stop.cancel();
+            }
         }
         Verdict::Wait => {}
     }
@@ -277,6 +328,48 @@ mod tests {
             Verdict::Wait
         );
         assert_eq!(judge(Some(&t), "0.11.0", &cell, MINUTE), Verdict::Confirm);
+    }
+
+    #[test]
+    fn judge_waits_while_the_station_restarts() {
+        let t = trial("0.11.0", true);
+        // W czasie drenażu dyspozytor nie tyka, a stos bywa w przebudowie.
+        let cell = HealthCell::default();
+        cell.set_restarting(true);
+        assert_eq!(judge(Some(&t), "0.11.0", &cell, MINUTE), Verdict::Wait);
+        cell.set_restarting(false);
+        assert!(matches!(judge(Some(&t), "0.11.0", &cell, MINUTE), Verdict::Bad(_)));
+    }
+
+    #[tokio::test]
+    async fn the_confirm_task_waits_for_a_restart_to_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        crate::update::install::write_trial(&p, &trial("0.11.0", true)).unwrap();
+        let cell = Arc::new(HealthCell::default());
+        cell.mark_ready();
+        cell.set_restarting(true);
+        let stop = CancelToken::new();
+        let task = tokio::spawn(confirm_after(
+            p.clone(),
+            cell.clone(),
+            "0.11.0".into(),
+            stop.clone(),
+            Duration::ZERO,
+        ));
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(!p.verdict().exists() && !p.confirmed().exists(), "ocena czeka");
+        // Nowy przebieg wstał zdrowy.
+        cell.set_radio(true, None);
+        cell.set_dispatcher_alive(true);
+        cell.set_restarting(false);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(p.confirmed()).unwrap(), "0.11.0");
+        assert!(!p.verdict().exists());
+        assert!(!stop.is_cancelled());
     }
 
     #[test]
@@ -382,8 +475,9 @@ mod tests {
             verdict.starts_with("bad 0.11.0: nadawanie nie wstało: brak karty"),
             "{verdict}"
         );
-        assert!(stop.is_cancelled(), "niezdrowa wersja zatrzymuje stację");
         assert!(cell.fatal().is_some(), "proces kończy się błędem");
+        // `stop` dopiero awaryjnie, po `FATAL_GRACE`: zwykle kończy drenaż.
+        assert!(stop.is_cancelled(), "bez stacji, która by się skończyła, idzie stop");
 
         // Bez próby albo próba innej wersji: nic.
         std::fs::remove_file(p.verdict()).unwrap();

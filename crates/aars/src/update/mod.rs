@@ -25,6 +25,19 @@ pub fn read_trial(p: &UpdatePaths) -> Option<Trial> {
     serde_json::from_str(&text).ok()
 }
 
+/// Próba, która jeszcze trwa: `trial.json` bez potwierdzenia tej wersji.
+/// Po zapisaniu `confirmed` strażnik zamknie próbę dopiero przy następnym
+/// starcie, a do tego czasu panel i instalacja mają ją widzieć jako
+/// zakończoną (przegląd 5–7 M-6).
+pub fn open_trial(p: &UpdatePaths) -> Option<Trial> {
+    let trial = read_trial(p)?;
+    let confirmed = read_service_file(&p.confirmed(), install::SMALL_FILE)
+        .ok()
+        .flatten()
+        .map(|t| t.trim().to_owned());
+    (confirmed.as_deref() != Some(trial.version.as_str())).then_some(trial)
+}
+
 /// Ostatni wynik z `last-result.json`, jeśli jest czytelny.
 pub fn read_last_result(p: &UpdatePaths) -> Option<LastResult> {
     let text = read_service_file(&p.last_result(), install::SMALL_FILE).ok()??;
@@ -94,6 +107,13 @@ pub async fn cli(config: &Config, action: UpdateAction) -> Result<()> {
             }
         }
         UpdateAction::Rollback => {
+            // R7: kopia i przywrócenie bazy tylko przy zatrzymanej usłudze
+            // (przegląd 5–7 M-7). Działające `aars run` trzyma blokadę.
+            if paths::service_running(&p) {
+                anyhow::bail!(
+                    "usługa aars działa — najpierw `sudo systemctl stop aars`, potem powtórz polecenie"
+                );
+            }
             if !is_working(&p.previous()) {
                 anyhow::bail!("brak poprzedniej wersji w {}", p.previous().display());
             }

@@ -243,6 +243,9 @@ pub enum Exit {
     /// Koniec procesu po bieżącym nadaniu: aktualizację zainstaluje strażnik
     /// przy następnym starcie (etap 10, R10a).
     Update,
+    /// Nowa wersja w próbie dostała werdykt `bad` (R9): koniec procesu po
+    /// bieżącym nadaniu, błędem, a strażnik wraca do poprzedniej wersji.
+    Unhealthy,
     Stop,
 }
 
@@ -437,6 +440,8 @@ async fn run_station(
     ready: Option<oneshot::Sender<Arc<StationHandle>>>,
 ) -> Result<Exit> {
     health.set_dispatcher_alive(false);
+    // Do wejścia w pętlę ocena próby czeka (przegląd 5–7 I-2).
+    health.set_restarting(true);
     let sources = aars_sources::modules();
     let mut descriptors = aars_core::module::builtin();
     descriptors.extend(sources.iter().map(|m| m.descriptor));
@@ -772,6 +777,10 @@ async fn run_station(
         if update.is_cancelled() {
             break Exit::Update;
         }
+        // Werdykt `bad` nie przerywa nadania (I-2): ta sama droga co restart.
+        if health.fatal().is_some() {
+            break Exit::Unhealthy;
+        }
         // R9: dyspozytor pracuje, gdy jego pętla tyka. W trakcie nadania nie
         // tyka, ale nadanie trwa najwyżej do limitu strażnika.
         let alive = match (&dispatcher_task, &handle.control) {
@@ -781,9 +790,14 @@ async fn run_station(
             _ => true,
         };
         health.set_dispatcher_alive(alive);
+        health.set_restarting(false);
         tokio::time::sleep(CONTROL_POLL).await;
     };
     health.set_dispatcher_alive(false);
+    if matches!(exit, Exit::Restart) {
+        // Drenaż i budowa następnego przebiegu to nie „dyspozytor stoi”.
+        health.set_restarting(true);
+    }
     // `STOPPING=1` tylko przy zatrzymaniu na żądanie (Ctrl-C, SIGTERM).
     // Panika dyspozytora i werdykt „zła wersja” kończą proces błędem, który
     // systemd ma podnieść, więc nie udają zatrzymania (przegląd 1–4, M-2).
@@ -794,7 +808,9 @@ async fn run_station(
 
     // Panika dyspozytora zostawia wątek sekwencera bez joina (I-2): wtedy
     // nie wolno otwierać tego samego PTT drugi raz w tym samym procesie.
-    if let (Exit::Restart | Exit::Update, Some(task)) = (&exit, dispatcher_task.as_mut()) {
+    if let (Exit::Restart | Exit::Update | Exit::Unhealthy, Some(task)) =
+        (&exit, dispatcher_task.as_mut())
+    {
         // R4: dyspozytor nie bierze nic nowego, dokańcza nadanie i robi join
         // wątku sekwencera. Strażnik i most działają dalej. Ctrl-C w tym
         // czasie przerywa nadanie jak zwykle.
@@ -1583,6 +1599,157 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    fn trial_paths(dir: &std::path::Path) -> crate::update::paths::UpdatePaths {
+        let paths = crate::update::paths::UpdatePaths {
+            install_root: dir.join("opt"),
+            guard_dir: dir.join("guard"),
+            state_dir: dir.join("state"),
+            db_path: dir.join("aars.db"),
+        };
+        std::fs::create_dir_all(&paths.guard_dir).unwrap();
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        crate::update::install::write_trial(
+            &paths,
+            &aars_core::update::Trial {
+                format: 1,
+                version: "0.11.0".to_owned(),
+                previous: "0.10.0".to_owned(),
+                installed_at: String::new(),
+                attempts: 1,
+                radio_was_up: true,
+            },
+        )
+        .unwrap();
+        paths
+    }
+
+    async fn tx_results(pool: &SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT result FROM tx_log ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn wait_keyed(ptt: &FakePtt) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ptt.is_keyed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("zadanie musi wejść na antenę");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restart_during_the_trial_and_a_long_transmission_is_not_a_bad_verdict() {
+        // Przegląd 5–7 I-2: chwila oceny trafia w drenaż przed restartem.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = trial_paths(dir.path());
+        let pool = aars_core::db::test_pool().await;
+        // FakeSynth: 50 ms na znak, ~3 s audio.
+        enqueue_one(&pool, "komunikat testowy trwa kilka dobrych sekund na antenie").await;
+        let hardware = Arc::new(FakeHardware::new(&[]));
+        let ptt = hardware.ptt.clone();
+        let health = Arc::new(HealthCell::default());
+        let stop = CancelToken::new();
+        let fake = Arc::new(FakeNotifier::default());
+        let config = station_config("trial-restart");
+        let (task, handle) = start_full(
+            config.clone(),
+            pool.clone(),
+            hardware.clone(),
+            stop.clone(),
+            fake.clone(),
+            health.clone(),
+        )
+        .await;
+        wait_keyed(&ptt).await;
+        handle.request_restart();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !health.restarting() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("drenaż oznacza restart");
+        // Ocena teraz: czas próby minął, a stacja właśnie drenuje.
+        let confirm = tokio::spawn(crate::update::health::confirm_after(
+            paths.clone(),
+            health.clone(),
+            "0.11.0".to_owned(),
+            stop.clone(),
+            Duration::ZERO,
+        ));
+        let exit = tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Restart));
+        assert!(!stop.is_cancelled(), "nadanie nie zostało przerwane przez stop");
+        assert_eq!(tx_results(&pool).await, vec!["ok".to_owned()]);
+        assert!(!paths.verdict().exists(), "w trakcie restartu nie ma werdyktu");
+
+        // Następny przebieg w tym samym procesie.
+        let (task, _handle) = start_full(
+            config,
+            pool.clone(),
+            Arc::new(FakeHardware::new(&[])),
+            stop.clone(),
+            fake,
+            health.clone(),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), confirm)
+            .await
+            .expect("ocena po restarcie")
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(paths.confirmed()).unwrap(), "0.11.0");
+        assert!(!paths.verdict().exists());
+        assert!(health.fatal().is_none());
+        stop.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bad_verdict_during_a_transmission_waits_for_the_unkey() {
+        // Przegląd 5–7 I-2, pkt 2: werdykt przy działającym stosie kończy
+        // przez drenaż, a nie przez `stop`.
+        let pool = aars_core::db::test_pool().await;
+        enqueue_one(&pool, "komunikat testowy trwa kilka sekund").await;
+        enqueue_one(&pool, "drugie zadanie nie wchodzi").await;
+        let hardware = Arc::new(FakeHardware::new(&[]));
+        let ptt = hardware.ptt.clone();
+        let health = Arc::new(HealthCell::default());
+        let stop = CancelToken::new();
+        let fake = Arc::new(FakeNotifier::default());
+        let (task, _handle) = start_full(
+            station_config("bad-verdict"),
+            pool.clone(),
+            hardware,
+            stop.clone(),
+            fake.clone(),
+            health.clone(),
+        )
+        .await;
+        wait_keyed(&ptt).await;
+        health.set_fatal("bad 0.11.0: dyspozytor nie pracuje".to_owned());
+        let exit = tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Unhealthy));
+        assert!(!ptt.is_keyed());
+        assert!(!stop.is_cancelled());
+        assert_eq!(tx_results(&pool).await, vec!["ok".to_owned()]);
+        assert!(
+            !fake.events().contains(&"STOPPING=1".to_owned()),
+            "{:?}",
+            fake.events()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

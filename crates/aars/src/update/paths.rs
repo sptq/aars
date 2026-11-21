@@ -252,6 +252,103 @@ pub fn write_atomic_nofollow(path: &Path, data: &[u8]) -> std::io::Result<()> {
     result
 }
 
+/// Usuwa plik z katalogu usługi (`request`, `confirmed`, `verdict`) przez
+/// `unlinkat` względem deskryptora katalogu otwartego z
+/// `O_DIRECTORY|O_NOFOLLOW` (przegląd 5–7 M-3): gdy usługa podmieni
+/// `state_dir` na dowiązanie, root nie usunie pliku w katalogu docelowym.
+/// Brak pliku to nie błąd.
+pub fn remove_service_entry(path: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "ścieżka bez nazwy pliku")
+    })?;
+    let c_parent = CString::new(parent.as_os_str().as_bytes())?;
+    let c_name = CString::new(name.as_bytes())?;
+    // SAFETY: obie ścieżki to poprawne C-stringi żyjące do końca wywołań.
+    let fd = unsafe {
+        libc::open(
+            c_parent.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return if err.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(err)
+        };
+    }
+    // SAFETY: `fd` właśnie otwarty i nigdzie indziej nie posiadany.
+    let dir = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: deskryptor żyje (`dir`), nazwa to poprawny C-string.
+    let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), c_name.as_ptr(), 0) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// Plik blokady trzymany przez działające `aars run` (przegląd 5–7 M-7).
+pub fn service_lock_path(p: &UpdatePaths) -> PathBuf {
+    p.state_dir.join("run.lock")
+}
+
+/// Blokada `flock` na czas życia procesu `aars run`. `None` (z ostrzeżeniem
+/// w logu), gdy katalogu usługi nie ma albo blokady nie da się założyć —
+/// stacja i tak działa, a ręczny powrót traci tylko to zabezpieczenie.
+pub fn hold_service_lock(p: &UpdatePaths) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = service_lock_path(p);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .inspect_err(|err| {
+            tracing::warn!(path = %path.display(), %err, "blokada usługi niedostępna");
+        })
+        .ok()?;
+    // SAFETY: deskryptor należy do `file`, który żyje w tym wywołaniu.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        tracing::warn!(path = %path.display(), "blokadę usługi trzyma inny proces aars");
+        return None;
+    }
+    Some(file)
+}
+
+/// Czy działa `aars run` (trzyma blokadę z `hold_service_lock`). Plik
+/// otwarty bez podążania za dowiązaniem i bez czekania na FIFO.
+pub fn service_running(p: &UpdatePaths) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(Some(file)) = open_regular_nofollow(&service_lock_path(p)) else {
+        return false;
+    };
+    // SAFETY: deskryptor należy do `file`, który żyje w tym wywołaniu.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        // SAFETY: jak wyżej; zwalniamy własną, chwilową blokadę.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        false
+    } else {
+        true
+    }
+}
+
 /// Atomowa podmiana dowiązania: nowe pod nazwą tymczasową i `rename(2)`.
 pub fn swap_link(link: &Path, target: &Path) -> std::io::Result<()> {
     real_parent(link)?;
@@ -345,6 +442,45 @@ mod tests {
             read_service_file(&dir.path().join("brak"), 8).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn removing_a_service_entry_does_not_go_through_a_swapped_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("cudzy");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("request"), "0.11.0").unwrap();
+        let state = dir.path().join("update");
+        std::os::unix::fs::symlink(&elsewhere, &state).unwrap();
+
+        assert!(remove_service_entry(&state.join("request")).is_err());
+        assert!(elsewhere.join("request").exists(), "plik za dowiązaniem zostaje");
+
+        std::fs::remove_file(&state).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("request"), "0.11.0").unwrap();
+        remove_service_entry(&state.join("request")).unwrap();
+        assert!(!state.join("request").exists());
+        // Brak pliku i brak katalogu to nie błąd.
+        remove_service_entry(&state.join("request")).unwrap();
+        remove_service_entry(&dir.path().join("nie-ma/request")).unwrap();
+    }
+
+    #[test]
+    fn the_service_lock_is_seen_while_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = UpdatePaths {
+            install_root: dir.path().join("opt"),
+            guard_dir: dir.path().join("guard"),
+            state_dir: dir.path().to_path_buf(),
+            db_path: dir.path().join("aars.db"),
+        };
+        assert!(!service_running(&p), "bez pliku blokady usługa nie działa");
+        let lock = hold_service_lock(&p).expect("blokada");
+        assert!(service_running(&p));
+        assert!(hold_service_lock(&p).is_none(), "drugi proces nie dostanie blokady");
+        drop(lock);
+        assert!(!service_running(&p));
     }
 
     #[test]

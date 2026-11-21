@@ -111,12 +111,11 @@ fn show(
 ) -> Response {
     let s = status_of(state);
     let last = last_text(&s);
-    // Strażnik liczy starty od zera przy instalacji, więc bieżący start to
-    // `attempts + 1`; powyżej limitu i tak następuje powrót.
+    // `attempts` to numer bieżącego startu (przebieg z instalacją = 1, R8).
     let trial = s.trial.as_ref().map(|t| {
         (
             t.version.clone(),
-            (t.attempts + 1).min(MAX_ATTEMPTS),
+            t.attempts.clamp(1, MAX_ATTEMPTS),
             t.previous.clone(),
         )
     });
@@ -468,7 +467,7 @@ mod tests {
             version: "0.11.0".to_owned(),
             previous: "0.10.0".to_owned(),
             installed_at: "2026-11-21T10:00:00Z".to_owned(),
-            attempts: 0,
+            attempts: 1,
             radio_was_up: true,
         });
         let env = admin_env(fake).await;

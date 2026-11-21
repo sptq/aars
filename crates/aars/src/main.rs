@@ -299,6 +299,9 @@ async fn main() -> Result<()> {
                     "wynik aktualizacji zapisany w audycie"
                 );
             }
+            // Działające `aars run` trzyma blokadę, więc ręczny powrót
+            // (`aars update rollback`) odmówi (przegląd 5–7 M-7).
+            let _service_lock = update::paths::hold_service_lock(&update_paths);
             let health = Arc::new(update::health::HealthCell::default());
             // R9: po 60 s od gotowości próba nowej wersji dostaje
             // potwierdzenie albo werdykt.
@@ -329,7 +332,8 @@ async fn main() -> Result<()> {
                         );
                         break;
                     }
-                    station::Exit::Stop => break,
+                    // Werdykt `bad` po bieżącym nadaniu: błąd procesu niżej.
+                    station::Exit::Unhealthy | station::Exit::Stop => break,
                 }
             }
             if let Some(reason) = health.fatal() {

@@ -204,7 +204,7 @@ impl UpdateControl for UpdateHandle {
         UpdateStatus {
             current: self.running.clone(),
             previous: installed_version(&self.paths.previous()),
-            trial: super::read_trial(&self.paths),
+            trial: super::open_trial(&self.paths),
             unsupported: self.unsupported.clone(),
             last: super::read_last_result(&self.paths).or_else(|| self.last.clone()),
         }
@@ -234,7 +234,7 @@ impl UpdateControl for UpdateHandle {
         let by = by.to_owned();
         Box::pin(async move {
             self.client()?;
-            if let Some(trial) = super::read_trial(&self.paths) {
+            if let Some(trial) = super::open_trial(&self.paths) {
                 return Err(UpdateRefusal::TrialRunning(trial.version));
             }
             if self.in_progress.swap(true, Ordering::SeqCst) {
@@ -494,6 +494,13 @@ mod tests {
             Err(UpdateRefusal::TrialRunning("0.10.0".to_owned()))
         );
         assert_eq!(s.handle.status().trial.unwrap().version, "0.10.0");
+
+        // Potwierdzona próba (M-6): `trial.json` zostaje do następnego
+        // startu, ale panel i instalacja widzą ją jako zamkniętą.
+        std::fs::create_dir_all(&s.paths.state_dir).unwrap();
+        write_atomic_nofollow(&s.paths.confirmed(), b"0.10.0").unwrap();
+        assert_eq!(s.handle.status().trial, None);
+        assert_eq!(s.handle.install("0.11.0", "admin").await, Ok(()));
 
         let s = setup(&server, &key, Some(UpdateRefusal::Unsupported.to_string())).await;
         assert_eq!(

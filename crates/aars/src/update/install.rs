@@ -145,13 +145,19 @@ impl Owner for NoOwner {
 }
 
 /// Czy przed instalacją stacja nadawała: `hw_state:origin` ≠ `none` (R8).
-/// Baza otwarta tylko do odczytu z `immutable=1`, więc nie powstają pliki
-/// `-wal`/`-shm` roota. Każdy błąd (brak bazy, brak klucza) daje `false`.
-pub fn radio_was_up(db_path: &Path) -> bool {
-    if !db_path.is_file() {
-        return false;
+/// Czyta **kopię** bazy z `snapshots/` (plik i katalog roota, przegląd 5–7
+/// I-1, M-2), nie bazę w katalogu usługi: kopia powstała przez
+/// `open_service_file`, więc nie idzie za dowiązaniem ani twardym
+/// dowiązaniem. Otwarcie zwykłe, tylko do odczytu, bez `immutable`, żeby
+/// SQLite nałożył `-wal`: stacja nie robi checkpointu przy wyjściu, więc
+/// świeży stan bywa wyłącznie w dzienniku. Pliki `-shm` powstają w katalogu
+/// roota. Każdy błąd (brak kopii, brak klucza) daje `false`.
+pub fn radio_was_up(snapshot: &Path) -> bool {
+    match std::fs::symlink_metadata(snapshot) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        _ => return false,
     }
-    let path = db_path.to_owned();
+    let path = snapshot.to_owned();
     // Własny wątek z własnym runtime: strażnik bywa wołany z wnętrza tokio.
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -163,7 +169,6 @@ pub fn radio_was_up(db_path: &Path) -> bool {
             let options = sqlx::sqlite::SqliteConnectOptions::new()
                 .filename(&path)
                 .read_only(true)
-                .immutable(true)
                 .create_if_missing(false);
             let mut conn = options.connect().await.ok()?;
             let origin: Option<String> =
@@ -199,11 +204,12 @@ pub fn install_requested(
     key: &TrustedKey,
     smoke: &dyn SmokeTest,
     current: &str,
-    radio_was_up: bool,
     now: DateTime<Utc>,
 ) -> Result<Trial, String> {
     let requested = requested_version(p);
-    let _ = std::fs::remove_file(p.request());
+    if let Err(err) = super::paths::remove_service_entry(&p.request()) {
+        tracing::warn!(%err, "usunięcie żądania pominięte");
+    }
     let version = requested?.ok_or_else(|| "brak żądania instalacji".to_owned())?;
     semver::Version::parse(&version)
         .map_err(|_| format!("nieczytelna wersja w żądaniu: {version:?}"))?;
@@ -257,18 +263,38 @@ pub fn install_requested(
         let _ = std::fs::remove_dir_all(&release);
         return Err(err);
     }
+    // Stan sprzed instalacji z kopii roota, z nałożonym `-wal` (I-1).
+    let radio = radio_was_up(&p.snapshots().join(snapshot_name(current)));
 
     // Znacznik roota z oczekiwaną próbą: gdy prąd zniknie między
     // przełączeniem a zapisem próby, następny przebieg strażnika zamieni go
     // w próbę (`finish_interrupted`). Każde inne wyjście z tej funkcji
     // znacznik usuwa (strażnik zakresu), więc nie zostaje nieaktualny.
-    let trial = new_trial(&version, current, radio_was_up, now);
+    let trial = new_trial(&version, current, radio, now);
     let marker = MarkerGuard::write(p, &trial)?;
     let old_target = std::fs::read_link(p.current()).map_err(|e| io_err(&p.current(), e))?;
+    let old_previous = std::fs::read_link(p.previous()).ok();
     // Przełączenie: najpierw `previous` na działającą, potem `current`.
     swap_link(&p.previous(), &old_target).map_err(|e| io_err(&p.previous(), e))?;
     swap_link(&p.current(), &relative_release(&version)).map_err(|e| io_err(&p.current(), e))?;
-    write_trial(p, &trial)?;
+    if let Err(err) = write_trial(p, &trial) {
+        // Bez zapisanej próby nowa wersja chodziłaby bez licznika i bez
+        // powrotu (przegląd 5–7 M-5): wracamy od razu do starej. Baza nie
+        // była jeszcze otwarta przez nową wersję, więc kopii nie trzeba.
+        let reverted = swap_link(&p.current(), &old_target).and_then(|()| match &old_previous {
+            Some(target) => swap_link(&p.previous(), target),
+            None => std::fs::remove_file(p.previous()),
+        });
+        if let Err(revert) = reverted {
+            // Znacznik zostaje: następny przebieg zamieni go w próbę.
+            std::mem::forget(marker);
+            return Err(format!(
+                "zapis próby zawiódł ({err}), a cofnięcie przełączenia też ({revert})"
+            ));
+        }
+        let _ = std::fs::remove_dir_all(&release);
+        return Err(format!("zapis próby zawiódł, przełączenie cofnięte: {err}"));
+    }
     drop(marker);
     prune_releases(p);
     let _ = std::fs::remove_dir_all(p.staging());
@@ -334,7 +360,9 @@ fn new_trial(version: &str, previous: &str, radio_was_up: bool, now: DateTime<Ut
         version: version.to_owned(),
         previous: previous.to_owned(),
         installed_at: now.to_rfc3339(),
-        attempts: 0,
+        // Przebieg z instalacją poprzedza pierwszy start nowej wersji, więc
+        // liczy się jako start nr 1 (R8: trzy starty, przegląd 5–7 M-1).
+        attempts: 1,
         radio_was_up,
     }
 }
@@ -563,7 +591,13 @@ pub fn restore_database(p: &UpdatePaths, owner: &dyn Owner, version: &str) -> Re
         match std::fs::remove_file(&path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(io_err(&path, err)),
+            // Niezwykły wpis (np. katalog podłożony przez usługę) idzie na
+            // bok zamiast blokować powrót przy każdym starcie (M-4).
+            Err(err) => {
+                let aside = sidecar(&path, &format!(".bad-{}", std::process::id()));
+                std::fs::rename(&path, &aside).map_err(|_| io_err(&path, err))?;
+                tracing::warn!(path = %path.display(), "niezwykły plik bazy odsunięty na bok");
+            }
         }
     }
     copy_for_service(&snapshot, &p.db_path, owner)?;
@@ -628,56 +662,79 @@ mod tests {
         assert!(ProcessSmoke.version_of(&dir.path().join("brak")).is_err());
     }
 
+    /// Kopia `aars.db` i `-wal` bez checkpointu, jak `snapshot_database`
+    /// przy usłudze, która nie zamknęła bazy czysto.
+    fn copy_without_checkpoint(db: &Path, dest: &Path) {
+        std::fs::copy(db, dest).unwrap();
+        let wal = sidecar(db, "-wal");
+        if wal.exists() {
+            std::fs::copy(&wal, sidecar(dest, "-wal")).unwrap();
+        }
+    }
+
     #[tokio::test]
-    async fn radio_was_up_reads_the_apply_status_without_writing() {
+    async fn radio_was_up_sees_a_state_written_only_to_the_wal() {
         use aars_core::hardware::{ApplyStatus, ConfigOrigin, HardwareRepo};
 
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("aars.db");
-        assert!(!radio_was_up(&db), "brak bazy");
-        assert!(!db.exists(), "odczyt nie zakłada bazy");
+        let snap = dir.path().join("snap");
+        std::fs::create_dir_all(&snap).unwrap();
+        let copy = snap.join("aars-0.10.0.db");
+        assert!(!radio_was_up(&copy), "brak kopii");
+        assert!(!copy.exists(), "odczyt nie zakłada bazy");
 
         let pool = aars_core::db::connect(&db).await.unwrap();
         aars_core::db::migrate(&pool).await.unwrap();
         let repo = HardwareRepo::new(pool.clone());
-        assert!(!radio_was_up(&db), "bez stanu zastosowania");
+        repo.set_apply_status(&ApplyStatus {
+            origin: ConfigOrigin::None,
+            error: Some("nic nie wstało".to_owned()),
+        })
+        .await
+        .unwrap();
+        // `none` w głównym pliku, potem `panel` tylko w dzienniku WAL.
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&pool)
+            .await
+            .unwrap();
         repo.set_apply_status(&ApplyStatus {
             origin: ConfigOrigin::Panel,
             error: None,
         })
         .await
         .unwrap();
-        // Jak przy zatrzymanej usłudze: dziennik WAL przepisany do bazy,
-        // pliki pomocnicze usunięte.
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        assert!(sidecar(&db, "-wal").metadata().unwrap().len() > 0, "stan jest w WAL");
+        copy_without_checkpoint(&db, &copy);
+        assert!(radio_was_up(&copy), "stan z WAL musi się liczyć (I-1)");
+
+        // I odwrotnie: tryb bez nadawania tylko w WAL.
+        repo.set_apply_status(&ApplyStatus {
+            origin: ConfigOrigin::None,
+            error: Some("karta zniknęła".to_owned()),
+        })
+        .await
+        .unwrap();
+        for f in [copy.clone(), sidecar(&copy, "-wal"), sidecar(&copy, "-shm")] {
+            let _ = std::fs::remove_file(f);
+        }
+        copy_without_checkpoint(&db, &copy);
+        assert!(!radio_was_up(&copy), "tryb bez nadawania");
         pool.close().await;
-        let wal = sidecar(&db, "-wal");
-        let shm = sidecar(&db, "-shm");
-        let _ = std::fs::remove_file(&wal);
-        let _ = std::fs::remove_file(&shm);
 
-        assert!(radio_was_up(&db));
-        assert!(!wal.exists() && !shm.exists(), "odczyt niczego nie tworzy");
+        std::fs::write(&copy, "to nie baza").unwrap();
+        let _ = std::fs::remove_file(sidecar(&copy, "-wal"));
+        let _ = std::fs::remove_file(sidecar(&copy, "-shm"));
+        assert!(!radio_was_up(&copy));
+    }
 
-        let pool = aars_core::db::connect(&db).await.unwrap();
-        HardwareRepo::new(pool.clone())
-            .set_apply_status(&ApplyStatus {
-                origin: ConfigOrigin::None,
-                error: Some("nic nie wstało".to_owned()),
-            })
-            .await
-            .unwrap();
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        pool.close().await;
-        assert!(!radio_was_up(&db), "tryb bez nadawania");
-
-        std::fs::write(&db, "to nie baza").unwrap();
-        assert!(!radio_was_up(&db));
+    #[test]
+    fn radio_was_up_does_not_follow_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cel.db");
+        std::fs::write(&target, "x").unwrap();
+        let link = dir.path().join("aars-0.10.0.db");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!radio_was_up(&link));
     }
 }
