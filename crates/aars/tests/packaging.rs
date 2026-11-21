@@ -327,3 +327,126 @@ fn the_image_script_verifies_and_always_cleans_up() {
         assert!(text.contains(needle), "build-image.sh bez {needle}");
     }
 }
+
+/// `scripts/sign-release.sh` z atrapami `gh` i `minisign`: odmawia podpisu,
+/// gdy szkic nie zgadza się z manifestem, zanim zapyta o potwierdzenie,
+/// i nigdy nie wypisuje ścieżki klucza. Bez `jq` test się pomija.
+#[cfg(unix)]
+#[test]
+fn the_signing_script_refuses_a_draft_that_does_not_match_its_manifest() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+
+    if std::process::Command::new("jq").arg("--version").output().is_err() {
+        eprintln!("pomijam: brak jq");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let write = |path: &str, body: &[u8]| {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        path
+    };
+    let script = std::fs::read(repo("scripts/sign-release.sh")).unwrap();
+    write("repo/scripts/sign-release.sh", &script);
+    write("repo/keys/aars-release.pub", b"untrusted comment: test\nRWQtest\n");
+    let key = write("tajne-miejsce/aars.key", b"sekret");
+    let fake_gh = "#!/bin/sh\ncase \"$1 $2\" in\n  \"release view\") echo true ;;\n  \"release download\") shift; while [ $# -gt 0 ]; do [ \"$1\" = --dir ] && d=\"$2\"; shift; done; mkdir -p \"$d\"; cp \"$FAKE_DRAFT\"/* \"$d\"/ ;;\n  *) echo \"nieoczekiwane gh $*\" >&2; exit 1 ;;\nesac\n";
+    for (name, body) in [("bin/gh", fake_gh), ("bin/minisign", "#!/bin/sh\necho podpis >&2\nexit 1\n")] {
+        let path = write(name, body.as_bytes());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Szkic: archiwum z plikami wydania i trzy pozostałe pliki.
+    let stage = root.join("stage");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(stage.join("aars"), "#!/bin/sh\necho aars 0.10.0\n").unwrap();
+    std::fs::write(stage.join("VERSION"), "0.10.0\n").unwrap();
+    std::fs::write(stage.join("LICENSE"), "MIT\n").unwrap();
+    std::fs::create_dir_all(root.join("draft")).unwrap();
+    let archive = root.join("draft/aars-0.10.0-aarch64-linux-gnu.tar.gz");
+    let status = std::process::Command::new("tar")
+        .env("COPYFILE_DISABLE", "1")
+        .arg("-czf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&stage)
+        .args(["aars", "VERSION", "LICENSE"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    write("draft/aars-0.10.0-rpi.img.xz", b"obraz");
+    write("draft/aars-os-list.json", b"{}");
+    write("draft/piper_tts-1.8.0.tar.gz", b"zrodlo");
+    let asset = |name: &str, kind: &str| {
+        let data = std::fs::read(root.join("draft").join(name)).unwrap();
+        let sha: String = Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
+        serde_json::json!({ "name": name, "sha256": sha, "size": data.len(), "kind": kind })
+    };
+    let manifest = serde_json::json!({
+        "format": 1,
+        "version": "0.10.0",
+        "target": "aarch64-unknown-linux-gnu",
+        "published_at": "2026-11-21T12:00:00Z",
+        "notes": "",
+        "assets": [
+            asset("aars-0.10.0-aarch64-linux-gnu.tar.gz", "binary"),
+            asset("aars-0.10.0-rpi.img.xz", "image"),
+            asset("aars-os-list.json", "imager-list"),
+            asset("piper_tts-1.8.0.tar.gz", "source"),
+        ],
+    });
+    write("draft/aars-manifest.json", manifest.to_string().as_bytes());
+
+    let run = |prepare: &dyn Fn(&Path)| {
+        let draft = root.join("draft-run");
+        let _ = std::fs::remove_dir_all(&draft);
+        std::fs::create_dir_all(&draft).unwrap();
+        for entry in std::fs::read_dir(root.join("draft")).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), draft.join(entry.file_name())).unwrap();
+        }
+        prepare(&draft);
+        let path = format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap());
+        let out = std::process::Command::new("bash")
+            .arg(root.join("repo/scripts/sign-release.sh"))
+            .arg("v0.10.0")
+            .env("PATH", path)
+            .env("FAKE_DRAFT", &draft)
+            .env("MINISIGN_KEY", &key)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!text.contains("tajne-miejsce"), "ścieżka klucza w wyjściu: {text}");
+        assert!(!text.contains("podpis\n"), "minisign nie może ruszyć: {text}");
+        text
+    };
+    type Prepare<'a> = &'a dyn Fn(&Path);
+    let cases: [(&str, Prepare, &str); 5] = [
+        ("zmieniony plik", &|d| std::fs::write(d.join("aars-0.10.0-rpi.img.xz"), b"OBRAZ").unwrap(), "SHA-256"),
+        ("plik spoza manifestu", &|d| std::fs::write(d.join("dodatek.txt"), b"x").unwrap(), "nie zgadzają się"),
+        ("brak pliku", &|d| std::fs::remove_file(d.join("aars-os-list.json")).unwrap(), "nie zgadzają się"),
+        (
+            "inna wersja",
+            &|d| {
+                let path = d.join("aars-manifest.json");
+                let text = std::fs::read_to_string(&path).unwrap().replace("\"0.10.0\"", "\"0.11.0\"");
+                std::fs::write(path, text).unwrap();
+            },
+            "wersja w manifeście",
+        ),
+        ("podpis już jest", &|d| std::fs::write(d.join("aars-manifest.json.minisig"), b"x").unwrap(), "ma już podpis"),
+    ];
+    for (name, prepare, needle) in cases {
+        let text = run(prepare);
+        assert!(text.contains(needle), "{name}: {text}");
+    }
+}

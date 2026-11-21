@@ -24,7 +24,8 @@ pub const URGENT_HORIZON: Duration = Duration::from_secs(60);
 
 /// To, czego aktualizacja potrzebuje od stacji: koniec po bieżącym nadaniu.
 pub trait UpdateTarget: Send + Sync {
-    fn request_update(&self);
+    /// `false`: stacja tej prośby już nie wykona (przebieg się skończył).
+    fn request_update(&self) -> bool;
 }
 
 /// Dlaczego aktualizacja z panelu jest wyłączona (R11); `None` = działa.
@@ -171,6 +172,16 @@ impl UpdateHandle {
             return Err(refusal);
         }
 
+        if !self.station.request_update() {
+            // Przebieg stacji skończył się w trakcie pobierania (restart w
+            // procesie): żądanie bez końca procesu odpaliłoby się przy
+            // przypadkowym starcie, bez admina (przegląd 8–9 I-1).
+            super::discard_request(&self.paths, "stacja uruchamiała się ponownie w trakcie pobierania");
+            return Err(UpdateRefusal::Failed(
+                "Stacja uruchamiała się ponownie w trakcie pobierania — spróbuj jeszcze raz za chwilę."
+                    .to_owned(),
+            ));
+        }
         let detail = format!("{} → {version}: {by}", self.running);
         if let Err(err) = sqlx::query(
             "INSERT INTO audit_log (user_id, action, detail) \
@@ -184,7 +195,6 @@ impl UpdateHandle {
             tracing::error!(%err, "zapis update_install do audytu zawiódł");
         }
         tracing::info!(%detail, "aktualizacja pobrana i sprawdzona — stacja skończy po bieżącym nadaniu");
-        self.station.request_update();
         Ok(())
     }
 }
@@ -265,11 +275,14 @@ mod tests {
     #[derive(Default)]
     struct FakeStation {
         requests: AtomicUsize,
+        /// Przebieg stacji już się skończył.
+        closed: AtomicBool,
     }
 
     impl UpdateTarget for FakeStation {
-        fn request_update(&self) {
+        fn request_update(&self) -> bool {
             self.requests.fetch_add(1, Ordering::SeqCst);
+            !self.closed.load(Ordering::SeqCst)
         }
     }
 
@@ -389,6 +402,26 @@ mod tests {
             Err(UpdateRefusal::InProgress),
             "po prośbie do stacji następna instalacja czeka"
         );
+    }
+
+    #[tokio::test]
+    async fn a_request_the_station_cannot_take_is_withdrawn() {
+        let key = TestKey::generate();
+        let server = release_server(&key, "0.11.0", ARCHIVE).await;
+        let s = setup(&server, &key, None).await;
+        s.station.closed.store(true, Ordering::SeqCst);
+
+        let refusal = s.handle.install("0.11.0", "admin").await.unwrap_err();
+        assert!(matches!(refusal, UpdateRefusal::Failed(ref m) if m.contains("spróbuj jeszcze raz")), "{refusal:?}");
+        assert!(!s.paths.request().exists(), "żądanie nie może czekać na przypadkowy start");
+        assert_eq!(s.staging_files(), 0);
+        let audits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(audits, 0);
+        s.station.closed.store(false, Ordering::SeqCst);
+        s.handle.install("0.11.0", "admin").await.unwrap();
     }
 
     #[tokio::test]

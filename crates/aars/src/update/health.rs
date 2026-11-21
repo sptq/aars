@@ -36,6 +36,8 @@ pub struct HealthCell {
     fatal: Mutex<Option<String>>,
     /// Pierwsza gotowość w tym procesie (`READY=1`).
     ready_at: std::sync::OnceLock<Instant>,
+    /// Limit drenażu bieżącego przebiegu w ms (limit strażnika TX + zapas).
+    drain_limit_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Default for HealthCell {
@@ -47,6 +49,7 @@ impl Default for HealthCell {
             last_error: Mutex::new(None),
             fatal: Mutex::new(None),
             ready_at: std::sync::OnceLock::new(),
+            drain_limit_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -96,6 +99,17 @@ impl HealthCell {
         self.ready_at.get().copied()
     }
 
+    /// Limit drenażu przebiegu stacji: od niego zależą `restart_wait`
+    /// i `fatal_grace` (przegląd 8–9 M-1).
+    pub fn set_drain_limit(&self, limit: Duration) {
+        let ms = u64::try_from(limit.as_millis()).unwrap_or(u64::MAX);
+        self.drain_limit_ms.store(ms, Ordering::SeqCst);
+    }
+
+    pub fn drain_limit(&self) -> Duration {
+        Duration::from_millis(self.drain_limit_ms.load(Ordering::SeqCst))
+    }
+
     pub fn set_fatal(&self, reason: String) {
         *self.fatal.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
     }
@@ -139,24 +153,40 @@ pub fn judge(
     Verdict::Confirm
 }
 
-/// Jak długo ocena czeka na koniec restartu w procesie (drenaż ma własny
-/// limit: limit strażnika TX + 30 s, plus budowa nowego przebiegu).
+/// Najkrótsze czekanie oceny na koniec restartu w procesie i na koniec
+/// procesu po werdykcie `bad`.
 #[cfg(not(test))]
-const RESTART_WAIT: Duration = Duration::from_secs(10 * 60);
+const MIN_WAIT: Duration = Duration::from_secs(10 * 60);
 #[cfg(test)]
-const RESTART_WAIT: Duration = Duration::from_secs(20);
+const MIN_WAIT: Duration = Duration::from_secs(20);
+#[cfg(not(test))]
+const MIN_GRACE: Duration = Duration::from_secs(10 * 60);
+#[cfg(test)]
+const MIN_GRACE: Duration = Duration::from_secs(5);
+/// Zapas ponad limit drenażu: budowa następnego przebiegu albo koniec procesu.
+#[cfg(not(test))]
+const OVER_DRAIN: Duration = Duration::from_secs(2 * 60);
+#[cfg(test)]
+const OVER_DRAIN: Duration = Duration::from_secs(2);
+
+/// Jak długo ocena czeka na koniec restartu w procesie: zawsze dłużej niż
+/// drenaż (limit strażnika TX + 30 s), także przy `tx_max_duration_s = 600`
+/// (przegląd 8–9 M-1).
+pub(crate) fn restart_wait(drain_limit: Duration) -> Duration {
+    MIN_WAIT.max(drain_limit + OVER_DRAIN)
+}
 
 /// Zapas na zakończenie przez drenaż po werdykcie `bad`; potem `stop`.
-#[cfg(not(test))]
-const FATAL_GRACE: Duration = Duration::from_secs(10 * 60);
-#[cfg(test)]
-const FATAL_GRACE: Duration = Duration::from_secs(5);
+/// Dłuższy niż drenaż, więc awaryjny `stop` nie utnie pełnego nadania.
+pub(crate) fn fatal_grace(drain_limit: Duration) -> Duration {
+    MIN_GRACE.max(drain_limit + OVER_DRAIN)
+}
 
 /// Raz na proces: po `CONFIRM_AFTER` od `READY=1` zapisuje `confirmed` albo
 /// `verdict`. W trakcie restartu w procesie czeka (I-2). Przy `bad` oznacza
 /// proces do zakończenia błędem: stacja kończy go drenażem, czyli po
 /// bieżącym nadaniu, a nie przez `stop` (to przerwałoby nadanie). `stop`
-/// idzie dopiero awaryjnie, gdy drenaż nie skończył procesu w `FATAL_GRACE`.
+/// idzie dopiero awaryjnie, gdy drenaż nie skończył procesu w `fatal_grace`.
 /// Strażnik przy następnym starcie wraca do poprzedniej.
 pub async fn confirm_task(
     paths: UpdatePaths,
@@ -194,20 +224,30 @@ pub(crate) async fn confirm_after(
         tokio::time::sleep(Duration::from_millis(200).min(deadline - Instant::now())).await;
     }
     // `judge` mierzy od gotowości; tu czas już minął, więc podajemy pełny.
-    let give_up = Instant::now() + RESTART_WAIT;
+    let wait = restart_wait(cell.drain_limit());
+    let give_up = Instant::now() + wait;
     let verdict = loop {
         if stop.is_cancelled() {
             return;
         }
         let since = ready_at.elapsed().max(CONFIRM_AFTER);
         let verdict = judge(Some(&trial), &running, &cell, since);
+        // Drugi odczyt `restarting` po werdykcie `bad`: przebieg mógł właśnie
+        // wyjść z pętli i ustawić `restarting` przed `alive = false`
+        // (przegląd 8–9 M-2).
+        if matches!(verdict, Verdict::Bad(_)) && cell.restarting() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if Instant::now() < give_up {
+                continue;
+            }
+        }
         if verdict != Verdict::Wait || !cell.restarting() {
             break verdict;
         }
         if Instant::now() >= give_up {
             break Verdict::Bad(format!(
                 "bad {running}: stacja nie wstała po restarcie w {} s",
-                RESTART_WAIT.as_secs()
+                wait.as_secs()
             ));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -227,7 +267,7 @@ pub(crate) async fn confirm_after(
             }
             cell.set_fatal(reason);
             // Stacja widzi `fatal` w swojej pętli i kończy przez drenaż.
-            tokio::time::sleep(FATAL_GRACE).await;
+            tokio::time::sleep(fatal_grace(cell.drain_limit())).await;
             if !stop.is_cancelled() {
                 tracing::error!("drenaż po werdykcie nie skończył procesu — zatrzymuję stację");
                 stop.cancel();
@@ -297,6 +337,16 @@ pub async fn stored_last_result(pool: &SqlitePool) -> Option<LastResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waits_outlast_the_longest_drain() {
+        // tx_max_duration_s = 600, tx_tail 2 s, strażnik +2 s, zapas 30 s.
+        let drain = Duration::from_secs(600 + 2 + 2 + 30);
+        assert!(restart_wait(drain) > drain);
+        assert!(fatal_grace(drain) > drain);
+        assert!(restart_wait(Duration::ZERO) >= MIN_WAIT);
+        assert!(fatal_grace(Duration::ZERO) >= MIN_GRACE);
+    }
     use aars_core::update::ResultKind;
 
     fn trial(version: &str, radio_was_up: bool) -> Trial {
@@ -476,7 +526,7 @@ mod tests {
             "{verdict}"
         );
         assert!(cell.fatal().is_some(), "proces kończy się błędem");
-        // `stop` dopiero awaryjnie, po `FATAL_GRACE`: zwykle kończy drenaż.
+        // `stop` dopiero awaryjnie, po `fatal_grace`: zwykle kończy drenaż.
         assert!(stop.is_cancelled(), "bez stacji, która by się skończyła, idzie stop");
 
         // Bez próby albo próba innej wersji: nic.

@@ -254,6 +254,9 @@ pub struct StationHandle {
     control: Option<DispatcherControl>,
     restart: CancelToken,
     update: CancelToken,
+    /// Przebieg stacji wyszedł z pętli: prośba o aktualizację do tego
+    /// uchwytu już nie zakończy procesu (przegląd 8–9 I-1).
+    closed: CancelToken,
     status: ApplyStatus,
     hardware: Option<HardwareSettings>,
     station: StationSettings,
@@ -263,9 +266,19 @@ pub struct StationHandle {
 impl crate::update::control::UpdateTarget for StationHandle {
     /// Prośba o zakończenie procesu po bieżącym nadaniu (R10a): ta sama
     /// droga co restart, ale `run_once` zwraca `Exit::Update`.
-    fn request_update(&self) {
-        tracing::info!("zlecono aktualizację — stacja skończy po bieżącym nadaniu");
+    ///
+    /// `false`, gdy ten przebieg już się skończył (np. restart w procesie
+    /// wygrał): wtedy nikt nie zakończy procesu, a żądanie trzeba wycofać.
+    /// Kolejność (najpierw `update`, potem odczyt `closed`) pasuje do pętli,
+    /// która po `closed` sprawdza `update` jeszcze raz.
+    fn request_update(&self) -> bool {
         self.update.cancel();
+        if self.closed.is_cancelled() {
+            tracing::warn!("prośba o aktualizację do zakończonego przebiegu stacji — wycofana");
+            return false;
+        }
+        tracing::info!("zlecono aktualizację — stacja skończy po bieżącym nadaniu");
+        true
     }
 }
 
@@ -548,6 +561,14 @@ async fn run_station(
     let drain = CancelToken::new();
     let restart = CancelToken::new();
     let update = CancelToken::new();
+    let closed = CancelToken::new();
+    // Żądanie sprzed tego przebiegu nie przyszło z tego przebiegu: strażnik
+    // już je widział albo poprzedni przebieg nie zakończył procesu
+    // (przegląd 8–9 I-1). Nie może czekać na przypadkowy start.
+    crate::update::discard_request(
+        &crate::update::paths::UpdatePaths::from_config(base),
+        "żądanie sprzed startu tego przebiegu stacji",
+    );
 
     let users = aars_core::user::UserRepo::new(pool.clone());
     // R12: tryb pierwszego konta tylko z pliku (`base`). W trybie `wizard`
@@ -606,6 +627,7 @@ async fn run_station(
     }) = stack
     {
         drain_limit = watchdog_limit + DRAIN_MARGIN;
+        health.set_drain_limit(drain_limit);
         let renderer = Arc::new(render::PiperRenderer::new(
             cache.clone(),
             synth.clone(),
@@ -650,6 +672,7 @@ async fn run_station(
         control,
         restart: restart.clone(),
         update: update.clone(),
+        closed: closed.clone(),
         status: status.clone(),
         hardware,
         station: station.clone(),
@@ -684,10 +707,14 @@ async fn run_station(
         .with_update(update_control)
         .with_first_admin(base.setup.first_admin)
         .with_local_nets(local_nets())
-        .with_host_names(station_host_names(
-            &local_host_name(),
-            &[&base.server.bind, &config.server.bind],
-        ))
+        .with_host_names({
+            let mut names =
+                station_host_names(&local_host_name(), &[&base.server.bind, &config.server.bind]);
+            // `server.allowed_hosts` tylko z pliku (`base`), jak ścieżki.
+            names.extend(base.server.allowed_hosts.iter().map(|n| n.to_ascii_lowercase()));
+            names
+        })
+        .with_host_check(true)
         .with_probe(probe)
         .with_modules(registry.clone())
         .with_base_config(Arc::new(base.clone()))
@@ -772,11 +799,13 @@ async fn run_station(
             dispatcher_failed = true;
             break Exit::Stop;
         }
-        if restart.is_cancelled() {
-            break Exit::Restart;
-        }
+        // Aktualizacja przed restartem: obie idą tą samą drogą drenażu, a
+        // `Update` i tak kończy proces (przegląd 8–9 I-1).
         if update.is_cancelled() {
             break Exit::Update;
+        }
+        if restart.is_cancelled() {
+            break Exit::Restart;
         }
         // Werdykt `bad` nie przerywa nadania (I-2): ta sama droga co restart.
         if health.fatal().is_some() {
@@ -794,11 +823,20 @@ async fn run_station(
         health.set_restarting(false);
         tokio::time::sleep(CONTROL_POLL).await;
     };
-    health.set_dispatcher_alive(false);
+    // Prośba o aktualizację, która przyszła tuż po odczycie `update` w pętli,
+    // zobaczy `closed` albo zostanie zauważona tutaj — nigdy nie przepada.
+    closed.cancel();
+    let exit = match exit {
+        Exit::Restart if update.is_cancelled() => Exit::Update,
+        other => other,
+    };
     if matches!(exit, Exit::Restart) {
         // Drenaż i budowa następnego przebiegu to nie „dyspozytor stoi”.
+        // Najpierw `restarting`, potem `alive = false`: ocena próby czyta je
+        // w tej kolejności (przegląd 8–9 M-2).
         health.set_restarting(true);
     }
+    health.set_dispatcher_alive(false);
     // `STOPPING=1` tylko przy zatrzymaniu na żądanie (Ctrl-C, SIGTERM).
     // Panika dyspozytora i werdykt „zła wersja” kończą proces błędem, który
     // systemd ma podnieść, więc nie udają zatrzymania (przegląd 1–4, M-2).
@@ -1260,6 +1298,11 @@ mod tests {
         config.server.bind = "127.0.0.1:0".to_owned();
         config.storage.cache_dir =
             std::env::temp_dir().join(format!("aars-station-{tag}-{}", std::process::id()));
+        // Testy nie dotykają /var/lib ani /opt.
+        let update = std::env::temp_dir().join(format!("aars-update-{tag}-{}", std::process::id()));
+        config.update.state_dir = update.join("state");
+        config.update.guard_dir = update.join("guard");
+        config.update.install_root = update.join("opt");
         config
     }
 
@@ -1451,7 +1494,7 @@ mod tests {
         .await
         .expect("zadanie musi wejść na antenę");
         assert!(health.dispatcher_alive());
-        handle.request_update();
+        assert!(handle.request_update());
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while !task.is_finished() {
@@ -2312,6 +2355,45 @@ mod tests {
             .unwrap();
     }
 
+    /// Przegląd 8–9 I-1: restart i aktualizacja naraz dają `Exit::Update`,
+    /// a prośba do zakończonego przebiegu jest odrzucana. Żądanie sprzed
+    /// przebiegu znika przy jego starcie.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_racing_a_restart_wins_and_a_stale_handle_refuses() {
+        let config = station_config("race");
+        let paths = crate::update::paths::UpdatePaths::from_config(&config);
+        std::fs::create_dir_all(paths.staging().join("0.11.0")).unwrap();
+        std::fs::write(paths.request(), "0.11.0\n").unwrap();
+
+        let pool = aars_core::db::test_pool().await;
+        let (task, handle) =
+            start(config.clone(), pool.clone(), Arc::new(FakeHardware::new(&[])), CancelToken::new()).await;
+        assert!(!paths.request().exists(), "stare żądanie wycofane przy starcie przebiegu");
+        assert!(!paths.staging().exists());
+
+        handle.restart.cancel();
+        assert!(handle.request_update());
+        let exit = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Update), "aktualizacja wygrywa z restartem");
+        assert!(!handle.request_update(), "przebieg zakończony — prośba odrzucona");
+
+        // Restart sam: prośba do starego uchwytu po końcu przebiegu przepada.
+        let (task, handle) =
+            start(config, pool, Arc::new(FakeHardware::new(&[])), CancelToken::new()).await;
+        handle.restart.cancel();
+        let exit = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Restart));
+        assert!(!handle.request_update());
+    }
+
     /// Kryterium wyjścia etapu 10 (Task 13): aktualizacja zlecona w trakcie
     /// nadania czeka na `Unkey`, strażnik instaluje, zdrowa wersja zostaje
     /// potwierdzona, a następna, która nie zbudowała stosu nadawczego
@@ -2342,7 +2424,9 @@ mod tests {
 
         struct NoStation;
         impl UpdateTarget for NoStation {
-            fn request_update(&self) {}
+            fn request_update(&self) -> bool {
+                true
+            }
         }
 
         async fn open(path: &std::path::Path) -> SqlitePool {

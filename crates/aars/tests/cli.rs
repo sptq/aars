@@ -468,6 +468,11 @@ fn update_status_and_guard_work_without_an_installation() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains("nic do zrobienia"));
 
+    // Bez pliku blokady stan usługi jest nieznany: odmowa bez --force (M-5).
     let out = run(&["update", "rollback"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nie wiadomo, czy usługa aars działa"));
+    let out = run(&["update", "rollback", "--force"]);
     assert!(!out.status.success(), "powrót bez poprzedniej wersji to błąd");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("brak poprzedniej wersji"));
 }

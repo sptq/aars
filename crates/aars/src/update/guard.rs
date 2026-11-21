@@ -94,7 +94,18 @@ pub fn run_guard(
         return actions;
     }
     match state {
-        TrialFile::Present(trial) => actions.push(judge_trial(p, owner, trial, now)),
+        TrialFile::Present(trial) => match judge_trial(p, owner, trial, now) {
+            // Próba zamknięta (potwierdzona albo nieaktualna): żądanie
+            // instalacji przyjęte po potwierdzeniu wykonujemy w tym samym
+            // przebiegu, a nie przy przypadkowym późniejszym starcie (przegląd
+            // 8–9 I-1).
+            GuardAction::Nothing => install_request(p, key, smoke, now, &mut actions),
+            closed @ GuardAction::Confirmed(_) => {
+                actions.push(closed);
+                install_request(p, key, smoke, now, &mut actions);
+            }
+            other => actions.push(other),
+        },
         TrialFile::Broken(why) => {
             // Bez czytelnej próby nie wiemy, czy nowa wersja jest sprawdzona:
             // bezpieczniej wrócić do poprzedniej, niż porzucić próbę.
@@ -114,25 +125,33 @@ pub fn run_guard(
                 });
             }
         }
-        TrialFile::Missing => {
-            // 3. Instalacja tylko poza próbą.
-            match requested_version(p) {
-                Ok(Some(version)) => actions.push(install(p, key, smoke, &version, now)),
-                Ok(None) => {}
-                Err(err) => {
-                    // Treści nieczytelnego żądania nie przepisujemy do wyniku:
-                    // mógłby to być cudzy plik podpięty przez usługę.
-                    tracing::error!(%err, "żądanie instalacji nieczytelne — usuwam");
-                    unlink_service(&p.request());
-                }
-            }
-        }
+        TrialFile::Missing => install_request(p, key, smoke, now, &mut actions),
     }
 
     if actions.is_empty() {
         actions.push(GuardAction::Nothing);
     }
     actions
+}
+
+/// 3. Instalacja żądania — tylko poza próbą.
+fn install_request(
+    p: &UpdatePaths,
+    key: Option<&TrustedKey>,
+    smoke: &dyn SmokeTest,
+    now: DateTime<Utc>,
+    actions: &mut Vec<GuardAction>,
+) {
+    match requested_version(p) {
+        Ok(Some(version)) => actions.push(install(p, key, smoke, &version, now)),
+        Ok(None) => {}
+        Err(err) => {
+            // Treści nieczytelnego żądania nie przepisujemy do wyniku:
+            // mógłby to być cudzy plik podpięty przez usługę.
+            tracing::error!(%err, "żądanie instalacji nieczytelne — usuwam");
+            unlink_service(&p.request());
+        }
+    }
 }
 
 enum TrialFile {
@@ -800,6 +819,35 @@ mod tests {
         let actions = run_guard(&st.paths, None, &FakeSmoke::ok(), &NoOwner, now());
         assert_eq!(actions, vec![GuardAction::InstallFailed(NO_KEY.to_owned())]);
         assert_eq!(st.releases(), vec!["0.10.0".to_owned()]);
+    }
+
+    #[test]
+    fn a_request_after_a_confirmed_trial_installs_in_the_same_run() {
+        let st = station();
+        st.installed("0.11.0");
+        std::fs::write(st.paths.confirmed(), "0.11.0\n").unwrap();
+        st.stage("0.12.0", &good_archive("0.12.0"));
+
+        assert_eq!(
+            st.guard(),
+            vec![
+                GuardAction::Confirmed("0.11.0".to_owned()),
+                GuardAction::Installed("0.12.0".to_owned())
+            ]
+        );
+        assert_eq!(st.current().as_deref(), Some("0.12.0"));
+        assert_eq!(st.link(&st.paths.previous()), Path::new("releases/0.11.0"));
+        assert!(!st.paths.request().exists(), "żądanie zużyte");
+        assert_eq!(st.trial().unwrap().version, "0.12.0");
+    }
+
+    #[test]
+    fn a_request_during_an_open_trial_waits() {
+        let st = station();
+        st.installed("0.11.0");
+        st.stage("0.12.0", &good_archive("0.12.0"));
+        assert_eq!(st.guard(), vec![GuardAction::Counted(2)]);
+        assert_eq!(st.current().as_deref(), Some("0.11.0"));
     }
 
     #[test]

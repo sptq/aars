@@ -103,6 +103,11 @@ impl Default for SourcesConfig {
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind: String,
+    /// Dodatkowe nazwy, pod którymi panel odpowiada (obrona przed DNS
+    /// rebinding). Zawsze przechodzą literały IP, `localhost`, nazwa hosta,
+    /// `{nazwa}.local` i host z `bind`. Tylko w pliku.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -204,7 +209,10 @@ pub struct StorageConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            server: ServerConfig { bind: "0.0.0.0:8080".to_owned() },
+            server: ServerConfig {
+                bind: "0.0.0.0:8080".to_owned(),
+                allowed_hosts: Vec::new(),
+            },
             audio: AudioConfig {
                 device: "default".to_owned(),
                 sample_rate: 48_000,

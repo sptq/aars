@@ -304,12 +304,15 @@ pub fn service_lock_path(p: &UpdatePaths) -> PathBuf {
     p.state_dir.join("run.lock")
 }
 
-/// Blokada `flock` na czas życia procesu `aars run`. `None` (z ostrzeżeniem
-/// w logu), gdy katalogu usługi nie ma albo blokady nie da się założyć —
-/// stacja i tak działa, a ręczny powrót traci tylko to zabezpieczenie.
-pub fn hold_service_lock(p: &UpdatePaths) -> Option<std::fs::File> {
+/// Blokada `flock` na czas życia procesu `aars run`. Zakłada katalog
+/// usługi, gdy go nie ma (przegląd 8–9 M-5): bez pliku blokady ręczny powrót
+/// nie wiedziałby, czy usługa działa. Błąd, gdy katalogu nie da się założyć
+/// albo blokadę trzyma inny proces.
+pub fn hold_service_lock(p: &UpdatePaths) -> Result<std::fs::File, String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
+    std::fs::create_dir_all(&p.state_dir)
+        .map_err(|e| format!("katalog usługi {}: {e}", p.state_dir.display()))?;
     let path = service_lock_path(p);
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -319,33 +322,42 @@ pub fn hold_service_lock(p: &UpdatePaths) -> Option<std::fs::File> {
         .mode(0o644)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
-        .inspect_err(|err| {
-            tracing::warn!(path = %path.display(), %err, "blokada usługi niedostępna");
-        })
-        .ok()?;
+        .map_err(|e| format!("blokada usługi {}: {e}", path.display()))?;
     // SAFETY: deskryptor należy do `file`, który żyje w tym wywołaniu.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        tracing::warn!(path = %path.display(), "blokadę usługi trzyma inny proces aars");
-        return None;
+        return Err(format!(
+            "blokadę usługi {} trzyma inny proces aars",
+            path.display()
+        ));
     }
-    Some(file)
+    Ok(file)
+}
+
+/// Stan usługi z pliku blokady.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceState {
+    Running,
+    Stopped,
+    /// Pliku blokady nie ma albo nie da się go otworzyć: nie wiadomo.
+    Unknown,
 }
 
 /// Czy działa `aars run` (trzyma blokadę z `hold_service_lock`). Plik
-/// otwarty bez podążania za dowiązaniem i bez czekania na FIFO.
-pub fn service_running(p: &UpdatePaths) -> bool {
+/// otwarty bez podążania za dowiązaniem i bez czekania na FIFO. Brak pliku
+/// to `Unknown`, nie „zatrzymana” (przegląd 8–9 M-5).
+pub fn service_state(p: &UpdatePaths) -> ServiceState {
     use std::os::fd::AsRawFd;
     let Ok(Some(file)) = open_regular_nofollow(&service_lock_path(p)) else {
-        return false;
+        return ServiceState::Unknown;
     };
     // SAFETY: deskryptor należy do `file`, który żyje w tym wywołaniu.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
         // SAFETY: jak wyżej; zwalniamy własną, chwilową blokadę.
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        false
+        ServiceState::Stopped
     } else {
-        true
+        ServiceState::Running
     }
 }
 
@@ -472,15 +484,15 @@ mod tests {
         let p = UpdatePaths {
             install_root: dir.path().join("opt"),
             guard_dir: dir.path().join("guard"),
-            state_dir: dir.path().to_path_buf(),
+            state_dir: dir.path().join("var/lib/aars/update"),
             db_path: dir.path().join("aars.db"),
         };
-        assert!(!service_running(&p), "bez pliku blokady usługa nie działa");
-        let lock = hold_service_lock(&p).expect("blokada");
-        assert!(service_running(&p));
-        assert!(hold_service_lock(&p).is_none(), "drugi proces nie dostanie blokady");
+        assert_eq!(service_state(&p), ServiceState::Unknown, "bez pliku blokady: nie wiadomo");
+        let lock = hold_service_lock(&p).expect("blokada zakłada katalog usługi");
+        assert_eq!(service_state(&p), ServiceState::Running);
+        assert!(hold_service_lock(&p).is_err(), "drugi proces nie dostanie blokady");
         drop(lock);
-        assert!(!service_running(&p));
+        assert_eq!(service_state(&p), ServiceState::Stopped);
     }
 
     #[test]

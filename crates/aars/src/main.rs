@@ -321,7 +321,20 @@ async fn main() -> Result<()> {
             }
             // Działające `aars run` trzyma blokadę, więc ręczny powrót
             // (`aars update rollback`) odmówi (przegląd 5–7 M-7).
-            let _service_lock = update::paths::hold_service_lock(&update_paths);
+            // Pod systemd brak blokady kończy start: bez niej ręczny powrót
+            // nie wie, czy usługa działa (przegląd 8–9 M-5). Poza usługą
+            // (praca deweloperska) tylko ostrzeżenie; `rollback` odmówi wtedy
+            // bez `--force`.
+            let _service_lock = match update::paths::hold_service_lock(&update_paths) {
+                Ok(lock) => Some(lock),
+                Err(err) if service::under_systemd() => {
+                    anyhow::bail!("blokada usługi: {err}");
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "blokada usługi niedostępna (poza systemd)");
+                    None
+                }
+            };
             let health = Arc::new(update::health::HealthCell::default());
             // R9: po 60 s od gotowości próba nowej wersji dostaje
             // potwierdzenie albo werdykt.
@@ -332,30 +345,46 @@ async fn main() -> Result<()> {
                 stop.clone(),
             ));
 
-            loop {
-                match station::run_once(
-                    &config,
-                    &pool,
-                    factory.clone(),
-                    probe.clone(),
-                    stop.clone(),
-                    notifier.clone(),
-                    health.clone(),
-                )
-                .await?
-                {
-                    station::Exit::Restart => tracing::info!("restart stacji w procesie"),
-                    station::Exit::Update => {
-                        notifier.stopping();
-                        tracing::info!(
-                            "kończę proces — aktualizację zainstaluje strażnik przy starcie"
-                        );
-                        break;
+            let mut updating = false;
+            let run_result: Result<()> = async {
+                loop {
+                    match station::run_once(
+                        &config,
+                        &pool,
+                        factory.clone(),
+                        probe.clone(),
+                        stop.clone(),
+                        notifier.clone(),
+                        health.clone(),
+                    )
+                    .await?
+                    {
+                        station::Exit::Restart => tracing::info!("restart stacji w procesie"),
+                        station::Exit::Update => {
+                            notifier.stopping();
+                            tracing::info!(
+                                "kończę proces — aktualizację zainstaluje strażnik przy starcie"
+                            );
+                            updating = true;
+                            break;
+                        }
+                        // Werdykt `bad` po bieżącym nadaniu: błąd procesu niżej.
+                        station::Exit::Unhealthy | station::Exit::Stop => break,
                     }
-                    // Werdykt `bad` po bieżącym nadaniu: błąd procesu niżej.
-                    station::Exit::Unhealthy | station::Exit::Stop => break,
                 }
+                Ok(())
             }
+            .await;
+            // Żądanie przeżywa proces tylko przy końcu „aktualizacja”: przy
+            // zatrzymaniu, werdykcie albo błędzie instalacja odpaliłaby się
+            // przy przypadkowym starcie, bez admina (przegląd 8–9 I-1).
+            if !updating {
+                update::discard_request(
+                    &update::paths::UpdatePaths::from_config(&config),
+                    "proces kończy się bez aktualizacji",
+                );
+            }
+            run_result?;
             if let Some(reason) = health.fatal() {
                 anyhow::bail!("nowa wersja niezdrowa, strażnik wróci do poprzedniej: {reason}");
             }

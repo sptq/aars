@@ -38,6 +38,24 @@ pub fn open_trial(p: &UpdatePaths) -> Option<Trial> {
     (confirmed.as_deref() != Some(trial.version.as_str())).then_some(trial)
 }
 
+/// Usuwa żądanie instalacji i pobrane pliki, których żaden koniec procesu
+/// nie przekaże strażnikowi (przegląd 8–9 I-1): żądanie sprzed startu tego
+/// przebiegu, po restarcie w procesie albo przy końcu procesu innym niż
+/// aktualizacja. Instalacja dzieje się tylko w chwili wybranej przez admina.
+pub fn discard_request(p: &paths::UpdatePaths, why: &str) -> bool {
+    let request = p.request();
+    if std::fs::symlink_metadata(&request).is_err() {
+        return false;
+    }
+    if let Err(err) = std::fs::remove_file(&request) {
+        tracing::error!(%err, "nie da się usunąć żądania instalacji");
+        return false;
+    }
+    let _ = std::fs::remove_dir_all(p.staging());
+    tracing::warn!(reason = why, "żądanie instalacji wycofane — zleć aktualizację jeszcze raz");
+    true
+}
+
 /// Ostatni wynik z `last-result.json`, jeśli jest czytelny.
 pub fn read_last_result(p: &UpdatePaths) -> Option<LastResult> {
     let text = read_service_file(&p.last_result(), install::SMALL_FILE).ok()??;
@@ -106,13 +124,20 @@ pub async fn cli(config: &Config, action: UpdateAction) -> Result<()> {
                 println!("{action}");
             }
         }
-        UpdateAction::Rollback => {
+        UpdateAction::Rollback { force } => {
             // R7: kopia i przywrócenie bazy tylko przy zatrzymanej usłudze
-            // (przegląd 5–7 M-7). Działające `aars run` trzyma blokadę.
-            if paths::service_running(&p) {
-                anyhow::bail!(
+            // (przegląd 5–7 M-7). Działające `aars run` trzyma blokadę, a jej
+            // brak to „nie wiadomo”, nie „zatrzymana” (przegląd 8–9 M-5).
+            match paths::service_state(&p) {
+                paths::ServiceState::Running => anyhow::bail!(
                     "usługa aars działa — najpierw `sudo systemctl stop aars`, potem powtórz polecenie"
-                );
+                ),
+                paths::ServiceState::Unknown if !force => anyhow::bail!(
+                    "nie wiadomo, czy usługa aars działa (brak {}) — sprawdź `systemctl is-active aars`, \
+                     zatrzymaj usługę i powtórz z --force",
+                    paths::service_lock_path(&p).display()
+                ),
+                _ => {}
             }
             if !is_working(&p.previous()) {
                 anyhow::bail!("brak poprzedniej wersji w {}", p.previous().display());

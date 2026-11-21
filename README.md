@@ -196,6 +196,10 @@ sudo systemctl stop aars     # przerywa nadanie, PTT opada od razu
 ```
 
 Panel działa po HTTP, bez HTTPS: jest przeznaczony do sieci lokalnej.
+Odpowiada tylko pod adresem IP, `localhost`, nazwą hosta stacji,
+`{nazwa}.local` i nazwą z `server.bind`; obca nazwa (np. domena przepięta
+przez DNS rebinding) dostaje `421`. Inne nazwy, np. z lokalnego DNS, dopisz
+do `server.allowed_hosts` w `/etc/aars/aars.toml`.
 
 ### Aktualizacja z panelu
 
@@ -234,6 +238,13 @@ sudo aars --config /etc/aars/aars.toml update rollback   # ręczny powrót z kop
 sudo systemctl start aars
 ```
 
+`update rollback` odmawia, gdy usługa działa. Gdy nie da się tego ustalić
+(brak pliku blokady `/var/lib/aars/update/run.lock`), odmawia także; po
+sprawdzeniu `systemctl is-active aars` można wymusić powrót opcją `--force`.
+Zlecona instalacja dzieje się tylko w tej chwili: gdy proces skończy się
+inaczej niż aktualizacją (zatrzymanie, restart w trakcie pobierania, błąd),
+żądanie jest wycofywane i trzeba je zlecić ponownie.
+
 ### Licencje
 
 AARS: MIT. Piper (`piper-tts` 1.8.0, OHF-Voice/piper1-gpl) i wbudowany
@@ -251,9 +262,17 @@ w obrazie w `/usr/share/doc/aars/THIRD-PARTY.md`, a źródło Pipera
    `aars-os-list.json`, manifest i tworzy **szkic** wydania. CI niczego nie
    podpisuje.
 3. Na swoim komputerze, z kluczem prywatnym poza GitHubem:
-   `scripts/sign-release.sh v0.10.0` (pobiera manifest, podpisuje
-   z komentarzem zaufanym `aars 0.10.0`, sprawdza kluczem
-   `keys/aars-release.pub`, dołącza podpis i publikuje wydanie).
+   `scripts/sign-release.sh v0.10.0 [--compare ścieżka/do/aars]`. Skrypt
+   pobiera wszystkie pliki szkicu, liczy ich sumy i rozmiary i porównuje
+   z manifestem (odmawia przy każdej różnicy, brakującym albo dodatkowym
+   pliku), sprawdza manifest regułami stacji (wersja = znacznik, target,
+   jedna binarka, limity), opcjonalnie porównuje binarkę z lokalną
+   kompilacją, pokazuje podsumowanie z commitem znacznika i czeka na wpisanie
+   wersji. Dopiero wtedy podpisuje z komentarzem zaufanym `aars 0.10.0`,
+   sprawdza podpis kluczem `keys/aars-release.pub`, dołącza go i publikuje
+   wydanie. Wymaga `gh`, `minisign` i `jq`. Binarkę buduje CI: bez
+   `--compare` podpis potwierdza, że podpisujesz pliki, które widziałeś,
+   a nie, że CI zbudowało je z tego źródła.
 
 Dopóki `keys/aars-release.pub` zawiera `UNSET`, binarka nie ma klucza wydań,
 aktualizacja z panelu jest wyłączona, a `release.yml` buduje tylko wydania

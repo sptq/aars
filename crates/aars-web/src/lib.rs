@@ -60,6 +60,8 @@ struct DashboardPage {
     tx_unavailable: Option<String>,
     /// Stacja działa na ostatniej działającej konfiguracji (tylko admin).
     last_good_note: Option<String>,
+    /// Tryb kreatora bez włączonego admina (pasek dla zalogowanych).
+    no_admin: bool,
 }
 
 #[derive(Template)]
@@ -231,15 +233,19 @@ async fn dashboard(
     State(state): State<AppState>,
     current: Result<CurrentUser, AuthRejection>,
 ) -> Response {
-    // R12: w trybie `wizard` bez admina pulpit prowadzi do kreatora, także
-    // bez sesji (dlatego `Result`, a nie samo `CurrentUser`).
-    if let Some(redirect) = setup_page::wizard_redirect(&state).await {
-        return redirect;
-    }
+    // R12: w trybie `wizard` bez admina pulpit prowadzi do kreatora tylko
+    // żądania bez sesji (dlatego `Result`). Zalogowany operator zostaje na
+    // pulpicie, bo tu jest wyłącznik nadawania (przegląd 8–9 M-3).
     let current = match current {
         Ok(current) => current,
-        Err(rejection) => return rejection.into_response(),
+        Err(rejection) => {
+            if let Some(redirect) = setup_page::wizard_redirect(&state).await {
+                return redirect;
+            }
+            return rejection.into_response();
+        }
     };
+    let no_admin = setup_page::wizard_redirect(&state).await.is_some();
     let interlocks = state.interlocks.snapshot();
     // Błąd kolejki nie może zabrać wyłącznika nadawania: notka zamiast tabeli.
     let (pending, queue_error) = match queue_rows(&state, 50).await {
@@ -279,6 +285,7 @@ async fn dashboard(
         chrome: Chrome::from(&current),
         tx_unavailable,
         last_good_note,
+        no_admin,
         tx_enabled: interlocks.tx_enabled,
         poisoned: interlocks.poisoned,
         pending,
@@ -540,7 +547,32 @@ pub fn router(state: AppState) -> Router {
         .route("/modules/{id}/settings", post(modules_page::save_settings))
         .route("/healthz", get(healthz))
         .route("/assets/{*path}", get(assets::serve))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), host_check))
         .with_state(state)
+}
+
+/// Odpowiedź na żądanie pod obcą nazwą (`421`).
+pub const FOREIGN_HOST: &str = "Panel stacji odpowiada tylko pod nazwą albo adresem stacji. \
+     Inną nazwę dopisz do server.allowed_hosts w aars.toml.";
+
+/// Obrona przed DNS rebinding na całym panelu (przegląd 8–9 M-4): obca
+/// domena przepięta na adres stacji ma w `Host` swoją nazwę, więc nie
+/// dostanie ani strony logowania, ani sesji.
+async fn host_check(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !state.check_hosts {
+        return next.run(request).await;
+    }
+    match setup_page::request_host(request.headers(), request.uri()) {
+        Some(host) if setup_page::host_allowed(&host, &state.host_names) => next.run(request).await,
+        other => {
+            tracing::warn!(host = ?other, path = %request.uri().path(), "obca nazwa w Host — odmowa");
+            (StatusCode::MISDIRECTED_REQUEST, FOREIGN_HOST).into_response()
+        }
+    }
 }
 
 #[cfg(test)]

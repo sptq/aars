@@ -80,7 +80,12 @@ pub enum UpdateAction {
     /// Strażnik startu (root, z `ExecStartPre` usługi); zawsze kończy się kodem 0.
     Guard,
     /// Ręczny powrót do poprzedniej wersji razem z kopią bazy (root).
-    Rollback,
+    Rollback {
+        /// Powrót mimo nieznanego stanu usługi (brak pliku blokady). Tylko
+        /// po sprawdzeniu, że `systemctl is-active aars` mówi `inactive`.
+        #[arg(long)]
+        force: bool,
+    },
     /// Sprawdza najnowsze wydanie; niczego nie pobiera poza manifestem.
     Check,
 }

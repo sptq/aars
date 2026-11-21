@@ -85,6 +85,10 @@ pub struct AppState {
     /// hosta, `{nazwa}.local`, host z `server.bind`. Literały IP i
     /// `localhost` przechodzą zawsze.
     pub host_names: Arc<Vec<String>>,
+    /// Kontrola `Host` na całym panelu (przegląd 8–9 M-4). Stacja ją
+    /// włącza; testy bez nagłówka `Host` działają bez niej. `/setup`
+    /// sprawdza `Host` zawsze.
+    pub check_hosts: bool,
 }
 
 /// „Odśwież teraz” dla źródła: `true`, gdy źródło o tym id istnieje i zostało
@@ -118,6 +122,7 @@ impl AppState {
             first_admin: FirstAdmin::Console,
             local_nets: Arc::new(Vec::new()),
             host_names: Arc::new(Vec::new()),
+            check_hosts: false,
         }
     }
 
@@ -133,6 +138,12 @@ impl AppState {
 
     pub fn with_host_names(mut self, names: Vec<String>) -> Self {
         self.host_names = Arc::new(names);
+        self
+    }
+
+    /// Panel odpowiada tylko pod nazwami z `host_names` i literałami IP.
+    pub fn with_host_check(mut self, on: bool) -> Self {
+        self.check_hosts = on;
         self
     }
 
@@ -209,6 +220,7 @@ impl AppState {
             first_admin: FirstAdmin::Console,
             local_nets: Arc::new(Vec::new()),
             host_names: Arc::new(Vec::new()),
+            check_hosts: false,
         }
     }
 }

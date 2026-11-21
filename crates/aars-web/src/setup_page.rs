@@ -132,7 +132,7 @@ async fn wizard_open(state: &AppState) -> Result<bool, Response> {
 /// lokalnej. Zwraca adres klienta.
 /// Nazwa hosta z `Host` (albo z adresu żądania przy HTTP/2), bez portu,
 /// małymi literami i bez kropki na końcu. IPv6 bez nawiasów.
-fn request_host(headers: &HeaderMap, uri: &axum::http::Uri) -> Option<String> {
+pub(crate) fn request_host(headers: &HeaderMap, uri: &axum::http::Uri) -> Option<String> {
     let raw = match headers.get(header::HOST) {
         Some(value) => value.to_str().ok()?.trim().to_owned(),
         None => uri.authority()?.as_str().to_owned(),
@@ -587,6 +587,60 @@ mod tests {
             "{}",
             reply.body
         );
+    }
+
+    /// Przegląd 8–9 M-4: kontrola `Host` na całym panelu. `POST /login`
+    /// pod przepiętą nazwą nie dostaje sesji.
+    #[tokio::test]
+    async fn the_whole_panel_refuses_a_foreign_host() {
+        let state = AppState::for_tests(aars_core::db::test_pool().await)
+            .with_host_names(vec!["aars".to_owned(), "aars.local".to_owned(), "panel.lan".to_owned()])
+            .with_host_check(true);
+        UserRepo::new(state.pool.clone())
+            .create("op", "dlugie-haslo-1", aars_core::user::Role::Operator)
+            .await
+            .unwrap();
+        let app = app_from(&state, "192.168.1.10:5555");
+        let login = "username=op&password=dlugie-haslo-1";
+        let evil = [("host", "evil.example")];
+        let reply = send_with(&app, "POST", "/login", None, login, &evil).await;
+        assert_eq!(reply.status, StatusCode::MISDIRECTED_REQUEST);
+        assert!(reply.cookies.is_empty(), "{:?}", reply.cookies);
+        for path in ["/", "/login", "/healthz"] {
+            let reply = send_with(&app, "GET", path, None, "", &[("host", "evil.example:8080")]).await;
+            assert_eq!(reply.status, StatusCode::MISDIRECTED_REQUEST, "{path}");
+        }
+        let reply = send_with(&app, "GET", "/healthz", None, "", &[]).await;
+        assert_eq!(reply.status, StatusCode::MISDIRECTED_REQUEST, "bez Host");
+        for host in ["192.168.1.2:8080", "[fe80::1]:8080", "localhost:8080", "aars.local", "PANEL.lan:8080"] {
+            let reply = send_with(&app, "GET", "/healthz", None, "", &[("host", host)]).await;
+            assert_eq!(reply.status, StatusCode::OK, "{host}");
+        }
+        let ok = [("host", "aars.local:8080")];
+        let reply = send_with(&app, "POST", "/login", None, login, &ok).await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER);
+        assert!(!reply.cookies.is_empty());
+    }
+
+    /// Przegląd 8–9 M-3: zalogowany operator zostaje na pulpicie z
+    /// wyłącznikiem nadawania, a pasek prowadzi do kreatora.
+    #[tokio::test]
+    async fn a_logged_in_operator_keeps_the_dashboard_without_an_admin() {
+        let state = wizard_state().await;
+        let repo = UserRepo::new(state.pool.clone());
+        let id = repo
+            .create("op", "dlugie-haslo-1", aars_core::user::Role::Operator)
+            .await
+            .unwrap();
+        let session = repo.start_session(id, None).await.unwrap();
+        let app = app_from(&state, "203.0.113.7:5555");
+        let cookie = format!("{}={}", crate::auth::SESSION_COOKIE, session.id);
+        let reply = send(&app, "GET", "/", Some(&cookie), "").await;
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.location);
+        assert!(reply.body.contains("Zatrzymaj nadawanie"), "{}", reply.body);
+        assert!(reply.body.contains("Brak konta administratora"), "{}", reply.body);
+        let reply = send(&app, "GET", "/", None, "").await;
+        assert_eq!(reply.location.as_deref(), Some("/setup"));
     }
 
     #[tokio::test]
