@@ -16,7 +16,8 @@ use aars_web::state::{UpdateControl, UpdateFuture};
 use sqlx::SqlitePool;
 
 use super::fetch::ReleaseClient;
-use super::paths::{UpdatePaths, installed_version, write_atomic_nofollow};
+use super::install::Request;
+use super::paths::{UpdatePaths, installed_version, write_new_nofollow};
 use super::verify::{NO_KEY, TrustedKey};
 
 /// Horyzont pilnych komunikatów, przy których odmawiamy (R10c).
@@ -155,16 +156,26 @@ impl UpdateHandle {
         if !is_newer(latest, &self.running).map_err(UpdateRefusal::Failed)? {
             return Err(UpdateRefusal::NotNewer(latest.clone()));
         }
+        // Każde pobranie ma własny identyfikator: żądanie i katalog w
+        // `staging/` należą tylko do niego (przegląd końcowy M-4).
+        let run = new_run_id();
         let staged = client
-            .stage(&signed, &self.running, &self.paths.state_dir)
+            .stage(&signed, &self.running, &self.paths.state_dir, &run)
             .await
             .map_err(UpdateRefusal::Failed)?;
+        let request = Request::new(version, &run).text();
 
-        // Pobieranie trwało: pilny komunikat mógł wpaść w tym czasie.
+        // Pobieranie trwało: pilny komunikat mógł wpaść w tym czasie. Żądania
+        // innego pobrania (z nowszego przebiegu stacji) nie nadpisujemy.
         let requested = async {
             self.refuse_if_urgent().await?;
-            write_atomic_nofollow(&self.paths.request(), version.as_bytes())
-                .map_err(|e| UpdateRefusal::Failed(format!("zapis żądania: {e}")))
+            write_new_nofollow(&self.paths.request(), request.as_bytes()).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    UpdateRefusal::InProgress
+                } else {
+                    UpdateRefusal::Failed(format!("zapis żądania: {e}"))
+                }
+            })
         }
         .await;
         if let Err(refusal) = requested {
@@ -175,8 +186,14 @@ impl UpdateHandle {
         if !self.station.request_update() {
             // Przebieg stacji skończył się w trakcie pobierania (restart w
             // procesie): żądanie bez końca procesu odpaliłoby się przy
-            // przypadkowym starcie, bez admina (przegląd 8–9 I-1).
-            super::discard_request(&self.paths, "stacja uruchamiała się ponownie w trakcie pobierania");
+            // przypadkowym starcie, bez admina (przegląd 8–9 I-1). Usuwamy
+            // tylko własne żądanie i własny katalog (M-4).
+            super::discard_own_request(
+                &self.paths,
+                &request,
+                &staged.dir,
+                "stacja uruchamiała się ponownie w trakcie pobierania",
+            );
             return Err(UpdateRefusal::Failed(
                 "Stacja uruchamiała się ponownie w trakcie pobierania — spróbuj jeszcze raz za chwilę."
                     .to_owned(),
@@ -197,6 +214,18 @@ impl UpdateHandle {
         tracing::info!(%detail, "aktualizacja pobrana i sprawdzona — stacja skończy po bieżącym nadaniu");
         Ok(())
     }
+}
+
+/// Identyfikator jednego pobrania (cyfry szesnastkowe): czas i licznik
+/// procesu. Wystarczy niepowtarzalność w obrębie stacji; bezpieczeństwo od
+/// niego nie zależy, bo strażnik i tak sprawdza podpis.
+fn new_run_id() -> String {
+    use std::sync::atomic::AtomicU64;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    format!("{nanos:016x}{:08x}", NEXT.fetch_add(1, Ordering::Relaxed) as u32)
 }
 
 fn refusal_text(reason: RefusalReason) -> &'static str {
@@ -263,6 +292,7 @@ impl UpdateControl for UpdateHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::atomic::AtomicUsize;
 
     use aars_core::queue::EnqueueRequest;
@@ -376,14 +406,12 @@ mod tests {
 
         s.handle.install("0.11.0", "admin").await.unwrap();
 
-        assert_eq!(
-            std::fs::read_to_string(s.paths.request()).unwrap(),
-            "0.11.0"
-        );
-        let archive = s
-            .paths
-            .staging()
-            .join("0.11.0")
+        let request = Request::parse(&std::fs::read_to_string(s.paths.request()).unwrap());
+        assert_eq!(request.version, "0.11.0");
+        assert!(request.run.is_some(), "żądanie z identyfikatorem pobrania");
+        let archive = request
+            .staged_dir(&s.paths.staging())
+            .unwrap()
             .join(binary_archive_name("0.11.0"));
         assert_eq!(
             sha256_hex(&std::fs::read(archive).unwrap()),
@@ -422,6 +450,127 @@ mod tests {
         assert_eq!(audits, 0);
         s.station.closed.store(false, Ordering::SeqCst);
         s.handle.install("0.11.0", "admin").await.unwrap();
+    }
+
+    /// Drugi uchwyt na tych samych ścieżkach: nowy przebieg stacji po
+    /// restarcie w procesie (własna flaga `in_progress`).
+    fn next_run(s: &Setup, server: &wiremock::MockServer, key: &TestKey) -> (UpdateHandle, Arc<FakeStation>) {
+        let station = Arc::new(FakeStation::default());
+        let handle = UpdateHandle::with_client(
+            s.paths.clone(),
+            Some(ReleaseClient::new(&server.uri(), key.trusted()).unwrap()),
+            "0.10.0",
+            None,
+            UpdateDeps {
+                pool: s.pool.clone(),
+                queue: s.queue.clone(),
+                interlocks: s.interlocks.clone(),
+                station: station.clone(),
+                last: None,
+            },
+        );
+        (handle, station)
+    }
+
+    /// Żądanie w `request` i jego katalog z archiwum, tak jak je zobaczy
+    /// strażnik.
+    fn staged_request(s: &Setup) -> Option<(Request, bool)> {
+        let text = std::fs::read_to_string(s.paths.request()).ok()?;
+        let request = Request::parse(&text);
+        let archive = request
+            .staged_dir(&s.paths.staging())
+            .unwrap()
+            .join(binary_archive_name(&request.version));
+        let ok = std::fs::read(archive).is_ok_and(|a| a == ARCHIVE);
+        Some((request, ok))
+    }
+
+    #[tokio::test]
+    async fn a_stale_handle_does_not_withdraw_the_next_runs_request() {
+        // Przegląd końcowy M-4: stary przebieg (A) pobiera, restart w
+        // procesie, nowy przebieg (B) pobiera i kończy pierwszy. A kończy
+        // później i nie może skasować żądania ani pobrania B.
+        let key = TestKey::generate();
+        let server = release_server(&key, "0.11.0", ARCHIVE).await;
+        let s = setup(&server, &key, None).await;
+        s.station.closed.store(true, Ordering::SeqCst);
+        let (next, next_station) = next_run(&s, &server, &key);
+
+        let (stale, fresh) = tokio::join!(
+            async {
+                // A ruszył wcześniej, ale jego archiwum przychodzi później.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                s.handle.install("0.11.0", "admin").await
+            },
+            next.install("0.11.0", "admin")
+        );
+        assert_eq!(fresh, Ok(()));
+        assert!(stale.is_err(), "{stale:?}");
+        assert_eq!(next_station.requests.load(Ordering::SeqCst), 1);
+        let (request, archive_ok) = staged_request(&s).expect("żądanie B zostaje");
+        assert_eq!(request.version, "0.11.0");
+        assert!(archive_ok, "pobranie B zostaje w staging");
+        assert_eq!(s.staging_files(), 1, "katalog A usunięty");
+    }
+
+    #[tokio::test]
+    async fn a_stale_handle_that_finishes_first_withdraws_only_itself() {
+        let key = TestKey::generate();
+        let server = release_server(&key, "0.11.0", ARCHIVE).await;
+        let s = setup(&server, &key, None).await;
+        s.station.closed.store(true, Ordering::SeqCst);
+        let (next, _) = next_run(&s, &server, &key);
+
+        let (stale, fresh) = tokio::join!(s.handle.install("0.11.0", "admin"), async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            next.install("0.11.0", "admin").await
+        });
+        assert!(stale.is_err(), "{stale:?}");
+        assert_eq!(fresh, Ok(()));
+        let (_, archive_ok) = staged_request(&s).expect("żądanie B");
+        assert!(archive_ok);
+        assert_eq!(s.staging_files(), 1);
+    }
+
+    #[test]
+    fn discarding_ones_own_request_leaves_a_foreign_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = UpdatePaths {
+            install_root: dir.path().join("opt"),
+            guard_dir: dir.path().join("guard"),
+            state_dir: dir.path().join("state"),
+            db_path: dir.path().join("aars.db"),
+        };
+        let mine = Request::new("0.11.0", "aa").staged_dir(&paths.staging()).unwrap();
+        let theirs = Request::new("0.11.0", "bb").staged_dir(&paths.staging()).unwrap();
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+        let foreign = Request::new("0.11.0", "bb").text();
+        std::fs::write(paths.request(), &foreign).unwrap();
+
+        let own = Request::new("0.11.0", "aa").text();
+        assert!(!crate::update::discard_own_request(&paths, &own, &mine, "test"));
+        assert_eq!(std::fs::read_to_string(paths.request()).unwrap(), foreign);
+        assert!(theirs.exists() && !mine.exists());
+
+        assert!(crate::update::discard_own_request(&paths, &foreign, &theirs, "test"));
+        assert!(!paths.request().exists() && !theirs.exists());
+    }
+
+    #[test]
+    fn a_request_cannot_point_outside_staging() {
+        let staging = Path::new("/s");
+        for bad in ["0.11.0\n../x", "0.11.0\nzz", "../0.11.0\naa", "0.11.0/x\naa"] {
+            assert!(Request::parse(bad).staged_dir(staging).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            Request::parse("0.11.0\nab12\n").staged_dir(staging).unwrap(),
+            Path::new("/s/0.11.0-ab12")
+        );
+        assert_eq!(
+            Request::parse("0.11.0\n").staged_dir(staging).unwrap(),
+            Path::new("/s/0.11.0")
+        );
     }
 
     #[tokio::test]
@@ -531,7 +680,7 @@ mod tests {
         // Potwierdzona próba (M-6): `trial.json` zostaje do następnego
         // startu, ale panel i instalacja widzą ją jako zamkniętą.
         std::fs::create_dir_all(&s.paths.state_dir).unwrap();
-        write_atomic_nofollow(&s.paths.confirmed(), b"0.10.0").unwrap();
+        crate::update::paths::write_atomic_nofollow(&s.paths.confirmed(), b"0.10.0").unwrap();
         assert_eq!(s.handle.status().trial, None);
         assert_eq!(s.handle.install("0.11.0", "admin").await, Ok(()));
 

@@ -86,13 +86,19 @@ fn the_reset_unit_hands_the_request_to_the_service_user() {
     let d = directives(&read("packaging/systemd/aars-reset-admin.service"));
     assert_eq!(one(&d, "Type"), "oneshot");
     assert_eq!(one(&d, "User"), "aars");
-    assert_eq!(one(&d, "ConditionPathExists"), "/boot/firmware/aars-reset-admin");
+    // Plik z rozszerzeniem z Notatnika też (przegląd końcowy M-3); `|` to
+    // „którykolwiek”, bez niego oba warunki musiałyby być spełnione.
+    assert_eq!(
+        values(&d, "ConditionPathExists"),
+        ["|/boot/firmware/aars-reset-admin", "|/boot/firmware/aars-reset-admin.txt"]
+    );
     assert_eq!(one(&d, "Before"), "aars.service");
+    // Root robi tylko `rm -f` obu nazw; prośbę zakłada `aars`.
     assert_eq!(
         values(&d, "ExecStart"),
         [
             "/usr/bin/touch /var/lib/aars/aars-reset-admin",
-            "+/usr/bin/rm -f /boot/firmware/aars-reset-admin"
+            "+/usr/bin/rm -f /boot/firmware/aars-reset-admin /boot/firmware/aars-reset-admin.txt"
         ]
     );
 }
@@ -129,6 +135,9 @@ fn the_image_config_loads_and_uses_the_wizard_and_vox() {
     let bind: std::net::SocketAddr = config.server.bind.parse().unwrap();
     assert!(bind.port() >= 1024, "{bind}");
     assert!(bind.ip().is_unspecified(), "{bind}");
+    // Jedno gniazdo dla IPv6 i IPv4: kreator z globalnego IPv6 (R12,
+    // przegląd końcowy M-2).
+    assert!(bind.is_ipv6(), "{bind}");
     assert!(Path::new(&config.tts.model).starts_with(&config.tts.voices_dir));
     assert_eq!(config.tts.piper_bin, "/opt/aars/piper/bin/piper");
     assert_eq!(config.storage.db_path, Path::new("/var/lib/aars/aars.db"));
@@ -269,6 +278,49 @@ fn release_workflow_does_not_sign_in_ci() {
     assert!(!text.contains("branches"));
     for job in ["make_manifest", "build-image.sh", "aars-os-list.json", "source.lock"] {
         assert!(text.contains(job), "release.yml bez {job}");
+    }
+}
+
+/// Zadania `release.yml` jako (nazwa, treść), po wcięciu dwóch spacji.
+fn release_jobs(text: &str) -> Vec<(String, String)> {
+    let jobs = text.split("\njobs:\n").nth(1).expect("release.yml bez jobs:");
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in jobs.lines() {
+        if let Some(name) = line.strip_prefix("  ").and_then(|l| l.strip_suffix(':'))
+            && !name.starts_with([' ', '#'])
+        {
+            out.push((name.to_owned(), String::new()));
+        } else if let Some((_, body)) = out.last_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    out
+}
+
+#[test]
+fn only_the_publish_job_can_write_and_it_compiles_nothing() {
+    // Przegląd końcowy M-5: przejęta zależność nie może dostać tokenu z
+    // prawem zapisu ani skompilowanych plików z cache'u gałęzi domyślnej.
+    let text = read(".github/workflows/release.yml");
+    assert!(!text.contains("rust-cache"), "bez cache'u Rusta w wydaniu");
+    let checkouts = text.matches("actions/checkout@").count();
+    assert_eq!(
+        text.matches("persist-credentials: false").count(),
+        checkouts,
+        "każdy checkout bez zapisanego tokenu"
+    );
+    let jobs = release_jobs(&text);
+    assert!(jobs.len() >= 4, "{:?}", jobs.iter().map(|j| &j.0).collect::<Vec<_>>());
+    for (name, body) in &jobs {
+        let writes = body.contains("contents: write");
+        assert_eq!(writes, name == "publish", "{name}: prawo zapisu tylko w publish");
+        if writes {
+            for forbidden in ["cargo", "actions/checkout", "make_manifest", "rust-toolchain", "apt-get"] {
+                assert!(!body.contains(forbidden), "publish nie może mieć {forbidden}");
+            }
+            assert!(body.contains("gh release create"));
+        }
     }
 }
 

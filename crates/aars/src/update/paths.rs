@@ -252,6 +252,28 @@ pub fn write_atomic_nofollow(path: &Path, data: &[u8]) -> std::io::Result<()> {
     result
 }
 
+/// Jak `write_atomic_nofollow`, ale bez zastępowania: gdy `path` już jest
+/// (także jako dowiązanie), wynik to `AlreadyExists` i nic się nie zmienia
+/// (przegląd końcowy M-4). Plik tymczasowy jest zapisany w całości, zanim
+/// `link` wystawi go pod docelową nazwą, więc nikt nie przeczyta połowy.
+pub fn write_new_nofollow(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = temp_name(path);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        std::fs::hard_link(&tmp, path)
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
 /// Usuwa plik z katalogu usługi (`request`, `confirmed`, `verdict`) przez
 /// `unlinkat` względem deskryptora katalogu otwartego z
 /// `O_DIRECTORY|O_NOFOLLOW` (przegląd 5–7 M-3): gdy usługa podmieni

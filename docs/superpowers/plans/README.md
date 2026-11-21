@@ -60,4 +60,17 @@ wiążące i nie zmieniają się (poza zmianą podziału etapów 9–11 w spec �
   w Raspberry Pi Imager odpadł na razie: pierwsze konto zakłada kreator
   `/setup`. Zostaje reset kont admina plikiem `aars-reset-admin` z partycji
   boot, ale konta wyłącza usługa `aars` przy starcie, a nie root w osobnej
-  usłudze (`aars-reset-admin.service` tylko przekazuje prośbę).
+  usłudze (`aars-reset-admin.service` tylko przekazuje prośbę). Przechodzi
+  też `aars-reset-admin.txt` (Notatnik w Windows dopisuje rozszerzenie).
+- **Etap 10, R15: `TimeoutStopSec=660` zamiast 30 s.** SIGTERM przerywa
+  nadanie przez sekwencer, więc zwykłe zatrzymanie trwa sekundy. Limit
+  obejmuje najgorszy ograniczony przypadek: najdłuższe nadanie do strażnika
+  TX (600 s + 2 s opóźnienia PTT + 2 s zapasu) i 30 s drenażu. SIGKILL
+  wcześniej zostawiłby linię PTT jądru.
+- **Etap 10, R15: `StateDirectoryMode=0750`** (plus `d /var/lib/aars 0750
+  aars aars -` w tmpfiles), żeby baza z hashami haseł nie była czytelna dla
+  innych kont na Pi.
+- **Etap 10, R14: obraz słucha na `[::]:8080`, a nie na `0.0.0.0:8080`.**
+  Jedno gniazdo dla IPv6 i IPv4 (Linux, `bindv6only = 0`), więc kreator
+  działa też z globalnego IPv6 w sieci `/64` stacji. Bez IPv6 w jądrze panel
+  sam przechodzi na `0.0.0.0` tego samego portu.

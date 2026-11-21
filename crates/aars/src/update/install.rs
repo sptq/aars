@@ -186,11 +186,79 @@ pub fn radio_was_up(snapshot: &Path) -> bool {
     .unwrap_or(false)
 }
 
+/// Żądanie instalacji z pliku `request`: wersja w pierwszym wierszu i
+/// identyfikator pobrania w drugim (przegląd końcowy M-4). Identyfikator
+/// wiąże żądanie z jego katalogiem `staging/{wersja}-{id}`, więc nieaktualny
+/// przebieg usuwa tylko swoje pliki. Bez identyfikatora katalog to
+/// `staging/{wersja}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request {
+    pub version: String,
+    pub run: Option<String>,
+}
+
+/// Najdłuższy identyfikator pobrania (cyfry szesnastkowe).
+const MAX_RUN_ID: usize = 32;
+
+impl Request {
+    pub fn new(version: &str, run: &str) -> Self {
+        Self {
+            version: version.to_owned(),
+            run: Some(run.to_owned()),
+        }
+    }
+
+    pub fn parse(text: &str) -> Self {
+        let mut lines = text.lines().map(str::trim);
+        let version = lines.next().unwrap_or_default().to_owned();
+        let run = lines.next().filter(|r| !r.is_empty()).map(str::to_owned);
+        Self { version, run }
+    }
+
+    /// Treść pliku `request`.
+    pub fn text(&self) -> String {
+        match &self.run {
+            Some(run) => format!("{}\n{run}\n", self.version),
+            None => format!("{}\n", self.version),
+        }
+    }
+
+    /// Katalog pobranego wydania w `staging`. Wersja i identyfikator
+    /// przychodzą od usługi, więc tylko bezpieczne znaki (bez `/` i `..`).
+    pub fn staged_dir(&self, staging: &Path) -> Result<PathBuf, String> {
+        let version_ok = !self.version.is_empty()
+            && !self.version.starts_with('.')
+            && self
+                .version
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
+        if !version_ok {
+            return Err(format!("nieczytelna wersja w żądaniu: {:?}", self.version));
+        }
+        match &self.run {
+            None => Ok(staging.join(&self.version)),
+            Some(run)
+                if !run.is_empty()
+                    && run.len() <= MAX_RUN_ID
+                    && run.chars().all(|c| c.is_ascii_hexdigit()) =>
+            {
+                Ok(staging.join(format!("{}-{run}", self.version)))
+            }
+            Some(run) => Err(format!("nieczytelny identyfikator pobrania w żądaniu: {run:?}")),
+        }
+    }
+}
+
+/// Żądanie zapisane w `request` przez usługę.
+pub fn requested(p: &UpdatePaths) -> Result<Option<Request>, String> {
+    read_service_file(&p.request(), SMALL_FILE)
+        .map(|text| text.map(|t| Request::parse(&t)))
+        .map_err(|e| format!("odczyt żądania: {e}"))
+}
+
 /// Wersja zapisana w `request` przez usługę.
 pub fn requested_version(p: &UpdatePaths) -> Result<Option<String>, String> {
-    read_service_file(&p.request(), SMALL_FILE)
-        .map(|text| text.map(|t| t.trim().to_owned()))
-        .map_err(|e| format!("odczyt żądania: {e}"))
+    requested(p).map(|r| r.map(|r| r.version))
 }
 
 /// Instalacja żądanego wydania (R6 + R7 + R8 krok 3): ponowna weryfikacja
@@ -206,11 +274,12 @@ pub fn install_requested(
     current: &str,
     now: DateTime<Utc>,
 ) -> Result<Trial, String> {
-    let requested = requested_version(p);
+    let requested = requested(p);
     if let Err(err) = super::paths::remove_service_entry(&p.request()) {
         tracing::warn!(%err, "usunięcie żądania pominięte");
     }
-    let version = requested?.ok_or_else(|| "brak żądania instalacji".to_owned())?;
+    let request = requested?.ok_or_else(|| "brak żądania instalacji".to_owned())?;
+    let version = request.version.clone();
     semver::Version::parse(&version)
         .map_err(|_| format!("nieczytelna wersja w żądaniu: {version:?}"))?;
 
@@ -224,7 +293,7 @@ pub fn install_requested(
         return Err(format!("wersja {version} nie jest nowsza od {current}"));
     }
 
-    let staged = p.staging().join(&version);
+    let staged = request.staged_dir(&p.staging())?;
     let manifest = read_signed_manifest(&staged, key)?;
     if manifest.version != version {
         return Err(format!(

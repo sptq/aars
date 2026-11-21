@@ -1,7 +1,8 @@
 //! Reset kont admina plikiem z partycji boot (R13, bez importu hasła z
 //! Raspberry Pi Imager, który na razie odpada).
 //!
-//! Właściciel kładzie pusty plik `aars-reset-admin` na partycji boot.
+//! Właściciel kładzie pusty plik `aars-reset-admin` (albo
+//! `aars-reset-admin.txt`, przegląd końcowy M-3) na partycji boot.
 //! `aars-reset-admin.service` (przed `aars.service`) zakłada jako użytkownik
 //! `aars` plik o tej samej nazwie obok bazy, a jako root usuwa plik z
 //! partycji boot. Bazę rusza wyłącznie ten proces (użytkownik `aars`), więc

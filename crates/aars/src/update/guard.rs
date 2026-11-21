@@ -40,6 +40,8 @@ pub enum GuardAction {
     RolledBack(String),
     Installed(String),
     InstallFailed(String),
+    /// Próba zamknięta, żądanie czeka: instaluje strażnik z `current`.
+    HandOver,
 }
 
 impl std::fmt::Display for GuardAction {
@@ -52,6 +54,7 @@ impl std::fmt::Display for GuardAction {
             Self::RolledBack(v) => write!(f, "strażnik: powrót do wersji {v}"),
             Self::Installed(v) => write!(f, "strażnik: zainstalowano wersję {v}, próba trwa"),
             Self::InstallFailed(e) => write!(f, "strażnik: instalacja nieudana: {e}"),
+            Self::HandOver => write!(f, "strażnik: instalację przejmuje strażnik bieżącej wersji"),
         }
     }
 }
@@ -98,11 +101,12 @@ pub fn run_guard(
             // Próba zamknięta (potwierdzona albo nieaktualna): żądanie
             // instalacji przyjęte po potwierdzeniu wykonujemy w tym samym
             // przebiegu, a nie przy przypadkowym późniejszym starcie (przegląd
-            // 8–9 I-1).
-            GuardAction::Nothing => install_request(p, key, smoke, now, &mut actions),
+            // 8–9 I-1). Instaluje jednak strażnik z `current`, z jego kluczem
+            // wydań i jego kodem, nie ten z `previous` (przegląd końcowy I-1).
+            GuardAction::Nothing => hand_over_request(p, now, &mut actions),
             closed @ GuardAction::Confirmed(_) => {
                 actions.push(closed);
-                install_request(p, key, smoke, now, &mut actions);
+                hand_over_request(p, now, &mut actions);
             }
             other => actions.push(other),
         },
@@ -131,6 +135,102 @@ pub fn run_guard(
     if actions.is_empty() {
         actions.push(GuardAction::Nothing);
     }
+    actions
+}
+
+/// Próba właśnie się zamknęła, a usługa zostawiła żądanie: instalację
+/// przekazujemy strażnikowi z `current` (przegląd końcowy I-1). Ten przebieg
+/// mógł wystartować z `previous`, a stara binarka sprawdziłaby nowe wydanie
+/// starym kluczem wydań i starym kodem. Gdy `trial.json` nie zniknął,
+/// przekazanie byłoby pętlą — wtedy żądanie przepada z wynikiem `failed`.
+fn hand_over_request(p: &UpdatePaths, now: DateTime<Utc>, actions: &mut Vec<GuardAction>) {
+    if std::fs::symlink_metadata(p.request()).is_err() {
+        return;
+    }
+    if std::fs::symlink_metadata(p.trial()).is_ok() {
+        drop_request(p, "próba nie dała się zamknąć (trial.json został)", now, actions);
+        return;
+    }
+    actions.push(GuardAction::HandOver);
+}
+
+/// Żądanie, którego nie wykonamy: usunięte, z wynikiem `failed`.
+fn drop_request(p: &UpdatePaths, why: &str, now: DateTime<Utc>, actions: &mut Vec<GuardAction>) {
+    let version = requested_version(p).ok().flatten().unwrap_or_default();
+    unlink_service(&p.request());
+    let from = installed_version(&p.current()).unwrap_or_default();
+    let detail = format!("instalacja nie ruszyła: {why}");
+    record(p, ResultKind::Failed, &version, &from, &detail, now);
+    actions.push(GuardAction::InstallFailed(detail));
+}
+
+/// Zmienna środowiska, którą strażnik ustawia przy przekazaniu instalacji
+/// strażnikowi z `current`. Drugi raz już nie przekazuje (bez pętli).
+pub const HANDED_OVER_ENV: &str = "AARS_GUARD_HANDED_OVER";
+
+/// Uruchomienie strażnika z `current` (I-1). Prawdziwa wersja to `exec`,
+/// który wraca tylko z błędem; w testach to kolejny przebieg strażnika z
+/// kluczem bieżącej wersji.
+pub trait CurrentGuard {
+    fn run(&self, binary: &std::path::Path) -> Result<Vec<GuardAction>, String>;
+}
+
+/// `exec {current}/aars` z tymi samymi argumentami co ten proces.
+pub struct ExecCurrent;
+
+impl CurrentGuard for ExecCurrent {
+    #[cfg(unix)]
+    fn run(&self, binary: &std::path::Path) -> Result<Vec<GuardAction>, String> {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(binary)
+            .args(std::env::args_os().skip(1))
+            .env(HANDED_OVER_ENV, "1")
+            .exec();
+        Err(format!("uruchomienie {}: {err}", binary.display()))
+    }
+
+    #[cfg(not(unix))]
+    fn run(&self, binary: &std::path::Path) -> Result<Vec<GuardAction>, String> {
+        Err(format!("uruchomienie {}: tylko na Uniksie", binary.display()))
+    }
+}
+
+/// Cały przebieg strażnika z przekazaniem instalacji (I-1): `run_guard`,
+/// a gdy ten oddał żądanie, strażnik z `current`. `current == None` znaczy,
+/// że ten proces sam jest już wynikiem przekazania: drugiego nie ma, a
+/// żądanie przepada. `report` dostaje każdą akcję, zanim `exec` zastąpi
+/// proces.
+pub fn guard_and_hand_over(
+    p: &UpdatePaths,
+    key: Option<&TrustedKey>,
+    smoke: &dyn SmokeTest,
+    owner: &dyn Owner,
+    now: DateTime<Utc>,
+    current: Option<&dyn CurrentGuard>,
+    report: &mut dyn FnMut(&GuardAction),
+) -> Vec<GuardAction> {
+    let mut actions = run_guard(p, key, smoke, owner, now);
+    actions.iter().for_each(&mut *report);
+    if actions.last() != Some(&GuardAction::HandOver) {
+        return actions;
+    }
+    let mut tail = Vec::new();
+    match current {
+        None => drop_request(p, "przekazanie do bieżącej wersji się zapętliło", now, &mut tail),
+        Some(current) => match current.run(&p.current().join("aars")) {
+            Ok(more) => {
+                actions.extend(more);
+                return actions;
+            }
+            Err(err) => {
+                tracing::error!(%err, "strażnik bieżącej wersji nie ruszył");
+                let why = format!("strażnik bieżącej wersji nie ruszył ({err})");
+                drop_request(p, &why, now, &mut tail);
+            }
+        },
+    }
+    tail.iter().for_each(&mut *report);
+    actions.extend(tail);
     actions
 }
 
@@ -821,24 +921,222 @@ mod tests {
         assert_eq!(st.releases(), vec!["0.10.0".to_owned()]);
     }
 
+    /// Strażnik z `current` w teście: kolejny przebieg z kluczem bieżącej
+    /// wersji zamiast `exec` (I-1). Zapisuje, którą binarkę miał uruchomić.
+    struct CurrentWith<'a> {
+        st: &'a Station,
+        key: &'a TestKey,
+        ran: Mutex<Vec<PathBuf>>,
+    }
+
+    impl CurrentGuard for CurrentWith<'_> {
+        fn run(&self, binary: &Path) -> Result<Vec<GuardAction>, String> {
+            self.ran.lock().unwrap().push(binary.to_owned());
+            Ok(run_guard(
+                &self.st.paths,
+                Some(&self.key.trusted()),
+                &FakeSmoke::ok(),
+                &NoOwner,
+                now(),
+            ))
+        }
+    }
+
+    struct FailingExec;
+
+    impl CurrentGuard for FailingExec {
+        fn run(&self, _: &Path) -> Result<Vec<GuardAction>, String> {
+            Err("brak pliku".to_owned())
+        }
+    }
+
+    impl Station {
+        /// Jak `stage`, ale podpis innym kluczem.
+        fn stage_signed_by(&self, key: &TestKey, version: &str) {
+            let archive = good_archive(version);
+            let dir = self.stage(version, &archive);
+            let manifest = std::fs::read(dir.join(MANIFEST_NAME)).unwrap();
+            std::fs::write(
+                dir.join(SIGNATURE_NAME),
+                key.sign(&manifest, &format!("aars {version}")),
+            )
+            .unwrap();
+        }
+
+        /// Przebieg strażnika z `previous` (klucz `previous_key`), który
+        /// przekazuje instalację do `current`.
+        fn guard_from_previous(
+            &self,
+            previous_key: &TestKey,
+            current: Option<&dyn CurrentGuard>,
+        ) -> Vec<GuardAction> {
+            let mut reported = Vec::new();
+            let actions = guard_and_hand_over(
+                &self.paths,
+                Some(&previous_key.trusted()),
+                &FakeSmoke::ok(),
+                &NoOwner,
+                now(),
+                current,
+                &mut |a| reported.push(a.clone()),
+            );
+            // Akcje strażnika z `current` raportuje już tamten proces; ten
+            // raportuje wszystko do `HandOver` włącznie, zanim zrobi `exec`.
+            assert!(actions.starts_with(&reported), "{reported:?} / {actions:?}");
+            let handed = actions.iter().position(|a| *a == GuardAction::HandOver);
+            if let Some(at) = handed {
+                assert!(reported.len() > at, "przekazanie w logu przed `exec`");
+            }
+            actions
+        }
+    }
+
     #[test]
-    fn a_request_after_a_confirmed_trial_installs_in_the_same_run() {
+    fn a_request_after_a_confirmed_trial_waits_for_the_current_guard() {
         let st = station();
         st.installed("0.11.0");
         std::fs::write(st.paths.confirmed(), "0.11.0\n").unwrap();
         st.stage("0.12.0", &good_archive("0.12.0"));
 
+        // Sam `run_guard` (strażnik z `previous`) nie instaluje.
         assert_eq!(
             st.guard(),
-            vec![
-                GuardAction::Confirmed("0.11.0".to_owned()),
-                GuardAction::Installed("0.12.0".to_owned())
-            ]
+            vec![GuardAction::Confirmed("0.11.0".to_owned()), GuardAction::HandOver]
         );
-        assert_eq!(st.current().as_deref(), Some("0.12.0"));
+        assert_eq!(st.current().as_deref(), Some("0.11.0"));
+        assert!(st.paths.request().exists(), "żądanie czeka na strażnika z current");
+        assert!(st.trial().is_none());
+
+        // Strażnik z `current` (już bez próby) instaluje.
+        assert_eq!(st.guard(), vec![GuardAction::Installed("0.12.0".to_owned())]);
         assert_eq!(st.link(&st.paths.previous()), Path::new("releases/0.11.0"));
         assert!(!st.paths.request().exists(), "żądanie zużyte");
         assert_eq!(st.trial().unwrap().version, "0.12.0");
+    }
+
+    #[test]
+    fn after_a_confirmed_trial_the_request_is_verified_with_the_current_key() {
+        // 0.10.0 ma stary klucz, 0.11.0 wniosła nowy (rotacja z R4), a
+        // 0.12.0 jest podpisana nowym. Przebieg startuje z `previous`.
+        let st = station();
+        let old_key = TestKey::generate();
+        st.installed("0.11.0");
+        std::fs::write(st.paths.confirmed(), "0.11.0\n").unwrap();
+        st.stage("0.12.0", &good_archive("0.12.0"));
+
+        let current = CurrentWith {
+            st: &st,
+            key: &st.key,
+            ran: Mutex::new(Vec::new()),
+        };
+        assert_eq!(
+            st.guard_from_previous(&old_key, Some(&current)),
+            vec![
+                GuardAction::Confirmed("0.11.0".to_owned()),
+                GuardAction::HandOver,
+                GuardAction::Installed("0.12.0".to_owned())
+            ]
+        );
+        assert_eq!(
+            *current.ran.lock().unwrap(),
+            vec![st.paths.current().join("aars")],
+            "instaluje binarka z current"
+        );
+        assert_eq!(st.current().as_deref(), Some("0.12.0"));
+        assert_eq!(st.last().kind, ResultKind::Installed);
+    }
+
+    #[test]
+    fn after_a_confirmed_trial_a_release_signed_with_the_old_key_is_refused() {
+        // Wyciekły stary klucz: usługa podkłada wydanie nim podpisane.
+        // Strażnik z `previous` by je przyjął; z `current` odmawia.
+        let st = station();
+        let old_key = TestKey::generate();
+        st.installed("0.11.0");
+        std::fs::write(st.paths.confirmed(), "0.11.0\n").unwrap();
+        st.stage_signed_by(&old_key, "0.12.0");
+
+        let current = CurrentWith {
+            st: &st,
+            key: &st.key,
+            ran: Mutex::new(Vec::new()),
+        };
+        let actions = st.guard_from_previous(&old_key, Some(&current));
+        assert_eq!(actions[0], GuardAction::Confirmed("0.11.0".to_owned()));
+        assert!(
+            matches!(&actions[1..], [GuardAction::HandOver, GuardAction::InstallFailed(_)]),
+            "{actions:?}"
+        );
+        assert_eq!(st.current().as_deref(), Some("0.11.0"));
+        assert!(!st.releases().contains(&"0.12.0".to_owned()));
+        assert!(!st.paths.request().exists());
+    }
+
+    #[test]
+    fn a_stale_trial_also_hands_the_request_over() {
+        let st = station();
+        st.installed("0.11.0");
+        // Próba innej wersji niż bieżąca (np. po samonaprawie).
+        let mut trial = st.trial().unwrap();
+        trial.version = "0.10.5".to_owned();
+        write_trial(&st.paths, &trial).unwrap();
+        st.stage("0.12.0", &good_archive("0.12.0"));
+        assert_eq!(st.guard(), vec![GuardAction::HandOver]);
+        assert_eq!(st.current().as_deref(), Some("0.11.0"));
+    }
+
+    #[test]
+    fn a_handed_over_guard_does_not_hand_over_again() {
+        let st = station();
+        st.installed("0.11.0");
+        std::fs::write(st.paths.confirmed(), "0.11.0\n").unwrap();
+        st.stage("0.12.0", &good_archive("0.12.0"));
+
+        let actions = st.guard_from_previous(&st.key, None);
+        assert_eq!(actions[0], GuardAction::Confirmed("0.11.0".to_owned()));
+        assert!(
+            matches!(&actions[1..], [GuardAction::HandOver, GuardAction::InstallFailed(_)]),
+            "{actions:?}"
+        );
+        assert!(!st.paths.request().exists(), "żądanie nie wraca przy każdym starcie");
+        assert_eq!(st.current().as_deref(), Some("0.11.0"));
+        assert_eq!(st.last().kind, ResultKind::Failed);
+        assert_eq!(st.last().version, "0.12.0");
+    }
+
+    #[test]
+    fn a_failed_exec_drops_the_request_with_a_result() {
+        let st = station();
+        st.installed("0.11.0");
+        std::fs::write(st.paths.confirmed(), "0.11.0\n").unwrap();
+        st.stage("0.12.0", &good_archive("0.12.0"));
+
+        let actions = st.guard_from_previous(&st.key, Some(&FailingExec));
+        let [GuardAction::Confirmed(_), GuardAction::HandOver, GuardAction::InstallFailed(why)] =
+            actions.as_slice()
+        else {
+            panic!("{actions:?}");
+        };
+        assert!(why.contains("brak pliku"), "{why}");
+        assert!(!st.paths.request().exists());
+        assert_eq!(st.current().as_deref(), Some("0.11.0"));
+        assert_eq!(st.last().kind, ResultKind::Failed);
+    }
+
+    #[test]
+    fn without_a_closed_trial_nothing_is_handed_over() {
+        let st = station();
+        let calls = CurrentWith {
+            st: &st,
+            key: &st.key,
+            ran: Mutex::new(Vec::new()),
+        };
+        st.stage("0.11.0", &good_archive("0.11.0"));
+        assert_eq!(
+            st.guard_from_previous(&st.key, Some(&calls)),
+            vec![GuardAction::Installed("0.11.0".to_owned())]
+        );
+        assert!(calls.ran.lock().unwrap().is_empty());
     }
 
     #[test]

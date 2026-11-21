@@ -386,12 +386,20 @@ fn local_nets() -> Vec<aars_core::netlocal::LocalNet> {
     }
 }
 
+/// Domeny lokalne, pod którymi router albo DHCP zwykle ogłasza nazwę
+/// hosta (przegląd końcowy M-1). Żadna nie jest delegowana w publicznym
+/// DNS, więc nie otwiera DNS rebinding. Inne (np. `fritz.box`, który jest
+/// w publicznej strefie `.box`) dopisuje się w `server.allowed_hosts`.
+const LOCAL_SUFFIXES: [&str; 5] = ["local", "lan", "home", "home.arpa", "localdomain"];
+
 /// Nazwy, pod którymi panel jest stacją (`Host` kreatora, obrona przed DNS
-/// rebinding): nazwa hosta, `{nazwa}.local` i nazwy hostów z adresów
-/// nasłuchu. Literały IP sprawdza panel sam.
+/// rebinding): nazwa hosta, `{nazwa}.{domena lokalna}` (`LOCAL_SUFFIXES`) i
+/// nazwy hostów z adresów nasłuchu. Literały IP i `{nazwa}-{N}.local` po
+/// kolizji w avahi sprawdza panel sam.
 fn station_host_names(host: &str, binds: &[&str]) -> Vec<String> {
     let base = host.trim_end_matches('.').trim_end_matches(".local").to_ascii_lowercase();
-    let mut names = vec![base.clone(), format!("{base}.local")];
+    let mut names = vec![base.clone()];
+    names.extend(LOCAL_SUFFIXES.iter().map(|suffix| format!("{base}.{suffix}")));
     for bind in binds {
         let name = match bind.rsplit_once(':') {
             Some((name, _)) => name.trim_start_matches('[').trim_end_matches(']'),
@@ -434,6 +442,34 @@ fn setup_url(bound: std::net::SocketAddr, host: &str) -> String {
     } else {
         format!("http://{bound}/setup")
     }
+}
+
+/// Nasłuch panelu. Obraz słucha na `[::]:8080` (przegląd końcowy M-2): na
+/// Linuksie z `net.ipv6.bindv6only = 0` (domyślnie) jedno gniazdo przyjmuje
+/// IPv6 i IPv4 (jako `::ffff:a.b.c.d`). Gdy jądro nie ma IPv6
+/// (`ipv6.disable=1`), `[::]` nie wstanie — wtedy panel słucha na
+/// `0.0.0.0` tego samego portu, żeby właściciel nie stracił dostępu.
+async fn bind_panel(bind: &str) -> std::io::Result<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(bind).await {
+        Ok(listener) => Ok(listener),
+        Err(err) => match ipv4_fallback(bind, &err) {
+            Some(v4) => {
+                tracing::warn!(%err, %bind, fallback = %v4, "IPv6 niedostępne — panel słucha tylko na IPv4");
+                tokio::net::TcpListener::bind(v4).await
+            }
+            None => Err(err),
+        },
+    }
+}
+
+/// `[::]:port` → `0.0.0.0:port`, gdy błąd nie dotyczy portu (zajęty albo
+/// bez uprawnień — tam IPv4 nic nie zmieni).
+fn ipv4_fallback(bind: &str, err: &std::io::Error) -> Option<std::net::SocketAddr> {
+    use std::io::ErrorKind;
+    let addr: std::net::SocketAddr = bind.parse().ok()?;
+    let port_problem = matches!(err.kind(), ErrorKind::AddrInUse | ErrorKind::PermissionDenied);
+    (addr.is_ipv6() && addr.ip().is_unspecified() && !port_problem)
+        .then(|| std::net::SocketAddr::from(([0, 0, 0, 0], addr.port())))
 }
 
 /// Stan dla systemd, gdy stacja działa bez stosu nadawczego (R6).
@@ -492,7 +528,7 @@ async fn run_station(
     };
 
     // Panel: `bind` kandydata, a przy błędzie `bind` z pliku (R6).
-    let listener = match tokio::net::TcpListener::bind(&config.server.bind).await {
+    let listener = match bind_panel(&config.server.bind).await {
         Ok(listener) => listener,
         Err(err) if config.server.bind != base.server.bind => {
             let note = format!(
@@ -505,7 +541,7 @@ async fn run_station(
                 audit_system(pool, "hardware_apply_failed", &note).await;
             }
             notes.push(note);
-            tokio::net::TcpListener::bind(&base.server.bind)
+            bind_panel(&base.server.bind)
                 .await
                 .with_context(|| format!("nasłuch na {}", base.server.bind))?
         }
@@ -2302,12 +2338,50 @@ mod tests {
     fn station_host_names_cover_the_hostname_mdns_and_the_bind_host() {
         assert_eq!(
             station_host_names("Stacja", &["0.0.0.0:8080", "panel.lan:8080"]),
-            vec!["panel.lan", "stacja", "stacja.local"]
+            vec![
+                "panel.lan",
+                "stacja",
+                "stacja.home",
+                "stacja.home.arpa",
+                "stacja.lan",
+                "stacja.local",
+                "stacja.localdomain"
+            ]
         );
         assert_eq!(
             station_host_names("aars.local", &["[::]:8080"]),
-            vec!["aars", "aars.local"]
+            vec!["aars", "aars.home", "aars.home.arpa", "aars.lan", "aars.local", "aars.localdomain"]
         );
+    }
+
+    #[test]
+    fn only_an_unavailable_ipv6_wildcard_falls_back_to_ipv4() {
+        use std::io::{Error, ErrorKind};
+        let unavailable = Error::from(ErrorKind::AddrNotAvailable);
+        assert_eq!(
+            ipv4_fallback("[::]:8080", &unavailable),
+            Some("0.0.0.0:8080".parse().unwrap())
+        );
+        assert_eq!(ipv4_fallback("[::]:8080", &Error::from(ErrorKind::AddrInUse)), None);
+        assert_eq!(ipv4_fallback("0.0.0.0:8080", &unavailable), None);
+        assert_eq!(ipv4_fallback("[fe80::1]:8080", &unavailable), None);
+    }
+
+    #[tokio::test]
+    async fn the_image_bind_accepts_ipv4_clients() {
+        // `[::]` jednym gniazdem (M-2). Bez IPv6 w środowisku testu działa
+        // zapasowe `0.0.0.0`; tak samo zachowa się stacja.
+        let listener = bind_panel("[::]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.map(|(_, peer)| peer) });
+        let _client = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let peer = accept.await.unwrap().unwrap();
+        let ip = match peer.ip() {
+            std::net::IpAddr::V6(v6) => std::net::IpAddr::V4(v6.to_ipv4_mapped().expect("IPv4 jako ::ffff:")),
+            v4 => v4,
+        };
+        assert_eq!(ip, std::net::IpAddr::from([127, 0, 0, 1]));
+        assert!(aars_core::netlocal::is_local_client(peer.ip(), &[]));
     }
 
     #[test]

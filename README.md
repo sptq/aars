@@ -160,7 +160,8 @@ OS Lite 64-bit (Trixie) z AARS, Piperem 1.8.0 i polskim głosem
 
 ### Pierwsze konto
 
-Otwórz `http://aars.local:8080` z komputera w tej samej sieci lokalnej.
+Otwórz `http://aars.local:8080` (albo `http://{adres IP stacji}:8080`)
+z komputera w tej samej sieci lokalnej.
 Panel przekieruje na kreator `/setup`, w którym zakładasz konto
 administratora (nazwa 3–32 znaki `a-z 0-9 . _ -`, hasło co najmniej
 10 znaków). Kreator działa tylko:
@@ -176,7 +177,9 @@ przychodzi z pętli zwrotnej.
 
 **Reset konta admina.** Gdy ktoś zajął stację pierwszy albo hasło zginęło,
 wyłącz Pi, połóż na partycji boot karty pusty plik `aars-reset-admin`
-i włącz Pi. Przy starcie wszystkie konta admina zostają wyłączone, ich sesje
+i włącz Pi. Przechodzi też `aars-reset-admin.txt` (Notatnik w Windows
+dopisuje `.txt`, a Eksplorator domyślnie je ukrywa), a wielkość liter nie ma
+znaczenia. Przy starcie wszystkie konta admina zostają wyłączone, ich sesje
 zakończone, plik usunięty, a w audycie pojawia się `admin_reset`. Kreator
 `/setup` otwiera się znowu (ta sama nazwa konta dostaje nowe hasło). Konta
 operatorów i obserwatorów zostają.
@@ -197,9 +200,17 @@ sudo systemctl stop aars     # przerywa nadanie, PTT opada od razu
 
 Panel działa po HTTP, bez HTTPS: jest przeznaczony do sieci lokalnej.
 Odpowiada tylko pod adresem IP, `localhost`, nazwą hosta stacji,
-`{nazwa}.local` i nazwą z `server.bind`; obca nazwa (np. domena przepięta
-przez DNS rebinding) dostaje `421`. Inne nazwy, np. z lokalnego DNS, dopisz
-do `server.allowed_hosts` w `/etc/aars/aars.toml`.
+`{nazwa}.local`, `{nazwa}-{N}.local` (tak avahi nazywa drugą stację o tej
+samej nazwie w sieci, np. `aars-2.local`), `{nazwa}.lan`, `{nazwa}.home`,
+`{nazwa}.home.arpa`, `{nazwa}.localdomain` i nazwą z `server.bind`; obca
+nazwa (np. domena przepięta przez DNS rebinding) dostaje `421`. Gdy nazwa
+nie działa, otwórz panel pod adresem IP stacji (np. z listy urządzeń
+routera). Inne nazwy, np. `aars.fritz.box`, dopisz do `server.allowed_hosts`
+w `/etc/aars/aars.toml`.
+
+Obraz słucha na `[::]:8080`: jedno gniazdo przyjmuje IPv6 i IPv4, więc
+kreator działa też z globalnego adresu IPv6 w tej samej sieci `/64`. Gdy
+jądro nie ma IPv6, panel sam słucha na `0.0.0.0:8080`.
 
 ### Aktualizacja z panelu
 
@@ -260,7 +271,10 @@ w obrazie w `/usr/share/doc/aars/THIRD-PARTY.md`, a źródło Pipera
 2. `.github/workflows/release.yml` buduje na `ubuntu-24.04-arm` binarkę,
    obraz (z przypiętymi sumami bazy Raspberry Pi OS, kół Pipera i głosu),
    `aars-os-list.json`, manifest i tworzy **szkic** wydania. CI niczego nie
-   podpisuje.
+   podpisuje. Zadania, które kompilują, mają tylko prawo odczytu i nie
+   zapisują tokenu w `.git/config`; prawo zapisu ma wyłącznie ostatnie
+   zadanie, które nic nie kompiluje, tylko zakłada szkic. Wydanie nie
+   używa cache'u kompilacji.
 3. Na swoim komputerze, z kluczem prywatnym poza GitHubem:
    `scripts/sign-release.sh v0.10.0 [--compare ścieżka/do/aars]`. Skrypt
    pobiera wszystkie pliki szkicu, liczy ich sumy i rozmiary i porównuje
@@ -273,6 +287,16 @@ w obrazie w `/usr/share/doc/aars/THIRD-PARTY.md`, a źródło Pipera
    wydanie. Wymaga `gh`, `minisign` i `jq`. Binarkę buduje CI: bez
    `--compare` podpis potwierdza, że podpisujesz pliki, które widziałeś,
    a nie, że CI zbudowało je z tego źródła.
+
+   Uwaga: budowa nie jest jeszcze powtarzalna. CI używa pływającego
+   `toolchain: stable`, a ścieżki budowy (`/home/runner/…`, rejestr cargo)
+   trafiają do binarki w lokalizacjach panik. `--compare` z innej maszyny
+   prawie zawsze kończy się więc różnicą i odmową, nawet gdy CI zbudowało
+   binarkę uczciwie. Zgodność wymaga tej samej wersji toolchaina i tych
+   samych ścieżek budowy, dopóki `release.yml` nie dostanie
+   `--remap-path-prefix` i przypiętego toolchaina. Dziś `--compare` to
+   sprawdzenie dla opiekuna, który odtworzy środowisko CI, a nie zwykły
+   krok wydania.
 
 Dopóki `keys/aars-release.pub` zawiera `UNSET`, binarka nie ma klucza wydań,
 aktualizacja z panelu jest wyłączona, a `release.yml` buduje tylko wydania

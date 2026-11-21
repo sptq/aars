@@ -160,13 +160,27 @@ fn is_port(port: &str) -> bool {
 }
 
 /// Obrona przed DNS rebinding: obca domena przepięta na adres stacji ma
-/// w `Host` swoją nazwę. Przechodzą tylko literały IP, `localhost` i nazwy
-/// stacji z `AppState::host_names` (nazwa hosta, `{nazwa}.local`, host z
-/// `server.bind`).
+/// w `Host` swoją nazwę. Przechodzą tylko literały IP, `localhost`, nazwy
+/// stacji z `AppState::host_names` (nazwa hosta, `{nazwa}.local` i inne
+/// domeny lokalne, host z `server.bind`, `server.allowed_hosts`) oraz
+/// `{nazwa}-{N}.local`, którą avahi nadaje po kolizji nazw w sieci
+/// (przegląd końcowy M-1). `.local` rozwiązuje tylko mDNS w sieci lokalnej,
+/// więc tej nazwy nie da się podpiąć z publicznego DNS.
 pub fn host_allowed(host: &str, names: &[String]) -> bool {
-    host.parse::<IpAddr>().is_ok()
-        || host == "localhost"
-        || names.iter().any(|n| n.trim_end_matches('.').eq_ignore_ascii_case(host))
+    let named = |host: &str| {
+        names
+            .iter()
+            .any(|n| n.trim_end_matches('.').eq_ignore_ascii_case(host))
+    };
+    host.parse::<IpAddr>().is_ok() || host == "localhost" || named(host) || avahi_renamed(host).is_some_and(|h| named(&h))
+}
+
+/// `aars-2.local` → `aars.local` (avahi: `{nazwa}-{N}`, N to same cyfry).
+fn avahi_renamed(host: &str) -> Option<String> {
+    let label = host.strip_suffix(".local")?;
+    let (base, n) = label.rsplit_once('-')?;
+    let digits = !n.is_empty() && n.len() <= 4 && n.bytes().all(|b| b.is_ascii_digit());
+    (digits && !base.is_empty() && !base.contains('.')).then(|| format!("{base}.local"))
 }
 
 /// `POST` z innej strony: `Sec-Fetch-Site: cross-site` albo `Origin`, który
@@ -386,6 +400,10 @@ mod tests {
             "AARS.local.:8080",
             "aars",
             "localhost:8080",
+            // avahi po kolizji nazw (M-1).
+            "aars-2.local",
+            "AARS-13.local:8080",
+            "[::ffff:192.168.1.10]:8080",
         ] {
             assert!(allowed(ok), "{ok}");
         }
@@ -397,6 +415,13 @@ mod tests {
             "aars.local:80:80",
             "[fe80::1]x",
             "",
+            "aars-.local",
+            "aars-2x.local",
+            "aars-2.lan",
+            "inna-2.local",
+            "evil.aars-2.local",
+            "aars-2.local.evil.example",
+            "aars-12345.local",
         ] {
             assert!(!allowed(bad), "{bad}");
         }
@@ -418,6 +443,23 @@ mod tests {
             let reply = send_with(&app, "GET", "/setup", None, "", &[("host", host)]).await;
             assert_eq!(reply.status, StatusCode::OK, "{host}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_ipv4_client_on_a_dual_stack_socket_passes_both_checks() {
+        // Obraz słucha na `[::]:8080` (przegląd końcowy M-2): klient IPv4
+        // przychodzi jako `::ffff:a.b.c.d`, a `Host` ma literał IPv4 albo
+        // nazwę stacji, także po kolizji w avahi (M-1).
+        let state = wizard_state().await;
+        let app = app_from(&state, "[::ffff:192.168.1.10]:5555");
+        for host in ["192.168.1.2:8080", "aars.local:8080", "aars-2.local:8080", "[::ffff:192.168.1.2]:8080"] {
+            let reply = send_with(&app, "GET", "/setup", None, "", &[("host", host)]).await;
+            assert_eq!(reply.status, StatusCode::OK, "{host}");
+        }
+        // Publiczny IPv4 zmapowany na IPv6 dalej nie jest lokalny.
+        let app = app_from(&state, "[::ffff:8.8.8.8]:5555");
+        let reply = send(&app, "GET", "/setup", None, "").await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

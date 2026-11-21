@@ -14,7 +14,10 @@
 #      dokładnie jedna binarka o właściwej nazwie, dozwolone nazwy i rodzaje,
 #      sumy 64 małe znaki szesnastkowe, limity rozmiarów stacji),
 #   4. z --compare: porównuje SHA-256 binarki `aars` z archiwum wydania
-#      z binarką zbudowaną lokalnie (różnica = odmowa),
+#      z binarką zbudowaną lokalnie (różnica = odmowa); budowa nie jest
+#      jeszcze powtarzalna (pływający toolchain stable, ścieżki /home/runner
+#      w binarce), więc różnica jest spodziewana, dopóki nie odtworzysz
+#      środowiska CI,
 #   5. pokazuje podsumowanie z commitem źródłowym znacznika i czeka, aż
 #      właściciel wpisze numer wersji.
 # Dopiero potem: podpis z komentarzem zaufanym "aars {wersja}", kontrola
@@ -22,7 +25,7 @@
 #
 # Zostaje zaufanie do CI: binarkę i obraz zbudował GitHub Actions. Skrypt
 # dowodzi, że podpisujesz dokładnie te pliki, które widziałeś, i tylko je;
-# niezależną kontrolę binarki daje --compare.
+# niezależną kontrolę binarki da --compare, gdy budowa stanie się powtarzalna.
 #
 # Wymaga: gh, minisign, jq, sha256sum albo shasum, tar.
 # Klucz: zmienna MINISIGN_KEY (domyślnie ~/.minisign/aars.key).

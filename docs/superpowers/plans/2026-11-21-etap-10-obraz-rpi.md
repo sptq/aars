@@ -40,6 +40,17 @@
 - **R17 Wersja produktu** to `version` crate'a `aars`, a znacznik wydania to `v{wersja}`. Workflow wydania sprawdza, czy znacznik zgadza się z `aars --version`. Proponowane pierwsze wydanie: `v0.10.0`, czyli numer etapu (pytanie do właściciela). Wersja widnieje w stopce panelu (każda rola), w `/healthz` (`ok {wersja}`) i w `aars update status`.
 - **R18 Role i audyt.** `/settings/update` oraz `POST /settings/update/check` i `/settings/update/install`: **admin**, z CSRF. Viewer i operator widzą tylko wersję w stopce. `/setup` jest bez logowania, ale tylko gdy nie ma admina, z sieci lokalnej i z CSRF double-submit (R12). Audyt: `update_install` (`{z} → {do}: {użytkownik}`), systemowe (bez użytkownika) `update_installed`, `update_rolled_back`, `update_failed` (z `last-result.json`, raz, przy starcie następnej wersji), `first_admin`, `admin_reset`. Każde ma polską etykietę w `audit_action_label`.
 
+### Odstępstwa w implementacji (zapisane po przeglądzie końcowym)
+
+- **R15 `TimeoutStopSec=660`, a nie 30.** SIGTERM przerywa nadanie przez sekwencer (R10e), więc zwykłe `systemctl stop` trwa sekundy. Limit liczy najgorszy ograniczony przypadek z kodu: najdłuższe nadanie do strażnika TX (600 s + 2 s opóźnienia PTT + 2 s zapasu) i zapas drenażu 30 s. SIGKILL wcześniej zostawiłby stan linii PTT jądru. Pilnuje tego test `the_service_stop_timeout_covers_the_longest_transmission`.
+- **R15 `StateDirectoryMode=0750`** (i `d /var/lib/aars 0750 aars aars -` w tmpfiles). Baza z hashami haseł nie jest czytelna dla innych kont. Bez wpisu tmpfiles założyłby `/var/lib/aars` jako root przed `StateDirectory`.
+- **R14 `bind = "[::]:8080"`, a nie `0.0.0.0:8080`** (przegląd końcowy M-2, decyzja kontrolera). Na Linuksie z `bindv6only = 0` jedno gniazdo przyjmuje IPv6 i IPv4 (`::ffff:a.b.c.d`), więc kreator z globalnego IPv6 (R12, punkt 2 listy ręcznej) działa. Bez IPv6 w jądrze panel sam słucha na `0.0.0.0` tego samego portu.
+- **R14 nazwy w `Host`** (M-1): poza nazwą hosta i `{nazwa}.local` przechodzą `{nazwa}-{N}.local` (avahi po kolizji nazw) oraz `{nazwa}.lan`, `.home`, `.home.arpa`, `.localdomain`.
+- **R13 reset admina** (M-3): przechodzi też `aars-reset-admin.txt`; root dalej tylko `rm -f`.
+- **R8 strażnik po potwierdzonej próbie** (I-1): strażnik z `previous` tylko zamyka próbę, a żądanie instalacji przekazuje (`exec`) strażnikowi z `current`, żeby nowe wydanie sprawdzały klucz i kod bieżącej wersji.
+- **R10 żądanie instalacji** (M-4): `request` ma w drugim wierszu identyfikator pobrania, a pobranie leży w `staging/{wersja}-{id}`. Nieaktualny przebieg usuwa tylko swoje pliki, a żądania innego pobrania nie nadpisuje.
+- **R4/R17 `release.yml`** (M-5): `checkout` bez zapisanego tokenu, bez `rust-cache`, manifest liczy osobne zadanie `manifest` narzędziem zbudowanym w `binary`, a `contents: write` ma tylko `publish`, bez checkoutu i kompilacji.
+
 ## Global Constraints
 
 - Kierunek zależności (spec §3): `aars` → {`aars-web`, `aars-sources`, `aars-audio`, `aars-ptt`} → `aars-core`. `aars-web` nie zależy od `aars-sources`, `aars-audio`, `aars-ptt` ani od kodu aktualizacji. Pobieranie, weryfikacja, instalacja i strażnik żyją w `crates/aars/src/update/`, a w `aars-core::update` są tylko czyste typy (manifest, stan próby, wynik, stan dla panelu). Bez nowego crate'a.
@@ -593,6 +604,6 @@ Ręcznie na Raspberry Pi (nie da się sprawdzić w CI; każdy punkt z wynikiem w
 8. Aktualizacja `rc.1 → rc.2` z panelu w trakcie długiego nadania: nadanie dokończone, usługa wraca w ≤ 2 min na nowej wersji, `/settings/update` pokazuje próbę, a po minucie potwierdzenie.
 9. Wymuszony powrót: wydanie `rc.3` z celowo psującym startem (np. `panic!` po `READY` za flagą kompilacji tylko w tym wydaniu testowym) → po trzech startach usługa działa na `rc.2`, panel pokazuje „Cofnięto”, a dane sprzed aktualizacji są na miejscu.
 10. Odcięcie zasilania w trakcie strażnika (między kopią bazy a przełączeniem): po włączeniu stacja wstaje na jednej z dwóch wersji, nigdy bez `current`.
-11. Reset admina z partycji boot (plik `aars-reset-admin`) otwiera kreator znowu.
+11. Reset admina z partycji boot (plik `aars-reset-admin`, a także `aars-reset-admin.txt` z Notatnika) otwiera kreator znowu.
 
 Uwaga przy wdrożeniu: etap nie dokłada migracji. Istniejące instalacje spoza obrazu (`aars run` z ręki) działają jak dotąd: `setup.first_admin = "console"`, aktualizacja z panelu wyłączona (R11).

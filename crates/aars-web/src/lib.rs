@@ -553,7 +553,8 @@ pub fn router(state: AppState) -> Router {
 
 /// Odpowiedź na żądanie pod obcą nazwą (`421`).
 pub const FOREIGN_HOST: &str = "Panel stacji odpowiada tylko pod nazwą albo adresem stacji. \
-     Inną nazwę dopisz do server.allowed_hosts w aars.toml.";
+     Otwórz go pod adresem IP stacji (np. http://192.168.1.20:8080) albo dopisz tę nazwę \
+     do server.allowed_hosts w aars.toml.";
 
 /// Obrona przed DNS rebinding na całym panelu (przegląd 8–9 M-4): obca
 /// domena przepięta na adres stacji ma w `Host` swoją nazwę, więc nie

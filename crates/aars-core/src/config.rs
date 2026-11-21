@@ -105,7 +105,8 @@ pub struct ServerConfig {
     pub bind: String,
     /// Dodatkowe nazwy, pod którymi panel odpowiada (obrona przed DNS
     /// rebinding). Zawsze przechodzą literały IP, `localhost`, nazwa hosta,
-    /// `{nazwa}.local` i host z `bind`. Tylko w pliku.
+    /// `{nazwa}.local`, `{nazwa}-{N}.local`, `{nazwa}.lan`, `.home`,
+    /// `.home.arpa`, `.localdomain` i host z `bind`. Tylko w pliku.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
 }

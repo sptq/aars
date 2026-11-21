@@ -3,9 +3,13 @@
 # przekazuje prośbę usłudze aars (plik obok bazy) i usuwa plik z partycji.
 # Kont nie wyłącza tu root: robi to aars przy starcie, w trybie kreatora,
 # więc baza nie dostaje plików roota.
+# Notatnik w Windows dopisuje .txt, a Eksplorator je ukrywa (przegląd końcowy
+# M-3), więc przechodzi też aars-reset-admin.txt ("|" to „którykolwiek”).
+# Wielkość liter nie ma znaczenia: vfat porównuje nazwy bez niej.
 [Unit]
 Description=AARS — prośba o reset kont admina z partycji boot
-ConditionPathExists=/boot/firmware/aars-reset-admin
+ConditionPathExists=|/boot/firmware/aars-reset-admin
+ConditionPathExists=|/boot/firmware/aars-reset-admin.txt
 After=local-fs.target systemd-tmpfiles-setup.service
 Before=aars.service
 
@@ -15,7 +19,7 @@ User=aars
 Group=aars
 ExecStart=/usr/bin/touch /var/lib/aars/aars-reset-admin
 # Usunięcie z partycji boot (vfat roota) wymaga roota: tylko ta linia.
-ExecStart=+/usr/bin/rm -f /boot/firmware/aars-reset-admin
+ExecStart=+/usr/bin/rm -f /boot/firmware/aars-reset-admin /boot/firmware/aars-reset-admin.txt
 
 [Install]
 WantedBy=multi-user.target

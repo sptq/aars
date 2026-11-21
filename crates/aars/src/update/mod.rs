@@ -42,8 +42,13 @@ pub fn open_trial(p: &UpdatePaths) -> Option<Trial> {
 /// nie przekaże strażnikowi (przegląd 8–9 I-1): żądanie sprzed startu tego
 /// przebiegu, po restarcie w procesie albo przy końcu procesu innym niż
 /// aktualizacja. Instalacja dzieje się tylko w chwili wybranej przez admina.
+///
+/// Wołają ją tylko miejsca, w których żadne pobranie nie może już należeć do
+/// żywego przebiegu (start przebiegu, koniec procesu), więc czyści cały
+/// `staging/`, także resztki po przerwanych pobraniach.
 pub fn discard_request(p: &paths::UpdatePaths, why: &str) -> bool {
     let request = p.request();
+    let _ = std::fs::remove_dir_all(p.staging());
     if std::fs::symlink_metadata(&request).is_err() {
         return false;
     }
@@ -51,7 +56,28 @@ pub fn discard_request(p: &paths::UpdatePaths, why: &str) -> bool {
         tracing::error!(%err, "nie da się usunąć żądania instalacji");
         return false;
     }
-    let _ = std::fs::remove_dir_all(p.staging());
+    tracing::warn!(reason = why, "żądanie instalacji wycofane — zleć aktualizację jeszcze raz");
+    true
+}
+
+/// Wycofanie przez nieaktualny uchwyt (przegląd końcowy M-4): tylko własny
+/// katalog `staged` i żądanie, gdy jego treść to dokładnie `request` z
+/// identyfikatorem tego pobrania. Żądanie i pobranie nowszego przebiegu
+/// zostają. Zwraca, czy usunęła żądanie.
+pub fn discard_own_request(p: &paths::UpdatePaths, request: &str, staged: &std::path::Path, why: &str) -> bool {
+    let _ = std::fs::remove_dir_all(staged);
+    let ours = matches!(
+        read_small_nofollow(&p.request(), install::SMALL_FILE),
+        Ok(Some(text)) if text == request
+    );
+    if !ours {
+        tracing::warn!(reason = why, "pobranie wycofane; żądanie innego pobrania zostaje");
+        return false;
+    }
+    if let Err(err) = std::fs::remove_file(p.request()) {
+        tracing::error!(%err, "nie da się usunąć żądania instalacji");
+        return false;
+    }
     tracing::warn!(reason = why, "żądanie instalacji wycofane — zleć aktualizację jeszcze raz");
     true
 }
@@ -111,18 +137,26 @@ pub async fn cli(config: &Config, action: UpdateAction) -> Result<()> {
         }
         UpdateAction::Guard => {
             // R8: strażnik nigdy nie blokuje startu — każdy wynik to kod 0.
+            // Po zamknięciu próby instaluje strażnik z `current`, nie ten z
+            // `previous` (przegląd końcowy I-1): `exec`, a w nim już bez
+            // drugiego przekazania.
             let key = verify::TrustedKey::embedded();
-            let actions = guard::run_guard(
+            let handed_over = std::env::var_os(guard::HANDED_OVER_ENV).is_some();
+            let exec = guard::ExecCurrent;
+            let current: Option<&dyn guard::CurrentGuard> =
+                if handed_over { None } else { Some(&exec) };
+            guard::guard_and_hand_over(
                 &p,
                 key.as_ref(),
                 &install::ProcessSmoke,
                 &install::ServiceOwner::default(),
                 chrono::Utc::now(),
+                current,
+                &mut |action| {
+                    tracing::info!("{action}");
+                    println!("{action}");
+                },
             );
-            for action in actions {
-                tracing::info!("{action}");
-                println!("{action}");
-            }
         }
         UpdateAction::Rollback { force } => {
             // R7: kopia i przywrócenie bazy tylko przy zatrzymanej usłudze

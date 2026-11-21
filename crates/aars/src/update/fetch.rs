@@ -44,7 +44,7 @@ pub struct SignedManifest {
     pub signature: Vec<u8>,
 }
 
-/// Pobrane i sprawdzone wydanie w `{state_dir}/staging/{wersja}`.
+/// Pobrane i sprawdzone wydanie w `{state_dir}/staging/{wersja}-{run}`.
 #[derive(Debug, Clone)]
 pub struct Staged {
     /// Sprawdzony manifest wydania; stacja potrzebuje dziś tylko katalogu,
@@ -108,15 +108,19 @@ impl ReleaseClient {
         })
     }
 
-    /// Pobiera archiwum binarki nowszego wydania do `staging/{wersja}`:
+    /// Pobiera archiwum binarki nowszego wydania do `staging/{wersja}-{run}`:
     /// strumieniowo do `.part` z limitem, potem rozmiar i suma, `rename` i
-    /// oba pliki manifestu obok. Poprzednie katalogi `staging/*` znikają;
-    /// przy błędzie znika też nowy, więc w `staging/` nic nie zostaje.
+    /// oba pliki manifestu obok. Katalog należy tylko do tego pobrania
+    /// (przegląd końcowy M-4): cudzych katalogów w `staging/` nie ruszamy,
+    /// bo mogą należeć do pobrania z nowszego przebiegu stacji. Resztki
+    /// usuwa start przebiegu (`discard_request`). Przy błędzie znika nowy
+    /// katalog.
     pub async fn stage(
         &self,
         signed: &SignedManifest,
         current: &str,
         state_dir: &Path,
+        run: &str,
     ) -> Result<Staged, String> {
         let manifest = &signed.manifest;
         if !is_newer(&manifest.version, current)? {
@@ -136,8 +140,10 @@ impl ReleaseClient {
         }
 
         let staging = state_dir.join("staging");
-        clear_dir(&staging).map_err(|e| format!("czyszczenie {}: {e}", staging.display()))?;
-        let dir = staging.join(&manifest.version);
+        let dir = super::install::Request::new(&manifest.version, run).staged_dir(&staging)?;
+        if std::fs::symlink_metadata(&dir).is_ok() {
+            clear_dir(&dir).map_err(|e| format!("czyszczenie {}: {e}", dir.display()))?;
+        }
         std::fs::create_dir_all(&dir).map_err(|e| format!("tworzenie {}: {e}", dir.display()))?;
 
         let result = self.stage_into(signed, &asset.name, &dir).await;
@@ -431,22 +437,26 @@ mod tests {
         let key = TestKey::generate();
         let server = release_server(&key, "0.11.0", ARCHIVE).await;
         let state = tempfile::tempdir().unwrap();
-        // Poprzednia, porzucona próba pobrania.
-        std::fs::create_dir_all(state.path().join("staging/0.10.5")).unwrap();
-        std::fs::write(state.path().join("staging/0.10.5/stary"), b"x").unwrap();
+        // Pobranie innego przebiegu stacji: nie nasze, więc zostaje (M-4).
+        std::fs::create_dir_all(state.path().join("staging/0.11.0-cd34")).unwrap();
+        std::fs::write(state.path().join("staging/0.11.0-cd34/cudzy"), b"x").unwrap();
+        // Resztka naszego katalogu znika przed pobraniem.
+        std::fs::create_dir_all(state.path().join("staging/0.11.0-ab12")).unwrap();
+        std::fs::write(state.path().join("staging/0.11.0-ab12/stary"), b"x").unwrap();
 
         let client = client(&server, &key);
         let signed = client.latest().await.unwrap();
-        let staged = client.stage(&signed, "0.10.0", state.path()).await.unwrap();
+        let staged = client.stage(&signed, "0.10.0", state.path(), "ab12").await.unwrap();
 
-        assert_eq!(staged.dir, state.path().join("staging/0.11.0"));
+        assert_eq!(staged.dir, state.path().join("staging/0.11.0-ab12"));
         assert_eq!(staged.manifest.version, "0.11.0");
         assert_eq!(
             files(&state.path().join("staging")),
             vec![
-                format!("0.11.0/{}", binary_archive_name("0.11.0")),
-                format!("0.11.0/{MANIFEST_NAME}"),
-                format!("0.11.0/{SIGNATURE_NAME}"),
+                format!("0.11.0-ab12/{}", binary_archive_name("0.11.0")),
+                format!("0.11.0-ab12/{MANIFEST_NAME}"),
+                format!("0.11.0-ab12/{SIGNATURE_NAME}"),
+                "0.11.0-cd34/cudzy".to_owned(),
             ]
         );
         let archive = std::fs::read(staged.dir.join(binary_archive_name("0.11.0"))).unwrap();
@@ -484,7 +494,7 @@ mod tests {
         let client = client(&server, &key);
         let signed = client.latest().await.unwrap();
         let err = client
-            .stage(&signed, "0.10.0", state.path())
+            .stage(&signed, "0.10.0", state.path(), "ab12")
             .await
             .unwrap_err();
         assert!(err.contains("suma się nie zgadza"), "{err}");
@@ -538,7 +548,7 @@ mod tests {
             .with_limits(limits);
 
         let err = client
-            .stage(&signed, "0.10.0", state.path())
+            .stage(&signed, "0.10.0", state.path(), "ab12")
             .await
             .unwrap_err();
         assert!(err.contains("za duży"), "{err}");
@@ -570,7 +580,7 @@ mod tests {
         let client = client(&server, &key);
         let signed = client.latest().await.unwrap();
         let err = client
-            .stage(&signed, "0.10.0", state.path())
+            .stage(&signed, "0.10.0", state.path(), "ab12")
             .await
             .unwrap_err();
         assert_eq!(err, "Wersja 0.10.0 nie jest nowsza od działającej.");
