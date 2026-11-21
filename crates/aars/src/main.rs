@@ -259,8 +259,9 @@ async fn main() -> Result<()> {
             // sekwencer opuści PTT (R10e).
             let stop = CancelToken::new();
             let on_signal = stop.clone();
+            let signals = service::StopSignals::register().context("nasłuch SIGINT i SIGTERM")?;
             tokio::spawn(async move {
-                service::wait_for_stop_signal().await;
+                signals.wait().await;
                 tracing::info!("zatrzymuję stację");
                 on_signal.cancel();
             });

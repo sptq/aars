@@ -127,40 +127,54 @@ pub fn watchdog_interval() -> Option<Duration> {
         .map(|d| d / 3)
 }
 
-/// Czeka na SIGINT (Ctrl-C) albo SIGTERM (`systemctl stop`). Oba kończą
-/// stację tą samą drogą: nadanie przerwane, PTT opuszczone przez sekwencer,
+/// Nasłuch SIGINT (Ctrl-C) i SIGTERM (`systemctl stop`). Oba kończą stację
+/// tą samą drogą: nadanie przerwane, PTT opuszczone przez sekwencer,
 /// ograniczony join (R10e).
-pub async fn wait_for_stop_signal() {
+///
+/// Rejestracja jest synchroniczna i idzie w `main`, zanim stacja wstanie
+/// (przegląd 1–4, M-1): sygnał, który przyjdzie wcześniej niż pierwsze
+/// odpytanie zadania, nie zabija już procesu domyślną akcją, a błąd
+/// rejestracji kończy start zamiast cicho zostawić samo Ctrl-C.
+pub struct StopSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    result = tokio::signal::ctrl_c() => {
-                        if let Err(err) = result {
-                            tracing::error!(%err, "oczekiwanie na Ctrl-C zawiodło");
-                            // Bez SIGINT zostaje jeszcze SIGTERM.
-                            term.recv().await;
-                        }
-                    }
-                    _ = term.recv() => {}
-                }
-            }
-            Err(err) => {
-                tracing::error!(%err, "nasłuch SIGTERM zawiódł — zostaje tylko Ctrl-C");
-                if let Err(err) = tokio::signal::ctrl_c().await {
-                    tracing::error!(%err, "oczekiwanie na Ctrl-C zawiodło");
-                    std::future::pending::<()>().await;
-                }
-            }
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl StopSignals {
+    /// Wymaga działającego runtime'u tokio.
+    pub fn register() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt())?,
+                terminate: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
         }
     }
-    #[cfg(not(unix))]
-    {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            tracing::error!(%err, "oczekiwanie na Ctrl-C zawiodło");
-            std::future::pending::<()>().await;
+
+    /// Czeka na pierwszy z sygnałów.
+    pub async fn wait(mut self) {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.interrupt.recv() => {}
+                _ = self.terminate.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &mut self;
+            if let Err(err) = tokio::signal::ctrl_c().await {
+                tracing::error!(%err, "oczekiwanie na Ctrl-C zawiodło");
+                std::future::pending::<()>().await;
+            }
         }
     }
 }
