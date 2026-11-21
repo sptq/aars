@@ -21,14 +21,20 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 croner.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 sd-notify = "0.5"
+reqwest.workspace = true
+minisign-verify = "0.3"
+sha2 = "0.10"
+serde_json.workspace = true
 
 [dev-dependencies]
 aars-core = { path = "../aars-core", features = ["testing"] }
 aars-web = { path = "../aars-web", features = ["testing"] }
 tower.workspace = true
 tempfile = "3"
+minisign = "0.10"
+wiremock.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

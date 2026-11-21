@@ -4,6 +4,7 @@ mod radio;
 mod render;
 mod service;
 mod station;
+mod update;
 
 use anyhow::{Context, Result};
 use clap::Parser;
