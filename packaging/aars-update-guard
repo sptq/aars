@@ -1,0 +1,10 @@
+#!/bin/sh
+# Strażnik startu AARS (ExecStartPre=-+, root). W trakcie próby nowej wersji
+# woła poprzednią, sprawdzoną binarkę; w pozostałych przypadkach bieżącą.
+# AARS_UPDATE_PREFIX służy wyłącznie testom.
+set -u
+P="${AARS_UPDATE_PREFIX:-}"
+if [ -e "$P/var/lib/aars-update/trial.json" ] && [ -x "$P/opt/aars/previous/aars" ]; then
+  exec "$P/opt/aars/previous/aars" update guard "$@"
+fi
+exec "$P/opt/aars/current/aars" update guard "$@"

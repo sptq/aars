@@ -301,6 +301,7 @@ async fn main() -> Result<()> {
                 tracing::info!("restart stacji w procesie");
             }
         }
+        cli::Command::Update { action } => update::cli(&config, action).await?,
         cli::Command::Hardware { action } => {
             use aars_core::hardware::HardwareRepo;
 

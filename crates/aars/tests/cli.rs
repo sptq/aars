@@ -432,3 +432,42 @@ fn sigterm_stops_the_station_like_ctrl_c() {
         "SIGTERM idzie tą samą drogą co Ctrl-C: {seen:#?}"
     );
 }
+
+#[test]
+fn the_version_flag_prints_what_the_smoke_test_expects() {
+    let out = aars().arg("--version").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("aars {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn update_status_and_guard_work_without_an_installation() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        aars()
+            .env("AARS_STORAGE__DB_PATH", dir.path().join("aars.db"))
+            .env("AARS_UPDATE__INSTALL_ROOT", dir.path().join("opt"))
+            .env("AARS_UPDATE__GUARD_DIR", dir.path().join("guard"))
+            .env("AARS_UPDATE__STATE_DIR", dir.path().join("state"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let out = run(&["update", "status"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("poprzednia: brak"), "{stdout}");
+    assert!(stdout.contains("próba:      brak"), "{stdout}");
+
+    // Strażnik zawsze kończy się kodem 0 (R8), nawet bez katalogów.
+    let out = run(&["update", "guard"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("nic do zrobienia"));
+
+    let out = run(&["update", "rollback"]);
+    assert!(!out.status.success(), "powrót bez poprzedniej wersji to błąd");
+}
