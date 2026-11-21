@@ -2,6 +2,7 @@ mod cli;
 mod probe;
 mod radio;
 mod render;
+mod service;
 mod station;
 
 use anyhow::{Context, Result};
@@ -251,25 +252,50 @@ async fn main() -> Result<()> {
             let pool = db::connect(&config.storage.db_path).await.context("otwieranie bazy")?;
             db::migrate(&pool).await.context("nakładanie migracji")?;
 
-            // Jeden `stop` na cały proces: Ctrl-C kończy także stację, która
-            // właśnie czeka na koniec nadania przed restartem.
+            // Jeden `stop` na cały proces: Ctrl-C i SIGTERM (`systemctl stop`)
+            // kończą także stację, która właśnie czeka na koniec nadania
+            // przed restartem. Bez SIGTERM systemd zabiłby proces, zanim
+            // sekwencer opuści PTT (R10e).
             let stop = CancelToken::new();
             let on_signal = stop.clone();
             tokio::spawn(async move {
-                match tokio::signal::ctrl_c().await {
-                    Ok(()) => {
-                        tracing::info!("zatrzymuję stację");
-                        on_signal.cancel();
-                    }
-                    Err(err) => tracing::error!(%err, "oczekiwanie na Ctrl-C zawiodło"),
-                }
+                service::wait_for_stop_signal().await;
+                tracing::info!("zatrzymuję stację");
+                on_signal.cancel();
             });
+
+            if service::under_systemd() {
+                tracing::info!(
+                    version = service::VERSION,
+                    "praca pod systemd — powiadomienia włączone"
+                );
+            }
+            let notifier: Arc<dyn service::Notifier> =
+                Arc::new(service::ReadyOnce::new(service::SystemdNotifier));
+            // Watchdog systemd tyka przez całe życie procesu, także podczas
+            // drenażu przed restartem: wykrywa zatrzymany runtime, nie stan
+            // nadawania (strażnik TX ma własny wątek).
+            if let Some(interval) = service::watchdog_interval() {
+                let notifier = notifier.clone();
+                tokio::spawn(async move {
+                    loop {
+                        notifier.watchdog();
+                        tokio::time::sleep(interval).await;
+                    }
+                });
+            }
 
             let factory: Arc<dyn station::HardwareFactory> = Arc::new(station::RealHardware);
             let probe: Arc<dyn aars_core::hardware::probe::HardwareProbe> = Arc::new(probe::HostProbe);
-            while let station::Exit::Restart =
-                station::run_once(&config, &pool, factory.clone(), probe.clone(), stop.clone())
-                    .await?
+            while let station::Exit::Restart = station::run_once(
+                &config,
+                &pool,
+                factory.clone(),
+                probe.clone(),
+                stop.clone(),
+                notifier.clone(),
+            )
+            .await?
             {
                 tracing::info!("restart stacji w procesie");
             }

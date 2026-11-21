@@ -13,6 +13,8 @@ pub struct Chrome {
     pub csrf: String,
     pub can_operate: bool,
     pub is_admin: bool,
+    /// Wersja produktu w stopce (każda rola, R17).
+    pub version: &'static str,
 }
 
 impl From<&CurrentUser> for Chrome {
@@ -23,6 +25,7 @@ impl From<&CurrentUser> for Chrome {
             csrf: current.csrf_token.clone(),
             can_operate: current.user.role.can(Role::Operator),
             is_admin: current.user.role.can(Role::Admin),
+            version: current.version,
         }
     }
 }

@@ -27,6 +27,7 @@ use aars_web::state::{NO_RADIO, StationControl, TestFuture};
 
 use crate::radio::{self, RadioStack};
 use crate::render;
+use crate::service::{self, Notifier};
 
 /// Skąd stacja bierze sprzęt. Jedyna droga do PTT i karty (D2); testy
 /// podmieniają ją na fałszywkę.
@@ -308,15 +309,22 @@ pub async fn source_start_failed(state: &SourceStateRepo, id: &str, reason: &str
 const CONTROL_POLL: Duration = Duration::from_millis(50);
 
 /// Jeden przebieg stacji: od zbudowania stosu do zatrzymania albo restartu.
+/// `notifier.ready()` idzie w każdym przebiegu po nasłuchu panelu; to, że
+/// systemd dostaje `READY=1` raz na proces, zapewnia `service::ReadyOnce`.
 pub async fn run_once(
     base: &Config,
     pool: &SqlitePool,
     factory: Arc<dyn HardwareFactory>,
     probe: Arc<dyn HardwareProbe>,
     stop: CancelToken,
+    notifier: Arc<dyn Notifier>,
 ) -> Result<Exit> {
-    run_station(base, pool, factory, probe, stop, None).await
+    run_station(base, pool, factory, probe, stop, notifier, None).await
 }
+
+/// Stan dla systemd, gdy stacja działa bez stosu nadawczego (R6).
+const RADIO_LESS_STATUS: &str =
+    "stacja działa bez nadawania — żadna konfiguracja sprzętu nie wstała";
 
 async fn run_station(
     base: &Config,
@@ -324,6 +332,7 @@ async fn run_station(
     factory: Arc<dyn HardwareFactory>,
     probe: Arc<dyn HardwareProbe>,
     stop: CancelToken,
+    notifier: Arc<dyn Notifier>,
     ready: Option<oneshot::Sender<Arc<StationHandle>>>,
 ) -> Result<Exit> {
     let sources = aars_sources::modules();
@@ -351,6 +360,7 @@ async fn run_station(
     }
     let first = cands[0].clone();
     let (built, errors) = build_first(cands, factory.as_ref(), pool).await;
+    let radio_less = built.is_none();
     let (stack, config, origin) = match built {
         Some((stack, cand)) => (Some(stack), cand.config, cand.origin),
         None => {
@@ -540,7 +550,8 @@ async fn run_station(
         .with_station(handle.clone())
         .with_probe(probe)
         .with_modules(registry.clone())
-        .with_base_config(Arc::new(base.clone()));
+        .with_base_config(Arc::new(base.clone()))
+        .with_version(service::VERSION);
     if let Some(marker) = watchdog_marker.clone() {
         state = state.with_watchdog_clear(Arc::new(move || marker.clear_poison()));
     }
@@ -589,6 +600,12 @@ async fn run_station(
         misfire_grace_s = station.misfire_grace_s,
         "stacja uruchomiona, Ctrl-C kończy"
     );
+    // R9: panel nasłuchuje, a stos nadawczy jest zbudowany albo stacja
+    // świadomie przeszła w tryb bez nadawania.
+    notifier.ready();
+    if radio_less {
+        notifier.status(RADIO_LESS_STATUS);
+    }
     if let Some(ready) = ready {
         let _ = ready.send(handle.clone());
     }
@@ -609,6 +626,9 @@ async fn run_station(
         }
         tokio::time::sleep(CONTROL_POLL).await;
     };
+    if matches!(exit, Exit::Stop) {
+        notifier.stopping();
+    }
 
     // Panika dyspozytora zostawia wątek sekwencera bez joina (I-2): wtedy
     // nie wolno otwierać tego samego PTT drugi raz w tym samym procesie.
@@ -625,7 +645,8 @@ async fn run_station(
                     break;
                 }
                 () = tokio::time::sleep(CONTROL_POLL) => {
-                    if stop.is_cancelled() {
+                    if stop.is_cancelled() && !shutdown.is_cancelled() {
+                        notifier.stopping();
                         shutdown.cancel();
                     }
                 }
@@ -721,6 +742,8 @@ mod tests {
     use aars_core::ptt::{FakePtt, PttEvent};
     use aars_core::sink::FakeSink;
     use aars_core::synth::FakeSynth;
+
+    use crate::service::{FakeNotifier, Notifier, ReadyOnce};
 
     struct FakeHardware {
         fail_devices: Vec<String>,
@@ -1018,6 +1041,23 @@ mod tests {
         hardware: Arc<FakeHardware>,
         stop: CancelToken,
     ) -> (tokio::task::JoinHandle<Result<Exit>>, Arc<StationHandle>) {
+        start_with(
+            config,
+            pool,
+            hardware,
+            stop,
+            Arc::new(FakeNotifier::default()),
+        )
+        .await
+    }
+
+    async fn start_with(
+        config: Config,
+        pool: SqlitePool,
+        hardware: Arc<FakeHardware>,
+        stop: CancelToken,
+        notifier: Arc<dyn Notifier>,
+    ) -> (tokio::task::JoinHandle<Result<Exit>>, Arc<StationHandle>) {
         let (ready_tx, ready_rx) = oneshot::channel();
         let probe: Arc<dyn HardwareProbe> = Arc::new(aars_core::hardware::probe::FakeProbe {
             audio: Ok(vec![]),
@@ -1025,7 +1065,16 @@ mod tests {
             gpio: Ok(vec![]),
         });
         let task = tokio::spawn(async move {
-            run_station(&config, &pool, hardware, probe, stop, Some(ready_tx)).await
+            run_station(
+                &config,
+                &pool,
+                hardware,
+                probe,
+                stop,
+                notifier,
+                Some(ready_tx),
+            )
+            .await
         });
         let handle = tokio::time::timeout(Duration::from_secs(10), ready_rx)
             .await
@@ -1547,5 +1596,99 @@ mod tests {
         assert!(matches!(exit, Exit::Stop));
         assert!(!ptt.is_keyed(), "PTT opuszczone przez ograniczony join");
         assert_eq!(get(&pool, "poisoned").await.as_deref(), Some("false"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_is_sent_once_after_the_panel_listens() {
+        let pool = aars_core::db::test_pool().await;
+        let fake = Arc::new(FakeNotifier::default());
+        let notifier: Arc<dyn Notifier> = Arc::new(ReadyOnce::new(fake.clone()));
+        let config = station_config("ready");
+
+        let (task, handle) = start_with(
+            config.clone(),
+            pool.clone(),
+            Arc::new(FakeHardware::new(&[])),
+            CancelToken::new(),
+            notifier.clone(),
+        )
+        .await;
+        // `ready` idzie po nasłuchu panelu i zbudowaniu stosu.
+        assert_eq!(fake.events(), vec!["READY=1".to_owned()]);
+
+        handle.request_restart();
+        let exit = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Restart));
+        assert!(
+            !fake.events().contains(&"STOPPING=1".to_owned()),
+            "restart w procesie to nie zatrzymanie: {:?}",
+            fake.events()
+        );
+
+        let stop = CancelToken::new();
+        let (task, _handle) = start_with(
+            config,
+            pool,
+            Arc::new(FakeHardware::new(&[])),
+            stop.clone(),
+            notifier,
+        )
+        .await;
+        stop.cancel();
+        let exit = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Stop));
+
+        assert_eq!(
+            fake.events(),
+            vec![
+                "READY=1".to_owned(),
+                "STATUS=restart w procesie".to_owned(),
+                "STOPPING=1".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_is_sent_in_radio_less_mode_too() {
+        let pool = aars_core::db::test_pool().await;
+        let fake = Arc::new(FakeNotifier::default());
+        let stop = CancelToken::new();
+        let (task, handle) = start_with(
+            station_config("ready-noradio"),
+            pool,
+            Arc::new(FakeHardware::new(&["default"])),
+            stop.clone(),
+            fake.clone(),
+        )
+        .await;
+        assert_eq!(handle.apply_status().origin, ConfigOrigin::None);
+
+        let events = fake.events();
+        assert_eq!(
+            events.first().map(String::as_str),
+            Some("READY=1"),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.starts_with("STATUS=") && e.contains("bez nadawania")),
+            "{events:?}"
+        );
+
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

@@ -57,6 +57,8 @@ pub struct AppState {
     pub base_config: Arc<Config>,
     /// Budzi źródło danych o podanym id; `None`, gdy panel działa bez źródeł.
     pub source_refresh: Option<SourceRefresh>,
+    /// Wersja produktu do stopki i `/healthz` (R17); ustawia ją binarka.
+    pub version: &'static str,
 }
 
 /// „Odśwież teraz” dla źródła: `true`, gdy źródło o tym id istnieje i zostało
@@ -85,7 +87,13 @@ impl AppState {
             modules: Arc::new(ModuleRegistry::new(aars_core::module::builtin())),
             base_config: Arc::new(Config::default()),
             source_refresh: None,
+            version: "0.0.0",
         }
+    }
+
+    pub fn with_version(mut self, version: &'static str) -> Self {
+        self.version = version;
+        self
     }
 
     pub fn with_watchdog_clear(mut self, clear: WatchdogClear) -> Self {
@@ -146,6 +154,7 @@ impl AppState {
             })),
             base_config: Arc::new(Config::default()),
             source_refresh: None,
+            version: "0.0.0-test",
         }
     }
 }

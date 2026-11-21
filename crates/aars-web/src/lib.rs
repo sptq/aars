@@ -38,6 +38,7 @@ pub use crate::state::AppState;
 #[template(path = "login.html")]
 struct LoginPage {
     error: Option<String>,
+    version: &'static str,
 }
 
 #[derive(Template)]
@@ -148,8 +149,16 @@ struct TxEnabledForm {
     enabled: String,
 }
 
-async fn login_page() -> Response {
-    page(&LoginPage { error: None })
+async fn login_page(State(state): State<AppState>) -> Response {
+    page(&LoginPage {
+        error: None,
+        version: state.version,
+    })
+}
+
+/// `/healthz`: żywy panel i wersja, która go serwuje (R17).
+async fn healthz(State(state): State<AppState>) -> String {
+    format!("ok {}", state.version)
 }
 
 async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
@@ -176,6 +185,7 @@ async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>
                 StatusCode::UNAUTHORIZED,
                 page(&LoginPage {
                     error: Some("Niepoprawna nazwa użytkownika lub hasło.".to_owned()),
+                    version: state.version,
                 }),
             )
                 .into_response()
@@ -505,7 +515,7 @@ pub fn router(state: AppState) -> Router {
         .route("/modules", get(modules_page::page_view))
         .route("/modules/{id}/enabled", post(modules_page::set_enabled))
         .route("/modules/{id}/settings", post(modules_page::save_settings))
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz))
         .route("/assets/{*path}", get(assets::serve))
         .with_state(state)
 }
@@ -615,6 +625,53 @@ pub(crate) mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_the_version() {
+        let app = router(state().await.with_version("0.10.0"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"ok 0.10.0");
+    }
+
+    #[tokio::test]
+    async fn the_footer_shows_the_version_on_login() {
+        let response = router(state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("AARS 0.0.0-test"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn the_footer_shows_the_version_to_every_role() {
+        for role in [Role::Viewer, Role::Operator, Role::Admin] {
+            let (app, cookie, _csrf, _state) = logged_in(role).await;
+            let html = get_body(app, &cookie, "/").await;
+            assert!(html.contains("AARS 0.0.0-test"), "{role:?}: {html}");
+        }
     }
 
     #[tokio::test]
