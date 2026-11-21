@@ -480,6 +480,26 @@ impl UserRepo {
         Ok(id)
     }
 
+    /// Reset z partycji boot (R13): wyłącza wszystkie konta admina i kończy
+    /// ich sesje w jednej transakcji, więc kreator `/setup` otwiera się
+    /// znowu. Konta operatorów i obserwatorów zostają nietknięte. Zwraca
+    /// liczbę wyłączonych kont. Ochrona ostatniego admina z `set_disabled`
+    /// celowo tu nie działa: to jest wyjście awaryjne właściciela.
+    pub async fn disable_all_admins(&self) -> Result<u64, DbError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE role = 'admin')",
+        )
+        .execute(&mut *tx)
+        .await?;
+        let result =
+            sqlx::query("UPDATE users SET disabled = 1 WHERE role = 'admin' AND disabled = 0")
+                .execute(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
+    }
+
     /// Przy pierwszym starcie tworzy konto `admin` z losowym hasłem i zwraca
     /// je, żeby binarka mogła je wypisać na konsolę. Gdy jakikolwiek
     /// użytkownik już istnieje, nie robi nic.
@@ -526,6 +546,28 @@ mod tests {
         let again = repo.create_first_admin("drugi", "dlugie-haslo-2").await;
         assert!(matches!(again, Err(FirstAdminError::AlreadyExists)), "{again:?}");
         assert!(repo.authenticate("drugi", "dlugie-haslo-2").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn disabling_all_admins_ends_their_sessions_and_spares_operators() {
+        let repo = UserRepo::new(test_pool().await);
+        let admin = repo.create_first_admin("szef", "dlugie-haslo-1").await.unwrap();
+        let operator = repo.create("op", "dlugie-haslo-2", Role::Operator).await.unwrap();
+        let admin_session = repo.start_session(admin, None).await.unwrap().id;
+        let operator_session = repo.start_session(operator, None).await.unwrap().id;
+
+        assert_eq!(repo.disable_all_admins().await.unwrap(), 1);
+        assert!(!repo.has_enabled_admin().await.unwrap());
+        assert!(repo.by_id(admin).await.unwrap().unwrap().disabled);
+        assert!(repo.session_user(&admin_session).await.unwrap().is_none());
+        assert!(!repo.by_id(operator).await.unwrap().unwrap().disabled);
+        assert!(repo.session_user(&operator_session).await.unwrap().is_some());
+
+        // Kreator przyjmuje tę samą nazwę z nowym hasłem.
+        repo.create_first_admin("szef", "nowe-haslo-123").await.unwrap();
+        assert!(repo.authenticate("szef", "nowe-haslo-123").await.is_ok());
+        assert_eq!(repo.disable_all_admins().await.unwrap(), 1);
+        assert_eq!(repo.disable_all_admins().await.unwrap(), 0);
     }
 
     #[tokio::test]

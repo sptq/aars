@@ -3,6 +3,7 @@ mod probe;
 mod radio;
 mod render;
 mod service;
+mod setup;
 mod station;
 mod update;
 
@@ -252,6 +253,25 @@ async fn main() -> Result<()> {
 
             let pool = db::connect(&config.storage.db_path).await.context("otwieranie bazy")?;
             db::migrate(&pool).await.context("nakładanie migracji")?;
+
+            // R13: reset kont admina plikiem z partycji boot. Tylko w trybie
+            // kreatora — przy haśle z konsoli nikt nie założyłby nowego admina.
+            let reset_flag = setup::reset_flag_path(&config.storage.db_path);
+            if config.setup.first_admin == aars_core::config::FirstAdmin::Wizard {
+                match setup::reset_admins(&reset_flag, &pool).await {
+                    Ok(Some(n)) => tracing::warn!(
+                        disabled = n,
+                        "reset kont admina z partycji boot — załóż konto w kreatorze /setup"
+                    ),
+                    Ok(None) => {}
+                    Err(err) => tracing::error!("reset kont admina nie powiódł się: {err}"),
+                }
+            } else if reset_flag.exists() {
+                tracing::warn!(
+                    flag = %reset_flag.display(),
+                    "prośba o reset admina pominięta: działa tylko z setup.first_admin = \"wizard\""
+                );
+            }
 
             // Jeden `stop` na cały proces: Ctrl-C i SIGTERM (`systemctl stop`)
             // kończą także stację, która właśnie czeka na koniec nadania
