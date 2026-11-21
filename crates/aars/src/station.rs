@@ -28,6 +28,7 @@ use aars_web::state::{NO_RADIO, StationControl, TestFuture};
 use crate::radio::{self, RadioStack};
 use crate::render;
 use crate::service::{self, Notifier};
+use crate::update::health::HealthCell;
 
 /// Skąd stacja bierze sprzęt. Jedyna droga do PTT i karty (D2); testy
 /// podmieniają ją na fałszywkę.
@@ -239,6 +240,9 @@ pub fn hardware_show_lines(
 
 pub enum Exit {
     Restart,
+    /// Koniec procesu po bieżącym nadaniu: aktualizację zainstaluje strażnik
+    /// przy następnym starcie (etap 10, R10a).
+    Update,
     Stop,
 }
 
@@ -246,10 +250,20 @@ pub enum Exit {
 pub struct StationHandle {
     control: Option<DispatcherControl>,
     restart: CancelToken,
+    update: CancelToken,
     status: ApplyStatus,
     hardware: Option<HardwareSettings>,
     station: StationSettings,
     tx_tail: Duration,
+}
+
+impl crate::update::control::UpdateTarget for StationHandle {
+    /// Prośba o zakończenie procesu po bieżącym nadaniu (R10a): ta sama
+    /// droga co restart, ale `run_once` zwraca `Exit::Update`.
+    fn request_update(&self) {
+        tracing::info!("zlecono aktualizację — stacja skończy po bieżącym nadaniu");
+        self.update.cancel();
+    }
 }
 
 /// Najkrótsze oczekiwanie panelu na test PTT: przy krótszym radio mogłoby
@@ -318,14 +332,26 @@ pub async fn run_once(
     probe: Arc<dyn HardwareProbe>,
     stop: CancelToken,
     notifier: Arc<dyn Notifier>,
+    health: Arc<HealthCell>,
 ) -> Result<Exit> {
-    run_station(base, pool, factory, probe, stop, notifier, None).await
+    run_station(base, pool, factory, probe, stop, notifier, health, None).await
 }
+
+/// Zapas drenażu ponad limit strażnika TX: zamknięcie strumienia, join
+/// wątku sekwencera i zapis wyniku. W testach krótszy, żeby test
+/// zawieszonego drenażu nie trwał pół minuty.
+#[cfg(not(test))]
+const DRAIN_MARGIN: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const DRAIN_MARGIN: Duration = Duration::from_secs(2);
 
 /// Stan dla systemd, gdy stacja działa bez stosu nadawczego (R6).
 const RADIO_LESS_STATUS: &str =
     "stacja działa bez nadawania — żadna konfiguracja sprzętu nie wstała";
 
+// Argumenty to niezależne zależności przebiegu (sprzęt, sonda, sygnały,
+// systemd, zdrowie, uchwyt dla testów); struktura dla nich nic by nie dała.
+#[allow(clippy::too_many_arguments)]
 async fn run_station(
     base: &Config,
     pool: &SqlitePool,
@@ -333,8 +359,10 @@ async fn run_station(
     probe: Arc<dyn HardwareProbe>,
     stop: CancelToken,
     notifier: Arc<dyn Notifier>,
+    health: Arc<HealthCell>,
     ready: Option<oneshot::Sender<Arc<StationHandle>>>,
 ) -> Result<Exit> {
+    health.set_dispatcher_alive(false);
     let sources = aars_sources::modules();
     let mut descriptors = aars_core::module::builtin();
     descriptors.extend(sources.iter().map(|m| m.descriptor));
@@ -361,6 +389,7 @@ async fn run_station(
     let first = cands[0].clone();
     let (built, errors) = build_first(cands, factory.as_ref(), pool).await;
     let radio_less = built.is_none();
+    health.set_radio(!radio_less, join_errors(&errors));
     let (stack, config, origin) = match built {
         Some((stack, cand)) => (Some(stack), cand.config, cand.origin),
         None => {
@@ -437,6 +466,7 @@ async fn run_station(
     let shutdown = CancelToken::new();
     let drain = CancelToken::new();
     let restart = CancelToken::new();
+    let update = CancelToken::new();
 
     let users = aars_core::user::UserRepo::new(pool.clone());
     if let Some(password) = users
@@ -481,12 +511,16 @@ async fn run_station(
     let mut poison_task = None;
     let mut watchdog = None;
     let mut watchdog_marker = None;
+    // Bez stosu nie ma nadań, więc i drenażu; wartość tylko dla porządku.
+    let mut drain_limit = Duration::ZERO;
     if let Some(RadioStack {
         sequencer,
         watchdog: wd,
         interlocks: locks,
+        watchdog_limit,
     }) = stack
     {
+        drain_limit = watchdog_limit + DRAIN_MARGIN;
         let renderer = Arc::new(render::PiperRenderer::new(
             cache.clone(),
             synth.clone(),
@@ -530,6 +564,7 @@ async fn run_station(
     let handle = Arc::new(StationHandle {
         control,
         restart: restart.clone(),
+        update: update.clone(),
         status: status.clone(),
         hardware,
         station: station.clone(),
@@ -603,6 +638,7 @@ async fn run_station(
     // R9: panel nasłuchuje, a stos nadawczy jest zbudowany albo stacja
     // świadomie przeszła w tryb bez nadawania.
     notifier.ready();
+    health.mark_ready();
     if radio_less {
         notifier.status(RADIO_LESS_STATUS);
     }
@@ -624,24 +660,45 @@ async fn run_station(
         if restart.is_cancelled() {
             break Exit::Restart;
         }
+        if update.is_cancelled() {
+            break Exit::Update;
+        }
+        // R9: dyspozytor pracuje, gdy jego pętla tyka. W trakcie nadania nie
+        // tyka, ale nadanie trwa najwyżej do limitu strażnika.
+        let alive = match (&dispatcher_task, &handle.control) {
+            (Some(task), Some(control)) => {
+                !task.is_finished() && control.since_beat() <= drain_limit
+            }
+            _ => true,
+        };
+        health.set_dispatcher_alive(alive);
         tokio::time::sleep(CONTROL_POLL).await;
     };
+    health.set_dispatcher_alive(false);
     if matches!(exit, Exit::Stop) {
         notifier.stopping();
     }
 
     // Panika dyspozytora zostawia wątek sekwencera bez joina (I-2): wtedy
     // nie wolno otwierać tego samego PTT drugi raz w tym samym procesie.
-    if let (Exit::Restart, Some(task)) = (&exit, dispatcher_task.as_mut()) {
+    if let (Exit::Restart | Exit::Update, Some(task)) = (&exit, dispatcher_task.as_mut()) {
         // R4: dyspozytor nie bierze nic nowego, dokańcza nadanie i robi join
         // wątku sekwencera. Strażnik i most działają dalej. Ctrl-C w tym
         // czasie przerywa nadanie jak zwykle.
         tracing::info!("restart: czekam na koniec bieżącego nadania");
         drain.cancel();
+        // Drenaż ma limit (przegląd 1–4, I-1): po limicie strażnika TX i
+        // zapasie wątek sekwencera wisi (np. zawieszona karta). Watchdog
+        // systemd i tak tyka, więc bez limitu stacja milczałaby bez końca.
+        // Kończymy proces błędem; jądro zwolni PTT i kartę, a
+        // `Restart=always` podniesie go na czysto.
+        let give_up = tokio::time::Instant::now() + drain_limit;
+        let mut joined_cleanly = false;
         loop {
             tokio::select! {
                 joined = &mut *task => {
                     dispatcher_failed = joined.is_err();
+                    joined_cleanly = true;
                     break;
                 }
                 () = tokio::time::sleep(CONTROL_POLL) => {
@@ -649,10 +706,20 @@ async fn run_station(
                         notifier.stopping();
                         shutdown.cancel();
                     }
+                    if !stop.is_cancelled() && tokio::time::Instant::now() >= give_up {
+                        tracing::error!(
+                            limit_s = drain_limit.as_secs(),
+                            "nadanie nie skończyło się w limicie drenażu — kończę proces błędem"
+                        );
+                        dispatcher_failed = true;
+                        break;
+                    }
                 }
             }
         }
-        dispatcher_task = None;
+        if joined_cleanly {
+            dispatcher_task = None;
+        }
         // Po zwykłym drenażu wątek sekwencera jest dołączony i znacznik czysty.
         // Znacznik w górze bez Ctrl-C znaczy, że joina nie było (np. nie
         // wystartował wątek `aars-seq-join`): stary wątek trzyma jeszcze PTT
@@ -744,6 +811,7 @@ mod tests {
     use aars_core::synth::FakeSynth;
 
     use crate::service::{FakeNotifier, Notifier, ReadyOnce};
+    use crate::update::control::UpdateTarget;
 
     struct FakeHardware {
         fail_devices: Vec<String>,
@@ -1058,6 +1126,25 @@ mod tests {
         stop: CancelToken,
         notifier: Arc<dyn Notifier>,
     ) -> (tokio::task::JoinHandle<Result<Exit>>, Arc<StationHandle>) {
+        start_full(
+            config,
+            pool,
+            hardware,
+            stop,
+            notifier,
+            Arc::new(HealthCell::default()),
+        )
+        .await
+    }
+
+    async fn start_full(
+        config: Config,
+        pool: SqlitePool,
+        hardware: Arc<FakeHardware>,
+        stop: CancelToken,
+        notifier: Arc<dyn Notifier>,
+        health: Arc<HealthCell>,
+    ) -> (tokio::task::JoinHandle<Result<Exit>>, Arc<StationHandle>) {
         let (ready_tx, ready_rx) = oneshot::channel();
         let probe: Arc<dyn HardwareProbe> = Arc::new(aars_core::hardware::probe::FakeProbe {
             audio: Ok(vec![]),
@@ -1072,6 +1159,7 @@ mod tests {
                 probe,
                 stop,
                 notifier,
+                health,
                 Some(ready_tx),
             )
             .await
@@ -1152,6 +1240,142 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(result, "ok", "restart nie może przerwać nadania");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_requested_mid_transmission_waits_for_the_unkey() {
+        let pool = aars_core::db::test_pool().await;
+        let queue = QueueRepo::new(pool.clone());
+        let mut ids = Vec::new();
+        for text in [
+            "komunikat testowy trwa sekundy",
+            "drugi komunikat w kolejce",
+        ] {
+            ids.extend(
+                queue
+                    .enqueue(aars_core::queue::EnqueueRequest {
+                        message_id: None,
+                        // FakeSynth: 50 ms na znak, ~1,5 s audio.
+                        rendered_text: text.to_owned(),
+                        priority: Priority::Normal,
+                        interrupting: false,
+                        not_before: None,
+                        expires_at: None,
+                        repeat_count: 1,
+                        repeat_interval: Duration::ZERO,
+                        created_by: None,
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        let hardware = Arc::new(FakeHardware::new(&[]));
+        let ptt = hardware.ptt.clone();
+        let health = Arc::new(HealthCell::default());
+        let (task, handle) = start_full(
+            station_config("update"),
+            pool.clone(),
+            hardware,
+            CancelToken::new(),
+            Arc::new(FakeNotifier::default()),
+            health.clone(),
+        )
+        .await;
+        assert!(health.radio_up());
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ptt.is_keyed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("zadanie musi wejść na antenę");
+        assert!(health.dispatcher_alive());
+        handle.request_update();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !task.is_finished() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "aktualizacja musi zakończyć przebieg"
+            );
+            assert!(
+                ptt.is_keyed() || !task.is_finished(),
+                "przebieg nie kończy się przy wciśniętym PTT"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!ptt.is_keyed(), "run_once wraca dopiero po opuszczeniu PTT");
+        let exit = task.await.unwrap().unwrap();
+        assert!(matches!(exit, Exit::Update));
+        assert!(
+            !health.dispatcher_alive(),
+            "po drenażu dyspozytor nie pracuje"
+        );
+
+        let transitions: Vec<PttEvent> = ptt
+            .events()
+            .into_iter()
+            .filter(|e| *e != PttEvent::ForceUnkey)
+            .collect();
+        assert_eq!(
+            transitions,
+            vec![PttEvent::Key, PttEvent::Unkey],
+            "{:?}",
+            ptt.events()
+        );
+        let result: String =
+            sqlx::query_scalar("SELECT result FROM tx_log WHERE queue_item_id = ?")
+                .bind(ids[0])
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(result, "ok", "aktualizacja nie może przerwać nadania");
+        let second: String = sqlx::query_scalar("SELECT state FROM queue_items WHERE id = ?")
+            .bind(ids[1])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(second, "pending", "drugie zadanie czeka na nową wersję");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drain_stuck_on_a_hung_output_ends_the_process_with_an_error() {
+        let pool = aars_core::db::test_pool().await;
+        // Strażnik: 1 s + 0 ogona + 2 s zapasu; drenaż: to plus zapas testowy.
+        put(&pool, "tx_max_duration_s", "1").await;
+        enqueue_one(&pool, "komunikat na zawieszoną kartę").await;
+        let hardware = Arc::new(FakeHardware::new(&[]));
+        let ptt = hardware.ptt.clone();
+        *hardware.sink.lock().unwrap() = Some(Arc::new(HangsLong));
+        let mut config = station_config("hung-drain");
+        config.ptt.tx_tail_ms = 0;
+        let (task, handle) = start(config, pool.clone(), hardware, CancelToken::new()).await;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ptt.is_keyed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("zadanie musi wejść na antenę");
+        let requested = std::time::Instant::now();
+        handle.request_restart();
+
+        // Limit drenażu (3 s + 2 s) i ograniczony join po zatrzymaniu (5 s).
+        let result = tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .expect("drenaż nie może czekać bez końca")
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "zawieszony drenaż to błąd procesu, nie restart"
+        );
+        assert!(
+            requested.elapsed() >= Duration::from_secs(4),
+            "najpierw czekamy na limit"
+        );
+        assert!(!ptt.is_keyed(), "PTT opuszczone");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

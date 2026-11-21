@@ -6,8 +6,10 @@
 // Do czasu, aż stacja i strażnik zaczną tego używać (zadania 6–7).
 #![allow(dead_code)]
 
+pub mod control;
 pub mod fetch;
 pub mod guard;
+pub mod health;
 pub mod install;
 pub mod paths;
 pub mod verify;
@@ -229,5 +231,44 @@ pub mod testkit {
             ],
         }))
         .unwrap()
+    }
+
+    /// Fałszywy serwer wydań na 127.0.0.1 z wydaniem `version` podpisanym
+    /// kluczem `key` pod `/latest/download/` i `/download/v…/`.
+    pub async fn release_server(
+        key: &TestKey,
+        version: &str,
+        archive: &[u8],
+    ) -> wiremock::MockServer {
+        use aars_core::update::{MANIFEST_NAME, SIGNATURE_NAME};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let manifest = manifest_for(version, archive);
+        let sig = key.sign(&manifest, &format!("aars {version}"));
+        Mock::given(method("GET"))
+            .and(path(format!("/latest/download/{MANIFEST_NAME}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(manifest))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/latest/download/{SIGNATURE_NAME}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(sig))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/download/v{version}/{}",
+                binary_archive_name(version)
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(archive.to_vec())
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+        server
     }
 }

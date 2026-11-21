@@ -12,6 +12,7 @@ use aars_core::interlock::InMemoryInterlocks;
 use aars_core::module::ModuleRegistry;
 use aars_core::queue::QueueRepo;
 use aars_core::settings::StationSettings;
+use aars_core::update::{Available, UpdateRefusal, UpdateStatus};
 use sqlx::SqlitePool;
 
 pub type TestFuture<'a> = Pin<Box<dyn Future<Output = TestOutcome> + Send + 'a>>;
@@ -31,6 +32,20 @@ pub trait StationControl: Send + Sync {
     fn request_restart(&self);
     /// Bez stosu nadawczego: `TestOutcome::Unsupported(NO_RADIO)`.
     fn run_test(&self, test: StationTest) -> TestFuture<'_>;
+}
+
+pub type UpdateFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Aktualizacja z panelu (etap 10, R10, R11, R18). Pobieranie, weryfikacja
+/// i instalacja żyją w binarce; panel zna tylko ten trait i czyste typy z
+/// `aars_core::update`, więc nie zależy od kodu aktualizacji.
+pub trait UpdateControl: Send + Sync {
+    fn status(&self) -> UpdateStatus;
+    /// Najnowsze wydanie; `None` = brak nowszego od działającego.
+    fn check(&self) -> UpdateFuture<'_, Result<Option<Available>, UpdateRefusal>>;
+    /// Pobiera i sprawdza wydanie `version`, potem prosi stację o
+    /// zakończenie po bieżącym nadaniu; instaluje strażnik przy starcie.
+    fn install(&self, version: &str, by: &str) -> UpdateFuture<'_, Result<(), UpdateRefusal>>;
 }
 
 /// Wszystko, czego panel potrzebuje od rdzenia. Panel nie trzyma uchwytu do

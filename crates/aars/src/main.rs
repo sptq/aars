@@ -288,17 +288,51 @@ async fn main() -> Result<()> {
 
             let factory: Arc<dyn station::HardwareFactory> = Arc::new(station::RealHardware);
             let probe: Arc<dyn aars_core::hardware::probe::HardwareProbe> = Arc::new(probe::HostProbe);
-            while let station::Exit::Restart = station::run_once(
-                &config,
-                &pool,
-                factory.clone(),
-                probe.clone(),
+            // Wynik instalacji albo powrotu z poprzedniego startu idzie do
+            // audytu raz, zanim stacja wstanie (R18).
+            let update_paths = update::paths::UpdatePaths::from_config(&config);
+            if let Some(last) = update::health::audit_last_result(&update_paths, &pool).await {
+                tracing::info!(
+                    action = last.audit_action(),
+                    version = %last.version,
+                    "wynik aktualizacji zapisany w audycie"
+                );
+            }
+            let health = Arc::new(update::health::HealthCell::default());
+            // R9: po 60 s od gotowości próba nowej wersji dostaje
+            // potwierdzenie albo werdykt.
+            tokio::spawn(update::health::confirm_task(
+                update_paths,
+                health.clone(),
+                service::VERSION.to_owned(),
                 stop.clone(),
-                notifier.clone(),
-            )
-            .await?
-            {
-                tracing::info!("restart stacji w procesie");
+            ));
+
+            loop {
+                match station::run_once(
+                    &config,
+                    &pool,
+                    factory.clone(),
+                    probe.clone(),
+                    stop.clone(),
+                    notifier.clone(),
+                    health.clone(),
+                )
+                .await?
+                {
+                    station::Exit::Restart => tracing::info!("restart stacji w procesie"),
+                    station::Exit::Update => {
+                        notifier.stopping();
+                        tracing::info!(
+                            "kończę proces — aktualizację zainstaluje strażnik przy starcie"
+                        );
+                        break;
+                    }
+                    station::Exit::Stop => break,
+                }
+            }
+            if let Some(reason) = health.fatal() {
+                anyhow::bail!("nowa wersja niezdrowa, strażnik wróci do poprzedniej: {reason}");
             }
         }
         cli::Command::Update { action } => update::cli(&config, action).await?,
