@@ -89,6 +89,11 @@ pub struct AppState {
     /// włącza; testy bez nagłówka `Host` działają bez niej. `/setup`
     /// sprawdza `Host` zawsze.
     pub check_hosts: bool,
+    /// Cały panel tylko dla klientów z sieci lokalnej (przegląd N-1), ta
+    /// sama reguła co kreator (`is_local_client` z `local_nets`). Stacja
+    /// włącza ją, gdy `server.allow_remote = false` (domyślnie); testy bez
+    /// `ConnectInfo` działają bez niej. `/setup` sprawdza adres zawsze.
+    pub lan_only: bool,
 }
 
 /// „Odśwież teraz” dla źródła: `true`, gdy źródło o tym id istnieje i zostało
@@ -123,6 +128,7 @@ impl AppState {
             local_nets: Arc::new(Vec::new()),
             host_names: Arc::new(Vec::new()),
             check_hosts: false,
+            lan_only: false,
         }
     }
 
@@ -144,6 +150,12 @@ impl AppState {
     /// Panel odpowiada tylko pod nazwami z `host_names` i literałami IP.
     pub fn with_host_check(mut self, on: bool) -> Self {
         self.check_hosts = on;
+        self
+    }
+
+    /// Panel odpowiada tylko klientom z sieci lokalnej; reszta dostaje `403`.
+    pub fn with_lan_only(mut self, on: bool) -> Self {
+        self.lan_only = on;
         self
     }
 
@@ -221,6 +233,7 @@ impl AppState {
             local_nets: Arc::new(Vec::new()),
             host_names: Arc::new(Vec::new()),
             check_hosts: false,
+            lan_only: false,
         }
     }
 }

@@ -141,10 +141,9 @@ pub async fn cli(config: &Config, action: UpdateAction) -> Result<()> {
             // `previous` (przegląd końcowy I-1): `exec`, a w nim już bez
             // drugiego przekazania.
             let key = verify::TrustedKey::embedded();
-            let handed_over = std::env::var_os(guard::HANDED_OVER_ENV).is_some();
+            let handed_over = std::env::var_os(guard::HANDED_OVER_ENV);
             let exec = guard::ExecCurrent;
-            let current: Option<&dyn guard::CurrentGuard> =
-                if handed_over { None } else { Some(&exec) };
+            let current = guard::current_guard(handed_over.as_deref(), &exec);
             guard::guard_and_hand_over(
                 &p,
                 key.as_ref(),

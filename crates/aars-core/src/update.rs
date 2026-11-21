@@ -217,7 +217,7 @@ pub enum UpdateRefusal {
     TrialRunning(String),
     #[error("Wersja {0} nie jest nowsza od działającej.")]
     NotNewer(String),
-    #[error("Aktualizacja już trwa.")]
+    #[error("Inna aktualizacja jest właśnie zlecana — spróbuj ponownie za chwilę.")]
     InProgress,
     #[error("{0}")]
     Failed(String),

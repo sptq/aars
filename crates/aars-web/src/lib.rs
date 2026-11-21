@@ -548,7 +548,59 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/assets/{*path}", get(assets::serve))
         .layer(axum::middleware::from_fn_with_state(state.clone(), host_check))
+        // Zewnętrzna warstwa: adres klienta przed `Host` i przed trasami.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), client_check))
         .with_state(state)
+}
+
+/// Odpowiedź dla klienta spoza sieci lokalnej (`403`, przegląd N-1).
+pub const NOT_LOCAL_PAGE: &str = "<!doctype html>
+<html lang=\"pl\"><head><meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>AARS: dostęp tylko z sieci lokalnej</title></head>
+<body style=\"font-family: sans-serif; max-width: 40em; margin: 2em auto; padding: 0 1em; line-height: 1.5\">
+<h1>Dostęp tylko z sieci lokalnej</h1>
+<p>Panel stacji odpowiada wyłącznie urządzeniom z sieci lokalnej stacji
+(adresy prywatne IPv4, link-local, ULA i ta sama sieć <code>/64</code> IPv6).
+Twój adres jest spoza tej sieci.</p>
+<p>Zdalny dostęp włącza administrator stacji: w pliku
+<code>/etc/aars/aars.toml</code> w sekcji <code>[server]</code> ustawia
+<code>allow_remote = true</code> i restartuje usługę
+(<code>sudo systemctl restart aars</code>).</p>
+<p><strong>Uwaga:</strong> panel działa po zwykłym HTTP, bez szyfrowania.
+Hasła i sesja idą jawnym tekstem, a konta operatora i administratora
+kluczują nadajnik. Nie wystawiaj panelu do internetu (przekierowanie portu,
+otwarty IPv6). Do zdalnej pracy użyj VPN do sieci stacji, np. WireGuard,
+wtedy <code>allow_remote</code> zwykle nie jest potrzebne.</p>
+</body></html>
+";
+
+/// Cały panel tylko dla sieci lokalnej (przegląd N-1): ta sama reguła co
+/// kreator `/setup`. Bez adresu klienta (serwer bez `ConnectInfo`) odmowa,
+/// a nie zgadywanie. `/healthz` też podlega kontroli; pętla zwrotna jest
+/// lokalna, więc nadzór na samej stacji działa.
+async fn client_check(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !state.lan_only {
+        return next.run(request).await;
+    }
+    match setup_page::client_ip(request.extensions()) {
+        Some(ip) if aars_core::netlocal::is_local_client(ip, &state.local_nets) => {
+            next.run(request).await
+        }
+        other => {
+            tracing::warn!(client = ?other, path = %request.uri().path(), "klient spoza sieci lokalnej — odmowa");
+            (
+                StatusCode::FORBIDDEN,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                NOT_LOCAL_PAGE,
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Odpowiedź na żądanie pod obcą nazwą (`421`).

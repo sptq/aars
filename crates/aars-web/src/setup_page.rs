@@ -61,7 +61,9 @@ pub struct SetupForm {
 
 /// Adres klienta z `ConnectInfo` (stacja) albo `MockConnectInfo` (testy).
 /// Brak obu znaczy, że serwer nie podaje adresów — wtedy kreator odmawia.
-fn client_ip(extensions: &Extensions) -> Option<IpAddr> {
+/// Adres jest kanoniczny: klient IPv4 na gnieździe `[::]` to `a.b.c.d`, a
+/// nie `::ffff:a.b.c.d` (audyt, logi, przegląd N-3).
+pub(crate) fn client_ip(extensions: &Extensions) -> Option<IpAddr> {
     extensions
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip())
@@ -70,6 +72,7 @@ fn client_ip(extensions: &Extensions) -> Option<IpAddr> {
                 .get::<MockConnectInfo<SocketAddr>>()
                 .map(|m| m.0.ip())
         })
+        .map(|ip| ip.to_canonical())
 }
 
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -460,6 +463,98 @@ mod tests {
         let app = app_from(&state, "[::ffff:8.8.8.8]:5555");
         let reply = send(&app, "GET", "/setup", None, "").await;
         assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    }
+
+    /// Panel z kontrolą sieci lokalnej (N-1), konto operatora `op`.
+    async fn lan_only_state(on: bool) -> AppState {
+        let state = crate::tests::state()
+            .await
+            .with_lan_only(on)
+            .with_local_nets(vec![LocalNet {
+                addr: "2a01:110::1".parse().unwrap(),
+                prefix: 64,
+            }]);
+        UserRepo::new(state.pool.clone())
+            .create("op", "dlugie-haslo", Role::Operator)
+            .await
+            .unwrap();
+        state
+    }
+
+    const LOGIN: &str = "username=op&password=dlugie-haslo";
+
+    #[tokio::test]
+    async fn the_whole_panel_refuses_clients_outside_the_local_network() {
+        let state = lan_only_state(true).await;
+        for client in ["[2a01:111::5]:5555", "8.8.8.8:5555", "[::ffff:8.8.8.8]:5555", "100.64.0.1:5555"] {
+            let app = app_from(&state, client);
+            for (method, uri, body) in [("GET", "/login", ""), ("POST", "/login", LOGIN), ("GET", "/healthz", ""), ("GET", "/", "")] {
+                let reply = send(&app, method, uri, None, body).await;
+                assert_eq!(reply.status, StatusCode::FORBIDDEN, "{client} {method} {uri}");
+                assert!(reply.body.contains("allow_remote = true"), "{}", reply.body);
+                assert!(reply.body.contains("VPN"), "{}", reply.body);
+                assert!(reply.cookies.is_empty(), "{client}: bez sesji");
+            }
+        }
+        // Bez adresu klienta: odmowa, nie zgadywanie.
+        let reply = send(&router(state.clone()), "GET", "/healthz", None, "").await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn local_clients_reach_the_whole_panel() {
+        let state = lan_only_state(true).await;
+        for client in [
+            "192.168.1.10:5555",
+            "10.0.0.7:5555",
+            "[::ffff:192.168.1.10]:5555",
+            "[2a01:110::5]:5555",
+            "[fe80::5]:5555",
+            "[fd00::5]:5555",
+            "127.0.0.1:5555",
+            "[::1]:5555",
+        ] {
+            let app = app_from(&state, client);
+            let reply = send(&app, "GET", "/healthz", None, "").await;
+            assert_eq!(reply.status, StatusCode::OK, "{client}");
+            assert_eq!(send(&app, "GET", "/login", None, "").await.status, StatusCode::OK, "{client}");
+            let reply = send(&app, "POST", "/login", None, LOGIN).await;
+            assert_eq!(reply.status, StatusCode::SEE_OTHER, "{client}: {}", reply.body);
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_remote_lets_global_clients_in() {
+        let state = lan_only_state(false).await;
+        for client in ["[2a01:111::5]:5555", "8.8.8.8:5555"] {
+            let app = app_from(&state, client);
+            assert_eq!(send(&app, "GET", "/healthz", None, "").await.status, StatusCode::OK, "{client}");
+            let reply = send(&app, "POST", "/login", None, LOGIN).await;
+            assert_eq!(reply.status, StatusCode::SEE_OTHER, "{client}: {}", reply.body);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_audit_shows_an_ipv4_client_without_the_mapped_prefix() {
+        // N-3: gniazdo `[::]` podaje `::ffff:a.b.c.d`, audyt ma `a.b.c.d`.
+        let state = wizard_state().await;
+        let app = app_from(&state, "[::ffff:192.168.1.10]:5555");
+        let (cookie, token) = open(&app).await;
+        let reply = send(
+            &app,
+            "POST",
+            "/setup",
+            Some(&cookie),
+            &body(&token, "szef", "dlugie-haslo", "dlugie-haslo"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+        let detail: String =
+            sqlx::query_scalar("SELECT detail FROM audit_log WHERE action = 'first_admin'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(detail, "szef z 192.168.1.10");
     }
 
     #[tokio::test]

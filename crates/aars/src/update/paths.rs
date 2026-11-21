@@ -217,7 +217,11 @@ fn temp_name(path: &Path) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
-    path.with_file_name(format!(".{name}.tmp-{}-{nanos}", std::process::id()))
+    // Licznik: dwa zapisy w tym samym procesie i tej samej nanosekundzie nie
+    // dostaną tej samej nazwy (`AlreadyExists` znaczy wtedy tylko cel, Nit-1).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_file_name(format!(".{name}.tmp-{}-{nanos}-{seq}", std::process::id()))
 }
 
 /// Zapis atomowy: plik tymczasowy `O_CREAT|O_EXCL|O_NOFOLLOW` obok, potem

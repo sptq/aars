@@ -208,9 +208,26 @@ nie działa, otwórz panel pod adresem IP stacji (np. z listy urządzeń
 routera). Inne nazwy, np. `aars.fritz.box`, dopisz do `server.allowed_hosts`
 w `/etc/aars/aars.toml`.
 
-Obraz słucha na `[::]:8080`: jedno gniazdo przyjmuje IPv6 i IPv4, więc
-kreator działa też z globalnego adresu IPv6 w tej samej sieci `/64`. Gdy
-jądro nie ma IPv6, panel sam słucha na `0.0.0.0:8080`.
+Obraz słucha na `[::]:8080`: jedno gniazdo przyjmuje IPv6 i IPv4 (także
+przy `net.ipv6.bindv6only = 1`), więc panel działa też z globalnego adresu
+IPv6 w tej samej sieci `/64`. Gdy jądro nie ma IPv6, panel sam słucha na
+`0.0.0.0:8080`.
+
+Domyślnie cały panel (logowanie, `/setup`, `/healthz`) odpowiada tylko
+klientom z sieci lokalnej stacji: pętla zwrotna, prywatne IPv4
+(`10/8`, `172.16/12`, `192.168/16`), link-local, IPv6 ULA (`fc00::/7`) i ta
+sama sieć `/64` co globalny adres IPv6 stacji. Każdy inny adres, np. z
+internetu przez otwarty IPv6 routera, dostaje `403` ze stroną z
+wyjaśnieniem. Zdalny dostęp włącza `allow_remote = true` w sekcji `[server]`
+pliku `/etc/aars/aars.toml` (tylko w pliku), po czym
+`sudo systemctl restart aars`.
+
+> **Uwaga.** Panel działa po zwykłym HTTP: hasła i ciasteczko sesji idą
+> jawnym tekstem, a logowanie nie ma limitu prób. Konta operatora i
+> administratora kluczują nadajnik i zlecają aktualizację. Nie przekierowuj
+> portu 8080 na routerze i nie otwieraj go dla IPv6 z internetu. Do pracy
+> zdalnej użyj VPN do sieci domowej (np. WireGuard): klient VPN z adresem z
+> sieci lokalnej przejdzie kontrolę bez `allow_remote`.
 
 ### Aktualizacja z panelu
 

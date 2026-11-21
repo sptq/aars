@@ -444,13 +444,14 @@ fn setup_url(bound: std::net::SocketAddr, host: &str) -> String {
     }
 }
 
-/// Nasłuch panelu. Obraz słucha na `[::]:8080` (przegląd końcowy M-2): na
-/// Linuksie z `net.ipv6.bindv6only = 0` (domyślnie) jedno gniazdo przyjmuje
-/// IPv6 i IPv4 (jako `::ffff:a.b.c.d`). Gdy jądro nie ma IPv6
-/// (`ipv6.disable=1`), `[::]` nie wstanie — wtedy panel słucha na
-/// `0.0.0.0` tego samego portu, żeby właściciel nie stracił dostępu.
+/// Nasłuch panelu. Obraz słucha na `[::]:8080` (przegląd końcowy M-2):
+/// jedno gniazdo przyjmuje IPv6 i IPv4 (jako `::ffff:a.b.c.d`). Gniazdo
+/// `[::]` ma jawnie `IPV6_V6ONLY = 0` (przegląd N-2), więc IPv4 działa także
+/// przy `net.ipv6.bindv6only = 1`. Gdy jądro nie ma IPv6 (`ipv6.disable=1`),
+/// `[::]` nie wstanie — wtedy panel słucha na `0.0.0.0` tego samego portu,
+/// żeby właściciel nie stracił dostępu.
 async fn bind_panel(bind: &str) -> std::io::Result<tokio::net::TcpListener> {
-    match tokio::net::TcpListener::bind(bind).await {
+    match bind_once(bind).await {
         Ok(listener) => Ok(listener),
         Err(err) => match ipv4_fallback(bind, &err) {
             Some(v4) => {
@@ -460,6 +461,28 @@ async fn bind_panel(bind: &str) -> std::io::Result<tokio::net::TcpListener> {
             None => Err(err),
         },
     }
+}
+
+/// `[::]:port` przez `socket2` z `IPV6_V6ONLY = 0`; każdy inny adres
+/// zwykłym `bind` tokio.
+async fn bind_once(bind: &str) -> std::io::Result<tokio::net::TcpListener> {
+    match bind.parse::<std::net::SocketAddr>() {
+        Ok(addr) if addr.is_ipv6() && addr.ip().is_unspecified() => dual_stack(addr),
+        _ => tokio::net::TcpListener::bind(bind).await,
+    }
+}
+
+fn dual_stack(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(false)?;
+    // Jak `TcpListener::bind` tokio na Uniksie: szybki restart usługi.
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(socket.into())
 }
 
 /// `[::]:port` → `0.0.0.0:port`, gdy błąd nie dotyczy portu (zajęty albo
@@ -751,6 +774,8 @@ async fn run_station(
             names
         })
         .with_host_check(true)
+        // `server.allow_remote` tylko z pliku (`base`), jak `allowed_hosts`.
+        .with_lan_only(!base.server.allow_remote)
         .with_probe(probe)
         .with_modules(registry.clone())
         .with_base_config(Arc::new(base.clone()))
@@ -2382,6 +2407,17 @@ mod tests {
         };
         assert_eq!(ip, std::net::IpAddr::from([127, 0, 0, 1]));
         assert!(aars_core::netlocal::is_local_client(peer.ip(), &[]));
+    }
+
+    #[tokio::test]
+    async fn the_wildcard_socket_is_dual_stack_regardless_of_bindv6only() {
+        // N-2: `IPV6_V6ONLY` ustawione jawnie na 0, nie z sysctl.
+        let Ok(listener) = dual_stack("[::]:0".parse().unwrap()) else {
+            return; // środowisko bez IPv6: stacja użyje zapasu `0.0.0.0`
+        };
+        let socket = socket2::SockRef::from(&listener);
+        assert!(!socket.only_v6().unwrap());
+        assert!(listener.local_addr().unwrap().is_ipv6());
     }
 
     #[test]

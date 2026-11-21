@@ -178,14 +178,36 @@ pub trait CurrentGuard {
 /// `exec {current}/aars` z tymi samymi argumentami co ten proces.
 pub struct ExecCurrent;
 
+/// Polecenie strażnika z `current`: `binary` z argumentami tego procesu
+/// (`update guard --config …` z unitu) i `AARS_GUARD_HANDED_OVER=1`.
+/// Osobno od `exec`, żeby test widział cel, argumenty i środowisko (N-4).
+pub(crate) fn current_command(
+    binary: &std::path::Path,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(binary);
+    command.args(args).env(HANDED_OVER_ENV, "1");
+    command
+}
+
+/// Strażnik z `current` albo `None`, gdy ten proces już jest wynikiem
+/// przekazania (`handed_over` = wartość `AARS_GUARD_HANDED_OVER`; liczy się
+/// sama obecność zmiennej).
+pub fn current_guard<'a>(
+    handed_over: Option<&std::ffi::OsStr>,
+    exec: &'a ExecCurrent,
+) -> Option<&'a dyn CurrentGuard> {
+    match handed_over {
+        Some(_) => None,
+        None => Some(exec),
+    }
+}
+
 impl CurrentGuard for ExecCurrent {
     #[cfg(unix)]
     fn run(&self, binary: &std::path::Path) -> Result<Vec<GuardAction>, String> {
         use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(binary)
-            .args(std::env::args_os().skip(1))
-            .env(HANDED_OVER_ENV, "1")
-            .exec();
+        let err = current_command(binary, std::env::args_os().skip(1)).exec();
         Err(format!("uruchomienie {}: {err}", binary.display()))
     }
 
@@ -1613,5 +1635,30 @@ mod tests {
             "baza 0.10.0"
         );
         assert!(st.trial().is_none());
+    }
+    #[test]
+    fn the_current_guard_is_the_binary_under_current_with_the_same_arguments() {
+        // N-4: cel `exec`, argumenty z unitu i znacznik przekazania.
+        let st = station();
+        let binary = st.paths.current().join("aars");
+        assert_eq!(binary, st.paths.install_root.join("current").join("aars"));
+        let args = ["update", "guard", "--config", "/etc/aars/aars.toml"].map(std::ffi::OsString::from);
+        let command = current_command(&binary, args.clone());
+        assert_eq!(command.get_program(), binary.as_os_str());
+        assert_eq!(command.get_args().collect::<Vec<_>>(), args.iter().map(|a| a.as_os_str()).collect::<Vec<_>>());
+        let envs: Vec<_> = command.get_envs().collect();
+        assert_eq!(
+            envs,
+            vec![(std::ffi::OsStr::new(HANDED_OVER_ENV), Some(std::ffi::OsStr::new("1")))]
+        );
+    }
+
+    #[test]
+    fn the_handed_over_variable_disables_the_current_guard() {
+        let exec = ExecCurrent;
+        assert!(current_guard(None, &exec).is_some());
+        assert!(current_guard(Some(std::ffi::OsStr::new("1")), &exec).is_none());
+        // Sama obecność zmiennej, także pustej, wyłącza przekazanie.
+        assert!(current_guard(Some(std::ffi::OsStr::new("")), &exec).is_none());
     }
 }

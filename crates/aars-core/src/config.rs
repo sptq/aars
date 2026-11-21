@@ -109,6 +109,11 @@ pub struct ServerConfig {
     /// `.home.arpa`, `.localdomain` i host z `bind`. Tylko w pliku.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// `false` (domyślnie): cały panel odpowiada tylko klientom z sieci
+    /// lokalnej stacji, reszta dostaje `403`. `true`: każdemu klientowi.
+    /// Tylko w pliku.
+    #[serde(default)]
+    pub allow_remote: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -213,6 +218,7 @@ impl Default for Config {
             server: ServerConfig {
                 bind: "0.0.0.0:8080".to_owned(),
                 allowed_hosts: Vec::new(),
+                allow_remote: false,
             },
             audio: AudioConfig {
                 device: "default".to_owned(),
@@ -364,6 +370,7 @@ mod tests {
         figment::Jail::expect_with(|_jail| {
             let cfg = Config::load(None).expect("domyślna konfiguracja musi się wczytać");
             assert_eq!(cfg.server.bind, "0.0.0.0:8080");
+            assert!(!cfg.server.allow_remote, "panel domyślnie tylko dla sieci lokalnej");
             assert_eq!(cfg.audio.sample_rate, 48_000);
             assert_eq!(cfg.ptt.backend, PttBackendKind::Vox);
             assert_eq!(cfg.ptt.channel_busy, ChannelBusyKind::None);
@@ -379,6 +386,7 @@ mod tests {
                 r#"
                 [server]
                 bind = "127.0.0.1:9000"
+                allow_remote = true
 
                 [ptt]
                 backend = "gpio"
@@ -391,6 +399,7 @@ mod tests {
 
             let cfg = Config::load(Some(std::path::Path::new("aars.toml"))).unwrap();
             assert_eq!(cfg.server.bind, "127.0.0.1:9000");
+            assert!(cfg.server.allow_remote);
             assert_eq!(cfg.ptt.backend, PttBackendKind::Gpio);
             assert_eq!(cfg.ptt.gpio.line, 17);
             assert_eq!(cfg.audio.sample_rate, 44_100, "env musi wygrywać z plikiem");

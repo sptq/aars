@@ -31,6 +31,11 @@ imgw_meteo_url = "https://danepubliczne.imgw.pl/api/data/warningsmeteo"
 # rebinding; inna nazwa dostaje 421). Inne nazwy, np. z lokalnego DNS, dopisz
 # tutaj (tylko w pliku):
 # allowed_hosts = ["stacja.dom.lan"]
+# Domyślnie cały panel odpowiada tylko klientom z sieci lokalnej (pętla,
+# prywatne IPv4, link-local, ULA, ta sama sieć /64 IPv6); inni dostają 403.
+# `true` wpuszcza każdego (tylko w pliku). Panel jest bez HTTPS i bez limitu
+# prób logowania: nie wystawiaj go do internetu, do pracy zdalnej użyj VPN.
+# allow_remote = false
 #
 # [audio]
 # device = "default"
