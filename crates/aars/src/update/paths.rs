@@ -91,18 +91,41 @@ fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// Zwykły plik otwarty bez podążania za dowiązaniem; `None`, gdy go nie ma.
-/// Dowiązanie daje błąd (`ELOOP`), a FIFO, urządzenie czy katalog — błąd
-/// „nie zwykły plik”.
+/// Dowiązanie daje błąd (`ELOOP`), FIFO, urządzenie czy katalog — błąd
+/// „nie zwykły plik”, a twarde dowiązanie albo plik innego właściciela niż
+/// katalog — odmowę.
 pub fn open_regular_nofollow(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     let file = match open_nofollow(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("{} nie jest zwykłym plikiem", path.display()),
+        ));
+    }
+    // `O_NOFOLLOW` nie łapie twardych dowiązań: usługa mogłaby podpiąć plik
+    // roota z tego samego systemu plików (np. `/etc/shadow`) pod nazwę ze
+    // swojego katalogu. Przyjmujemy więc tylko plik z jednym dowiązaniem,
+    // którego właściciel jest właścicielem katalogu.
+    use std::os::unix::fs::MetadataExt;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let dir_uid = std::fs::symlink_metadata(parent)?.uid();
+    if meta.nlink() != 1 || meta.uid() != dir_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{}: plik z {} dowiązaniami albo cudzy (uid {}, katalog {dir_uid})",
+                path.display(),
+                meta.nlink(),
+                meta.uid()
+            ),
         ));
     }
     Ok(Some(file))
@@ -236,6 +259,17 @@ mod tests {
 
         assert!(read_small_nofollow(&file, 3).is_err(), "limit");
         assert!(read_small_nofollow(dir.path(), 64).is_err(), "katalog");
+
+        // Twarde dowiązanie (np. usługa podpina `/etc/shadow` z tego samego
+        // systemu plików) nie jest czytane.
+        let hard = dir.path().join("twarde");
+        std::fs::hard_link(&file, &hard).unwrap();
+        assert!(read_small_nofollow(&hard, 64).is_err(), "nlink 2");
+        assert!(
+            read_small_nofollow(&file, 64).is_err(),
+            "oryginał też ma nlink 2"
+        );
+        std::fs::remove_file(&hard).unwrap();
 
         let fifo = dir.path().join("fifo");
         let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();

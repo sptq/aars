@@ -69,9 +69,18 @@ pub fn run_guard(
     let trial = read_trial(p);
     if let Some(trial) = trial {
         actions.push(judge_trial(p, owner, trial, now));
-    } else if let Ok(Some(version)) = requested_version(p) {
+    } else {
         // 3. Instalacja tylko poza próbą.
-        actions.push(install(p, key, smoke, &version, now));
+        match requested_version(p) {
+            Ok(Some(version)) => actions.push(install(p, key, smoke, &version, now)),
+            Ok(None) => {}
+            Err(err) => {
+                // Treści nieczytelnego żądania nie przepisujemy do wyniku:
+                // mógłby to być cudzy plik podpięty przez usługę.
+                tracing::error!(%err, "żądanie instalacji nieczytelne — usuwam");
+                let _ = std::fs::remove_file(p.request());
+            }
+        }
     }
 
     if actions.is_empty() {
@@ -820,8 +829,10 @@ mod tests {
     fn a_power_cut_after_the_switch_still_starts_the_trial() {
         let st = station();
         st.installed("0.11.0");
-        // Przełączenie było, zapisu próby nie: żądanie wciąż leży.
+        // Przełączenie było, zapisu próby nie: znacznik strażnika i żądanie
+        // wciąż leżą.
         std::fs::remove_file(st.paths.trial()).unwrap();
+        std::fs::write(st.paths.guard_dir.join("switching"), "0.11.0").unwrap();
         std::fs::write(st.paths.request(), "0.11.0").unwrap();
 
         assert_eq!(
@@ -833,6 +844,69 @@ mod tests {
             (trial.version.as_str(), trial.previous.as_str()),
             ("0.11.0", "0.10.0")
         );
+    }
+
+    #[test]
+    fn a_confirmed_version_cannot_be_put_on_trial_again() {
+        let st = station();
+        st.installed("0.11.0");
+        std::fs::write(st.paths.confirmed(), "0.11.0").unwrap();
+        assert_eq!(
+            st.guard(),
+            vec![GuardAction::Confirmed("0.11.0".to_owned())]
+        );
+        // Usługa (przejęta albo z żądania admina) prosi o tę samą wersję:
+        // nowa próba pozwoliłaby wymusić powrót do starszej.
+        std::fs::write(st.paths.request(), "0.11.0").unwrap();
+
+        let actions = st.guard();
+
+        assert_eq!(
+            actions,
+            vec![GuardAction::InstallFailed(
+                "wersja 0.11.0 już działa".to_owned()
+            )]
+        );
+        assert!(st.trial().is_none(), "bez nowej próby");
+        assert_eq!(st.current().as_deref(), Some("0.11.0"));
+        assert!(!st.paths.request().exists());
+    }
+
+    #[test]
+    fn a_database_hardlink_is_not_copied_into_the_snapshot() {
+        let st = station();
+        let secret = st.paths.db_path.with_file_name("shadow");
+        std::fs::write(&secret, "tajne").unwrap();
+        std::fs::remove_file(&st.paths.db_path).unwrap();
+        std::fs::hard_link(&secret, &st.paths.db_path).unwrap();
+        st.stage("0.11.0", &good_archive("0.11.0"));
+
+        let actions = st.guard();
+
+        assert!(
+            matches!(&actions[..], [GuardAction::InstallFailed(_)]),
+            "{actions:?}"
+        );
+        assert!(!st.paths.snapshots().join("aars-0.10.0.db").exists());
+        assert_eq!(st.current().as_deref(), Some("0.10.0"));
+        assert!(!st.last().detail.contains("tajne"));
+    }
+
+    #[test]
+    fn a_hardlinked_request_does_not_leak_into_the_result() {
+        let st = station();
+        let secret = st.paths.state_dir.join("sekret");
+        std::fs::write(&secret, "root:$6$tajne").unwrap();
+        std::fs::hard_link(&secret, st.paths.request()).unwrap();
+
+        let actions = st.guard();
+
+        assert_eq!(
+            actions,
+            vec![GuardAction::Nothing],
+            "nieczytelne żądanie pominięte"
+        );
+        assert!(!st.paths.last_result().exists() || !st.last().detail.contains("tajne"));
     }
 
     #[test]

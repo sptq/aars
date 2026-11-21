@@ -207,13 +207,22 @@ pub fn install_requested(
         .map_err(|_| format!("nieczytelna wersja w żądaniu: {version:?}"))?;
 
     // Przerwa w prądzie po przełączeniu, przed zapisem próby: wersja już
-    // stoi, więc zakładamy próbę, zamiast instalować drugi raz.
+    // stoi, więc zakładamy próbę, zamiast instalować drugi raz. Tylko ze
+    // znacznikiem roota sprzed przełączenia — inaczej żądanie tej samej
+    // wersji otwierałoby nową próbę potwierdzonej wersji i pozwalało
+    // wymusić powrót do starszej.
     if version == current {
+        let interrupted = std::fs::read_to_string(switching_marker(p))
+            .is_ok_and(|marker| marker.trim() == version);
+        if !interrupted {
+            return Err(format!("wersja {version} już działa"));
+        }
         let previous = installed_version(&p.previous())
             .filter(|prev| prev != current)
             .ok_or_else(|| format!("wersja {version} już działa"))?;
         let trial = new_trial(&version, &previous, radio_was_up, now);
         write_trial(p, &trial)?;
+        let _ = std::fs::remove_file(switching_marker(p));
         return Ok(trial);
     }
     if !is_newer(&version, current)? {
@@ -260,6 +269,9 @@ pub fn install_requested(
         return Err(err);
     }
 
+    // Znacznik roota: przełączenie trwa (przerwa w prądzie do zapisu próby).
+    write_atomic_nofollow(&switching_marker(p), version.as_bytes())
+        .map_err(|e| io_err(&switching_marker(p), e))?;
     // Przełączenie: najpierw `previous` na działającą, potem `current`.
     let old_target = std::fs::read_link(p.current()).map_err(|e| io_err(&p.current(), e))?;
     swap_link(&p.previous(), &old_target).map_err(|e| io_err(&p.previous(), e))?;
@@ -267,9 +279,15 @@ pub fn install_requested(
 
     let trial = new_trial(&version, current, radio_was_up, now);
     write_trial(p, &trial)?;
+    let _ = std::fs::remove_file(switching_marker(p));
     prune_releases(p);
     let _ = std::fs::remove_dir_all(p.staging());
     Ok(trial)
+}
+
+/// `guard_dir/switching`: wersja, na którą strażnik właśnie przełącza.
+fn switching_marker(p: &UpdatePaths) -> PathBuf {
+    p.guard_dir.join("switching")
 }
 
 fn new_trial(version: &str, previous: &str, radio_was_up: bool, now: DateTime<Utc>) -> Trial {
