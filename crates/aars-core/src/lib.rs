@@ -19,5 +19,6 @@ pub mod source_state;
 pub mod sink;
 pub mod synth;
 pub mod txlog;
+pub mod update;
 pub mod watchdog;
 pub mod user;

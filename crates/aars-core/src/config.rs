@@ -17,6 +17,55 @@ pub struct Config {
     pub tts: TtsConfig,
     pub storage: StorageConfig,
     pub sources: SourcesConfig,
+    /// Aktualizacja z wydań GitHub (etap 10). Tylko w pliku: kto zmienia
+    /// źródło aktualizacji, ten wybiera kod do uruchomienia (R5).
+    #[serde(default)]
+    pub update: UpdateConfig,
+    /// Zakładanie pierwszego konta (etap 10, R12).
+    #[serde(default)]
+    pub setup: SetupConfig,
+}
+
+/// Skąd stacja bierze wydania i gdzie trzyma stan aktualizacji (R5, R6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Adres wydań; manifest leży pod `{releases_url}/latest/download/…`.
+    pub releases_url: String,
+    /// Katalog roboczy usługi (użytkownik `aars`).
+    pub state_dir: PathBuf,
+    /// Stan strażnika startu (root).
+    pub guard_dir: PathBuf,
+    /// Katalog z `releases/`, `current` i `previous`.
+    pub install_root: PathBuf,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            releases_url: "https://github.com/sptq/aars/releases".to_owned(),
+            state_dir: PathBuf::from("/var/lib/aars/update"),
+            guard_dir: PathBuf::from("/var/lib/aars-update"),
+            install_root: PathBuf::from("/opt/aars"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SetupConfig {
+    pub first_admin: FirstAdmin,
+}
+
+/// Jak powstaje pierwsze konto administratora (R12).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FirstAdmin {
+    /// Hasło startowe wypisane na konsoli (jak przed etapem 10).
+    #[default]
+    Console,
+    /// Kreator `/setup` w panelu, z sieci lokalnej (obraz Raspberry Pi).
+    Wizard,
 }
 
 /// Adresy źródeł danych: to rozruch stacji, nie operacja (włączanie, obszar
@@ -187,6 +236,8 @@ impl Default for Config {
                 cache_max_bytes: 512 * 1024 * 1024,
             },
             sources: SourcesConfig::default(),
+            update: UpdateConfig::default(),
+            setup: SetupConfig::default(),
         }
     }
 }
@@ -337,6 +388,39 @@ mod tests {
             assert_eq!(cfg.ptt.gpio.chip, "/dev/gpiochip0", "nietknięte pola zachowują domyślne");
             Ok(())
         });
+    }
+
+    #[test]
+    fn a_config_without_update_and_setup_uses_the_defaults() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("aars.toml", "[server]\nbind = \"127.0.0.1:9000\"\n")?;
+            let cfg = Config::load(Some(std::path::Path::new("aars.toml"))).unwrap();
+            assert_eq!(
+                cfg.update.releases_url,
+                "https://github.com/sptq/aars/releases"
+            );
+            assert_eq!(cfg.update.state_dir, PathBuf::from("/var/lib/aars/update"));
+            assert_eq!(cfg.update.guard_dir, PathBuf::from("/var/lib/aars-update"));
+            assert_eq!(cfg.update.install_root, PathBuf::from("/opt/aars"));
+            assert_eq!(cfg.setup.first_admin, FirstAdmin::Console);
+            Ok(())
+        });
+        // Sama sekcja bez części pól też się wczytuje (obraz ustawia tylko `wizard`).
+        let cfg: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(
+                "[setup]\nfirst_admin = \"wizard\"\n[update]\ninstall_root = \"/tmp/x\"\n",
+            ))
+            .extract()
+            .unwrap();
+        assert_eq!(cfg.setup.first_admin, FirstAdmin::Wizard);
+        assert_eq!(cfg.update.install_root, PathBuf::from("/tmp/x"));
+        assert_eq!(cfg.update.guard_dir, PathBuf::from("/var/lib/aars-update"));
+        let partial: UpdateConfig = Figment::from(Toml::string("install_root = \"/tmp/x\"\n"))
+            .extract()
+            .unwrap();
+        assert_eq!(partial.releases_url, UpdateConfig::default().releases_url);
+        let empty: SetupConfig = Figment::from(Toml::string("")).extract().unwrap();
+        assert_eq!(empty.first_admin, FirstAdmin::Console);
     }
 
     #[test]
