@@ -37,12 +37,14 @@ fn hour_case(previous_core: Option<&str>) -> HourCase {
 
 /// Rozwinięcie „godz.” zależne od słowa przed nim: słowo „godzina” we
 /// właściwym przypadku, czy godzina idzie w dopełniaczu i czy to zakres
-/// („w godz. 7:00 – 15:00” → „w godzinach siódma – piętnasta”).
-fn godz_expansion(previous_core: Option<&str>) -> (&'static str, bool, bool) {
+/// („w godz. 7:00 – 15:00” → „w godzinach siódma – piętnasta”; „w godz. 7:00”
+/// bez zakresu → „w godzinie siódmej”).
+fn godz_expansion(previous_core: Option<&str>, range_follows: bool) -> (&'static str, bool, bool) {
     match previous_core.map(str::to_lowercase).as_deref() {
-        Some("od" | "do" | "około") => ("godziny", true, false),
+        Some("od" | "do" | "około" | "z") => ("godziny", true, false),
         Some("o" | "po") => ("godzinie", true, false),
-        Some("w") => ("godzinach", false, true),
+        Some("w") if range_follows => ("godzinach", false, true),
+        Some("w") => ("godzinie", true, false),
         _ => ("godzina", false, false),
     }
 }
@@ -198,6 +200,10 @@ const ABBREVIATIONS: &[(&str, &str)] = &[
     ("PM2.5", "P M dwa i pół"),
     ("MUF", "M U F"),
     ("KC2G", "K C dwa G"),
+    ("IMGW-PIB", "I M G W P I B"),
+    ("RP", "R P"),
+    ("Płd", "Południowy"),
+    ("nr", "numer"),
 ];
 
 /// Interpunkcja, która może poprzedzać słowo.
@@ -248,7 +254,12 @@ pub fn normalize(input: &str) -> String {
             && next_lead.is_empty()
             && let Some((hour, minute)) = clock_time(next_core)
         {
-            let (word, genitive, range) = godz_expansion(previous_core);
+            let range_follows = next_trail.is_empty()
+                && raw.get(idx + 2).is_some_and(|dash| RANGE_DASHES.contains(dash))
+                && parts.get(idx + 3).is_some_and(|&(end_lead, end_core, _)| {
+                    end_lead.is_empty() && clock_time(end_core).is_some()
+                });
+            let (word, genitive, range) = godz_expansion(previous_core, range_follows);
             let word = if core.starts_with('G') { capitalized(word) } else { word.to_owned() };
             push_word(&mut out, lead, &word, "");
             push_word(&mut out, "", &bare_time(hour, minute, genitive), next_trail);
@@ -526,13 +537,31 @@ mod tests {
         assert_eq!(n("Godz. 09:22"), "Godzina dziewiąta dwadzieścia dwa");
         assert_eq!(n("w godz. 7:00 – 15:00"), "w godzinach siódma – piętnasta");
         assert_eq!(n("w godz. 8:00 - 16:00."), "w godzinach ósma - szesnasta.");
-        assert_eq!(n("w godz. 7:00"), "w godzinach siódma");
         assert_eq!(n("18:00"), "godzina osiemnasta");
         // „godz.” bez godziny za nim zostaje jak jest.
         assert_eq!(
             n("czas oczekiwania 22 godz. Kolejka"),
             "czas oczekiwania dwadzieścia dwa godz. Kolejka"
         );
+    }
+
+    #[test]
+    fn godz_after_w_is_singular_unless_a_range_follows() {
+        assert_eq!(n("w godz. 7:00"), "w godzinie siódmej");
+        assert_eq!(n("w godz. 7:00."), "w godzinie siódmej.");
+        assert_eq!(n("w godz. 7:00 – 15:00"), "w godzinach siódma – piętnasta");
+    }
+
+    #[test]
+    fn godz_after_z_is_genitive() {
+        assert_eq!(n("Pomiar z godz. 20:20."), "Pomiar z godziny dwudziestej dwadzieścia.");
+    }
+
+    #[test]
+    fn imgw_pib_rp_and_nr_are_spelled() {
+        assert_eq!(n("Źródło: IMGW-PIB."), "Źródło: I M G W P I B.");
+        assert_eq!(n("wody wewnętrzne RP - Bałtyk Płd,"), "wody wewnętrzne R P - Bałtyk Południowy,");
+        assert_eq!(n("nr 140"), "numer sto czterdzieści");
     }
 
     #[test]

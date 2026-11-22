@@ -267,6 +267,7 @@ mod tests {
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect(),
             tracked_keys: Default::default(),
+            tracked: Default::default(),
         }
     }
 
@@ -427,6 +428,64 @@ mod tests {
             gust.text
         );
         assert_eq!(gust.fingerprint, "gust:80");
+    }
+
+    fn ctx_tracked(now: &str, tracked: &[(&str, &str)]) -> SourceCtx {
+        let mut ctx = ctx_at(now, &[]);
+        ctx.tracked = tracked
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        ctx
+    }
+
+    #[test]
+    fn a_weaker_value_today_keeps_the_announced_fingerprint() {
+        let now = "2026-11-22T07:00:00Z";
+        let f = edited(|v| v["hourly"]["wind_gusts_10m"][10] = 85.0.into());
+        // Bez śledzenia: odcisk z bieżącej wartości.
+        let free = alerts::to_output(&f, &ctx_at(now, &[]));
+        assert_eq!(item(&free, "gust:2026-11-22").fingerprint, "gust:80");
+        let held = alerts::to_output(&f, &ctx_tracked(now, &[("gust:2026-11-22", "gust:90")]));
+        assert_eq!(item(&held, "gust:2026-11-22").fingerprint, "gust:90");
+
+        // Pod progiem: pozycja zostaje, z odciskiem i wartością kubełka.
+        let f = edited(|v| v["hourly"]["wind_gusts_10m"][10] = 60.0.into());
+        let out = alerts::to_output(&f, &ctx_tracked(now, &[("gust:2026-11-22", "gust:80")]));
+        let gust = item(&out, "gust:2026-11-22");
+        assert_eq!(gust.fingerprint, "gust:80");
+        assert_eq!(gust.topic, "gust:2026-11-22");
+        assert!(gust.text.contains("dziś porywy wiatru do 80 km/h."), "{}", gust.text);
+        assert_eq!(gust.valid_until, Some(at("2026-11-22T23:00:00Z")));
+
+        let out = alerts::to_output(&f, &ctx_tracked(now, &[("frost:2026-11-22", "frost:-15")]));
+        let frost = item(&out, "frost:2026-11-22");
+        assert_eq!(frost.fingerprint, "frost:-15");
+        assert!(frost.text.contains("do -15 °C."), "{}", frost.text);
+    }
+
+    #[test]
+    fn a_stronger_value_today_is_a_new_fingerprint() {
+        let now = "2026-11-22T07:00:00Z";
+        let f = edited(|v| {
+            v["hourly"]["wind_gusts_10m"][10] = 95.0.into();
+            v["hourly"]["temperature_2m"][10] = (-21.0).into();
+        });
+        let out = alerts::to_output(
+            &f,
+            &ctx_tracked(now, &[("gust:2026-11-22", "gust:80"), ("frost:2026-11-22", "frost:-15")]),
+        );
+        assert_eq!(item(&out, "gust:2026-11-22").fingerprint, "gust:90");
+        assert_eq!(item(&out, "frost:2026-11-22").fingerprint, "frost:-20");
+    }
+
+    #[test]
+    fn tomorrow_is_not_held() {
+        let out = alerts::to_output(
+            &open_meteo_forecast(),
+            &ctx_tracked("2026-11-22T07:00:00Z", &[("gust:2026-11-23", "gust:90")]),
+        );
+        assert!(out.items.iter().all(|i| i.key != "gust:2026-11-23"), "{:?}", out.items);
     }
 
     #[test]

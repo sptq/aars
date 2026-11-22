@@ -146,6 +146,7 @@ mod tests {
             position: None,
             settings: Default::default(),
             tracked_keys: Default::default(),
+            tracked: Default::default(),
         }
     }
 

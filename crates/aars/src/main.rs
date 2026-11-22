@@ -610,6 +610,7 @@ async fn source_preview(config: &Config, id: &str) -> Result<()> {
         position,
         settings,
         tracked_keys: Default::default(),
+        tracked: Default::default(),
     };
     let output = source
         .fetch(&ctx)

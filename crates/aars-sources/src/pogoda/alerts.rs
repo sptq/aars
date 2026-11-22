@@ -115,6 +115,54 @@ fn end_of_day(date: NaiveDate) -> Option<DateTime<Utc>> {
     warsaw_to_utc((date + Duration::days(1)).and_hms_opt(0, 0, 0)?)
 }
 
+/// Siła odcisku: |liczba| po dwukropku (`gust:80` → 80, `frost:-15` → 15).
+fn strength(fingerprint: &str) -> Option<i64> {
+    fingerprint
+        .rsplit_once(':')
+        .and_then(|(_, value)| value.parse::<i64>().ok())
+        .map(i64::abs)
+}
+
+/// Alert odtworzony z wartości kubełka śledzonego odcisku (dziś, gdy prognoza
+/// chwilowo już niczego nie przekracza). Runner tylko dotyka takiej pozycji.
+fn held_alert(kind: &'static str, fingerprint: &str, date: NaiveDate) -> Option<Alert> {
+    let value = fingerprint.rsplit_once(':')?.1.parse::<i64>().ok()?;
+    let when = "dziś";
+    let (text, summary) = match kind {
+        "gust" => (
+            format!("{when} porywy wiatru do {value} km/h."),
+            format!("porywy wiatru do {value} km/h, {}", day_month(date)),
+        ),
+        "frost" => (
+            format!("{when} spadek temperatury do {value} °C."),
+            format!("spadek temperatury do {value} °C, {}", day_month(date)),
+        ),
+        "precip" => (
+            format!("{when} opady do {value} mm."),
+            format!("opady do {value} mm, {}", day_month(date)),
+        ),
+        _ => return None,
+    };
+    Some(Alert { kind, fingerprint: fingerprint.to_owned(), text, summary })
+}
+
+fn item_of(alert: Alert, date: NaiveDate) -> SourceItem {
+    let key = format!("{}:{}", alert.kind, date.format("%Y-%m-%d"));
+    SourceItem {
+        topic: key.clone(),
+        key,
+        fingerprint: alert.fingerprint,
+        text: format!("Prognoza pogody: {} {ATTRIBUTION}", alert.text),
+        change_text: format!("Zmiana prognozy: {} {ATTRIBUTION}", alert.text),
+        cancel_text: String::new(),
+        summary: alert.summary,
+        priority: Priority::Normal,
+        interrupting: false,
+        valid_from: None,
+        valid_until: end_of_day(date),
+    }
+}
+
 pub fn to_output(forecast: &Forecast, ctx: &SourceCtx) -> SourceOutput {
     let limits = thresholds(ctx);
     let today = ctx.now.with_timezone(&Warsaw).date_naive();
@@ -125,26 +173,31 @@ pub fn to_output(forecast: &Forecast, ctx: &SourceCtx) -> SourceOutput {
     ];
     let mut items = Vec::new();
     for (extremes, when) in periods {
-        let Some(day) = extremes else {
-            continue;
+        // Dziś prognoza z mijających godzin tylko słabnie: ogłoszona siła
+        // zostaje (C10), więc nie ma ponownego ogłoszenia przy spadku ani
+        // odwołania, gdy wartość schodzi pod próg.
+        let hold_today = when == "dziś";
+        let mut alerts = match &extremes {
+            Some(day) => alerts_for(day, when, limits),
+            None => Vec::new(),
         };
-        let date = day.date;
-        for alert in alerts_for(&day, when, limits) {
-            let key = format!("{}:{}", alert.kind, date.format("%Y-%m-%d"));
-            items.push(SourceItem {
-                topic: key.clone(),
-                key,
-                fingerprint: alert.fingerprint,
-                text: format!("Prognoza pogody: {} {ATTRIBUTION}", alert.text),
-                change_text: format!("Zmiana prognozy: {} {ATTRIBUTION}", alert.text),
-                cancel_text: String::new(),
-                summary: alert.summary,
-                priority: Priority::Normal,
-                interrupting: false,
-                valid_from: None,
-                valid_until: end_of_day(date),
-            });
+        let date = extremes.as_ref().map_or(today, |day| day.date);
+        if hold_today {
+            for kind in ["gust", "frost", "precip"] {
+                let key = format!("{kind}:{}", date.format("%Y-%m-%d"));
+                let Some(held) = ctx.tracked.get(&key) else { continue };
+                let Some(held_strength) = strength(held) else { continue };
+                match alerts.iter_mut().find(|a| a.kind == kind) {
+                    Some(alert) => {
+                        if strength(&alert.fingerprint).is_some_and(|new| new < held_strength) {
+                            alert.fingerprint = held.clone();
+                        }
+                    }
+                    None => alerts.extend(held_alert(kind, held, date)),
+                }
+            }
         }
+        items.extend(alerts.into_iter().map(|alert| item_of(alert, date)));
     }
     SourceOutput {
         items,

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -40,6 +40,8 @@ pub struct SourceCtx {
     pub settings: BTreeMap<String, String>,
     /// Klucze aktywnych pozycji tego źródła (A4), sprzed tego cyklu.
     pub tracked_keys: HashSet<String>,
+    /// Klucz -> odcisk aktywnych pozycji tego źródła przy bieżącym zakresie.
+    pub tracked: HashMap<String, String>,
 }
 
 pub struct SourceOutput {

@@ -219,6 +219,7 @@ mod tests {
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect(),
             tracked_keys: Default::default(),
+            tracked: Default::default(),
         }
     }
 

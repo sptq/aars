@@ -147,6 +147,7 @@ impl SourceRunner {
             position,
             settings,
             tracked_keys: HashSet::new(),
+            tracked: Default::default(),
         }
     }
 
@@ -176,6 +177,11 @@ impl SourceRunner {
         let scope = self.source.scope(&ctx);
         let active = self.state.active_items(id).await?;
         ctx.tracked_keys = active.iter().filter(|a| a.area == scope).map(|a| a.item_key.clone()).collect();
+        ctx.tracked = active
+            .iter()
+            .filter(|a| a.area == scope)
+            .map(|a| (a.item_key.clone(), a.fingerprint.clone()))
+            .collect();
 
         self.settle_pending_cancellations(id, now).await?;
 
@@ -239,7 +245,7 @@ impl SourceRunner {
             if let Some(old) = existing {
                 consumed.insert(old.id);
                 if old.fingerprint == item.fingerprint {
-                    self.state.touch(old.id, now).await?;
+                    self.state.touch(old.id, now, item.valid_until).await?;
                     announced
                         .entry(item.fingerprint.as_str())
                         .or_insert((old.queue_item_id, old.aired, old.superseded.clone()));
@@ -467,6 +473,8 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use chrono::TimeDelta;
+
     use aars_core::db::test_pool;
     use aars_core::queue::QueueItem;
 
@@ -480,6 +488,7 @@ mod tests {
         calls: AtomicUsize,
         last_ctx: Mutex<Option<SeenCtx>>,
         last_keys: Mutex<Option<HashSet<String>>>,
+        last_tracked: Mutex<Option<HashMap<String, String>>>,
         needs: Needs,
         /// `None`: domyślny zakres (tekst obszaru).
         scope: Mutex<Option<String>>,
@@ -495,6 +504,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 last_ctx: Mutex::new(None),
                 last_keys: Mutex::new(None),
+                last_tracked: Mutex::new(None),
                 needs,
                 scope: Mutex::new(None),
             })
@@ -521,6 +531,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_ctx.lock().unwrap() = Some((ctx.position.clone(), ctx.settings.clone()));
             *self.last_keys.lock().unwrap() = Some(ctx.tracked_keys.clone());
+            *self.last_tracked.lock().unwrap() = Some(ctx.tracked.clone());
             let next = self.script.lock().ok().and_then(|mut s| s.pop_front());
             Box::pin(async move { next.unwrap_or(Err(SourceError::Http("skrypt wyczerpany".into()))) })
         }
@@ -1133,6 +1144,29 @@ mod tests {
         assert_eq!(keys, HashSet::from(["k1".to_owned()]));
     }
 
+    #[tokio::test]
+    async fn tracked_fingerprints_reach_the_source() {
+        let r = rig(vec![ok(vec![warning("k1", "f1")]), ok(vec![warning("k1", "f1")])]).await;
+        r.runner.cycle(now()).await;
+        r.runner.cycle(now()).await;
+        let tracked = r.source.last_tracked.lock().unwrap().clone().unwrap();
+        assert_eq!(tracked, HashMap::from([("k1".to_owned(), "f1".to_owned())]));
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_item_gets_its_new_valid_until() {
+        let mut first = warning("k1", "f1");
+        first.valid_until = Some(now() + TimeDelta::hours(1));
+        let mut second = warning("k1", "f1");
+        second.valid_until = Some(now() + TimeDelta::hours(3));
+        let r = rig(vec![ok(vec![first]), ok(vec![second])]).await;
+        r.runner.cycle(now()).await;
+        let report = r.runner.cycle(now()).await;
+        assert_eq!((report.announced, report.changed), (0, 0));
+        let items = r.state.active_items("imgw-meteo").await.unwrap();
+        assert_eq!(items[0].valid_until, Some(now() + TimeDelta::hours(3)));
+    }
+
     /// Wynik prawdziwego `gios::to_output` dla stacji przy Rzeszowie (promień 5 km):
     /// fiks (PI) albo fiks z dodanym PA dla tej samej strefy i parametru.
     fn gios_rzeszow(pa: bool, keep_pi: bool) -> SourceOutput {
@@ -1159,6 +1193,7 @@ mod tests {
             position: Some(aars_core::geo::StationPosition { lat: 50.04, lon: 22.00, locator: "KN00".into() }),
             settings: [("radius_km".to_owned(), "5".to_owned())].into(),
             tracked_keys: Default::default(),
+            tracked: Default::default(),
         };
         crate::gios::to_output(&warnings, skipped, &stations, &ctx)
     }

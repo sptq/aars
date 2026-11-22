@@ -228,7 +228,7 @@ pub fn compass8(from: (f64, f64), to: (f64, f64)) -> &'static str {
 /// nie zawiera znanych potknięć syntezy.
 #[cfg(test)]
 pub(crate) fn assert_speakable(texts: &[&str]) {
-    const RAW: &[&str] = &["RCB", "NOAA", "SWPC", "EMSC", "RSO", "GIOŚ", "PM10", "PM2,5", "PM2.5", "MUF", "KC2G"];
+    const RAW: &[&str] = &["RCB", "NOAA", "SWPC", "EMSC", "RSO", "GIOŚ", "PM10", "PM2,5", "PM2.5", "MUF", "KC2G", "PIB", "RP", "Płd", "nr"];
     for text in texts.iter().filter(|t| !t.is_empty()) {
         let spoken = aars_audio::text::normalize(text);
         assert!(!spoken.contains("godzinie godzina"), "{spoken}");

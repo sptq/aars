@@ -257,6 +257,7 @@ mod tests {
             }),
             settings: [("radius_km".to_owned(), radius.to_owned())].into(),
             tracked_keys: Default::default(),
+            tracked: Default::default(),
         }
     }
 

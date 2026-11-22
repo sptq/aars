@@ -373,7 +373,7 @@ impl SourceStateRepo {
         for status in self.statuses().await?.iter().filter(|s| s.enabled) {
             health.enabled += 1;
             let interval_s = self.config(&status.source_id).await?.map_or(DEFAULT_INTERVAL_S, |c| c.interval_s);
-            if status.is_stale(interval_s, now) {
+            if status.last_success_at.is_none() || status.is_stale(interval_s, now) {
                 health.unavailable += 1;
             }
         }
@@ -429,9 +429,10 @@ impl SourceStateRepo {
     }
 
     /// Pozycja widziana w odpowiedzi: zeruje licznik nieobecności.
-    pub async fn touch(&self, row: i64, now: DateTime<Utc>) -> Result<(), DbError> {
-        sqlx::query("UPDATE source_items SET last_seen_at = ?, misses = 0 WHERE id = ?")
+    pub async fn touch(&self, row: i64, now: DateTime<Utc>, valid_until: Option<DateTime<Utc>>) -> Result<(), DbError> {
+        sqlx::query("UPDATE source_items SET last_seen_at = ?, misses = 0, valid_until = ? WHERE id = ?")
             .bind(iso(now))
+            .bind(valid_until.map(iso))
             .bind(row)
             .execute(&self.pool)
             .await?;
@@ -708,10 +709,20 @@ mod tests {
         repo.record_success("old", at("2026-11-22T17:00:00Z")).await.unwrap();
         repo.record_success("off", at("2026-11-22T17:00:00Z")).await.unwrap();
         let health = repo.alert_source_health(now).await.unwrap();
-        assert_eq!(health, AlertSourceHealth { enabled: 3, unavailable: 1 });
+        assert_eq!(health, AlertSourceHealth { enabled: 3, unavailable: 2 });
+        assert_eq!(health, AlertSourceHealth { enabled: 3, unavailable: 2 });
         repo.record_failure("never", now, "zły").await.unwrap();
         let health = repo.alert_source_health(now).await.unwrap();
         assert_eq!(health, AlertSourceHealth { enabled: 3, unavailable: 2 });
+    }
+
+    #[tokio::test]
+    async fn touch_refreshes_valid_until() {
+        let repo = SourceStateRepo::new(test_pool().await);
+        let now = at("2026-07-23T09:00:00Z");
+        let row = repo.upsert_active(&tracked("a"), now).await.unwrap();
+        repo.touch(row, now, Some(at("2026-07-24T08:00:00Z"))).await.unwrap();
+        assert_eq!(repo.active_items("imgw-meteo").await.unwrap()[0].valid_until, Some(at("2026-07-24T08:00:00Z")));
     }
 
     #[tokio::test]
