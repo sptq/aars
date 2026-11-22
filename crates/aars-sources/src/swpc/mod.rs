@@ -167,6 +167,11 @@ pub fn to_output(scales: &Scales, ctx: &SourceCtx, episodes: &mut Episodes) -> S
                 episodes.remove(&scale);
             }
         }
+        // Próg podniesiony ponad szczyt epizodu: epizod się kończy (inaczej
+        // wróciłby jako nowe ogłoszenie przy nowym zakresie).
+        if episodes.get(&scale).is_some_and(|ep| ep.peak < min) {
+            episodes.remove(&scale);
+        }
         let Some(ep) = episodes.get(&scale) else {
             continue;
         };
@@ -359,6 +364,61 @@ mod tests {
         assert_eq!(fp(&step(18, 29, "2", &mut ep)).as_deref(), Some("G4"));
         assert_eq!(fp(&step(18, 31, "2", &mut ep)), None);
         assert!(ep.is_empty());
+    }
+
+    #[test]
+    fn raising_the_threshold_ends_an_episode_below_it() {
+        let mut ep = Episodes::new();
+        assert_eq!(run(&with_g("3"), &ctx(), &mut ep).items.len(), 1);
+        // Próg podniesiony do G4, a burza słabnie: epizod G3 jest poniżej
+        // nowego progu, więc nie wraca jako nowe ogłoszenie przy nowym zakresie.
+        let raised = ctx_at(at(15, 10), &[("g_min", "4")]);
+        assert!(run(&with_g("2"), &raised, &mut ep).items.is_empty());
+        assert!(ep.is_empty());
+        // Także gdy bieżący poziom wciąż jest G3.
+        assert_eq!(run(&with_g("3"), &ctx(), &mut ep).items.len(), 1);
+        assert!(run(&with_g("3"), &raised, &mut ep).items.is_empty());
+        assert!(ep.is_empty());
+    }
+
+    #[test]
+    fn r1_and_r5_read_like_this() {
+        let r = |level: &str| {
+            let c = ctx_at(at(15, 0), &[("r_min", "1")]);
+            run(&body(|v| v["0"]["R"]["Scale"] = level.into()), &c, &mut Episodes::new()).items[0]
+                .text
+                .clone()
+        };
+        assert_eq!(
+            r("1"),
+            "Uwaga, pogoda kosmiczna. Słabe zaniki łączności radiowej, poziom R1 w skali NOAA. \
+             Zaniki łączności na pasmach KF po dziennej stronie Ziemi. Dane: NOAA SWPC."
+        );
+        assert_eq!(
+            r("5"),
+            "Uwaga, pogoda kosmiczna. Ekstremalne zaniki łączności radiowej, poziom R5 w skali NOAA. \
+             Zaniki łączności na pasmach KF po dziennej stronie Ziemi. Dane: NOAA SWPC."
+        );
+    }
+
+    #[test]
+    fn a_strong_geomagnetic_storm_mentions_vhf_bands_in_words() {
+        let text = &run(&with_g("3"), &ctx(), &mut Episodes::new()).items[0].text;
+        assert!(text.contains("łączności przez zorzę na pasmach sześciu i dwóch metrów."), "{text}");
+    }
+
+    #[test]
+    fn swpc_texts_survive_normalization() {
+        let b = body(|v| {
+            v["0"]["G"]["Scale"] = "4".into();
+            v["0"]["S"]["Scale"] = "2".into();
+            v["0"]["R"]["Scale"] = "3".into();
+        });
+        let out = run(&b, &ctx(), &mut Episodes::new());
+        assert_eq!(out.items.len(), 3);
+        for i in &out.items {
+            crate::speech::assert_speakable(&[&i.text, &i.change_text, &i.cancel_text]);
+        }
     }
 
     #[test]

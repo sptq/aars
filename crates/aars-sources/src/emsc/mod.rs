@@ -273,7 +273,7 @@ mod tests {
         assert_eq!(
             item.text,
             format!(
-                "Wstrząs sejsmiczny o magnitudzie 2,1, {} na zachód od stacji, Polska, o godzinie 13:26. Dane: EMSC.",
+                "Wstrząs sejsmiczny o magnitudzie 2,1, {} na zachód od stacji, Polska, o 13:26. Dane: EMSC.",
                 crate::speech::km_phrase(km)
             )
         );
@@ -313,6 +313,16 @@ mod tests {
         assert_eq!(item.summary, format!("M2,1, {km} km, Polska"));
         let late = ctx_at(at(13, 0), &[("min_mag", "2.0"), ("radius_km", "300")]);
         assert!(run(FIXTURE, &late).items.is_empty());
+    }
+
+    #[test]
+    fn emsc_texts_survive_normalization() {
+        let out = run(FIXTURE, &strong_ctx());
+        let item = &out.items[0];
+        crate::speech::assert_speakable(&[&item.text, &item.change_text, &item.cancel_text]);
+        let spoken = aars_audio::text::normalize(&item.text);
+        assert!(spoken.contains("Polska, o godzinie trzynastej dwadzieścia sześć."), "{spoken}");
+        assert!(spoken.ends_with("Dane: E M S C."), "{spoken}");
     }
 
     #[test]
@@ -358,7 +368,7 @@ mod tests {
     fn an_unknown_region_is_not_spoken() {
         let out = run(&one_event(2.1, "ROMANIA"), &strong_ctx());
         let t = &out.items[0].text;
-        assert!(t.contains("od stacji, o godzinie"), "{t}");
+        assert!(t.contains("od stacji, o "), "{t}");
         assert!(!out.items[0].summary.ends_with(','));
     }
 

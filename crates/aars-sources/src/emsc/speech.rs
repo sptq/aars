@@ -30,7 +30,7 @@ pub fn announcement(q: &Quake, km: u32, direction: &str) -> String {
         .map(|r| format!(", {r}"))
         .unwrap_or_default();
     format!(
-        "Wstrząs sejsmiczny o magnitudzie {}, {} {direction} od stacji{region}, o godzinie {}. Dane: EMSC.",
+        "Wstrząs sejsmiczny o magnitudzie {}, {} {direction} od stacji{region}, o {}. Dane: EMSC.",
         mag_text(q.mag),
         crate::speech::km_phrase(km),
         crate::speech::warsaw_hhmm(q.time),

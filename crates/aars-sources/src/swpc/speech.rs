@@ -33,7 +33,7 @@ fn effects(scale: char, level: u8) -> &'static str {
             "Możliwe pogorszenie propagacji na pasmach KF, zwłaszcza na trasach północnych."
         }
         ('G', _) => {
-            "Możliwe pogorszenie propagacji na pasmach KF, zwłaszcza na trasach północnych. Możliwa zorza widoczna w Polsce i łączności przez zorzę na 6 i 2 metrach."
+            "Możliwe pogorszenie propagacji na pasmach KF, zwłaszcza na trasach północnych. Możliwa zorza widoczna w Polsce i łączności przez zorzę na pasmach sześciu i dwóch metrów."
         }
         ('S', _) => "Możliwe zaniki łączności KF w rejonach polarnych.",
         _ => "Zaniki łączności na pasmach KF po dziennej stronie Ziemi.",
