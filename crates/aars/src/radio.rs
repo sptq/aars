@@ -198,8 +198,7 @@ pub async fn apply_quiet_hours(
 ) {
     match aars_core::settings::SettingsRepo::new(pool.clone()).load().await {
         Ok(settings) => {
-            let quiet = settings.quiet_hours.is_some_and(|window| window.contains(now));
-            interlocks.set_quiet(quiet, settings.quiet_min_priority);
+            interlocks.set_quiet(settings.quiet_now(now), settings.quiet_min_priority);
         }
         Err(err) => tracing::error!(%err, "odczyt okna ciszy zawiódł"),
     }

@@ -1,4 +1,5 @@
 pub mod area;
+pub mod bulletin;
 pub mod config;
 pub mod db;
 pub mod dispatcher;

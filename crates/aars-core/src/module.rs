@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use chrono::NaiveTime;
 use sqlx::SqlitePool;
 
 use crate::area::{area_text, parse_area};
@@ -58,6 +59,8 @@ pub enum SettingKind {
     Decimal { min: f64, max: f64 },
     /// Podzbiór wartości z listy (wartość, etykieta), zapisany po przecinku.
     List(&'static [(&'static str, &'static str)]),
+    /// Pory doby `HH:MM` po przecinku; kanonicznie posortowane, bez duplikatów.
+    TimeList { max: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -143,6 +146,28 @@ impl ModuleDescriptor {
                         .collect::<Vec<_>>()
                         .join(",")
                 }
+                SettingKind::TimeList { max } => {
+                    let mut times = Vec::new();
+                    for part in raw.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                        let time = parse_clock(part).ok_or_else(|| {
+                            format!("{}: pora „{part}” ma mieć postać HH:MM", spec.label)
+                        })?;
+                        times.push(time);
+                    }
+                    times.sort_unstable();
+                    times.dedup();
+                    if times.is_empty() {
+                        return Err(format!("{}: podaj co najmniej jedną porę", spec.label));
+                    }
+                    if times.len() > max {
+                        return Err(format!("{}: najwyżej {max} pór", spec.label));
+                    }
+                    times
+                        .iter()
+                        .map(|t| t.format("%H:%M").to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
             };
             out.insert(spec.key.to_owned(), value);
         }
@@ -150,9 +175,62 @@ impl ModuleDescriptor {
     }
 }
 
+/// `HH:MM` albo `H:MM`; nic więcej.
+fn parse_clock(text: &str) -> Option<NaiveTime> {
+    let (h, m) = text.split_once(':')?;
+    let digits = |s: &str, len: std::ops::RangeInclusive<usize>| {
+        len.contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+    };
+    if !digits(h, 1..=2) || !digits(m, 2..=2) {
+        return None;
+    }
+    NaiveTime::from_hms_opt(h.parse().ok()?, m.parse().ok()?, 0)
+}
+
 fn comma(n: f64) -> String {
     format!("{n:.1}").replace('.', ",")
 }
+
+/// Części biuletynu (wartość, etykieta); kolejność w biuletynie jest stała.
+pub const BULLETIN_PARTS: &[(&str, &str)] = &[
+    ("pogoda", "Pogoda dla pozycji stacji"),
+    ("propagacja", "Warunki propagacji KF"),
+    ("ostrzezenia", "Obowiązujące ostrzeżenia"),
+];
+
+pub const BULLETIN: ModuleDescriptor = ModuleDescriptor {
+    id: "bulletin",
+    name: "Biuletyn",
+    description: "Nadaje o stałych porach biuletyn: pogoda, propagacja, obowiązujące ostrzeżenia.",
+    kind: ModuleKind::Bulletin,
+    toggle: Toggle::Switchable,
+    default_enabled: false,
+    needs: Needs::Nothing,
+    settings: &[
+        SettingSpec {
+            key: "times",
+            label: "Pory nadania",
+            help: "Czas lokalny, HH:MM po przecinku. Pora w oknie ciszy nocnej jest pomijana, gdy cisza zatrzymuje komunikaty zwykłe.",
+            kind: SettingKind::TimeList { max: 8 },
+            default: "07:00,19:00",
+        },
+        SettingSpec {
+            key: "parts",
+            label: "Części",
+            help: "Kolejność w biuletynie jest stała.",
+            kind: SettingKind::List(BULLETIN_PARTS),
+            default: "pogoda,propagacja,ostrzezenia",
+        },
+        SettingSpec {
+            key: "intro",
+            label: "Wstęp",
+            help: "Puste: „Biuletyn stacji {znak}.”",
+            kind: SettingKind::Text { max_len: 200 },
+            default: "",
+        },
+    ],
+    see_also: Some(("Pozycja, znak i okno ciszy", "/settings")),
+};
 
 /// Moduły wbudowane w rdzeń (R13). Źródła dokłada `aars_sources::modules()`.
 pub fn builtin() -> Vec<ModuleDescriptor> {
@@ -179,17 +257,7 @@ pub fn builtin() -> Vec<ModuleDescriptor> {
             settings: &[],
             see_also: Some(("Znak i tryb identyfikacji", "/settings")),
         },
-        ModuleDescriptor {
-            id: "bulletin",
-            name: "Biuletyn",
-            description: "Regularny biuletyn stacji.",
-            kind: ModuleKind::Bulletin,
-            toggle: Toggle::Planned("etap 11"),
-            default_enabled: false,
-            needs: Needs::Nothing,
-            settings: &[],
-            see_also: None,
-        },
+        BULLETIN,
     ]
 }
 
@@ -408,7 +476,7 @@ mod tests {
         assert_eq!(ids, ["scheduler", "auto-id", "bulletin"]);
         assert_eq!(b[0].toggle, Toggle::Switchable);
         assert!(matches!(b[1].toggle, Toggle::AlwaysOn(_)));
-        assert_eq!(b[2].toggle, Toggle::Planned("etap 11"));
+        assert_eq!(b[2].toggle, Toggle::Switchable);
         assert_eq!(b[0].see_also, Some(("Tolerancja spóźnień", "/settings")));
         assert_eq!(b[1].see_also, Some(("Znak i tryb identyfikacji", "/settings")));
         assert_eq!(ModuleKind::Ident.label(), "identyfikacja stacji");
@@ -537,11 +605,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_bulletin_cannot_be_enabled() {
+    async fn the_bulletin_can_be_enabled() {
         let repo = ModuleRepo::new(test_pool().await);
         let m = by_id("bulletin");
-        assert!(matches!(repo.set_enabled(&m, true).await, Err(ModuleError::Planned("etap 11"))));
         assert!(!repo.is_enabled(&m).await.unwrap());
+        repo.set_enabled(&m, true).await.unwrap();
+        assert!(repo.is_enabled(&m).await.unwrap());
+    }
+
+    #[test]
+    fn the_bulletin_is_switchable_with_three_settings() {
+        let m = by_id("bulletin");
+        assert_eq!(m.toggle, Toggle::Switchable);
+        assert!(!m.default_enabled);
+        assert_eq!(m.settings.len(), 3);
+        let defaults: BTreeMap<String, String> =
+            m.settings.iter().map(|s| (s.key.to_owned(), s.default.to_owned())).collect();
+        assert_eq!(m.validate(&defaults).unwrap(), defaults);
+        let mut input = defaults.clone();
+        input.insert("parts".into(), "ostrzezenia,pogoda".into());
+        assert_eq!(m.validate(&input).unwrap()["parts"], "pogoda,ostrzezenia");
+    }
+
+    #[test]
+    fn time_lists_are_sorted_deduplicated_and_bounded() {
+        const SPECS: &[SettingSpec] = &[SettingSpec {
+            key: "t", label: "Pory", help: "", kind: SettingKind::TimeList { max: 3 }, default: "07:00",
+        }];
+        let m = ModuleDescriptor { settings: SPECS, ..sample_source("x") };
+        let v = |s: &str| m.validate(&map(&[("t", s)]));
+        assert_eq!(v("19:00, 7:00,07:00").unwrap()["t"], "07:00,19:00");
+        assert_eq!(v("").unwrap_err(), "Pory: podaj co najmniej jedną porę");
+        for bad in ["25:00", "7.00"] {
+            let e = v(bad).unwrap_err();
+            assert!(e.contains(&format!("„{bad}”")) && e.contains("HH:MM"), "{bad}: {e}");
+        }
+        assert_eq!(v("01:00,02:00,03:00,04:00").unwrap_err(), "Pory: najwyżej 3 pór");
     }
 
     #[tokio::test]

@@ -82,6 +82,7 @@ fn kind_name(kind: SettingKind) -> &'static str {
         SettingKind::Choice(_) => "choice",
         SettingKind::Decimal { .. } => "decimal",
         SettingKind::List(_) => "list",
+        SettingKind::TimeList { .. } => "timelist",
     }
 }
 
@@ -91,7 +92,7 @@ fn field_view(spec: &aars_core::module::SettingSpec, value: String) -> FieldView
         SettingKind::Integer { min, max } => (0, min, max, Vec::new()),
         SettingKind::Area => (0, 0, 0, Vec::new()),
         SettingKind::Choice(options) | SettingKind::List(options) => (0, 0, 0, options.to_vec()),
-        SettingKind::Decimal { .. } => (0, 0, 0, Vec::new()),
+        SettingKind::Decimal { .. } | SettingKind::TimeList { .. } => (0, 0, 0, Vec::new()),
     };
     let (min_text, max_text) = match spec.kind {
         SettingKind::Decimal { min, max } => (
@@ -504,7 +505,7 @@ mod tests {
         for needle in [
             "Harmonogram",
             "Ostrzeżenia meteorologiczne IMGW",
-            "planowany — etap 11",
+            "Biuletyn",
             "zawsze włączony — identyfikacja stacji jest obowiązkowa",
             "źródło danych",
             "href=\"/sources\"",
@@ -527,6 +528,7 @@ mod tests {
             "action=\"/modules/scheduler/enabled\"",
             "action=\"/modules/imgw-meteo/enabled\"",
             "action=\"/modules/imgw-meteo/settings\"",
+            "action=\"/modules/bulletin/enabled\"",
             "<textarea",
             "name=\"area\"",
             "name=\"interval_s\" type=\"number\" min=\"60\" max=\"3600\" value=\"300\"",
@@ -537,7 +539,6 @@ mod tests {
         }
         for absent in [
             "action=\"/modules/auto-id/enabled\"",
-            "action=\"/modules/bulletin/enabled\"",
             "action=\"/modules/scheduler/settings\"",
         ] {
             assert!(!html.contains(absent), "{absent}: {html}");
@@ -598,19 +599,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_bulletin_cannot_be_enabled() {
+    async fn the_bulletin_can_be_enabled() {
         let (app, cookie, csrf, state) = app_as(Role::Admin, state().await).await;
-        let (status, _, body) = post(
-            &app,
-            &cookie,
-            &csrf,
-            "/modules/bulletin/enabled",
-            "enabled=1",
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.contains("etap 11"), "{body}");
-        assert!(audit_details(&state, "module_enabled").await.is_empty());
+        let (status, _, _) = post(&app, &cookie, &csrf, "/modules/bulletin/enabled", "enabled=1").await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(audit_details(&state, "module_enabled").await, vec!["bulletin: włączony".to_owned()]);
+        let (_, html) = get(&app, &cookie, "/modules").await;
+        assert!(html.contains("Pory nadania"), "{html}");
+        assert!(html.contains("value=\"07:00,19:00\""), "{html}");
     }
 
     #[tokio::test]
