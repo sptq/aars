@@ -4,6 +4,7 @@ pub mod auth;
 pub mod chrome;
 pub mod hardware_page;
 pub mod logs;
+mod map_page;
 pub mod messages;
 pub mod modules_page;
 pub mod preview;
@@ -521,6 +522,8 @@ pub fn router(state: AppState) -> Router {
         .route("/fragments/queue", get(queue_fragment))
         .route("/queue", get(queue_page::page_view))
         .route("/logs", get(logs::page_view))
+        .route("/map", get(map_page::page_view))
+        .route("/map/data", get(map_page::data))
         .route("/settings", get(settings_page::page_view).post(settings_page::submit))
         .route("/settings/position", post(settings_page::submit_position))
         .route(

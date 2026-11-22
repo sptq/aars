@@ -27,3 +27,4 @@ aars-core = { path = "../aars-core", features = ["testing"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 tower.workspace = true
 tempfile = "3"
+serde_json.workspace = true

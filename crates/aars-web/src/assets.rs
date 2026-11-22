@@ -13,12 +13,13 @@ pub async fn serve(axum::extract::Path(path): axum::extract::Path<String>) -> Re
         None => (StatusCode::NOT_FOUND, "nie ma takiego pliku").into_response(),
         Some(file) => {
             let mime = mime_guess::from_path(&path).first_or_octet_stream();
+            // Assety są wersjonowane razem z binarką, więc mogą leżeć w cache
+            // przeglądarki; granice powiatów (743 KB) zmieniają się rzadko.
+            let cache = if path == "powiaty.geojson" { "public, max-age=86400" } else { "public, max-age=3600" };
             (
                 [
                     (header::CONTENT_TYPE, mime.as_ref().to_owned()),
-                    // Assety są wersjonowane razem z binarką, więc mogą
-                    // leżeć w cache przeglądarki.
-                    (header::CACHE_CONTROL, "public, max-age=3600".to_owned()),
+                    (header::CACHE_CONTROL, cache.to_owned()),
                 ],
                 file.data,
             )
@@ -36,23 +37,48 @@ mod tests {
     use tower::ServiceExt;
 
     async fn content_type(path: &str) -> (StatusCode, String) {
+        let (status, mime, _) = fetch(path).await;
+        (status, mime)
+    }
+
+    /// Status, `Content-Type` i `Cache-Control` assetu.
+    async fn fetch(path: &str) -> (StatusCode, String, String) {
         let app = router(AppState::for_tests(aars_core::db::test_pool().await));
         let response = app
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
             .await
             .unwrap();
-        let mime = response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_owned();
-        (response.status(), mime)
+        let header_text = |name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let mime = header_text(header::CONTENT_TYPE);
+        let cache = header_text(header::CACHE_CONTROL);
+        (response.status(), mime, cache)
+    }
+
+    #[tokio::test]
+    async fn the_county_borders_are_cached_for_a_day() {
+        let (status, mime, cache) = fetch("/assets/powiaty.geojson").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(mime.contains("json"), "{mime}");
+        assert_eq!(cache, "public, max-age=86400");
+        let (status, _, cache) = fetch("/assets/station-map.js").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cache, "public, max-age=3600");
     }
 
     #[tokio::test]
     async fn leaflet_and_the_map_script_are_embedded() {
-        for path in ["/assets/vendor/leaflet/leaflet.js", "/assets/station-map.js"] {
+        for path in [
+            "/assets/vendor/leaflet/leaflet.js",
+            "/assets/station-map.js",
+            "/assets/warnings-map.js",
+        ] {
             let (status, mime) = content_type(path).await;
             assert_eq!(status, StatusCode::OK, "brak assetu {path}");
             assert!(mime.contains("javascript"), "{path}: {mime}");

@@ -190,6 +190,8 @@ async fn every_get_route_enforces_its_minimum_role() {
     let routes = [
         get("/", VIEWER),
         get("/logs", VIEWER),
+        get("/map", VIEWER),
+        get("/map/data", VIEWER),
         get("/fragments/queue", VIEWER),
         get("/account/password", VIEWER),
         get("/compose", OPERATOR),
