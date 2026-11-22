@@ -357,15 +357,21 @@ impl SharedSources {
 
 /// Ostrzeżenia z pamięci `imgw-meteo` w postaci dla mapy: jeden wpis na parę
 /// (ostrzeżenie, powiat); brak stopnia = 1, czas końca nieistniejący w
-/// Warszawie = wpis pominięty.
+/// Warszawie = wpis pominięty, ostrzeżenie jeszcze nieobowiązujące też.
 pub fn warnings_snapshot(
     snapshot: aars_sources::imgw_meteo::MeteoSnapshot,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> aars_web::state::WarningsSnapshot {
     let mut warnings = Vec::new();
     for w in &snapshot.warnings {
         let Some(until) = aars_sources::speech::warsaw_to_utc(w.valid_until) else {
             continue;
         };
+        // Ostrzeżenie, które jeszcze nie obowiązuje, nie barwi mapy (popup
+        // nie podaje początku). Początek nieistniejący w Warszawie — pokazujemy.
+        if aars_sources::speech::warsaw_to_utc(w.valid_from).is_some_and(|from| from > now) {
+            continue;
+        }
         for teryt in &w.teryt {
             warnings.push(aars_web::state::MapWarning {
                 teryt: teryt.clone(),
@@ -915,7 +921,9 @@ async fn run_station(
     }
     if let Some(meteo) = shared.meteo.clone() {
         state = state.with_warnings_map(Arc::new(move || {
-            meteo.snapshot().map(warnings_snapshot)
+            meteo
+                .snapshot()
+                .map(|snap| warnings_snapshot(snap, chrono::Utc::now()))
         }));
     }
     if let Some(built) = &bulletin {
@@ -1869,10 +1877,13 @@ mod tests {
         let parsed = aars_sources::imgw_meteo::parse::parse_warnings(JULY).unwrap();
         let total: usize = parsed.warnings.iter().map(|w| w.teryt.len()).sum();
         let fetched_at = chrono::Utc::now();
-        let snap = warnings_snapshot(aars_sources::imgw_meteo::MeteoSnapshot {
+        let snap = warnings_snapshot(
+            aars_sources::imgw_meteo::MeteoSnapshot {
+                fetched_at,
+                warnings: parsed.warnings.clone(),
+            },
             fetched_at,
-            warnings: parsed.warnings.clone(),
-        });
+        );
         assert_eq!(snap.fetched_at, fetched_at);
         assert_eq!(snap.warnings.len(), total);
         let until = chrono::DateTime::parse_from_rfc3339("2026-07-23T20:00:00Z")
@@ -1891,12 +1902,47 @@ mod tests {
         gap.valid_until =
             chrono::NaiveDateTime::parse_from_str("2026-03-29 02:30:00", "%Y-%m-%d %H:%M:%S")
                 .unwrap();
-        let snap = warnings_snapshot(aars_sources::imgw_meteo::MeteoSnapshot {
+        let snap = warnings_snapshot(
+            aars_sources::imgw_meteo::MeteoSnapshot {
+                fetched_at,
+                warnings: vec![no_level, gap],
+            },
             fetched_at,
-            warnings: vec![no_level, gap],
-        });
+        );
         assert_eq!(snap.warnings.len(), 1);
         assert_eq!(snap.warnings[0].level, 1);
+    }
+
+    #[test]
+    fn a_warning_not_yet_in_force_is_left_off_the_map() {
+        const JULY: &[u8] =
+            include_bytes!("../../aars-sources/tests/fixtures/imgw/warningsmeteo-2026-07-23.json");
+        let parsed = aars_sources::imgw_meteo::parse::parse_warnings(JULY).unwrap();
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let mut base = parsed.warnings[0].clone();
+        base.teryt = vec!["1801".into()];
+        let from = |s: &str| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap()
+        };
+        let mut started = base.clone();
+        started.valid_from = from("2026-07-23 08:00:00");
+        started.event = "Teraz".into();
+        let mut later = base.clone();
+        later.valid_from = from("2026-07-23 10:00:01");
+        later.event = "Później".into();
+        let snap = warnings_snapshot(
+            aars_sources::imgw_meteo::MeteoSnapshot {
+                fetched_at: at("2026-07-23T07:00:00Z"),
+                warnings: vec![started, later],
+            },
+            at("2026-07-23T08:00:00Z"),
+        );
+        let events: Vec<&str> = snap.warnings.iter().map(|w| w.event.as_str()).collect();
+        assert_eq!(events, ["Teraz"]);
     }
 
     #[test]
