@@ -47,3 +47,8 @@ install_root = "/opt/aars"
 
 [sources]
 imgw_meteo_url = "https://danepubliczne.imgw.pl/api/data/warningsmeteo"
+# Adresy pozostałych źródeł (wartości domyślne; odkomentuj, by zmienić):
+# rso_url = "https://komunikaty.tvp.pl/komunikatyxml"
+# swpc_url = "https://services.swpc.noaa.gov/products/noaa-scales.json"
+# gios_url = "https://api.gios.gov.pl/pjp-api/v1/rest"
+# emsc_url = "https://www.seismicportal.eu/fdsnws/event/1/query"

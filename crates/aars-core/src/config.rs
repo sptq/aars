@@ -73,28 +73,73 @@ pub enum FirstAdmin {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourcesConfig {
+    #[serde(default = "default_imgw_meteo_url")]
     pub imgw_meteo_url: String,
+    #[serde(default = "default_rso_url")]
+    pub rso_url: String,
+    #[serde(default = "default_swpc_url")]
+    pub swpc_url: String,
+    #[serde(default = "default_gios_url")]
+    pub gios_url: String,
+    #[serde(default = "default_emsc_url")]
+    pub emsc_url: String,
+}
+
+fn default_imgw_meteo_url() -> String {
+    "https://danepubliczne.imgw.pl/api/data/warningsmeteo".to_owned()
+}
+
+fn default_rso_url() -> String {
+    "https://komunikaty.tvp.pl/komunikatyxml".to_owned()
+}
+
+fn default_swpc_url() -> String {
+    "https://services.swpc.noaa.gov/products/noaa-scales.json".to_owned()
+}
+
+fn default_gios_url() -> String {
+    "https://api.gios.gov.pl/pjp-api/v1/rest".to_owned()
+}
+
+fn default_emsc_url() -> String {
+    "https://www.seismicportal.eu/fdsnws/event/1/query".to_owned()
 }
 
 impl SourcesConfig {
-    /// Adres musi być URL-em http(s); literówka ma wyjść przy starcie, nie
-    /// jako wieczna porażka odpytywania.
+    /// Każdy adres musi być URL-em http(s); literówka ma wyjść przy starcie,
+    /// nie jako wieczna porażka odpytywania.
     fn validate(&self) -> Result<(), ConfigError> {
-        let url = self.imgw_meteo_url.as_str();
-        let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
-        match rest {
-            Some(rest) if !rest.is_empty() && !rest.starts_with('/') && !url.contains(char::is_whitespace) => Ok(()),
-            _ => Err(ConfigError::Invalid(Box::new(figment::Error::from(format!(
-                "sources.imgw_meteo_url: „{url}” nie jest adresem http:// ani https://"
-            ))))),
+        let pairs = [
+            ("imgw_meteo_url", &self.imgw_meteo_url),
+            ("rso_url", &self.rso_url),
+            ("swpc_url", &self.swpc_url),
+            ("gios_url", &self.gios_url),
+            ("emsc_url", &self.emsc_url),
+        ];
+        for (key, url) in pairs {
+            let url = url.as_str();
+            let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
+            match rest {
+                Some(rest) if !rest.is_empty() && !rest.starts_with('/') && !url.contains(char::is_whitespace) => {}
+                _ => {
+                    return Err(ConfigError::Invalid(Box::new(figment::Error::from(format!(
+                        "sources.{key}: „{url}” nie jest adresem http:// ani https://"
+                    )))))
+                }
+            }
         }
+        Ok(())
     }
 }
 
 impl Default for SourcesConfig {
     fn default() -> Self {
         Self {
-            imgw_meteo_url: "https://danepubliczne.imgw.pl/api/data/warningsmeteo".to_owned(),
+            imgw_meteo_url: default_imgw_meteo_url(),
+            rso_url: default_rso_url(),
+            swpc_url: default_swpc_url(),
+            gios_url: default_gios_url(),
+            emsc_url: default_emsc_url(),
         }
     }
 }
@@ -357,6 +402,32 @@ mod tests {
                 jail.set_env("AARS_SOURCES__IMGW_METEO_URL", bad);
                 let err = Config::load(None).unwrap_err().to_string();
                 assert!(err.contains("imgw_meteo_url"), "{bad:?}: {err}");
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn a_partial_sources_block_keeps_the_other_defaults() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("aars.toml", "[sources]\nimgw_meteo_url = \"http://127.0.0.1:9/x\"\n")?;
+            let cfg = Config::load(Some(std::path::Path::new("aars.toml"))).unwrap();
+            assert_eq!(cfg.sources.imgw_meteo_url, "http://127.0.0.1:9/x");
+            assert_eq!(cfg.sources.rso_url, "https://komunikaty.tvp.pl/komunikatyxml");
+            assert_eq!(cfg.sources.swpc_url, "https://services.swpc.noaa.gov/products/noaa-scales.json");
+            assert_eq!(cfg.sources.gios_url, "https://api.gios.gov.pl/pjp-api/v1/rest");
+            assert_eq!(cfg.sources.emsc_url, "https://www.seismicportal.eu/fdsnws/event/1/query");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn every_source_url_is_validated() {
+        for key in ["IMGW_METEO_URL", "RSO_URL", "SWPC_URL", "GIOS_URL", "EMSC_URL"] {
+            figment::Jail::expect_with(|jail| {
+                jail.set_env(format!("AARS_SOURCES__{key}"), "ftp://x");
+                let err = Config::load(None).unwrap_err().to_string();
+                assert!(err.contains(&key.to_lowercase()), "{key}: {err}");
                 Ok(())
             });
         }
