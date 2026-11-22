@@ -5,6 +5,7 @@ pub mod emsc;
 pub mod gios;
 pub mod http;
 pub mod imgw_meteo;
+pub mod rso;
 pub mod runner;
 pub mod source;
 pub mod speech;
