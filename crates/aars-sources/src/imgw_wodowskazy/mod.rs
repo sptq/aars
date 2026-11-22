@@ -32,6 +32,8 @@ const FRESH_READING: TimeDelta = TimeDelta::hours(3);
 const FRESH_FETCH: TimeDelta = TimeDelta::minutes(20);
 const VALID_FOR: TimeDelta = TimeDelta::hours(24);
 const PART_GAUGES: usize = 3;
+/// Śledzony wodowskaz jest ogłaszany dalej, dopóki stan ≥ próg − tyle cm.
+const HYSTERESIS_CM: f64 = 5.0;
 
 pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     id: ID,
@@ -126,6 +128,27 @@ fn latlon(pos: Option<&StationPosition>) -> Option<(f64, f64)> {
     pos.map(|p| (p.lat, p.lon))
 }
 
+/// Przekroczenie do ogłoszenia z uwzględnieniem śledzonego odcisku: śledzona
+/// pozycja nie obniża stanu (raz `alarmowy` zostaje `alarmowy`) i trzyma się,
+/// dopóki stan nie spadnie o więcej niż `HYSTERESIS_CM` poniżej najniższego
+/// progu stacji — wodowskaz chwiejący się przy progu nie migocze na antenie.
+fn held_exceedance(g: &Gauge, level: f64, held: Option<&String>) -> Option<Exceedance> {
+    let now = g.exceedance();
+    let held = match held.map(String::as_str) {
+        Some("ostrzegawczy") => Exceedance::Warning,
+        Some("alarmowy") => Exceedance::Alarm,
+        _ => return now,
+    };
+    match now {
+        Some(Exceedance::Alarm) => Some(Exceedance::Alarm),
+        Some(Exceedance::Warning) => Some(held),
+        None => {
+            let lowest = g.warning_cm.or(g.alarm_cm)?;
+            (level >= lowest - HYSTERESIS_CM).then_some(held)
+        }
+    }
+}
+
 /// Czysta funkcja: lista IMGW → pozycje przekroczeń wodowskazów z `ctx` (C6–C8).
 pub fn to_output(gauges: &[Gauge], ctx: &SourceCtx) -> SourceOutput {
     let chosen = match latlon(ctx.position.as_ref()) {
@@ -148,7 +171,7 @@ pub fn to_output(gauges: &[Gauge], ctx: &SourceCtx) -> SourceOutput {
         if g.warning_cm.or(g.alarm_cm).is_some() {
             fresh.insert(&g.id);
         }
-        let Some(e) = g.exceedance() else {
+        let Some(e) = held_exceedance(g, level, ctx.tracked.get(&g.id)) else {
             continue;
         };
         let text = speech::announcement(g, e, level, measured);
@@ -458,9 +481,9 @@ mod tests {
         );
         assert_eq!(
             hel.text,
-            "Wodowskaz Hel na rzece Bałtyk: stan wody 566 cm, powyżej stanu ostrzegawczego (550 cm). Pomiar z godz. 20:20. Źródło: IMGW-PIB."
+            "Wodowskaz Hel (Bałtyk): stan wody 566 cm, powyżej stanu ostrzegawczego (550 cm). Pomiar z godz. 20:20. Źródło: IMGW-PIB."
         );
-        assert_eq!(hel.summary, "Bałtyk w Hel: stan ostrzegawczy");
+        assert_eq!(hel.summary, "Hel, Bałtyk: stan ostrzegawczy");
         assert_eq!(
             hel.cancel_text,
             "Wodowskaz Hel: stan wody spadł poniżej stanu ostrzegawczego."
@@ -653,6 +676,153 @@ mod tests {
         crate::speech::assert_speakable(&[&part]);
     }
 
+    #[test]
+    fn a_tracked_gauge_keeps_its_level_within_the_hysteresis() {
+        // Gdańsk: ostrzegawczy 550, alarmowy 570.
+        let run = |level: &str, held: Option<&str>, edit: &dyn Fn(&mut serde_json::Value)| {
+            let g = edited("154180140", &|w| {
+                w["stan_wody"] = level.into();
+                edit(w);
+            });
+            let mut c = ctx_full("2026-11-22T20:00:00Z", &[("stations", "154180140")], &[]);
+            if let Some(held) = held {
+                c.tracked_keys.insert("154180140".to_owned());
+                c.tracked.insert("154180140".to_owned(), held.to_owned());
+            }
+            let o = to_output(&g, &c);
+            assert!(o.complete);
+            o.items.first().map(|i| i.fingerprint.clone())
+        };
+        let none = &|_: &mut serde_json::Value| {};
+        // Bez śledzenia: zwykłe progi.
+        assert_eq!(run("569", None, none).as_deref(), Some("ostrzegawczy"));
+        assert_eq!(run("549", None, none), None);
+        // Śledzony alarm nie spada do ostrzegawczego i trzyma się do 545 cm.
+        assert_eq!(
+            run("569", Some("alarmowy"), none).as_deref(),
+            Some("alarmowy")
+        );
+        assert_eq!(
+            run("545", Some("alarmowy"), none).as_deref(),
+            Some("alarmowy")
+        );
+        assert_eq!(run("544", Some("alarmowy"), none), None);
+        // Śledzony ostrzegawczy rośnie do alarmowego.
+        assert_eq!(
+            run("571", Some("ostrzegawczy"), none).as_deref(),
+            Some("alarmowy")
+        );
+        assert_eq!(
+            run("547", Some("ostrzegawczy"), none).as_deref(),
+            Some("ostrzegawczy")
+        );
+        // Stacja z samym alarmowym: histereza od alarmowego.
+        let alarm_only =
+            &|w: &mut serde_json::Value| w["stan_ostrzegawczy"] = serde_json::Value::Null;
+        assert_eq!(
+            run("565", Some("alarmowy"), alarm_only).as_deref(),
+            Some("alarmowy")
+        );
+        assert_eq!(run("564", Some("alarmowy"), alarm_only), None);
+        // Nieznany odcisk w bazie: zwykłe progi.
+        assert_eq!(run("546", Some("coś"), none), None);
+    }
+
+    #[test]
+    fn water_body_names_are_spelled_out() {
+        let g = gauges();
+        let river = |id: &str| {
+            g.iter()
+                .find(|g| g.id == id)
+                .unwrap()
+                .river
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(river("154210060"), "Jezioro Mamry");
+        assert_eq!(river("152210150"), "Zbiornik Dębe");
+        assert_eq!(river("152230110"), "Zbiornik Siemianówka");
+        assert_eq!(river("153220190"), "Jezioro Rajgrodzkie");
+        assert_eq!(river("153160040"), "Jezioro Drawsko");
+        assert_eq!(river("154170140"), "Jezioro Jasień Południowe");
+        assert_eq!(river("153220140"), "Ełk (Kanał Rudzki)");
+        assert_eq!(river("154180100"), "Bałtyk");
+        assert_eq!(
+            parse::water_name("Jez.  Pn. Kanał. X"),
+            "Jezioro Północne Kanał X"
+        );
+    }
+
+    #[test]
+    fn lakes_reservoirs_and_the_sea_are_not_rivers() {
+        let forced = |id: &str, level: &str| {
+            let g = edited(id, &|w| w["stan_wody"] = level.into());
+            to_output(&g, &ctx(&[("stations", id)]))
+        };
+        let mamry = forced("154210060", "170");
+        let mamry = item(&mamry, "154210060");
+        assert!(
+            mamry
+                .text
+                .starts_with("Wodowskaz Przystań (Jezioro Mamry): stan wody 170 cm, powyżej stanu ostrzegawczego (160 cm)."),
+            "{}",
+            mamry.text
+        );
+        assert_eq!(mamry.summary, "Przystań, Jezioro Mamry: stan ostrzegawczy");
+        let debe = forced("152210150", "380");
+        assert!(
+            item(&debe, "152210150").text.starts_with(
+                "Wodowskaz Popowo (Zbiornik Dębe): stan wody 380 cm, powyżej stanu alarmowego"
+            ),
+            "{}",
+            item(&debe, "152210150").text
+        );
+        let o = to_output(&gauges(), &ctx(&[("stations", "153180120")]));
+        let hel = item(&o, "153180120");
+        assert!(
+            hel.text
+                .starts_with("Wodowskaz Hel (Bałtyk): stan wody 566 cm"),
+            "{}",
+            hel.text
+        );
+        // Zwykła rzeka dalej „na rzece”.
+        let rzeszow = forced("150220010", "310");
+        assert!(
+            item(&rzeszow, "150220010")
+                .text
+                .starts_with("Wodowskaz Rzeszów na rzece Wisłok: stan wody 310 cm"),
+            "{}",
+            item(&rzeszow, "150220010").text
+        );
+        assert_eq!(
+            item(&rzeszow, "150220010").summary,
+            "Rzeszów, Wisłok: stan ostrzegawczy"
+        );
+    }
+
+    #[test]
+    fn texts_for_every_gauge_in_the_fixture_are_speakable() {
+        let g = gauges();
+        assert_eq!(g.len(), 913);
+        for gauge in &g {
+            // Wymuszone przekroczenie: stan nad progiem, próg zawsze jest.
+            let mut forced = gauge.clone();
+            let warning = forced.warning_cm.unwrap_or(300.0);
+            forced.warning_cm = Some(warning);
+            forced.level_cm = Some(warning + 1.0);
+            let e = forced.exceedance().unwrap();
+            let text = speech::announcement(&forced, e, warning + 1.0, at("2026-11-22T19:20:00Z"));
+            let part = speech::bulletin(&[(&forced, warning + 1.0)]).unwrap();
+            crate::speech::assert_speakable(&[
+                &text,
+                &speech::change(&text),
+                &speech::cancellation(&forced),
+                &speech::summary(&forced, e),
+                &part,
+            ]);
+        }
+    }
+
     mod part_tests {
         use super::*;
         use wiremock::matchers::{method, path};
@@ -715,7 +885,7 @@ mod tests {
             .await;
             assert_eq!(
                 t,
-                "Stany wód. Wisłok w Rzeszów: 72 cm. Wisłok w Żarnowa: 164 cm. Stobnica w Godowa: 609 cm. Źródło: IMGW-PIB."
+                "Stany wód. Rzeszów, Wisłok: 72 cm. Żarnowa, Wisłok: 164 cm. Godowa, Stobnica: 609 cm. Źródło: IMGW-PIB."
             );
         }
 
@@ -734,12 +904,9 @@ mod tests {
                 ),
             )
             .await;
+            assert!(t.contains("Hel, Bałtyk: 566 cm, stan ostrzegawczy."), "{t}");
             assert!(
-                t.contains("Bałtyk w Hel: 566 cm, stan ostrzegawczy."),
-                "{t}"
-            );
-            assert!(
-                t.contains("Bałtyk w Władysławowo: 572 cm, stan alarmowy."),
+                t.contains("Władysławowo, Bałtyk: 572 cm, stan alarmowy."),
                 "{t}"
             );
         }
@@ -754,7 +921,7 @@ mod tests {
                 &part_ctx("2026-11-22T20:10:00Z", Some(position()), &[]),
             )
             .await;
-            assert!(t.starts_with("Stany wód. Wisłok w Rzeszów: 72 cm."), "{t}");
+            assert!(t.starts_with("Stany wód. Rzeszów, Wisłok: 72 cm."), "{t}");
         }
 
         #[tokio::test]

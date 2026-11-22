@@ -8,9 +8,22 @@ use crate::speech::{round_int, warsaw_hhmm};
 
 const SOURCE: &str = "Źródło: IMGW-PIB.";
 
-/// Ogłoszenie przekroczenia (C8: bez rzeki — bez „na rzece …”).
+/// Początki nazw, które nie są rzekami (po rozwinięciu skrótów).
+const WATER_BODIES: &[&str] = &[
+    "Jezioro", "Zbiornik", "Zalew", "Zatoka", "Bałtyk", "Morze", "Kanał",
+];
+
+fn is_water_body(name: &str) -> bool {
+    name.split_whitespace()
+        .next()
+        .is_some_and(|first| WATER_BODIES.contains(&first))
+}
+
+/// Ogłoszenie przekroczenia: „na rzece …” tylko dla rzeki, jezioro, zbiornik
+/// i morze w nawiasie; bez rzeki — sama stacja (C8).
 pub fn announcement(g: &Gauge, e: Exceedance, level_cm: f64, measured: DateTime<Utc>) -> String {
     let place = match &g.river {
+        Some(water) if is_water_body(water) => format!("Wodowskaz {} ({water})", g.name),
         Some(river) => format!("Wodowskaz {} na rzece {river}", g.name),
         None => format!("Wodowskaz {}", g.name),
     };
@@ -45,10 +58,10 @@ pub fn cancellation(g: &Gauge) -> String {
     )
 }
 
-/// „{rzeka} w {stacja}” albo sama stacja.
+/// „{stacja}, {rzeka}” albo sama stacja (nazw miejscowości nie odmieniamy).
 fn label(g: &Gauge) -> String {
     match &g.river {
-        Some(river) => format!("{river} w {}", g.name),
+        Some(river) => format!("{}, {river}", g.name),
         None => g.name.clone(),
     }
 }

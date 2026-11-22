@@ -35,7 +35,8 @@ impl Exceedance {
 pub struct Gauge {
     pub id: String,
     pub name: String,
-    /// `None` dla pustej, `null` albo `"-"` (morze w Gdańsku).
+    /// `None` dla pustej, `null` albo `"-"` (morze w Gdańsku); skróty
+    /// akwenów rozwinięte (`water_name`).
     pub river: Option<String>,
     pub lat: f64,
     pub lon: f64,
@@ -112,7 +113,7 @@ fn parse_entry(entry: &serde_json::Value) -> Option<Gauge> {
         return None;
     }
     let river = text("rzeka")
-        .map(clean_text)
+        .map(|r| water_name(&clean_text(r)))
         .filter(|r| !r.is_empty() && r != "-");
     Some(Gauge {
         id: id.to_owned(),
@@ -126,4 +127,45 @@ fn parse_entry(entry: &serde_json::Value) -> Option<Gauge> {
         warning_cm: threshold(entry.get("stan_ostrzegawczy")),
         alarm_cm: threshold(entry.get("stan_alarmowy")),
     })
+}
+
+/// Skróty w nazwach akwenów IMGW (z kropką i bez).
+const WATER_WORDS: &[(&str, &str)] = &[
+    ("Jez", "Jezioro"),
+    ("jez", "Jezioro"),
+    ("Zb", "Zbiornik"),
+    ("Pd", "Południowe"),
+    ("Pn", "Północne"),
+    ("Kanał", "Kanał"),
+];
+
+/// Nazwa rzeki albo akwenu do mowy: kropka między literami → spacja
+/// („Jez.Miedwie”), skróty rozwinięte („Jez. Mamry” → „Jezioro Mamry”,
+/// „Zb. Dębe” → „Zbiornik Dębe”, „Pd.” → „Południowe”), spacje zwinięte.
+pub fn water_name(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut spaced = String::with_capacity(raw.len());
+    for (i, c) in chars.iter().enumerate() {
+        let between_letters = *c == '.'
+            && i.checked_sub(1)
+                .and_then(|p| chars.get(p))
+                .is_some_and(|p| p.is_alphabetic())
+            && chars.get(i + 1).is_some_and(|n| n.is_alphabetic());
+        if between_letters {
+            spaced.push(' ');
+        } else {
+            spaced.push(*c);
+        }
+    }
+    spaced
+        .split_whitespace()
+        .map(|word| {
+            let bare = word.strip_suffix('.').unwrap_or(word);
+            match WATER_WORDS.iter().find(|(abbr, _)| *abbr == bare) {
+                Some((_, full)) => (*full).to_owned(),
+                None => word.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }

@@ -396,10 +396,7 @@ mod tests {
             i.text
         );
         let spoken = aars_audio::text::normalize(&i.text);
-        assert!(
-            spoken.contains("Ważne do godziny dwunastej"),
-            "{spoken}"
-        );
+        assert!(spoken.contains("Ważne do godziny dwunastej"), "{spoken}");
     }
 
     #[test]
