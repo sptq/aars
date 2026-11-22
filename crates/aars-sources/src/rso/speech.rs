@@ -42,7 +42,8 @@ pub fn change(text: &str) -> String {
 }
 
 pub fn cancel(title: &str) -> String {
-    format!("Komunikat RSO „{}” nie obowiązuje.", clean_text(title))
+    let title = truncate_sentence(&clean_text(title), TITLE_MAX).0;
+    format!("Komunikat RSO „{title}” nie obowiązuje.")
 }
 
 pub fn summary(title: &str) -> String {

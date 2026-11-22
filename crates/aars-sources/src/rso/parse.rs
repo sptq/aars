@@ -15,6 +15,8 @@ pub struct News {
     pub valid_until: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub province_slugs: Vec<String>,
+    /// Slug województwa kanału, z którego pozycję pobrano (ustawia `fetch`).
+    pub feed_slug: Option<String>,
 }
 
 /// Czas polski `YYYY-MM-DD HH:MM:SS`; brak albo śmieci to `None`.
@@ -61,6 +63,7 @@ fn parse_item(v: &Value) -> Option<News> {
         valid_until: local_time(v, "valid_to"),
         updated_at: local_time(v, "updated_at"),
         province_slugs: province_slugs(v),
+        feed_slug: None,
     })
 }
 

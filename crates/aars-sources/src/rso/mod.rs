@@ -71,7 +71,7 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
         SettingSpec {
             key: "categories",
             label: "Kategorie",
-            help: "Które kategorie komunikatów RSO pobierać. Alert RCB i atak z powietrza przerywają audycję.",
+            help: "Które kategorie komunikatów RSO pobierać. Atak z powietrza jest pobierany zawsze, nawet odznaczony. Alert RCB i atak z powietrza przerywają audycję.",
             kind: SettingKind::List(CATEGORIES),
             default: DEFAULT_CATEGORIES,
         },
@@ -209,7 +209,11 @@ impl DataSource for Rso {
 
     fn fetch<'a>(&'a self, ctx: &'a SourceCtx) -> FetchFuture<'a> {
         Box::pin(async move {
-            let cats = categories(ctx);
+            // Atak z powietrza zawsze: odznaczenie go nie może zgubić alarmu.
+            let mut cats = categories(ctx);
+            if !cats.iter().any(|c| c.is_attack()) {
+                cats.push(Category(ATTACK));
+            }
             let mut batches = Vec::new();
             let mut skipped = 0;
             let mut failed = 0;
@@ -225,8 +229,11 @@ impl DataSource for Rso {
                         Err(e) => Err(e),
                     };
                     match result {
-                        Ok((news, s)) => {
+                        Ok((mut news, s)) => {
                             skipped += s;
+                            for n in &mut news {
+                                n.feed_slug = Some(slug.to_owned());
+                            }
                             batches.push((*cat, news));
                         }
                         Err(e) => {
@@ -274,18 +281,16 @@ fn mentions_test(n: &News) -> bool {
     false
 }
 
-fn fingerprint(n: &News, alarm: bool) -> String {
+/// `{id}|{tytuł}|{skrót16}` dla każdej pozycji: RSO nie łączy starych i
+/// nowych id, więc scalanie R4 po odcisku nic nie daje, a id chroni przed
+/// scaleniem nowego komunikatu o identycznym szablonie ze starym. Odcisk nie
+/// zależy od kategorii (alarm czy nie), więc częściowa awaria go nie zmienia.
+fn fingerprint(n: &News) -> String {
     let clean = crate::speech::clean_text(&n.content);
     let head: String = clean.chars().take(FINGERPRINT_CHARS).collect();
     let digest = Sha256::digest(head.as_bytes());
     let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    // Alarm: id w odcisku, żeby runner (R4) nie scalił nowego komunikatu o
-    // identycznym szablonie ze śledzonym starym.
-    if alarm {
-        format!("{}|{}|{hex}", n.id, n.title)
-    } else {
-        format!("{}|{hex}", n.title)
-    }
+    format!("{}|{}|{hex}", n.id, n.title)
 }
 
 /// Czysta funkcja: paczki (kategoria, pozycje) → ogłoszenia dla obszaru.
@@ -309,15 +314,25 @@ pub fn to_output(
             if items.iter().any(|i| i.key == n.id.to_string()) {
                 continue;
             }
-            // Pierwsze województwo obszaru, którego dotyczy pozycja.
-            let Some(voivodeship) = ctx.area.iter().find_map(|entry| {
-                let (_, slug, name) = voivodeship_of(&entry.code)?;
-                n.province_slugs.iter().any(|s| s == slug).then_some(*name)
-            }) else {
-                continue;
-            };
             let key = n.id.to_string();
             let alarm = n.title.to_lowercase().contains("alert rcb") || attack_ids.contains(&n.id);
+            // Pierwsze województwo obszaru, którego dotyczy pozycja. Alarm bez
+            // województw należy do kanału, z którego przyszedł (nie gubimy go).
+            let in_area = |slugs: &[&str]| {
+                ctx.area.iter().find_map(|entry| {
+                    let (_, slug, name) = voivodeship_of(&entry.code)?;
+                    slugs.contains(slug).then_some(*name)
+                })
+            };
+            let provinces: Vec<&str> = n.province_slugs.iter().map(String::as_str).collect();
+            let voivodeship = if provinces.is_empty() && alarm {
+                n.feed_slug.as_deref().and_then(|feed| in_area(&[feed]))
+            } else {
+                in_area(&provinces)
+            };
+            let Some(voivodeship) = voivodeship else {
+                continue;
+            };
             if !alarm {
                 if !words.is_empty() {
                     let hay = [&n.title, &n.shortcut, &n.content]
@@ -328,7 +343,8 @@ pub fn to_output(
                         continue;
                     }
                 }
-                let stale = n.updated_at.is_some_and(|t| ctx.now - t > max_age);
+                // Brak `updated_at`: wieku nie znamy, więc bezpieczniej pominąć.
+                let stale = n.updated_at.is_none_or(|t| ctx.now - t > max_age);
                 if stale && !ctx.tracked_keys.contains(&key) {
                     continue;
                 }
@@ -337,7 +353,7 @@ pub fn to_output(
             let text = speech::announcement(n, voivodeship);
             items.push(SourceItem {
                 topic: format!("rso:{}", n.id),
-                fingerprint: fingerprint(n, alarm),
+                fingerprint: fingerprint(n),
                 change_text: speech::change(&text),
                 text,
                 cancel_text: speech::cancel(&n.title),
@@ -384,6 +400,14 @@ mod tests {
                 .collect(),
             tracked_keys: Default::default(),
         }
+    }
+
+    /// Kontekst, w którym pozycja z id Alertu (23521833) jest już śledzona:
+    /// zwykłe komunikaty z tym id przechodzą bramkę wieku.
+    fn tracked(area: &str) -> SourceCtx {
+        let mut c = ctx(area, &[]);
+        c.tracked_keys.insert("23521833".into());
+        c
     }
 
     fn news(body: &[u8]) -> Vec<News> {
@@ -511,10 +535,16 @@ mod tests {
         let mut c = ctx("02", &[]);
         c.tracked_keys.insert("23524661".into());
         assert_eq!(keys(&run(vec![n.clone()], ogolne(), &c)), ["23524661"]);
-        // Dłuższy próg też je przepuszcza; brak updated_at nie wyklucza.
+        // Dłuższy próg też je przepuszcza.
         assert_eq!(keys(&run(vec![n.clone()], ogolne(), &ctx("02", &[("max_age_h", "48")]))), ["23524661"]);
+        // Brak updated_at: wieku nie da się sprawdzić, więc nieśledzona pozycja
+        // jest pomijana (bezpieczniej niż nadać stary komunikat), śledzona zostaje.
         let mut undated = n;
         undated.updated_at = None;
+        assert!(run(vec![undated.clone()], ogolne(), &ctx("02", &[])).items.is_empty());
+        assert_eq!(keys(&run(vec![undated.clone()], ogolne(), &c)), ["23524661"]);
+        // Alarm bez updated_at przechodzi zawsze.
+        undated.title = "Alert RCB".into();
         assert_eq!(keys(&run(vec![undated], ogolne(), &ctx("02", &[]))), ["23524661"]);
     }
 
@@ -559,20 +589,79 @@ mod tests {
     }
 
     #[test]
-    fn alarm_fingerprints_carry_the_id_plain_ones_do_not() {
+    fn every_fingerprint_carries_the_id() {
         let fp = |id: i64, title: &str, cat: Category| {
             let mut n = alert();
             n.id = id;
             n.title = title.into();
             n.updated_at = None;
-            run(vec![n], cat, &ctx("02", &[])).items[0].fingerprint.clone()
+            let mut c = ctx("02", &[]);
+            c.tracked_keys.insert(id.to_string());
+            run(vec![n], cat, &c).items[0].fingerprint.clone()
         };
         assert_ne!(fp(1, "Alert RCB", ogolne()), fp(2, "Alert RCB", ogolne()));
         assert!(fp(1, "Alert RCB", ogolne()).starts_with("1|Alert RCB|"));
         let atak = Category("atak-z-powietrza");
         assert_ne!(fp(1, "Alarm", atak), fp(2, "Alarm", atak));
-        assert_eq!(fp(1, "Woda", ogolne()), fp(2, "Woda", ogolne()));
-        assert!(fp(1, "Woda", ogolne()).starts_with("Woda|"));
+        // RSO nie łączy starych i nowych id, więc odcisk bez id nic nie daje,
+        // a przy częściowej awarii zmieniałby się z kategorią (fałszywa zmiana).
+        assert_ne!(fp(1, "Woda", ogolne()), fp(2, "Woda", ogolne()));
+        assert!(fp(1, "Woda", ogolne()).starts_with("1|Woda|"));
+        let mut n = alert();
+        n.title = "Komunikat".into();
+        n.updated_at = None;
+        let with_attack = to_output(
+            vec![(ogolne(), vec![n.clone()]), (Category("atak-z-powietrza"), vec![n.clone()])],
+            0,
+            0,
+            &tracked("02"),
+        );
+        let attack_failed = to_output(vec![(ogolne(), vec![n])], 0, 1, &tracked("02"));
+        assert_eq!(with_attack.items[0].fingerprint, attack_failed.items[0].fingerprint);
+    }
+
+    #[test]
+    fn a_long_title_is_cut_in_the_cancellation_too() {
+        let mut n = alert();
+        n.title = "Bardzo długi tytuł komunikatu ".repeat(20);
+        let i = &run(vec![n], ogolne(), &tracked("02")).items[0];
+        assert!(i.cancel_text.chars().count() <= 200, "{}", i.cancel_text);
+        assert!(i.cancel_text.starts_with("Komunikat RSO „Bardzo długi"), "{}", i.cancel_text);
+        assert!(i.cancel_text.ends_with("” nie obowiązuje."), "{}", i.cancel_text);
+    }
+
+    #[test]
+    fn an_alarm_without_provinces_belongs_to_the_voivodeship_of_its_feed() {
+        let mut n = alert();
+        n.province_slugs.clear();
+        n.feed_slug = Some("lodzkie".into());
+        let out = run(vec![n.clone()], ogolne(), &ctx("02\n10", &[]));
+        assert_eq!(keys(&out), ["23521833"]);
+        assert!(out.items[0].text.starts_with("Alert RCB, województwo łódzkie."), "{}", out.items[0].text);
+        // Atak z powietrza też.
+        let mut attack = n.clone();
+        attack.title = "Alarm".into();
+        assert_eq!(run(vec![attack], Category("atak-z-powietrza"), &ctx("10", &[])).items.len(), 1);
+        // Zwykły komunikat bez województw dalej odpada, nawet śledzony.
+        let mut plain = n;
+        plain.title = "Woda".into();
+        let mut c = ctx("10", &[]);
+        c.tracked_keys.insert(plain.id.to_string());
+        assert!(run(vec![plain], ogolne(), &c).items.is_empty());
+    }
+
+    #[test]
+    fn rso_texts_survive_normalization() {
+        let mut c = ctx("02", &[]);
+        let all = news(OGOLNE);
+        for n in &all {
+            c.tracked_keys.insert(n.id.to_string());
+        }
+        let out = run(all, ogolne(), &c);
+        assert!(out.items.len() >= 2);
+        for i in &out.items {
+            crate::speech::assert_speakable(&[&i.text, &i.change_text, &i.cancel_text]);
+        }
     }
 
     #[test]
@@ -581,7 +670,7 @@ mod tests {
         n.title = "Bardzo długi tytuł komunikatu ".repeat(20);
         n.content = "Zdanie numer jeden jest tutaj. ".repeat(15);
         n.updated_at = None;
-        let i = &run(vec![n], ogolne(), &ctx("02", &[])).items[0];
+        let i = &run(vec![n], ogolne(), &tracked("02")).items[0];
         assert!(i.text.chars().count() <= 750, "{}", i.text.chars().count());
         assert!(i.text.starts_with("Komunikat RSO, województwo dolnośląskie. Bardzo długi"));
         assert!(!i.text.contains("Pełna treść"), "{}", i.text);
@@ -601,7 +690,8 @@ mod tests {
         n.title = "Woda".into();
         n.updated_at = None;
         n.content = "Awaria &amp; <b>wodociągu</b> w Pieńsku".into();
-        let c = ctx("02", &[("keywords", "awaria & wodociągu")]);
+        let mut c = ctx("02", &[("keywords", "awaria & wodociągu")]);
+        c.tracked_keys.insert(n.id.to_string());
         assert_eq!(run(vec![n], ogolne(), &c).items.len(), 1);
     }
 
@@ -661,7 +751,7 @@ mod tests {
         n.updated_at = None;
         n.content = "Zdanie numer jeden jest tutaj. ".repeat(70);
         assert!(n.content.chars().count() >= 2000);
-        let i = &run(vec![n], ogolne(), &ctx("02", &[])).items[0];
+        let i = &run(vec![n], ogolne(), &tracked("02")).items[0];
         assert!(i.text.chars().count() <= 700, "{}", i.text.chars().count());
         assert!(i.text.ends_with("tutaj. Pełna treść na stronie RSO."), "{}", i.text);
     }
@@ -716,7 +806,7 @@ mod tests {
         let mut n = alert();
         n.title = "Ł".repeat(120);
         n.updated_at = None;
-        let out = run(vec![n], ogolne(), &ctx("02", &[]));
+        let out = run(vec![n], ogolne(), &tracked("02"));
         assert_eq!(out.items[0].summary.chars().count(), 80);
     }
 
@@ -780,10 +870,39 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn the_attack_feed_is_fetched_even_when_unchecked() {
+            let server = MockServer::start().await;
+            mount(&server, "/lodzkie/ogolne/0", json_body(PUSTO), 1).await;
+            mount(&server, "/lodzkie/atak-z-powietrza/0", json_body(ATAK_PUSTO), 1).await;
+            let src = Rso::new(&server.uri()).unwrap();
+            let out = src.fetch(&ctx("10", &[("categories", "ogolne")])).await.unwrap();
+            assert!(out.complete);
+            let help = DESCRIPTOR.settings[1].help;
+            assert!(help.contains("Atak z powietrza jest pobierany zawsze"), "{help}");
+        }
+
+        #[tokio::test]
+        async fn an_alarm_without_provinces_from_a_feed_is_kept() {
+            let server = MockServer::start().await;
+            let mut v: Value = serde_json::from_slice(OGOLNE).unwrap();
+            for n in v["newses"].as_array_mut().unwrap() {
+                n["provinces"] = json!([]);
+            }
+            mount(&server, "/lodzkie/ogolne/0", json_body(&serde_json::to_vec(&v).unwrap()), 1).await;
+            mount(&server, "/lodzkie/atak-z-powietrza/0", json_body(ATAK_PUSTO), 1).await;
+            let src = Rso::new(&server.uri()).unwrap();
+            let out = src.fetch(&ctx("10", &[])).await.unwrap();
+            assert_eq!(keys(&out), ["23521833"]);
+            assert!(out.items[0].text.starts_with("Alert RCB, województwo łódzkie."));
+        }
+
+        #[tokio::test]
         async fn two_voivodeships_are_fetched_separately() {
             let server = MockServer::start().await;
             mount(&server, "/lodzkie/ogolne/0", json_body(PUSTO), 1).await;
             mount(&server, "/dolnoslaskie/ogolne/0", json_body(OGOLNE), 1).await;
+            mount(&server, "/lodzkie/atak-z-powietrza/0", json_body(ATAK_PUSTO), 1).await;
+            mount(&server, "/dolnoslaskie/atak-z-powietrza/0", json_body(ATAK_PUSTO), 1).await;
             let src = Rso::new(&server.uri()).unwrap();
             let c = ctx("10\n02", &[("categories", "ogolne")]);
             let out = src.fetch(&c).await.unwrap();
