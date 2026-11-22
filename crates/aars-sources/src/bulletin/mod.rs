@@ -1,18 +1,29 @@
 //! Kompozytor biuletynu: trait części, czyste składanie z limitem długości.
 
 pub mod ostrzezenia;
+pub mod runner;
 
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 
-use aars_core::geo::StationPosition;
-use aars_core::source_state::TrackedItem;
+use aars_core::config::Config;
+use aars_core::error::DbError;
+use aars_core::geo::{PositionRepo, StationPosition};
+use aars_core::module::{BULLETIN, BULLETIN_PARTS};
+use aars_core::settings::SettingsRepo;
+use aars_core::source_state::{SourceStateRepo, TrackedItem};
 use chrono::{DateTime, Utc};
+use sqlx::SqlitePool;
 
 use crate::source::SourceError;
+use crate::speech::{truncate_sentence, warsaw_hhmm};
+use crate::{pogoda, propagacja};
 
 pub use ostrzezenia::Ostrzezenia;
+pub use runner::{BulletinRunner, BulletinTick, due_fires};
 
 /// Wejście części: chwila nadania, pozycja stacji, ustawienia
 /// `module:bulletin:*` (bez prefiksu) i żywe alerty.
@@ -146,6 +157,168 @@ pub fn length_limit(tx_max_duration_s: u64) -> usize {
     usize::try_from(tx_max_duration_s.saturating_mul(10))
         .unwrap_or(usize::MAX)
         .min(1500)
+}
+
+const SETTINGS_PREFIX: &str = "module:bulletin:";
+const DEFAULT_PART_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Ustawienia `module:bulletin:*` (bez prefiksu); brakujące klucze z opisu modułu.
+pub(crate) async fn module_settings(
+    pool: &SqlitePool,
+) -> Result<BTreeMap<String, String>, DbError> {
+    let mut out: BTreeMap<String, String> = BULLETIN
+        .settings
+        .iter()
+        .map(|s| (s.key.to_owned(), s.default.to_owned()))
+        .collect();
+    out.extend(
+        SettingsRepo::new(pool.clone())
+            .kv_prefix(SETTINGS_PREFIX)
+            .await?,
+    );
+    Ok(out)
+}
+
+fn order_of(id: &str) -> usize {
+    BULLETIN_PARTS
+        .iter()
+        .position(|(v, _)| *v == id)
+        .unwrap_or(BULLETIN_PARTS.len())
+}
+
+/// Kompozytor: wspólna ścieżka nadania i podglądu. Wszystko, co zależy od
+/// operatora (znak, części, wstęp, limit nadawania), czyta z bazy przy
+/// każdym złożeniu.
+pub struct Bulletin {
+    pool: SqlitePool,
+    parts: Vec<Arc<dyn BulletinPart>>,
+    part_timeout: Duration,
+}
+
+impl Bulletin {
+    /// Kolejność części wg `BULLETIN_PARTS`, nie wg wektora.
+    pub fn new(pool: SqlitePool, parts: Vec<Arc<dyn BulletinPart>>) -> Self {
+        let mut parts = parts;
+        parts.sort_by_key(|p| order_of(p.id()));
+        Self {
+            pool,
+            parts,
+            part_timeout: DEFAULT_PART_TIMEOUT,
+        }
+    }
+
+    pub fn with_part_timeout(mut self, t: Duration) -> Self {
+        self.part_timeout = t;
+        self
+    }
+
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    /// Składa biuletyn na chwilę `now` bez zapisu do kolejki (podgląd).
+    pub async fn compose(&self, now: DateTime<Utc>) -> Result<Composed, DbError> {
+        self.compose_at(now, now).await
+    }
+
+    /// `now` — chwila danych; `spoken` — pora wypowiadana we wstępie.
+    pub(crate) async fn compose_at(
+        &self,
+        now: DateTime<Utc>,
+        spoken: DateTime<Utc>,
+    ) -> Result<Composed, DbError> {
+        let station = SettingsRepo::new(self.pool.clone()).load().await?;
+        let settings = module_settings(&self.pool).await?;
+        let selected: Vec<String> = settings
+            .get("parts")
+            .map(|v| v.split(',').map(|p| p.trim().to_owned()).collect())
+            .unwrap_or_default();
+        let chosen = |id: &str| selected.iter().any(|p| p == id);
+        let position = PositionRepo::new(self.pool.clone()).load().await?;
+        let active_alerts = if chosen("ostrzezenia") {
+            SourceStateRepo::new(self.pool.clone())
+                .live_alerts(now)
+                .await?
+        } else {
+            Vec::new()
+        };
+        let intro = intro_text(
+            settings.get("intro").map(String::as_str).unwrap_or(""),
+            &station.callsign,
+        );
+        let ctx = Arc::new(PartCtx {
+            now,
+            position,
+            settings,
+            active_alerts,
+        });
+
+        let timeout = self.part_timeout;
+        let running: Vec<_> = self
+            .parts
+            .iter()
+            .filter(|p| chosen(p.id()))
+            .map(|part| {
+                let part = Arc::clone(part);
+                let ctx = Arc::clone(&ctx);
+                let id = part.id();
+                let handle = tokio::spawn(async move {
+                    let result = tokio::time::timeout(timeout, part.compose(&ctx)).await;
+                    outcome(result, part.max_chars(), timeout)
+                });
+                (id, handle)
+            })
+            .collect();
+        let mut parts = Vec::with_capacity(running.len());
+        for (id, handle) in running {
+            let outcome = handle
+                .await
+                .unwrap_or_else(|e| PartOutcome::Failed(format!("część przerwana: {e}")));
+            if let PartOutcome::Failed(why) = &outcome {
+                tracing::warn!(część = id, błąd = %why, "część biuletynu wypada");
+            }
+            parts.push((id, outcome));
+        }
+        Ok(assemble(
+            &intro,
+            &warsaw_hhmm(spoken),
+            parts,
+            length_limit(station.tx_max_duration_s),
+        ))
+    }
+}
+
+fn outcome(
+    result: Result<Result<PartText, SourceError>, tokio::time::error::Elapsed>,
+    max_chars: usize,
+    timeout: Duration,
+) -> PartOutcome {
+    match result {
+        Err(_) => PartOutcome::Failed(format!("przekroczony czas {} s", timeout.as_secs())),
+        Ok(Err(e)) => PartOutcome::Failed(e.to_string()),
+        Ok(Ok(PartText::Empty(why))) => PartOutcome::Empty(why.to_owned()),
+        Ok(Ok(PartText::Text(text))) if text.trim().is_empty() => {
+            PartOutcome::Empty("pusta treść".to_owned())
+        }
+        Ok(Ok(PartText::Text(text))) => {
+            PartOutcome::Included(truncate_sentence(text.trim(), max_chars).0)
+        }
+    }
+}
+
+/// Biuletyn stacji: jedna `Pogoda` (ta sama instancja trafia do runnera
+/// źródeł), `Propagacja`, `Ostrzezenia`.
+pub fn build(
+    cfg: &Config,
+    pool: SqlitePool,
+) -> Result<(Arc<Bulletin>, Arc<pogoda::Pogoda>), SourceError> {
+    let pogoda = Arc::new(pogoda::Pogoda::new(&cfg.sources)?);
+    let parts: Vec<Arc<dyn BulletinPart>> = vec![
+        pogoda.clone(),
+        Arc::new(propagacja::Propagacja::new(&cfg.sources)?),
+        Arc::new(Ostrzezenia),
+    ];
+    Ok((Arc::new(Bulletin::new(pool, parts)), pogoda))
 }
 
 #[cfg(test)]
