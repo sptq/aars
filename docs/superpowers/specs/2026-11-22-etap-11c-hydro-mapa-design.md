@@ -182,3 +182,44 @@ meteo, i drobne poprawki odłożone w 11b.
    mapa pusta do pierwszego pobrania (stan „never”/„stale” z banerem).
 6. Granice uproszczone (Douglas-Peucker 0,004°) — koszt: drobne szczeliny
    między powiatami przy dużym przybliżeniu.
+
+## Rozstrzygnięcia po przeglądzie (mają pierwszeństwo przed tekstem wyżej)
+
+1. **Wodowskazy a nieświeże pomiary.** `complete = false` tylko wtedy, gdy
+   nieświeży (> 3 h) albo brakujący pomiar ma stacja, którą runner **już
+   śledzi** (`tracked_keys`); nieświeże stacje bez śledzonej pozycji po
+   prostu pomijamy. Każda pozycja wodowskazu ma `valid_until` = czas pomiaru
+   + 24 h (odświeżany z każdym świeżym pomiarem) — martwy wodowskaz wygasa
+   po cichu (runner: wygaśnięcie, bez „spadł poniżej”), nie wisi w
+   `ostrzezenia` w nieskończoność. Odwołanie „spadł poniżej” tylko po
+   świeżych pomiarach poniżej progu (2 pełne cykle).
+2. **`imgw-hydro`: temat = klucz** celowo (IMGW wydaje równoległe ostrzeżenia
+   o tym samym zdarzeniu dla jednego województwa — fixtura: 137 i 140).
+   Odwołanie nazywa numer i województwa: „Ostrzeżenie hydrologiczne nr
+   {numer} ({województwa}) „{zdarzenie}” nie obowiązuje.” Nowy numer przy
+   aktualizacji = nowe ogłoszenie + późniejsze odwołanie starego (koszt
+   przyjęty).
+3. **Susza wypada z biuletynu w 11c.** Dopasowanie tylko po województwie
+   dawałoby zdanie o suszy prawie zawsze (30 susz w fixturze). Wraca, gdy
+   będzie mapowanie zlewni. Część `wody` = same wodowskazy; nie potrzebuje
+   instancji `imgw-hydro`.
+4. **Alert pogodowy dnia 0 (poprawka 4):** raz ogłoszona pozycja dnia 0 jest
+   emitowana przez źródło do końca dnia z dotychczasowym odciskiem, gdy nowa
+   wartość jest słabsza (niższy kubełek albo pod progiem); silniejsza
+   (porywy/opady wyżej, mróz zimniej) = nowy odcisk = „Zmiana prognozy”.
+   `SourceCtx` dostaje `tracked: HashMap<String, String>` (klucz → odcisk
+   aktywnych pozycji, w zakresie, jak `tracked_keys`).
+5. **Mapa po restarcie:** pusta pamięć źródła ⇒ stan `never` niezależnie od
+   `source_state`. Źródło `imgw-meteo` zapamiętuje **wszystkie** ostrzeżenia
+   z odpowiedzi (przed filtrem obszaru). Pusty obszar ⇒ runner nie pobiera ⇒
+   mapa `never` z banerem „Ustaw obszar źródła ostrzeżeń meteo” (koszt
+   przyjęty).
+6. **Część `wody`:** do 3 najbliższych wodowskazów w `radius_km` (albo z
+   listy `stations`), ustawienia czytane z `source:imgw-wodowskazy:*` (przez
+   tę samą instancję co źródło, jak `pogoda`). Wodowskaz bez progów —
+   podany sam stan, bez słowa o progu.
+7. **Poprawka 1 tylko w `alert_source_health`** (`SourceStatus::is_stale` bez
+   zmian).
+8. (moje) Normalizer: „z godz.” → dopełniacz („z godziny dwudziestej
+   dwadzieścia”). `powiaty.geojson` serwowany bez kompresji (743 KB),
+   `Cache-Control: max-age=86400` tylko dla tego pliku.
