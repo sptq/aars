@@ -2,6 +2,7 @@
 //! pilnuje idempotencji, odwołań i wycofywania po błędach.
 
 pub mod emsc;
+pub mod gios;
 pub mod http;
 pub mod imgw_meteo;
 pub mod runner;

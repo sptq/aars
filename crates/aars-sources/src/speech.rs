@@ -46,7 +46,7 @@ pub fn clean_text(raw: &str) -> String {
             None => (line.as_str(), false),
         };
         if !out.is_empty() {
-            let separator = if is_item {
+            let separator = if is_item && !out.ends_with(':') {
                 "; "
             } else if after_item && !out.ends_with(['.', '!', '?']) {
                 ". "
@@ -216,7 +216,20 @@ mod tests {
             "od 31.10.2026: Dojazd do miejscowości; Gierłoż; Kruszewiec; Cegielnia; Kwiedzina; Pożarki; Martiany. Odbywał się będzie drogą wojewódzką numer 592 od strony miejscowości Kętrzyn."
         );
         // Kropka na końcu pozycji listy nie jest podwajana.
-        assert_eq!(clean_text("Lista:\n- a.\nDalej"), "Lista:; a. Dalej");
+        assert_eq!(clean_text("Lista:\n- a.\nDalej"), "Lista: a. Dalej");
+    }
+
+    #[test]
+    fn the_first_list_item_after_a_colon_is_joined_with_a_space() {
+        // Kształt zaleceń GIOŚ.
+        assert_eq!(
+            clean_text("Ogół ludności:\n- rozważ\n- ogranicz"),
+            "Ogół ludności: rozważ; ogranicz"
+        );
+        assert_eq!(
+            clean_text("Ogół ludności:\n- rozważ, \n-  ogranicz.\nWrażliwe grupy:\n- unikaj"),
+            "Ogół ludności: rozważ,; ogranicz. Wrażliwe grupy: unikaj"
+        );
     }
 
     #[test]
