@@ -100,6 +100,10 @@ impl Gios {
             pages = total;
             page += 1;
         }
+        // Pusta lista w pamięci na 24 h odwołałaby wszystkie alerty.
+        if all.is_empty() {
+            return Err(SourceError::Parse("pusta lista stacji pomiarowych".to_owned()));
+        }
         Ok(all)
     }
 
@@ -164,14 +168,16 @@ impl DataSource for Gios {
 }
 
 /// Czysta funkcja: ostrzeżenia → pozycje na `(strefa, poziom, parametr)` dla
-/// stacji w promieniu; ostrzeżenie ze stacji spoza listy jest ignorowane.
+/// stacji w promieniu. Temat to `(strefa, parametr)`: PA wypiera PI tej samej
+/// strefy i parametru, więc eskalacja to jedna zmiana, nie odwołanie. Ostrzeżenie
+/// ze stacji spoza listy czyni wynik niepełnym (nie wiadomo, gdzie jest).
 pub fn to_output(
     warnings: &[Warning],
     skipped: usize,
     stations: &[Station],
     ctx: &SourceCtx,
 ) -> SourceOutput {
-    let complete = skipped == 0;
+    let mut complete = skipped == 0;
     let Some(pos) = ctx.position.as_ref() else {
         return SourceOutput {
             items: Vec::new(),
@@ -181,26 +187,26 @@ pub fn to_output(
     let station = (pos.lat, pos.lon);
     let radius = f64::from(radius_km(ctx));
     let by_id: HashMap<i64, &Station> = stations.iter().map(|s| (s.id, s)).collect();
-    let mut items: Vec<SourceItem> = Vec::new();
+    let mut items: Vec<(&str, SourceItem)> = Vec::new();
     for w in warnings {
         let Some(st) = by_id.get(&w.station_id) else {
+            complete = false;
             continue;
         };
         if crate::speech::haversine_km(station, (st.lat, st.lon)) > radius {
             continue;
         }
         let key = format!("{}|{}|{}", w.zone_code, w.level, w.param_code);
-        if items.iter().any(|i| i.key == key) {
+        if items.iter().any(|(_, i)| i.key == key) {
             continue;
         }
-        let text = speech::announcement(w);
-        items.push(SourceItem {
-            topic: key.clone(),
+        items.push((w.level.as_str(), SourceItem {
+            topic: format!("{}|{}", w.zone_code, w.param_code),
             fingerprint: key.clone(),
             key,
-            change_text: text.clone(),
-            text,
-            cancel_text: speech::cancel(&w.zone_name),
+            text: speech::announcement(w),
+            change_text: speech::change(w),
+            cancel_text: speech::cancel(w),
             summary: speech::summary(w),
             priority: if w.level == "PA" {
                 Priority::High
@@ -210,8 +216,18 @@ pub fn to_output(
             interrupting: false,
             valid_from: None,
             valid_until: None,
-        });
+        }));
     }
+    let alarm_topics: Vec<String> = items
+        .iter()
+        .filter(|(level, _)| *level == "PA")
+        .map(|(_, i)| i.topic.clone())
+        .collect();
+    let items = items
+        .into_iter()
+        .filter(|(level, i)| !(*level == "PI" && alarm_topics.contains(&i.topic)))
+        .map(|(_, i)| i)
+        .collect();
     SourceOutput { items, complete }
 }
 
@@ -287,15 +303,17 @@ mod tests {
         assert_eq!(out.items.len(), 1);
         let item = &out.items[0];
         assert_eq!(item.key, "PL1801|PI|PM10");
-        assert_eq!(item.topic, "PL1801|PI|PM10");
+        assert_eq!(item.topic, "PL1801|PM10");
         assert_eq!(item.fingerprint, "PL1801|PI|PM10");
         assert!(
             item.text.starts_with(
-                "Alert smogowy GIOŚ, miasto Rzeszów. Przekroczony poziom informowania dla pył zawieszony PM10."
+                "Alert smogowy GIOŚ. Strefa: miasto Rzeszów. Zanieczyszczenie: pył zawieszony PM10. \
+                 Przekroczony poziom informowania. Ogół ludności:"
             ),
             "{}",
             item.text
         );
+        assert_eq!(item.change_text, format!("Zmiana alertu smogowego. {}", item.text));
         assert!(item.text.ends_with("Źródło: GIOŚ."), "{}", item.text);
         assert!(!item.text.contains('\n'));
         assert!(item.text.contains("Ogół ludności: rozważ"), "{}", item.text);
@@ -305,12 +323,23 @@ mod tests {
         );
         assert_eq!(
             item.cancel_text,
-            "Alert smogowy dla miasto Rzeszów odwołany. Źródło: GIOŚ."
+            "Koniec alertu smogowego GIOŚ. Strefa: miasto Rzeszów. Zanieczyszczenie: pył zawieszony PM10. Źródło: GIOŚ."
         );
         assert_eq!(item.summary, "PM10, poziom informowania, miasto Rzeszów");
         assert_eq!(item.priority, Priority::Normal);
         assert!(!item.interrupting);
         assert_eq!((item.valid_from, item.valid_until), (None, None));
+    }
+
+    #[test]
+    fn gios_texts_survive_normalization() {
+        let out = run_body(&with_pa_in_rzeszow(false), &ctx_at(at(12), "100"));
+        assert!(!out.items.is_empty());
+        for i in &out.items {
+            crate::speech::assert_speakable(&[&i.text, &i.change_text, &i.cancel_text]);
+        }
+        let spoken = aars_audio::text::normalize(&out.items[0].text);
+        assert!(spoken.contains("pył zawieszony P M dziesięć"), "{spoken}");
     }
 
     #[test]
@@ -340,7 +369,7 @@ mod tests {
         let item = &out.items[0];
         assert_eq!(item.key, "PL1801|PA|PM10");
         assert_eq!(item.priority, Priority::High);
-        assert!(item.text.contains("Przekroczony poziom alarmowy dla"));
+        assert!(item.text.contains("Przekroczony poziom alarmowy."), "{}", item.text);
         assert_eq!(item.summary, "PM10, poziom alarmowy, miasto Rzeszów");
     }
 
@@ -353,10 +382,11 @@ mod tests {
         }
         let out = run_body(&serde_json::to_vec(&v).unwrap(), &ctx_at(at(12), "10"));
         assert!(
-            out.items[0]
-                .text
-                .contains("Przekroczony poziom Poziom docelowy dla")
+            out.items[0].text.contains("Zanieczyszczenie: pył zawieszony PM10. Przekroczony poziom docelowy."),
+            "{}",
+            out.items[0].text
         );
+        assert!(!out.items[0].text.contains("poziom Poziom"));
         assert_eq!(out.items[0].priority, Priority::Normal);
     }
 
@@ -370,21 +400,49 @@ mod tests {
         assert!(
             out.items[0]
                 .text
-                .ends_with("pył zawieszony PM10. Zostań w domu. Źródło: GIOŚ."),
+                .ends_with("Przekroczony poziom informowania. Zostań w domu. Źródło: GIOŚ."),
             "{}",
             out.items[0].text
         );
     }
 
     #[test]
-    fn a_warning_for_an_unknown_station_is_ignored() {
+    fn a_warning_for_an_unknown_station_makes_the_output_incomplete() {
+        // Stacja spoza listy: nie wiadomo, czy jest w promieniu, więc brak
+        // pozycji nie może prowadzić do odwołania.
         let mut v: serde_json::Value = serde_json::from_slice(WARNINGS).unwrap();
         for w in v.as_array_mut().unwrap() {
             w["sensor"]["stationId"] = 999_999.into();
         }
         let out = run_body(&serde_json::to_vec(&v).unwrap(), &ctx_at(at(12), "100"));
         assert!(out.items.is_empty());
+        assert!(!out.complete);
+    }
+
+    fn with_pa_in_rzeszow(keep_pi: bool) -> Vec<u8> {
+        let mut v: serde_json::Value = serde_json::from_slice(WARNINGS).unwrap();
+        let list = v.as_array_mut().unwrap();
+        let i = list.iter().position(|w| w["zone"]["zoneCode"] == "PL1801").unwrap();
+        let mut pa = list[i].clone();
+        pa["standard"]["standardTypeCode"] = "PA".into();
+        pa["standard"]["standardType"] = "Poziom alarmowy".into();
+        if keep_pi {
+            list.push(pa);
+        } else {
+            list[i] = pa;
+        }
+        serde_json::to_vec(&v).unwrap()
+    }
+
+    #[test]
+    fn pi_is_dropped_when_pa_exists_for_the_same_zone_and_pollutant() {
+        let out = run_body(&with_pa_in_rzeszow(true), &ctx_at(at(12), "5"));
+        let keys: Vec<_> = out.items.iter().map(|i| (i.key.as_str(), i.topic.as_str())).collect();
+        assert_eq!(keys, [("PL1801|PA|PM10", "PL1801|PM10")]);
         assert!(out.complete);
+        let only_pa = run_body(&with_pa_in_rzeszow(false), &ctx_at(at(12), "5"));
+        assert_eq!(only_pa.items.len(), 1);
+        assert_eq!(only_pa.items[0].key, "PL1801|PA|PM10");
     }
 
     #[test]
@@ -467,6 +525,25 @@ mod tests {
             src.fetch(&ctx_at(at(12), "5")).await.unwrap();
             let later = Utc.with_ymd_and_hms(2026, 11, 24, 12, 0, 0).unwrap();
             let out = src.fetch(&ctx_at(later, "5")).await.unwrap();
+            assert_eq!(out.items.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn an_empty_station_list_is_an_error_and_is_not_cached() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/station/findAll"))
+                .respond_with(json(br#"{"Lista stacji pomiarowych":[],"totalPages":1}"#))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            stations_mock(&server, 1).await;
+            warnings_mock(&server).await;
+            let src = Gios::new(&server.uri()).unwrap();
+            let err = src.fetch(&ctx_at(at(12), "5")).await.err().unwrap();
+            assert!(matches!(err, SourceError::Parse(_)), "{err:?}");
+            // Następny cykl pobiera listę od nowa (nic nie trafiło do pamięci).
+            let out = src.fetch(&ctx_at(at(12), "5")).await.unwrap();
             assert_eq!(out.items.len(), 1);
         }
 

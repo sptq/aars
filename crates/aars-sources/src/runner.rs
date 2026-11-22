@@ -167,7 +167,7 @@ impl SourceRunner {
         }
         // Kontekst przed porównaniem R9. Zakres nie zależy od
         // `tracked_keys`, więc najpierw zakres, potem klucze aktywnych pozycji
-        // śledzonych przy tym zakresie (inne zakres R9 zaraz porzuci).
+        // śledzonych przy tym zakresie (inny zakres R9 zaraz porzuci).
         let mut ctx = self.context(now, id, &cfg).await;
         if needs == Needs::Position && ctx.position.is_none() {
             report.skipped = Some("brak pozycji stacji");
@@ -1131,5 +1131,67 @@ mod tests {
         r.runner.cycle(now()).await;
         let keys = r.source.last_keys.lock().unwrap().clone().unwrap();
         assert_eq!(keys, HashSet::from(["k1".to_owned()]));
+    }
+
+    /// Wynik prawdziwego `gios::to_output` dla stacji przy Rzeszowie (promień 5 km):
+    /// fiks (PI) albo fiks z dodanym PA dla tej samej strefy i parametru.
+    fn gios_rzeszow(pa: bool, keep_pi: bool) -> SourceOutput {
+        const STATIONS: &[u8] = include_bytes!("../tests/fixtures/gios/findAll-size500-2026-11-22.json");
+        const WARNINGS: &[u8] = include_bytes!("../tests/fixtures/gios/getWarnings-2026-11-22.json");
+        let mut v: serde_json::Value = serde_json::from_slice(WARNINGS).unwrap();
+        if pa {
+            let list = v.as_array_mut().unwrap();
+            let i = list.iter().position(|w| w["zone"]["zoneCode"] == "PL1801").unwrap();
+            let mut alarm = list[i].clone();
+            alarm["standard"]["standardTypeCode"] = "PA".into();
+            if keep_pi {
+                list.push(alarm);
+            } else {
+                list[i] = alarm;
+            }
+        }
+        let (stations, _) = crate::gios::parse::parse_stations(STATIONS).unwrap();
+        let (warnings, skipped) = crate::gios::parse::parse_warnings(&serde_json::to_vec(&v).unwrap()).unwrap();
+        let ctx = SourceCtx {
+            now: now(),
+            area: Vec::new(),
+            area_text: String::new(),
+            position: Some(aars_core::geo::StationPosition { lat: 50.04, lon: 22.00, locator: "KN00".into() }),
+            settings: [("radius_km".to_owned(), "5".to_owned())].into(),
+            tracked_keys: Default::default(),
+        };
+        crate::gios::to_output(&warnings, skipped, &stations, &ctx)
+    }
+
+    #[tokio::test]
+    async fn a_gios_escalation_from_pi_to_pa_is_one_change_and_no_cancellation() {
+        let pi = gios_rzeszow(false, false);
+        assert_eq!(pi.items.len(), 1);
+        let r = rig(vec![
+            Ok(pi),
+            Ok(gios_rzeszow(true, true)),
+            Ok(gios_rzeszow(true, false)),
+            Ok(gios_rzeszow(true, false)),
+        ])
+        .await;
+        let first = r.runner.cycle(now()).await;
+        assert_eq!(first.announced, 1);
+        air(&r).await;
+        let mut changed = 0;
+        let mut cancelled = 0;
+        for _ in 0..3 {
+            let report = r.runner.cycle(now()).await;
+            changed += report.changed;
+            cancelled += report.cancelled;
+        }
+        assert_eq!((changed, cancelled), (1, 0));
+        let pending = texts(&r.queue).await;
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert!(pending[0].starts_with("Zmiana alertu smogowego. Alert smogowy GIOŚ."), "{}", pending[0]);
+        assert!(pending[0].contains("Przekroczony poziom alarmowy."), "{}", pending[0]);
+        assert!(!pending.iter().any(|t| t.contains("Koniec alertu")));
+        let active = r.state.active_items("imgw-meteo").await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].item_key, "PL1801|PA|PM10");
     }
 }

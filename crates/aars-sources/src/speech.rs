@@ -46,6 +46,12 @@ pub fn clean_text(raw: &str) -> String {
             None => (line.as_str(), false),
         };
         if !out.is_empty() {
+            if is_item {
+                // „gardła,” + „; ” dałoby „gardła,;”.
+                while out.ends_with([',', ';']) {
+                    out.pop();
+                }
+            }
             let separator = if is_item && !out.ends_with(':') {
                 "; "
             } else if after_item && !out.ends_with(['.', '!', '?']) {
@@ -98,15 +104,22 @@ fn entity(name: &str) -> Option<char> {
         "quot" => Some('"'),
         "#39" => Some('\''),
         "nbsp" => Some(' '),
-        _ => name
-            .strip_prefix('#')
-            .filter(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
-            .and_then(|digits| digits.parse::<u32>().ok())
-            .and_then(char::from_u32),
+        _ => {
+            let number = name.strip_prefix('#')?;
+            let (digits, radix) = match number.strip_prefix(['x', 'X']) {
+                Some(hex) => (hex, 16),
+                None => (number, 10),
+            };
+            if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+                return None;
+            }
+            u32::from_str_radix(digits, radix).ok().and_then(char::from_u32)
+        }
     }
 }
 
-/// Nieznana encja zostaje dosłownie.
+/// Encje nazwane i liczbowe (dziesiętne `&#NN;`, szesnastkowe `&#xNN;`);
+/// nieznana encja zostaje dosłownie.
 fn decode_entities(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -119,7 +132,13 @@ fn decode_entities(text: &str) -> String {
             .and_then(|end| entity(&tail[..end]).map(|c| (c, end)));
         match decoded {
             Some((c, end)) => {
-                out.push(c);
+                // Znaki sterujące (np. `&#0;`) nie trafiają do syntezy; białe
+                // sterujące stają się spacją, żeby nie skleić słów.
+                if c.is_whitespace() {
+                    out.push(' ');
+                } else if !c.is_control() {
+                    out.push(c);
+                }
                 rest = &tail[end + 1..];
             }
             None => {
@@ -185,6 +204,22 @@ pub fn compass8(from: (f64, f64), to: (f64, f64)) -> &'static str {
     COMPASS8.get(sector).copied().unwrap_or(COMPASS8[0])
 }
 
+/// Wspólne sprawdzenie testów źródeł: tekst po normalizacji z `aars-audio`
+/// nie zawiera znanych potknięć syntezy.
+#[cfg(test)]
+pub(crate) fn assert_speakable(texts: &[&str]) {
+    const RAW: &[&str] = &["RCB", "NOAA", "SWPC", "EMSC", "RSO", "GIOŚ", "PM10", "PM2,5", "PM2.5"];
+    for text in texts.iter().filter(|t| !t.is_empty()) {
+        let spoken = aars_audio::text::normalize(text);
+        assert!(!spoken.contains("godzinie godzina"), "{spoken}");
+        assert!(!spoken.contains(",;"), "{spoken}");
+        for word in spoken.split_whitespace() {
+            let core = word.trim_matches(|c: char| !c.is_alphanumeric());
+            assert!(!RAW.contains(&core), "surowy skrót {core:?} w: {spoken}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,8 +263,22 @@ mod tests {
         );
         assert_eq!(
             clean_text("Ogół ludności:\n- rozważ, \n-  ogranicz.\nWrażliwe grupy:\n- unikaj"),
-            "Ogół ludności: rozważ,; ogranicz. Wrażliwe grupy: unikaj"
+            "Ogół ludności: rozważ; ogranicz. Wrażliwe grupy: unikaj"
         );
+    }
+
+    #[test]
+    fn a_list_item_ending_in_a_comma_or_semicolon_is_not_doubled() {
+        // Kształt z prawdziwego zalecenia GIOŚ: „…gardła,\n- ogranicz”.
+        assert_eq!(clean_text("Objawy:\n- ból gardła,\n- ogranicz;\n- unikaj"), "Objawy: ból gardła; ogranicz; unikaj");
+    }
+
+    #[test]
+    fn control_characters_from_entities_are_dropped_and_hex_entities_decoded() {
+        assert_eq!(clean_text("a&#0;b&#7;c"), "abc");
+        assert_eq!(clean_text("x&#10;y"), "x y");
+        assert_eq!(clean_text("&#x105;&#X119; &#x41;"), "ąę A");
+        assert_eq!(clean_text("&#xZZ; &#x;"), "&#xZZ; &#x;");
     }
 
     #[test]

@@ -48,7 +48,9 @@ fn parse_station(v: &serde_json::Value) -> Option<Station> {
 }
 
 /// Jedna strona listy stacji i `totalPages` (brak pola = 1). Stacje bez
-/// identyfikatora albo współrzędnych są pomijane: lista bywa niepełna.
+/// identyfikatora albo współrzędnych są pomijane: lista bywa niepełna. Gdy
+/// nie da się odczytać żadnej z niepustej listy, schemat się zmienił:
+/// `SourceError::Parse`.
 pub fn parse_stations(body: &[u8]) -> Result<(Vec<Station>, u32), SourceError> {
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| SourceError::Parse(e.to_string()))?;
@@ -60,7 +62,11 @@ pub fn parse_stations(body: &[u8]) -> Result<(Vec<Station>, u32), SourceError> {
         .get("totalPages")
         .and_then(|v| v.as_u64())
         .map_or(1, |n| u32::try_from(n).unwrap_or(u32::MAX));
-    Ok((list.iter().filter_map(parse_station).collect(), pages))
+    let stations: Vec<Station> = list.iter().filter_map(parse_station).collect();
+    if stations.is_empty() && !list.is_empty() {
+        return Err(SourceError::Parse("żadna stacja na liście nie ma czytelnych danych".to_owned()));
+    }
+    Ok((stations, pages))
 }
 
 fn text<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
@@ -140,6 +146,16 @@ mod tests {
         assert_eq!((stations.len(), pages), (1, 3));
         assert!(parse_stations(b"{}").is_err());
         assert!(parse_stations(b"nie json").is_err());
+    }
+
+    #[test]
+    fn a_station_list_where_nothing_parses_is_an_error() {
+        // Zmieniony schemat nie może wyglądać jak „brak stacji” (zmyślone odwołania).
+        let body = r#"{"Lista stacji pomiarowych":[{"id":1,"lat":50.1,"lon":20.2}],"totalPages":1}"#;
+        assert!(matches!(parse_stations(body.as_bytes()), Err(SourceError::Parse(_))));
+        // Pusta strona sama w sobie nie jest błędem; pustą całość odrzuca pobieranie.
+        let empty = r#"{"Lista stacji pomiarowych":[],"totalPages":1}"#;
+        assert_eq!(parse_stations(empty.as_bytes()).unwrap().0.len(), 0);
     }
 
     #[test]
