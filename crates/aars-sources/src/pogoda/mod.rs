@@ -511,6 +511,7 @@ mod tests {
                 position: pos,
                 settings: BTreeMap::new(),
                 active_alerts: Vec::new(),
+                alert_sources: Default::default(),
             }
         }
 

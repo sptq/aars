@@ -14,7 +14,7 @@ use aars_core::error::DbError;
 use aars_core::geo::{PositionRepo, StationPosition};
 use aars_core::module::{BULLETIN, BULLETIN_PARTS};
 use aars_core::settings::SettingsRepo;
-use aars_core::source_state::{SourceStateRepo, TrackedItem};
+use aars_core::source_state::{AlertSourceHealth, SourceStateRepo, TrackedItem};
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 
@@ -26,12 +26,13 @@ pub use ostrzezenia::Ostrzezenia;
 pub use runner::{BulletinRunner, BulletinTick, due_fires};
 
 /// Wejście części: chwila nadania, pozycja stacji, ustawienia
-/// `module:bulletin:*` (bez prefiksu) i żywe alerty.
+/// `module:bulletin:*` (bez prefiksu), żywe alerty i zdrowie źródeł alertów.
 pub struct PartCtx {
     pub now: DateTime<Utc>,
     pub position: Option<StationPosition>,
     pub settings: BTreeMap<String, String>,
     pub active_alerts: Vec<TrackedItem>,
+    pub alert_sources: AlertSourceHealth,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,9 +153,10 @@ pub fn intro_text(intro_setting: &str, callsign: &str) -> String {
     }
 }
 
-/// Limit długości tekstu: około 10 znaków na sekundę, nie więcej niż 1500.
+/// Limit długości tekstu: 10 s limitu nadawania na identyfikację i ogony,
+/// reszta po około 10 znaków na sekundę, nie więcej niż 1500.
 pub fn length_limit(tx_max_duration_s: u64) -> usize {
-    usize::try_from(tx_max_duration_s.saturating_mul(10))
+    usize::try_from(tx_max_duration_s.saturating_sub(10).saturating_mul(10))
         .unwrap_or(usize::MAX)
         .min(1500)
 }
@@ -235,12 +237,14 @@ impl Bulletin {
             .unwrap_or_default();
         let chosen = |id: &str| selected.iter().any(|p| p == id);
         let position = PositionRepo::new(self.pool.clone()).load().await?;
-        let active_alerts = if chosen("ostrzezenia") {
-            SourceStateRepo::new(self.pool.clone())
-                .live_alerts(now)
-                .await?
+        let (active_alerts, alert_sources) = if chosen("ostrzezenia") {
+            let repo = SourceStateRepo::new(self.pool.clone());
+            (
+                repo.live_alerts(now).await?,
+                repo.alert_source_health(now).await?,
+            )
         } else {
-            Vec::new()
+            (Vec::new(), AlertSourceHealth::default())
         };
         let intro = intro_text(
             settings.get("intro").map(String::as_str).unwrap_or(""),
@@ -251,6 +255,7 @@ impl Bulletin {
             position,
             settings,
             active_alerts,
+            alert_sources,
         });
 
         let timeout = self.part_timeout;
@@ -358,7 +363,7 @@ mod tests {
                 ("b", Included(long(200))),
                 ("c", Included(long(200))),
             ],
-            length_limit(30),
+            length_limit(40),
         );
         assert!(matches!(c.parts[0].1, Included(_)));
         assert_eq!(c.parts[1].1, DroppedForLength);
@@ -395,8 +400,12 @@ mod tests {
 
     #[test]
     fn length_limit_follows_the_tx_limit() {
+        // 10 s na identyfikację i ogony, potem około 10 znaków na sekundę.
         assert_eq!(length_limit(180), 1500);
-        assert_eq!(length_limit(60), 600);
+        assert_eq!(length_limit(160), 1500);
+        assert_eq!(length_limit(60), 500);
+        assert_eq!(length_limit(10), 0);
+        assert_eq!(length_limit(5), 0);
     }
 
     #[test]

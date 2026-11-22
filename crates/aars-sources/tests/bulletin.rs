@@ -107,17 +107,37 @@ async fn the_bulletin_reads_the_fixtures_into_one_text() {
     let (bulletin, _pogoda) = build(&config(&server), pool.clone()).unwrap();
 
     let now = at("2026-11-22T19:00:00Z");
+    // Bez włączonego źródła ostrzeżeń część milczy — nie mówi „brak ostrzeżeń”.
     let c = bulletin.compose(now).await.unwrap();
-    assert_eq!(c.text.as_deref(), Some(EXPECTED), "{:?}", c.parts);
-    assert_speakable(EXPECTED);
+    assert_eq!(
+        c.text.as_deref(),
+        Some(
+            EXPECTED
+                .replace(" Brak obowiązujących ostrzeżeń.", "")
+                .as_str()
+        ),
+        "{:?}",
+        c.parts
+    );
+    assert!(
+        c.parts.iter().any(|(id, o)| *id == "ostrzezenia"
+            && o.describe().contains("brak włączonych źródeł ostrzeżeń")),
+        "{:?}",
+        c.parts
+    );
 
-    // Nadane ostrzeżenie z włączonego, świeżego źródła wchodzi do biuletynu.
+    // Włączone, świeże źródło bez ostrzeżeń: „Brak obowiązujących ostrzeżeń.”
     let state = SourceStateRepo::new(pool.clone());
     state.set_enabled("swpc", true).await.unwrap();
     state
         .record_success("swpc", now - chrono::Duration::minutes(5))
         .await
         .unwrap();
+    let c = bulletin.compose(now).await.unwrap();
+    assert_eq!(c.text.as_deref(), Some(EXPECTED), "{:?}", c.parts);
+    assert_speakable(EXPECTED);
+
+    // Nadane ostrzeżenie z włączonego, świeżego źródła wchodzi do biuletynu.
     state
         .upsert_active(
             &NewTracked {

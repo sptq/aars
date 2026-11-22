@@ -23,6 +23,8 @@ const TICK: Duration = Duration::from_secs(10);
 /// Element kolejki żyje tyle po porze, więc większa tolerancja nie ma sensu (B3).
 const EXPIRY: TimeDelta = TimeDelta::minutes(15);
 const MAX_GRACE_S: u64 = 900;
+/// Tik co 10 s i składanie trwają; mniejsza tolerancja zabiłaby każdą porę.
+const MIN_GRACE_S: u64 = 60;
 const DEFAULT_TIMES: &str = "07:00,19:00";
 
 const LATE: &str = "spóźnione ponad misfire_grace_s";
@@ -64,6 +66,14 @@ fn parse_times(text: &str) -> Option<Vec<NaiveTime>> {
     times.filter(|t| !t.is_empty())
 }
 
+/// Najlepsza próba zapisania powodu przy porze, która i tak już przepadła;
+/// błąd zapisu idzie tylko do dziennika.
+async fn mark_skipped(fires: &BulletinFireRepo, fire_at: DateTime<Utc>, reason: &str) {
+    if let Err(e) = fires.set_skipped(fire_at, reason).await {
+        tracing::warn!(pora = %fire_at, powód = reason, błąd = %e, "nie zapisano powodu pominięcia biuletynu");
+    }
+}
+
 pub struct BulletinRunner {
     bulletin: Arc<Bulletin>,
     queue: Arc<QueueRepo>,
@@ -90,7 +100,7 @@ impl BulletinRunner {
             .or_else(|| parse_times(DEFAULT_TIMES))
             .unwrap_or_default();
         let station = SettingsRepo::new(pool.clone()).load().await?;
-        let grace_s = station.misfire_grace_s.min(MAX_GRACE_S);
+        let grace_s = station.misfire_grace_s.clamp(MIN_GRACE_S, MAX_GRACE_S);
         let grace = TimeDelta::seconds(i64::try_from(grace_s).unwrap_or(0));
         let fires = BulletinFireRepo::new(pool);
 
@@ -130,9 +140,7 @@ impl BulletinRunner {
             Ok(c) => c,
             Err(e) => {
                 // Pora jest już zajęta; zostawiamy ślad, dlaczego nic nie poszło.
-                let _ = fires
-                    .set_skipped(fire_at, &format!("błąd składania: {e}"))
-                    .await;
+                mark_skipped(&fires, fire_at, &format!("błąd składania: {e}")).await;
                 return Err(e);
             }
         };
@@ -143,7 +151,7 @@ impl BulletinRunner {
             tracing::info!(pora = %fire_at, powód = reason, "biuletyn pominięty");
             return Ok(tick);
         };
-        let ids = self
+        let enqueued = self
             .queue
             .enqueue(EnqueueRequest {
                 message_id: None,
@@ -156,12 +164,23 @@ impl BulletinRunner {
                 repeat_interval: Duration::ZERO,
                 created_by: None,
             })
-            .await?;
-        if let Some(&id) = ids.first() {
-            fires.set_queued(fire_at, id).await?;
-            tick.queued = Some(id);
-            tracing::info!(pora = %fire_at, element = id, "biuletyn w kolejce");
-        }
+            .await;
+        let ids = match enqueued {
+            Ok(ids) => ids,
+            Err(e) => {
+                mark_skipped(&fires, fire_at, &format!("błąd kolejki: {e}")).await;
+                return Err(e);
+            }
+        };
+        let Some(&id) = ids.first() else {
+            const NO_ITEM: &str = "kolejka nie zwróciła elementu";
+            mark_skipped(&fires, fire_at, NO_ITEM).await;
+            tick.skipped.push((fire_at, NO_ITEM.to_owned()));
+            return Ok(tick);
+        };
+        fires.set_queued(fire_at, id).await?;
+        tick.queued = Some(id);
+        tracing::info!(pora = %fire_at, element = id, "biuletyn w kolejce");
         Ok(tick)
     }
 
@@ -440,6 +459,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tiny_grace_still_airs_a_bulletin_a_few_seconds_late() {
+        // Tolerancja poniżej 60 s zabiłaby biuletyn przy tiku co 10 s.
+        let s = station().await;
+        s.put("misfire_grace_s", "0").await;
+        let tick = s.runner().tick(t("2026-11-23 07:00:15")).await.unwrap();
+        assert!(tick.queued.is_some(), "{tick:?}");
+        assert_eq!(s.queued().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_queue_error_leaves_a_reason_on_the_fire() {
+        let s = station().await;
+        sqlx::query(
+            "CREATE TRIGGER zepsuta_kolejka BEFORE INSERT ON queue_items
+             BEGIN SELECT RAISE(ABORT, 'zepsuta kolejka'); END",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let fire = t("2026-11-23 07:00");
+        assert!(s.runner().tick(t("2026-11-23 07:00:05")).await.is_err());
+        let reason = s.reason(fire).await.expect("powód przy porze");
+        assert!(reason.starts_with("błąd kolejki: "), "{reason}");
+        assert!(reason.contains("zepsuta kolejka"), "{reason}");
+        // Pora zajęta: kolejny tik nie próbuje drugi raz.
+        sqlx::query("DROP TRIGGER zepsuta_kolejka")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let again = s.runner().tick(t("2026-11-23 07:00:15")).await.unwrap();
+        assert_eq!(again.queued, None);
+        assert!(s.queued().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn no_avalanche_after_downtime() {
         let s = station().await;
         let tick = s.runner().tick(t("2026-11-23 20:30")).await.unwrap();
@@ -662,7 +716,8 @@ mod tests {
             None,
         )
         .await;
-        s.put("tx_max_duration_s", "30").await;
+        // (40 − 10) × 10 = 300 znaków: mieści się tylko pierwsza część.
+        s.put("tx_max_duration_s", "40").await;
         let c = s.bulletin.compose(t("2026-11-23 07:00")).await.unwrap();
         let text = c.text.expect("tekst z pierwszą częścią");
         assert!(text.contains(&long("a")), "{text}");

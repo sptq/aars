@@ -112,7 +112,7 @@ administrator:
 Pora, która przypadnie w oknie ciszy nocnej (a priorytet Zwykły jest
 poniżej progu ciszy), jest pominięta, nie przesunięta; okno kończące się
 dokładnie o porze jej nie blokuje. Po przestoju stacja nie nadrabia: pora
-spóźniona o więcej niż `misfire_grace_s` (najwyżej 15 min) jest pomijana,
+spóźniona o więcej niż `misfire_grace_s` (od 60 s do 15 min) jest pomijana,
 z kilku zaległych składana jest tylko najnowsza, a restart nie dubluje pory
 już zrobionej. Gdy żadna część nie ma treści, nic nie idzie na antenę.
 
@@ -120,7 +120,7 @@ już zrobionej. Gdy żadna część nie ma treści, nic nie idzie na antenę.
 |---|---|---|
 | `pogoda` | teraz, noc, jutro (temperatura, opis, opady, porywy) dla pozycji stacji; bez pozycji część wypada | Open-Meteo (ta sama prognoza co źródło `pogoda`, świeża do 60 min), zapasowo MET Norway |
 | `propagacja` | strumień słoneczny (SFI), indeks K, skale NOAA, najbliższa jonosonda i ocena pasm KF | NOAA SWPC, GIRO przez KC2G |
-| `ostrzezenia` | obowiązujące ostrzeżenia ze źródeł włączonych i nieprzestarzałych, które poszły na antenę (najwyżej 5, reszta jako „Pozostałych ostrzeżeń: n.”); brak = „Brak obowiązujących ostrzeżeń.” | `source_state` stacji |
+| `ostrzezenia` | obowiązujące ostrzeżenia ze źródeł włączonych i nieprzestarzałych, które poszły na antenę oraz czekające w kolejce (najwyżej 5, reszta — także bez opisu — jako „Pozostałych ostrzeżeń: n.”); brak = „Brak obowiązujących ostrzeżeń.”, a gdy część źródeł jest niedostępna — „Brak ostrzeżeń z dostępnych źródeł. Część źródeł ostrzeżeń jest niedostępna.”; bez żadnego włączonego źródła część wypada | `source_state` stacji |
 
 Każda część ma 20 s na odpowiedź (części liczone równolegle); część, która
 nie zdąży albo zawiedzie, wypada, reszta wychodzi. Progi oceny w części
@@ -135,7 +135,8 @@ nie zdąży albo zawiedzie, wypada, reszta wychodzi. Progi oceny w części
 - łączności dalekie (DX, pasma 80…10 m): najwyższe pasmo o dolnej krawędzi
   poniżej MUF(3000) × 0,85.
 
-Limit długości biuletynu to `min(1500, 10 × limit nadawania w s)` znaków:
+Limit długości biuletynu to `min(1500, 10 × (limit nadawania w s − 10))`
+znaków (10 s zostaje na identyfikację i ogony):
 gdy złożony tekst się nie mieści, wypadają całe części od końca (wstęp
 i „Koniec biuletynu.” zostają).
 

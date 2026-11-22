@@ -48,6 +48,15 @@ impl SourceStatus {
     }
 }
 
+/// Ile źródeł ostrzeżeń jest włączonych i ile z nich jest niedostępnych
+/// (przestarzałe wg R13) — żeby biuletyn nie mówił „brak ostrzeżeń”, gdy
+/// po prostu nie ma ich skąd wziąć.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AlertSourceHealth {
+    pub enabled: usize,
+    pub unavailable: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackedState {
     Active,
@@ -321,7 +330,9 @@ impl SourceStateRepo {
     }
 
     /// Obowiązujące ostrzeżenia z włączonych, świeżych źródeł, które poszły
-    /// na antenę. Najpilniejsze pierwsze, przy równym priorytecie starsze.
+    /// na antenę albo czekają w kolejce lub właśnie idą (nadadzą się przed
+    /// biuletynem). Anulowane, wygasłe, nieudane i przerwane się nie liczą.
+    /// Najpilniejsze pierwsze, przy równym priorytecie starsze.
     pub async fn live_alerts(&self, now: DateTime<Utc>) -> Result<Vec<TrackedItem>, DbError> {
         let columns = ITEM_COLUMNS.replace("id, source_id", "i.id, i.source_id");
         let rows = sqlx::query(&format!(
@@ -330,7 +341,9 @@ impl SourceStateRepo {
               WHERE i.state = 'active' AND s.enabled = 1
                 AND (i.valid_until IS NULL OR i.valid_until > ?)
                 AND (i.aired = 1
-                     OR i.queue_item_id IN (SELECT id FROM queue_items WHERE state = 'done'))
+                     OR i.queue_item_id IN (SELECT id FROM queue_items
+                                             WHERE state IN ('pending', 'rendering', 'ready',
+                                                             'transmitting', 'done')))
               ORDER BY i.priority, i.first_seen_at, i.id"
         ))
         .bind(iso(now))
@@ -352,6 +365,19 @@ impl SourceStateRepo {
             }
         }
         Ok(out)
+    }
+
+    /// Zdrowie włączonych źródeł ostrzeżeń w chwili `now`.
+    pub async fn alert_source_health(&self, now: DateTime<Utc>) -> Result<AlertSourceHealth, DbError> {
+        let mut health = AlertSourceHealth::default();
+        for status in self.statuses().await?.iter().filter(|s| s.enabled) {
+            health.enabled += 1;
+            let interval_s = self.config(&status.source_id).await?.map_or(DEFAULT_INTERVAL_S, |c| c.interval_s);
+            if status.is_stale(interval_s, now) {
+                health.unavailable += 1;
+            }
+        }
+        Ok(health)
     }
 
     async fn source_is_fresh(&self, source_id: &str, now: DateTime<Utc>) -> Result<bool, DbError> {
@@ -630,6 +656,11 @@ mod tests {
         };
         let pending = queue_state("pending").await;
         let done = queue_state("done").await;
+        let transmitting = queue_state("transmitting").await;
+        let cancelled = queue_state("cancelled").await;
+        let failed = queue_state("failed").await;
+        let interrupted = queue_state("interrupted").await;
+        let expired_q = queue_state("expired").await;
         let item = |source: &str, key: &str, priority: Priority, first: &str| NewTracked {
             source_id: source.into(),
             priority,
@@ -649,10 +680,38 @@ mod tests {
         add(item("old", "stale-source", Priority::Normal, "2026-11-22T18:00:00Z")).await;
         add(NewTracked { aired: false, queue_item_id: Some(pending), ..item("imgw-meteo", "pending", Priority::Normal, "2026-11-22T18:00:00Z") }).await;
         add(NewTracked { aired: false, queue_item_id: Some(done), ..item("imgw-meteo", "done", Priority::Low, "2026-11-22T18:00:00Z") }).await;
+        add(NewTracked { aired: false, queue_item_id: Some(transmitting), ..item("imgw-meteo", "transmitting", Priority::Low, "2026-11-22T18:01:00Z") }).await;
+        for (key, id) in [("q-cancelled", cancelled), ("q-failed", failed), ("q-interrupted", interrupted), ("q-expired", expired_q)] {
+            add(NewTracked { aired: false, queue_item_id: Some(id), ..item("imgw-meteo", key, Priority::Normal, "2026-11-22T18:00:00Z") }).await;
+        }
         add(NewTracked { valid_until: Some(at("2026-11-22T18:00:00Z")), ..item("imgw-meteo", "expired", Priority::Normal, "2026-11-22T18:00:00Z") }).await;
 
+        // Pozycja czekająca w kolejce (albo już nadawana) nadaje się przed
+        // biuletynem — jest żywa; anulowana, wygasła, nieudana i przerwana nie.
         let keys: Vec<String> = repo.live_alerts(now).await.unwrap().into_iter().map(|i| i.item_key).collect();
-        assert_eq!(keys, ["high", "normal-early", "normal-late", "done"]);
+        assert_eq!(keys, ["high", "pending", "normal-early", "normal-late", "done", "transmitting"]);
+    }
+
+    #[tokio::test]
+    async fn alert_source_health_counts_enabled_and_stale_sources() {
+        let pool = test_pool().await;
+        let repo = SourceStateRepo::new(pool.clone());
+        let now = at("2026-11-22T19:00:00Z");
+        assert_eq!(repo.alert_source_health(now).await.unwrap(), AlertSourceHealth::default());
+        sqlx::query(
+            "INSERT INTO source_state (source_id, enabled) VALUES ('fresh', 1), ('old', 1), ('never', 1), ('off', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        repo.record_success("fresh", at("2026-11-22T18:55:00Z")).await.unwrap();
+        repo.record_success("old", at("2026-11-22T17:00:00Z")).await.unwrap();
+        repo.record_success("off", at("2026-11-22T17:00:00Z")).await.unwrap();
+        let health = repo.alert_source_health(now).await.unwrap();
+        assert_eq!(health, AlertSourceHealth { enabled: 3, unavailable: 1 });
+        repo.record_failure("never", now, "zły").await.unwrap();
+        let health = repo.alert_source_health(now).await.unwrap();
+        assert_eq!(health, AlertSourceHealth { enabled: 3, unavailable: 2 });
     }
 
     #[tokio::test]

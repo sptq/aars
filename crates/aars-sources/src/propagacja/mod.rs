@@ -392,6 +392,7 @@ mod tests {
             }),
             settings: BTreeMap::new(),
             active_alerts: Vec::new(),
+            alert_sources: Default::default(),
         };
         part.compose(&ctx).await.unwrap()
     }
