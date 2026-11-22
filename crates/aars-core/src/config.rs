@@ -83,6 +83,10 @@ pub struct SourcesConfig {
     pub gios_url: String,
     #[serde(default = "default_emsc_url")]
     pub emsc_url: String,
+    #[serde(default = "default_open_meteo_url")]
+    pub open_meteo_url: String,
+    #[serde(default = "default_met_no_url")]
+    pub met_no_url: String,
 }
 
 fn default_imgw_meteo_url() -> String {
@@ -105,6 +109,14 @@ fn default_emsc_url() -> String {
     "https://www.seismicportal.eu/fdsnws/event/1/query".to_owned()
 }
 
+fn default_open_meteo_url() -> String {
+    "https://api.open-meteo.com/v1/forecast".to_owned()
+}
+
+fn default_met_no_url() -> String {
+    "https://api.met.no/weatherapi/locationforecast/2.0/compact".to_owned()
+}
+
 impl SourcesConfig {
     /// Każdy adres musi być URL-em http(s); literówka ma wyjść przy starcie,
     /// nie jako wieczna porażka odpytywania.
@@ -115,6 +127,8 @@ impl SourcesConfig {
             ("swpc_url", &self.swpc_url),
             ("gios_url", &self.gios_url),
             ("emsc_url", &self.emsc_url),
+            ("open_meteo_url", &self.open_meteo_url),
+            ("met_no_url", &self.met_no_url),
         ];
         for (key, url) in pairs {
             let url = url.as_str();
@@ -140,6 +154,8 @@ impl Default for SourcesConfig {
             swpc_url: default_swpc_url(),
             gios_url: default_gios_url(),
             emsc_url: default_emsc_url(),
+            open_meteo_url: default_open_meteo_url(),
+            met_no_url: default_met_no_url(),
         }
     }
 }
@@ -417,13 +433,18 @@ mod tests {
             assert_eq!(cfg.sources.swpc_url, "https://services.swpc.noaa.gov/products/noaa-scales.json");
             assert_eq!(cfg.sources.gios_url, "https://api.gios.gov.pl/pjp-api/v1/rest");
             assert_eq!(cfg.sources.emsc_url, "https://www.seismicportal.eu/fdsnws/event/1/query");
+            assert_eq!(cfg.sources.open_meteo_url, "https://api.open-meteo.com/v1/forecast");
+            assert_eq!(
+                cfg.sources.met_no_url,
+                "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+            );
             Ok(())
         });
     }
 
     #[test]
     fn every_source_url_is_validated() {
-        for key in ["IMGW_METEO_URL", "RSO_URL", "SWPC_URL", "GIOS_URL", "EMSC_URL"] {
+        for key in ["IMGW_METEO_URL", "RSO_URL", "SWPC_URL", "GIOS_URL", "EMSC_URL", "OPEN_METEO_URL", "MET_NO_URL"] {
             figment::Jail::expect_with(|jail| {
                 jail.set_env(format!("AARS_SOURCES__{key}"), "ftp://x");
                 let err = Config::load(None).unwrap_err().to_string();

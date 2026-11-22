@@ -4,11 +4,19 @@ use std::time::Duration;
 
 use crate::source::SourceError;
 
+/// User-Agent dla MET Norway (wymaga identyfikacji aplikacji i kontaktu); bez danych osobowych.
+pub const MET_USER_AGENT: &str = concat!("aars/", env!("CARGO_PKG_VERSION"), " github.com/sptq/aars");
+
 /// Klient HTTP źródeł: limit czasu i User-Agent `aars/{wersja}`, nic więcej.
 pub fn client(timeout: Duration) -> Result<reqwest::Client, SourceError> {
+    client_with_agent(timeout, concat!("aars/", env!("CARGO_PKG_VERSION")))
+}
+
+/// Jak `client`, z własnym User-Agentem.
+pub fn client_with_agent(timeout: Duration, agent: &str) -> Result<reqwest::Client, SourceError> {
     reqwest::Client::builder()
         .timeout(timeout)
-        .user_agent(concat!("aars/", env!("CARGO_PKG_VERSION")))
+        .user_agent(agent)
         .build()
         .map_err(|e| SourceError::Http(e.to_string()))
 }
