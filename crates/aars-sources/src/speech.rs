@@ -30,6 +30,26 @@ pub fn km_phrase(km: u32) -> String {
     format!("{km} {word}")
 }
 
+/// Liczba z jedną cyfrą po przecinku i przecinkiem dziesiętnym, bez końcowego
+/// „,0”; ujemne zero daje „0” (`1.2` → „1,2”, `2.0` → „2”).
+pub fn decimal_comma(x: f64) -> String {
+    let s = one_decimal(x);
+    let s = s.strip_suffix(",0").unwrap_or(&s);
+    if s == "-0" { "0".to_owned() } else { s.to_owned() }
+}
+
+/// Jak `decimal_comma`, ale zawsze z jedną cyfrą po przecinku (`4.0` → „4,0”).
+pub fn one_decimal(x: f64) -> String {
+    let s = format!("{x:.1}");
+    let s = if s == "-0.0" { "0.0".to_owned() } else { s };
+    s.replace('.', ",")
+}
+
+/// Zaokrąglenie do całości, połówki od zera (`2.5` → 3, `-0.4` → 0).
+pub fn round_int(x: f64) -> i64 {
+    x.round() as i64
+}
+
 /// Tekst z sieci do mowy: bez znaczników HTML i encji, jedna linia; wiersze
 /// listy (`- `) łączy średnik, a wiersz po liście zaczyna nowe zdanie.
 pub fn clean_text(raw: &str) -> String {
@@ -224,6 +244,18 @@ pub(crate) fn assert_speakable(texts: &[&str]) {
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+
+    #[test]
+    fn decimals_are_spoken_with_a_comma() {
+        assert_eq!(decimal_comma(1.2), "1,2");
+        assert_eq!(decimal_comma(2.0), "2");
+        assert_eq!(decimal_comma(-0.04), "0");
+        assert_eq!(one_decimal(4.0), "4,0");
+        assert_eq!(one_decimal(10.56), "10,6");
+        assert_eq!(round_int(2.5), 3);
+        assert_eq!(round_int(-0.4), 0);
+        assert_eq!(round_int(-1.9), -2);
+    }
 
     #[test]
     fn km_phrase_agrees_with_the_number() {
