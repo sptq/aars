@@ -245,7 +245,7 @@ async fn main() -> Result<()> {
             }
         }
         cli::Command::Source { action } => match action {
-            cli::SourceAction::Preview => source_preview(&config).await?,
+            cli::SourceAction::Preview { id } => source_preview(&config, &id).await?,
         },
         cli::Command::Run => {
             use aars_core::sink::CancelToken;
@@ -513,16 +513,18 @@ async fn cli_candidate(config: &Config) -> Result<station::Candidate> {
 }
 
 /// `aars source preview`: jedno pobranie, bez zapisu i bez kolejki.
-async fn source_preview(config: &Config) -> Result<()> {
-    use aars_sources::DataSource;
-
+async fn source_preview(config: &Config, id: &str) -> Result<()> {
     let pool = db::connect(&config.storage.db_path)
         .await
         .context("otwieranie bazy")?;
     db::migrate(&pool).await.context("nakładanie migracji")?;
 
-    let source = aars_sources::imgw_meteo::ImgwMeteo::new(&config.sources.imgw_meteo_url)
-        .map_err(|e| anyhow::anyhow!("klient HTTP: {e}"))?;
+    let module = aars_sources::modules()
+        .into_iter()
+        .find(|m| m.descriptor.id == id)
+        .ok_or_else(|| anyhow::anyhow!("nieznane źródło: {id}"))?;
+    let source = (module.build)(config).map_err(|e| anyhow::anyhow!("klient HTTP: {e}"))?;
+    let needs = source.needs();
     // `SourceStateRepo::config` zamienia zepsuty obszar na pusty, a tu trzeba
     // je odróżnić, więc czytamy surowy zapis.
     let raw: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
@@ -537,17 +539,30 @@ async fn source_preview(config: &Config) -> Result<()> {
             return Ok(());
         }
     };
-    if area.is_empty() {
+    if needs == aars_core::module::Needs::Area && area.is_empty() {
         println!("brak obszaru — ustaw go w panelu (/sources) albo w tabeli settings");
         return Ok(());
     }
 
     println!("obszar: {}", aars_core::area::area_text(&area));
+    let position = if needs == aars_core::module::Needs::Position {
+        let found = aars_core::geo::PositionRepo::new(pool.clone())
+            .load()
+            .await
+            .context("odczyt pozycji stacji")?;
+        if found.is_none() {
+            println!("brak pozycji stacji — ustaw ją w panelu (/settings)");
+            return Ok(());
+        }
+        found
+    } else {
+        None
+    };
     let ctx = aars_sources::SourceCtx {
         now: chrono::Utc::now(),
         area_text: aars_core::area::area_text(&area),
         area,
-        position: None,
+        position,
         settings: std::collections::BTreeMap::new(),
         tracked_keys: Default::default(),
     };
@@ -556,7 +571,7 @@ async fn source_preview(config: &Config) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("pobieranie: {e}"))?;
     if output.items.is_empty() {
-        println!("brak ostrzeżeń dla obszaru");
+        println!("brak pozycji ze źródła");
     }
     for item in &output.items {
         println!(

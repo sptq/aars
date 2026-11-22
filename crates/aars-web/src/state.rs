@@ -223,6 +223,10 @@ impl AppState {
                     name: "Ostrzeżenia meteorologiczne IMGW",
                     ..aars_core::module::sample_source("imgw-meteo")
                 });
+                // Źródła alarmowe etapu 11a: w panelu liczy się tylko ich id.
+                for id in ["rso", "swpc", "gios-smog", "emsc"] {
+                    all.push(aars_core::module::sample_source(id));
+                }
                 all
             })),
             base_config: Arc::new(Config::default()),

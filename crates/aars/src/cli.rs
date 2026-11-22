@@ -100,8 +100,12 @@ pub enum HardwareAction {
 
 #[derive(Debug, Subcommand)]
 pub enum SourceAction {
-    /// Jedno pobranie z obszarem z bazy; nic nie zapisuje ani nie nadaje.
-    Preview,
+    /// Jedno pobranie z obszarem i pozycją z bazy; nic nie zapisuje ani nie nadaje.
+    Preview {
+        /// Identyfikator źródła (np. `swpc`, `emsc`).
+        #[arg(default_value = "imgw-meteo")]
+        id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

@@ -61,6 +61,14 @@ const POSTS: &[(&str, u8)] = &[
     ("/queue/group/g/cancel", OPERATOR),
     ("/sources/imgw-meteo/enabled", OPERATOR),
     ("/sources/imgw-meteo/refresh", OPERATOR),
+    ("/sources/rso/enabled", OPERATOR),
+    ("/sources/rso/refresh", OPERATOR),
+    ("/sources/swpc/enabled", OPERATOR),
+    ("/sources/swpc/refresh", OPERATOR),
+    ("/sources/gios-smog/enabled", OPERATOR),
+    ("/sources/gios-smog/refresh", OPERATOR),
+    ("/sources/emsc/enabled", OPERATOR),
+    ("/sources/emsc/refresh", OPERATOR),
     ("/watchdog/clear", ADMIN),
     ("/settings", ADMIN),
     ("/settings/hardware", ADMIN),
@@ -73,6 +81,14 @@ const POSTS: &[(&str, u8)] = &[
     ("/modules/scheduler/enabled", ADMIN),
     ("/modules/imgw-meteo/enabled", ADMIN),
     ("/modules/imgw-meteo/settings", ADMIN),
+    ("/modules/rso/enabled", ADMIN),
+    ("/modules/rso/settings", ADMIN),
+    ("/modules/swpc/enabled", ADMIN),
+    ("/modules/swpc/settings", ADMIN),
+    ("/modules/gios-smog/enabled", ADMIN),
+    ("/modules/gios-smog/settings", ADMIN),
+    ("/modules/emsc/enabled", ADMIN),
+    ("/modules/emsc/settings", ADMIN),
     ("/users", ADMIN),
     ("/users/1/role", ADMIN),
     ("/users/1/disabled", ADMIN),
@@ -122,6 +138,11 @@ type Session = (u8, Option<(String, String)>);
 
 async fn sessions() -> (Router, AppState, Vec<Session>, i64) {
     let state = state().await;
+    // Migracja zasiewa tylko `imgw-meteo`; reszta źródeł rejestruje się jak na stacji.
+    aars_core::module::ModuleRepo::new(state.pool.clone())
+        .register(&state.modules)
+        .await
+        .unwrap();
     let users = UserRepo::new(state.pool.clone());
     for (name, role) in [
         ("v", Role::Viewer),
@@ -318,6 +339,14 @@ async fn every_post_route_enforces_its_role_with_a_valid_csrf_token() {
         ("/queue/group/g/cancel", OPERATOR, 200),
         ("/sources/imgw-meteo/enabled", OPERATOR, 303),
         ("/sources/imgw-meteo/refresh", OPERATOR, 503),
+        ("/sources/rso/enabled", OPERATOR, 303),
+        ("/sources/rso/refresh", OPERATOR, 503),
+        ("/sources/swpc/enabled", OPERATOR, 303),
+        ("/sources/swpc/refresh", OPERATOR, 503),
+        ("/sources/gios-smog/enabled", OPERATOR, 303),
+        ("/sources/gios-smog/refresh", OPERATOR, 503),
+        ("/sources/emsc/enabled", OPERATOR, 303),
+        ("/sources/emsc/refresh", OPERATOR, 503),
         ("/watchdog/clear", ADMIN, 303),
         ("/settings", ADMIN, 400),
         ("/settings/hardware", ADMIN, 400),
@@ -335,6 +364,14 @@ async fn every_post_route_enforces_its_role_with_a_valid_csrf_token() {
         ("/modules/imgw-meteo/enabled", ADMIN, 303),
         // `interval_s=5` jest poza zakresem 60–3600.
         ("/modules/imgw-meteo/settings", ADMIN, 400),
+        ("/modules/rso/enabled", ADMIN, 303),
+        ("/modules/rso/settings", ADMIN, 400),
+        ("/modules/swpc/enabled", ADMIN, 303),
+        ("/modules/swpc/settings", ADMIN, 400),
+        ("/modules/gios-smog/enabled", ADMIN, 303),
+        ("/modules/gios-smog/settings", ADMIN, 400),
+        ("/modules/emsc/enabled", ADMIN, 303),
+        ("/modules/emsc/settings", ADMIN, 400),
         ("/users", ADMIN, 200),
         ("/users/999/role", ADMIN, 404),
         ("/users/999/disabled", ADMIN, 404),

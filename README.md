@@ -19,8 +19,9 @@ natychmiast, a operator może wpisać i nadać własny komunikat z panelu www.
 - panel www (Axum + Askama + HTMX): logowanie, role, CSRF, nadawanie,
   kolejka na żywo, zarządzanie komunikatami i harmonogramem, ustawienia,
   użytkownicy, logi (szczegóły w sekcji „Panel”),
-- źródło danych IMGW: ostrzeżenia meteorologiczne dla wybranego obszaru trafiają
-  do kolejki jako polski komunikat (sekcja „Źródła danych”),
+- źródła danych: ostrzeżenia IMGW dla wybranego obszaru oraz alarmy (komunikaty
+  RSO, pogoda kosmiczna NOAA, smog GIOŚ, wstrząsy EMSC) trafiają do kolejki jako
+  polski komunikat (sekcja „Źródła danych”),
 - konfiguracja sprzętu, pozycji stacji i modułów z panelu admina, test PTT
   i test audio, restart stacji jednym przyciskiem (sekcja „Konfiguracja
   z panelu”),
@@ -67,9 +68,23 @@ Po instalacji źródło jest wyłączone. W panelu, w tej kolejności:
    operator może też kliknąć „Odśwież teraz” na `/sources`.
 
 Stan źródła (działa, błąd, przestarzałe, wyłączone, brak obszaru) widać też na
-pulpicie. Podgląd bez zapisu i bez kolejki: `cargo run -p aars -- source preview`
-pobiera ostrzeżenia dla zapisanego obszaru i wypisuje tekst, priorytet oraz
-postać znormalizowaną do syntezy.
+pulpicie. Podgląd bez zapisu i bez kolejki: `cargo run -p aars -- source preview [id]`
+(domyślnie `imgw-meteo`) pobiera dane dla zapisanego obszaru albo pozycji
+stacji i wypisuje tekst, priorytet oraz postać znormalizowaną do syntezy.
+
+### Źródła alarmowe (etap 11a)
+
+Wszystkie są po instalacji wyłączone; włącza się je tak samo jak `imgw-meteo`.
+Źródła bez obszaru (`rso`, `swpc`) działają od razu, `gios-smog` i `emsc`
+potrzebują pozycji stacji (ustawienia). Adresy w `[sources]` w `aars.toml`.
+
+| Źródło | Dane | Licencja i atrybucja |
+|---|---|---|
+| `imgw-meteo` | IMGW-PIB, ostrzeżenia meteorologiczne | dane publiczne IMGW |
+| `rso` | Regionalny System Ostrzegania (komunikaty.tvp.pl): Alert RCB, komunikaty wojewódzkie i sanepidu | brak jawnej licencji, dane publiczne administracji; w treści „Komunikat RSO” |
+| `swpc` | NOAA SWPC, skale G/S/R pogody kosmicznej | domena publiczna; „Dane: NOAA SWPC” |
+| `gios-smog` | GIOŚ, ostrzeżenia smogowe w promieniu stacji | CC BY 4.0; „Źródło: GIOŚ” |
+| `emsc` | EMSC, wstrząsy sejsmiczne w promieniu stacji | CC BY 4.0; „Dane: EMSC” |
 
 ## Konfiguracja z panelu
 
@@ -327,8 +342,9 @@ Kompilacja na Linuksa arm64 z macOS:
 
 Według spec §13:
 
-- etap 11: źródła IMGW hydro i PAA z kompozytorem biuletynu, moduł pogody
-  (Open-Meteo, zapasowo MET Norway) i mapa ostrzeżeń w panelu.
+- etap 11b: źródła IMGW hydro i PAA z kompozytorem biuletynu, moduł pogody
+  (Open-Meteo, zapasowo MET Norway), biuletyn propagacyjny i mapa ostrzeżeń
+  w panelu (11a, źródła alarmowe, jest gotowy).
 
 ## Uruchomienie
 
