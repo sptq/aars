@@ -24,7 +24,7 @@ pub const MONTHS_GENITIVE: [&str; 12] = [
 /// Czas IMGW to `Europe/Warsaw` (R11); wspólne z innymi źródłami.
 pub use crate::speech::warsaw_to_utc;
 
-fn day_month(t: NaiveDateTime) -> String {
+pub(crate) fn day_month(t: NaiveDateTime) -> String {
     let month = MONTHS_GENITIVE
         .get(t.month0() as usize)
         .copied()
@@ -51,7 +51,7 @@ pub fn validity(from: NaiveDateTime, until: NaiveDateTime) -> String {
     }
 }
 
-fn level_genitive(level: u8) -> Option<&'static str> {
+pub(crate) fn level_genitive(level: u8) -> Option<&'static str> {
     match level {
         1 => Some("pierwszego"),
         2 => Some("drugiego"),

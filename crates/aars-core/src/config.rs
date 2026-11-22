@@ -75,6 +75,8 @@ pub enum FirstAdmin {
 pub struct SourcesConfig {
     #[serde(default = "default_imgw_meteo_url")]
     pub imgw_meteo_url: String,
+    #[serde(default = "default_imgw_hydro_url")]
+    pub imgw_hydro_url: String,
     #[serde(default = "default_rso_url")]
     pub rso_url: String,
     #[serde(default = "default_swpc_url")]
@@ -97,6 +99,10 @@ pub struct SourcesConfig {
 
 fn default_imgw_meteo_url() -> String {
     "https://danepubliczne.imgw.pl/api/data/warningsmeteo".to_owned()
+}
+
+fn default_imgw_hydro_url() -> String {
+    "https://danepubliczne.imgw.pl/api/data/warningshydro".to_owned()
 }
 
 fn default_rso_url() -> String {
@@ -141,6 +147,7 @@ impl SourcesConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         let pairs = [
             ("imgw_meteo_url", &self.imgw_meteo_url),
+            ("imgw_hydro_url", &self.imgw_hydro_url),
             ("rso_url", &self.rso_url),
             ("swpc_url", &self.swpc_url),
             ("gios_url", &self.gios_url),
@@ -171,6 +178,7 @@ impl Default for SourcesConfig {
     fn default() -> Self {
         Self {
             imgw_meteo_url: default_imgw_meteo_url(),
+            imgw_hydro_url: default_imgw_hydro_url(),
             rso_url: default_rso_url(),
             swpc_url: default_swpc_url(),
             gios_url: default_gios_url(),
@@ -453,6 +461,7 @@ mod tests {
             jail.create_file("aars.toml", "[sources]\nimgw_meteo_url = \"http://127.0.0.1:9/x\"\n")?;
             let cfg = Config::load(Some(std::path::Path::new("aars.toml"))).unwrap();
             assert_eq!(cfg.sources.imgw_meteo_url, "http://127.0.0.1:9/x");
+            assert_eq!(cfg.sources.imgw_hydro_url, "https://danepubliczne.imgw.pl/api/data/warningshydro");
             assert_eq!(cfg.sources.rso_url, "https://komunikaty.tvp.pl/komunikatyxml");
             assert_eq!(cfg.sources.swpc_url, "https://services.swpc.noaa.gov/products/noaa-scales.json");
             assert_eq!(cfg.sources.gios_url, "https://api.gios.gov.pl/pjp-api/v1/rest");
@@ -474,7 +483,7 @@ mod tests {
 
     #[test]
     fn every_source_url_is_validated() {
-        for key in ["IMGW_METEO_URL", "RSO_URL", "SWPC_URL", "GIOS_URL", "EMSC_URL", "OPEN_METEO_URL", "MET_NO_URL", "SWPC_F107_URL", "SWPC_KP_URL", "KC2G_URL"] {
+        for key in ["IMGW_METEO_URL", "IMGW_HYDRO_URL", "RSO_URL", "SWPC_URL", "GIOS_URL", "EMSC_URL", "OPEN_METEO_URL", "MET_NO_URL", "SWPC_F107_URL", "SWPC_KP_URL", "KC2G_URL"] {
             figment::Jail::expect_with(|jail| {
                 jail.set_env(format!("AARS_SOURCES__{key}"), "ftp://x");
                 let err = Config::load(None).unwrap_err().to_string();
