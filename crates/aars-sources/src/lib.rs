@@ -1,6 +1,7 @@
 //! Źródła danych (spec §7): trait `DataSource` i ogólny `SourceRunner`, który
 //! pilnuje idempotencji, odwołań i wycofywania po błędach.
 
+pub mod emsc;
 pub mod http;
 pub mod imgw_meteo;
 pub mod runner;
