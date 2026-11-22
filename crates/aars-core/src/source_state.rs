@@ -710,7 +710,6 @@ mod tests {
         repo.record_success("off", at("2026-11-22T17:00:00Z")).await.unwrap();
         let health = repo.alert_source_health(now).await.unwrap();
         assert_eq!(health, AlertSourceHealth { enabled: 3, unavailable: 2 });
-        assert_eq!(health, AlertSourceHealth { enabled: 3, unavailable: 2 });
         repo.record_failure("never", now, "zły").await.unwrap();
         let health = repo.alert_source_health(now).await.unwrap();
         assert_eq!(health, AlertSourceHealth { enabled: 3, unavailable: 2 });
