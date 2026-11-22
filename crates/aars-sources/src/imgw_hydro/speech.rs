@@ -11,14 +11,15 @@ pub const MAX_TEXT_CHARS: usize = 700;
 const MIN_COURSE_CHARS: usize = 20;
 const SOURCE: &str = "Źródło: IMGW-PIB.";
 
-/// „Ważne do 24 listopada godz. 12:00”; północ to 24:00 poprzedniego dnia.
+/// „Ważne do godz. 12:00 24 listopada” (normalizacja czyta „do godziny
+/// dwunastej”); północ to 24:00 poprzedniego dnia.
 fn valid_until(until: NaiveDateTime) -> String {
     let (day, time) = if until.hour() == 0 && until.minute() == 0 {
         (until - chrono::Duration::days(1), "24:00".to_owned())
     } else {
         (until, until.format("%H:%M").to_string())
     };
-    format!("Ważne do {} godz. {time}", day_month(day))
+    format!("Ważne do godz. {time} {}", day_month(day))
 }
 
 fn capitalize(text: &str) -> String {

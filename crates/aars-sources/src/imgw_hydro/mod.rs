@@ -101,9 +101,6 @@ pub fn to_output(parsed: &ParsedHydro, ctx: &SourceCtx) -> SourceOutput {
     let mut complete = parsed.skipped == 0;
     let mut items = Vec::new();
     for w in &parsed.warnings {
-        if w.level < 0 {
-            continue;
-        }
         let matching: Vec<&HydroArea> = w
             .areas
             .iter()
@@ -253,6 +250,17 @@ mod tests {
     }
 
     #[test]
+    fn a_drought_without_an_office_does_not_make_the_fetch_incomplete() {
+        let mut v: serde_json::Value = serde_json::from_slice(FIX).unwrap();
+        v[0].as_object_mut().unwrap().remove("biuro");
+        v[1]["biuro"] = serde_json::Value::Null;
+        v[2].as_object_mut().unwrap().remove("obszary");
+        let out = run(&serde_json::to_vec(&v).unwrap(), "22");
+        assert!(out.complete);
+        assert_eq!(out.items.len(), 2);
+    }
+
+    #[test]
     fn warnings_match_by_voivodeship() {
         let keys = |area: &str| {
             run(FIX, area)
@@ -290,7 +298,7 @@ mod tests {
         assert!(i.text.starts_with("Ostrzeżenie hydrologiczne IMGW drugiego stopnia: Wezbranie z przekroczeniem stanów ostrzegawczych. Pomorskie, Wybrzeże Wschodnie"), "{}", i.text);
         assert!(
             i.text
-                .ends_with("Ważne do 24 listopada godz. 12:00. Źródło: IMGW-PIB."),
+                .ends_with("Ważne do godz. 12:00 24 listopada. Źródło: IMGW-PIB."),
             "{}",
             i.text
         );
@@ -374,8 +382,24 @@ mod tests {
         }));
         assert!(i.text.chars().count() <= 700, "{}", i.text.chars().count());
         assert!(i.text.ends_with("Źródło: IMGW-PIB."));
-        assert!(i.text.contains("Ważne do 24 listopada godz. 12:00."));
+        assert!(i.text.contains("Ważne do godz. 12:00 24 listopada."));
         assert!(i.text.contains("Zdanie numer jeden."));
+    }
+
+    #[test]
+    fn the_validity_is_read_as_until_an_hour() {
+        let i = item137(FIX);
+        assert!(
+            i.text
+                .ends_with("Ważne do godz. 12:00 24 listopada. Źródło: IMGW-PIB."),
+            "{}",
+            i.text
+        );
+        let spoken = aars_audio::text::normalize(&i.text);
+        assert!(
+            spoken.contains("Ważne do godziny dwunastej"),
+            "{spoken}"
+        );
     }
 
     #[test]
@@ -383,7 +407,7 @@ mod tests {
         let i = item137(&edited(&|w| w["data_do"] = "2026-11-25 00:00:00".into()));
         assert!(
             i.text
-                .ends_with("Ważne do 24 listopada godz. 24:00. Źródło: IMGW-PIB."),
+                .ends_with("Ważne do godz. 24:00 24 listopada. Źródło: IMGW-PIB."),
             "{}",
             i.text
         );

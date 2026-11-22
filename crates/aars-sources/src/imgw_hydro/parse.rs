@@ -17,7 +17,7 @@ pub struct HydroArea {
 pub struct HydroWarning {
     pub number: String,
     pub office: String,
-    /// −1 to susza hydrologiczna (nie ogłaszamy), 1–3 to stopnie ostrzeżenia.
+    /// Stopień ostrzeżenia 1–3 (susza nie trafia na tę listę).
     pub level: i8,
     pub valid_from: NaiveDateTime,
     pub valid_until: NaiveDateTime,
@@ -29,8 +29,16 @@ pub struct HydroWarning {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ParsedHydro {
     pub warnings: Vec<HydroWarning>,
+    /// Wpisy suszy hydrologicznej (stopień −1): nie ogłaszamy ich i nie
+    /// sprawdzamy reszty pól.
+    pub droughts: usize,
     /// Wpisy nieczytelne (brak pola, nieznany stopień, zła data).
     pub skipped: usize,
+}
+
+enum Entry {
+    Warning(HydroWarning),
+    Drought,
 }
 
 const DATE_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
@@ -53,7 +61,8 @@ pub fn parse_warnings(body: &[u8]) -> Result<ParsedHydro, SourceError> {
             let mut parsed = ParsedHydro::default();
             for entry in &entries {
                 match parse_entry(entry) {
-                    Some(w) => parsed.warnings.push(w),
+                    Some(Entry::Warning(w)) => parsed.warnings.push(w),
+                    Some(Entry::Drought) => parsed.droughts += 1,
                     None => parsed.skipped += 1,
                 }
             }
@@ -65,23 +74,28 @@ pub fn parse_warnings(body: &[u8]) -> Result<ParsedHydro, SourceError> {
     }
 }
 
-fn parse_entry(entry: &serde_json::Value) -> Option<HydroWarning> {
+/// Najpierw stopień: susza (−1) to tylko znacznik, bez wymagania `biuro`,
+/// `obszary` i reszty pól (inaczej jej brakujące pole psułoby kompletność).
+fn parse_entry(entry: &serde_json::Value) -> Option<Entry> {
     let text_field = |name: &str| entry.get(name).and_then(|v| v.as_str());
     let date = |name: &str| {
         text_field(name).and_then(|s| NaiveDateTime::parse_from_str(s.trim(), DATE_FORMAT).ok())
     };
-    let number = text_field("numer")?.trim();
-    let office = text_field("biuro")?.trim();
-    let event = clean_text(text_field("zdarzenie")?);
-    if number.is_empty() || office.is_empty() || event.is_empty() {
-        return None;
-    }
     let level: i8 = text_field("stopień")
         .or_else(|| text_field("stopien"))?
         .trim()
         .parse()
         .ok()
         .filter(|n| [-1, 1, 2, 3].contains(n))?;
+    if level == -1 {
+        return Some(Entry::Drought);
+    }
+    let number = text_field("numer")?.trim();
+    let office = text_field("biuro")?.trim();
+    let event = clean_text(text_field("zdarzenie")?);
+    if number.is_empty() || office.is_empty() || event.is_empty() {
+        return None;
+    }
     let mut areas = Vec::new();
     for area in entry.get("obszary")?.as_array()? {
         let voivodeship = area.get("wojewodztwo")?.as_str()?.trim().to_lowercase();
@@ -95,7 +109,7 @@ fn parse_entry(entry: &serde_json::Value) -> Option<HydroWarning> {
             description,
         });
     }
-    Some(HydroWarning {
+    Some(Entry::Warning(HydroWarning {
         number: number.to_owned(),
         office: office.to_owned(),
         level,
@@ -104,7 +118,7 @@ fn parse_entry(entry: &serde_json::Value) -> Option<HydroWarning> {
         event,
         course: clean_text(text_field("przebieg").unwrap_or_default()),
         areas,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -116,8 +130,8 @@ mod tests {
     #[test]
     fn the_fixture_has_34_warnings_and_30_droughts() {
         let p = parse_warnings(FIX).unwrap();
-        assert_eq!((p.warnings.len(), p.skipped), (34, 0));
-        assert_eq!(p.warnings.iter().filter(|w| w.level == -1).count(), 30);
+        assert_eq!((p.warnings.len(), p.droughts, p.skipped), (4, 30, 0));
+        assert!(p.warnings.iter().all(|w| w.level == 2));
         let w140 = p.warnings.iter().find(|w| w.number == "140").unwrap();
         assert_eq!(
             w140.areas
@@ -147,12 +161,13 @@ mod tests {
     #[test]
     fn unreadable_entries_are_counted() {
         let mut v: serde_json::Value = serde_json::from_slice(FIX).unwrap();
-        v[0].as_object_mut().unwrap().remove("numer");
+        // Wpisy 30–33 to ostrzeżenia 138, 139, 137, 140; reszta to susza.
+        v[30].as_object_mut().unwrap().remove("numer");
         v[1]["stopień"] = "7".into();
-        v[2]["data_od"] = "wczoraj".into();
-        v[3].as_object_mut().unwrap().remove("obszary");
+        v[31]["data_od"] = "wczoraj".into();
+        v[32].as_object_mut().unwrap().remove("obszary");
         let p = parse_warnings(&serde_json::to_vec(&v).unwrap()).unwrap();
-        assert_eq!((p.warnings.len(), p.skipped), (30, 4));
+        assert_eq!((p.warnings.len(), p.droughts, p.skipped), (1, 29, 4));
     }
 
     #[test]
@@ -162,6 +177,6 @@ mod tests {
         let level = first.remove("stopień").unwrap();
         first.insert("stopien".into(), level);
         let p = parse_warnings(&serde_json::to_vec(&v).unwrap()).unwrap();
-        assert_eq!((p.warnings.len(), p.skipped), (34, 0));
+        assert_eq!((p.warnings.len(), p.droughts, p.skipped), (4, 30, 0));
     }
 }
