@@ -6,6 +6,7 @@ pub mod imgw_meteo;
 pub mod runner;
 pub mod source;
 pub mod speech;
+pub mod swpc;
 
 pub use runner::{CycleReport, SourceRunner, next_delay};
 pub use source::{DataSource, FetchFuture, SourceCtx, SourceError, SourceItem, SourceOutput};
