@@ -31,23 +31,32 @@ pub fn km_phrase(km: u32) -> String {
 }
 
 /// Tekst z sieci do mowy: bez znaczników HTML i encji, jedna linia; wiersze
-/// listy (`- `) łączy średnik.
+/// listy (`- `) łączy średnik, a wiersz po liście zaczyna nowe zdanie.
 pub fn clean_text(raw: &str) -> String {
     let decoded = decode_entities(&strip_tags(raw));
     let mut out = String::new();
+    let mut after_item = false;
     for line in decoded.lines() {
         let line = collapse_spaces(line);
         if line.is_empty() {
             continue;
         }
-        let (item, separator) = match line.strip_prefix("- ") {
-            Some(rest) => (rest, "; "),
-            None => (line.as_str(), " "),
+        let (item, is_item) = match line.strip_prefix("- ") {
+            Some(rest) => (rest, true),
+            None => (line.as_str(), false),
         };
         if !out.is_empty() {
+            let separator = if is_item {
+                "; "
+            } else if after_item && !out.ends_with(['.', '!', '?']) {
+                ". "
+            } else {
+                " "
+            };
             out.push_str(separator);
         }
         out.push_str(item);
+        after_item = is_item;
     }
     out
 }
@@ -56,17 +65,24 @@ fn collapse_spaces(line: &str) -> String {
     line.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Usuwa `<…>`; `<` bez zamykającego `>` zostaje dosłownie.
+/// Zamienia znaczniki `<…>` na spację. Znacznik zaczyna `<` z literą
+/// ASCII, `/` albo `!` zaraz za nim; inne `<` (np. `< 5`) i `<` bez
+/// zamykającego `>` zostają dosłownie.
 fn strip_tags(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
     while let Some(start) = rest.find('<') {
         out.push_str(&rest[..start]);
-        match rest[start..].find('>') {
-            Some(end) => rest = &rest[start + end + 1..],
+        let tail = &rest[start + 1..];
+        let opens_tag = tail.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '/' || c == '!');
+        match tail.find('>').filter(|_| opens_tag) {
+            Some(end) => {
+                out.push(' ');
+                rest = &tail[end + 1..];
+            }
             None => {
-                out.push_str(&rest[start..]);
-                rest = "";
+                out.push('<');
+                rest = tail;
             }
         }
     }
@@ -189,6 +205,26 @@ mod tests {
         assert_eq!(clean_text("<p>A&amp;B</p>\r\n- x\n- y"), "A&B; x; y");
         assert_eq!(clean_text("a &lt;b&gt; &quot;c&quot; &#39;d&#39;&nbsp;e &#261;"), "a <b> \"c\" 'd' e ą");
         assert_eq!(clean_text("  dużo    spacji  "), "dużo spacji");
+    }
+
+    #[test]
+    fn a_line_after_a_list_starts_a_new_sentence() {
+        // Fragment z fiksa rso/wszystkie-informacje-drogowe-2026-11-22.json.
+        let raw = "od 31.10.2026: Dojazd do miejscowości \r\n\r\n- Gierłoż\r\n\r\n- Kruszewiec\r\n\r\n- Cegielnia\r\n\r\n- Kwiedzina\r\n\r\n- Pożarki\r\n\r\n- Martiany\r\n\r\nOdbywał się będzie drogą wojewódzką numer 592 od strony miejscowości Kętrzyn.\r\n\r\n \r\n\r\n ";
+        assert_eq!(
+            clean_text(raw),
+            "od 31.10.2026: Dojazd do miejscowości; Gierłoż; Kruszewiec; Cegielnia; Kwiedzina; Pożarki; Martiany. Odbywał się będzie drogą wojewódzką numer 592 od strony miejscowości Kętrzyn."
+        );
+        // Kropka na końcu pozycji listy nie jest podwajana.
+        assert_eq!(clean_text("Lista:\n- a.\nDalej"), "Lista:; a. Dalej");
+    }
+
+    #[test]
+    fn tags_become_spaces_and_plain_angle_brackets_survive() {
+        assert_eq!(clean_text("a<br>b"), "a b");
+        assert_eq!(clean_text("<p>Zdanie.</p><p>Drugie</p>"), "Zdanie. Drugie");
+        assert_eq!(clean_text("temperatura < 5 i > 0"), "temperatura < 5 i > 0");
+        assert_eq!(clean_text("x <!-- uwaga --> y </div>z"), "x y z");
     }
 
     #[test]

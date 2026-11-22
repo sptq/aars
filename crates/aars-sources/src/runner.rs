@@ -124,7 +124,6 @@ impl SourceRunner {
         now: DateTime<Utc>,
         id: &str,
         cfg: &aars_core::source_state::SourceConfig,
-        active: &[TrackedItem],
     ) -> SourceCtx {
         let pool = self.state.pool().clone();
         let position = match PositionRepo::new(pool.clone()).load().await {
@@ -147,7 +146,7 @@ impl SourceRunner {
             area_text: cfg.area_text.clone(),
             position,
             settings,
-            tracked_keys: active.iter().map(|a| a.item_key.clone()).collect(),
+            tracked_keys: HashSet::new(),
         }
     }
 
@@ -166,15 +165,17 @@ impl SourceRunner {
             report.skipped = Some("brak obszaru");
             return Ok(());
         }
-        // Kontekst przed porównaniem R9: zakres i `tracked_keys` liczone z
-        // pozycji aktywnych przed tym cyklem.
-        let active = self.state.active_items(id).await?;
-        let ctx = self.context(now, id, &cfg, &active).await;
+        // Kontekst przed porównaniem R9. Zakres nie zależy od
+        // `tracked_keys`, więc najpierw zakres, potem klucze aktywnych pozycji
+        // śledzonych przy tym zakresie (inne zakres R9 zaraz porzuci).
+        let mut ctx = self.context(now, id, &cfg).await;
         if needs == Needs::Position && ctx.position.is_none() {
             report.skipped = Some("brak pozycji stacji");
             return Ok(());
         }
         let scope = self.source.scope(&ctx);
+        let active = self.state.active_items(id).await?;
+        ctx.tracked_keys = active.iter().filter(|a| a.area == scope).map(|a| a.item_key.clone()).collect();
 
         self.settle_pending_cancellations(id, now).await?;
 
@@ -468,8 +469,6 @@ mod tests {
 
     use aars_core::db::test_pool;
     use aars_core::queue::QueueItem;
-
-    use aars_core::module::Needs;
 
     use super::*;
     use crate::source::{FetchFuture, SourceError, SourceOutput};
@@ -1100,6 +1099,28 @@ mod tests {
         let report = r.runner.cycle(now()).await;
         assert_eq!(report.announced, 2);
         assert_eq!(texts(&r.queue).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_position_source_with_a_position_runs_without_an_area() {
+        let r = rig_with(FakeSource::needing(Needs::Position, vec![ok(vec![warning("a", "f1")])])).await;
+        r.state.save_config("imgw-meteo", "", 300).await.unwrap();
+        let p = aars_core::geo::parse_position("", "", "JO91RS").unwrap();
+        PositionRepo::new(r.state.pool().clone()).save(p.as_ref()).await.unwrap();
+        let report = r.runner.cycle(now()).await;
+        assert_eq!(report.skipped, None);
+        assert!(report.fetched);
+        assert_eq!(report.announced, 1);
+    }
+
+    #[tokio::test]
+    async fn keys_tracked_under_another_scope_are_not_tracked_keys() {
+        let r = rig(vec![ok(vec![warning("k1", "f1")]), ok(vec![]), ok(vec![])]).await;
+        *r.source.scope.lock().unwrap() = Some("A".to_owned());
+        r.runner.cycle(now()).await;
+        *r.source.scope.lock().unwrap() = Some("B".to_owned());
+        r.runner.cycle(now()).await;
+        assert_eq!(r.source.last_keys.lock().unwrap().clone().unwrap(), HashSet::new());
     }
 
     #[tokio::test]
