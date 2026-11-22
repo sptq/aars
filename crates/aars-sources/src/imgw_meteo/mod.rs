@@ -6,7 +6,7 @@ pub mod speech;
 
 use std::time::Duration;
 
-use aars_core::module::{ModuleDescriptor, ModuleKind, SettingKind, SettingSpec, Toggle};
+use aars_core::module::{ModuleDescriptor, ModuleKind, Needs, SettingKind, SettingSpec, Toggle};
 
 use crate::source::{DataSource, FetchFuture, SourceCtx, SourceError, SourceItem, SourceOutput};
 use parse::ParsedWarnings;
@@ -23,6 +23,7 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     kind: ModuleKind::Source,
     toggle: Toggle::Switchable,
     default_enabled: false,
+    needs: Needs::Area,
     settings: &[
         SettingSpec {
             key: "area",

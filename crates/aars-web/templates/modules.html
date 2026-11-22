@@ -43,6 +43,13 @@
       <select id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}">
         {% for (value, label) in f.options %}<option value="{{ value }}" {% if f.value == *value %}selected{% endif %}>{{ label }}</option>{% endfor %}
       </select>
+      {% else if f.kind == "decimal" %}
+      <label for="{{ m.id }}-{{ f.key }}">{{ f.label }} ({{ f.min_text }}–{{ f.max_text }})</label>
+      <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="text" inputmode="decimal" value="{{ f.value }}" required>
+      {% else if f.kind == "list" %}
+      <fieldset style="border:0;padding:0;margin:0"><legend>{{ f.label }}</legend>
+        {% for (value, label, on) in f.checks %}<label style="display:block"><input type="checkbox" name="{{ f.key }}" value="{{ value }}" {% if *on %}checked{% endif %}> {{ label }}</label>{% endfor %}
+      </fieldset>
       {% else %}
       <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
       <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" value="{{ f.value }}" maxlength="{{ f.max_len }}">

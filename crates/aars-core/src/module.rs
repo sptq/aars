@@ -38,15 +38,29 @@ pub enum Toggle {
     Planned(&'static str),
 }
 
+/// Czego źródło potrzebuje od stacji, żeby w ogóle pracować.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Needs {
+    /// Obszar (TERYT) z ustawień źródła.
+    Area,
+    /// Pozycja stacji (lokator albo współrzędne).
+    Position,
+    Nothing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SettingKind {
     Text { max_len: usize },
     Integer { min: i64, max: i64 },
     Area,
     Choice(&'static [(&'static str, &'static str)]),
+    /// Liczba z jedną cyfrą po przecinku; wejście z kropką albo przecinkiem.
+    Decimal { min: f64, max: f64 },
+    /// Podzbiór wartości z listy (wartość, etykieta), zapisany po przecinku.
+    List(&'static [(&'static str, &'static str)]),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SettingSpec {
     pub key: &'static str,
     pub label: &'static str,
@@ -55,7 +69,7 @@ pub struct SettingSpec {
     pub default: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModuleDescriptor {
     pub id: &'static str,
     pub name: &'static str,
@@ -63,6 +77,7 @@ pub struct ModuleDescriptor {
     pub kind: ModuleKind,
     pub toggle: Toggle,
     pub default_enabled: bool,
+    pub needs: Needs,
     pub settings: &'static [SettingSpec],
     /// (tekst linku, ścieżka)
     pub see_also: Option<(&'static str, &'static str)>,
@@ -105,11 +120,38 @@ impl ModuleDescriptor {
                     }
                     v.to_owned()
                 }
+                SettingKind::Decimal { min, max } => {
+                    let range = || format!("{}–{}", comma(min), comma(max));
+                    match raw.trim().replace(',', ".").parse::<f64>() {
+                        Ok(n) if n.is_finite() && n >= min && n <= max => format!("{n:.1}"),
+                        _ => return Err(format!("{}: {}", spec.label, range())),
+                    }
+                }
+                SettingKind::List(options) => {
+                    let wanted: Vec<&str> =
+                        raw.split(',').map(str::trim).filter(|v| !v.is_empty()).collect();
+                    if wanted.is_empty() {
+                        return Err(format!("{}: wybierz co najmniej jedną", spec.label));
+                    }
+                    if wanted.iter().any(|w| !options.iter().any(|(v, _)| v == w)) {
+                        return Err(format!("{}: nieznana wartość", spec.label));
+                    }
+                    options
+                        .iter()
+                        .filter(|(v, _)| wanted.contains(v))
+                        .map(|(v, _)| *v)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
             };
             out.insert(spec.key.to_owned(), value);
         }
         Ok(out)
     }
+}
+
+fn comma(n: f64) -> String {
+    format!("{n:.1}").replace('.', ",")
 }
 
 /// Moduły wbudowane w rdzeń (R13). Źródła dokłada `aars_sources::modules()`.
@@ -122,6 +164,7 @@ pub fn builtin() -> Vec<ModuleDescriptor> {
             kind: ModuleKind::Scheduler,
             toggle: Toggle::Switchable,
             default_enabled: true,
+            needs: Needs::Nothing,
             settings: &[],
             see_also: Some(("Tolerancja spóźnień", "/settings")),
         },
@@ -132,6 +175,7 @@ pub fn builtin() -> Vec<ModuleDescriptor> {
             kind: ModuleKind::Ident,
             toggle: Toggle::AlwaysOn("identyfikacja stacji jest obowiązkowa"),
             default_enabled: true,
+            needs: Needs::Nothing,
             settings: &[],
             see_also: Some(("Znak i tryb identyfikacji", "/settings")),
         },
@@ -142,6 +186,7 @@ pub fn builtin() -> Vec<ModuleDescriptor> {
             kind: ModuleKind::Bulletin,
             toggle: Toggle::Planned("etap 11"),
             default_enabled: false,
+            needs: Needs::Nothing,
             settings: &[],
             see_also: None,
         },
@@ -158,6 +203,7 @@ pub fn sample_source(id: &'static str) -> ModuleDescriptor {
         kind: ModuleKind::Source,
         toggle: Toggle::Switchable,
         default_enabled: false,
+        needs: Needs::Area,
         settings: &[
             SettingSpec {
                 key: "area",
@@ -399,6 +445,46 @@ mod tests {
         assert!(m.validate(&map(&[("t", "abc"), ("c", "b")])).is_ok());
         assert_eq!(m.validate(&map(&[("t", "abcd"), ("c", "b")])).unwrap_err(), "Tekst: najwyżej 3 znaków");
         assert_eq!(m.validate(&map(&[("t", "a"), ("c", "z")])).unwrap_err(), "Wybór: nieznana wartość");
+    }
+
+    #[test]
+    fn decimal_settings_accept_a_comma_and_store_one_decimal() {
+        const SPECS: &[SettingSpec] = &[SettingSpec {
+            key: "m", label: "Próg", help: "", kind: SettingKind::Decimal { min: 1.0, max: 9.0 }, default: "3.0",
+        }];
+        let m = ModuleDescriptor { settings: SPECS, ..sample_source("x") };
+        let v = |s: &str| m.validate(&map(&[("m", s)]));
+        assert_eq!(v("3").unwrap()["m"], "3.0");
+        assert_eq!(v("4,5").unwrap()["m"], "4.5");
+        assert_eq!(v(" 2.0 ").unwrap()["m"], "2.0");
+        for bad in ["0.5", "9.5", "abc", "NaN"] {
+            let e = v(bad).unwrap_err();
+            assert!(e.contains("Próg") && e.contains("1,0–9,0"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn list_settings_store_known_slugs_in_declared_order() {
+        const OPTS: &[(&str, &str)] = &[
+            ("ogolne", "Ogólne"),
+            ("atak-z-powietrza", "Atak z powietrza"),
+            ("informacje-drogowe", "Drogowe"),
+        ];
+        const SPECS: &[SettingSpec] = &[SettingSpec {
+            key: "l", label: "Kategorie", help: "", kind: SettingKind::List(OPTS), default: "ogolne",
+        }];
+        let m = ModuleDescriptor { settings: SPECS, ..sample_source("x") };
+        let v = |s: &str| m.validate(&map(&[("l", s)]));
+        assert_eq!(v("informacje-drogowe, ogolne").unwrap()["l"], "ogolne,informacje-drogowe");
+        assert_eq!(v("ogolne,ogolne").unwrap()["l"], "ogolne");
+        assert_eq!(v("").unwrap_err(), "Kategorie: wybierz co najmniej jedną");
+        assert_eq!(v("stany-wod").unwrap_err(), "Kategorie: nieznana wartość");
+    }
+
+    #[test]
+    fn builtin_modules_need_nothing() {
+        assert!(builtin().iter().all(|m| m.needs == Needs::Nothing));
+        assert_eq!(sample_source("x").needs, Needs::Area);
     }
 
     #[tokio::test]

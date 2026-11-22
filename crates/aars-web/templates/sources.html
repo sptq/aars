@@ -14,7 +14,7 @@
       <tr><th>Ostatnia próba</th><td>{{ s.last_run }}</td></tr>
       <tr><th>Ostatni sukces</th><td>{{ s.last_success }}</td></tr>
       {% if let Some(error) = s.last_error %}<tr><th>Ostatni błąd</th><td class="error">{{ error }}</td></tr>{% endif %}
-      <tr><th>Obszar</th><td>{% if s.area_text.is_empty() %}brak{% else %}<pre style="margin:0">{{ s.area_text }}</pre>{% endif %}</td></tr>
+      {% if s.shows_area %}<tr><th>Obszar</th><td>{% if s.area_text.is_empty() %}brak{% else %}<pre style="margin:0">{{ s.area_text }}</pre>{% endif %}</td></tr>{% endif %}
       <tr><th>Interwał</th><td>{{ s.interval_s }} s</td></tr>
     </tbody>
   </table>

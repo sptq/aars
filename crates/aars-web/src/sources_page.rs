@@ -4,6 +4,8 @@
 //! runnera idzie przez `AppState::source_refresh`.
 
 use aars_core::error::DbError;
+use aars_core::geo::PositionRepo;
+use aars_core::module::Needs;
 use aars_core::source_state::{SourceConfig, SourceStateRepo, SourceStatus};
 use aars_core::user::Role;
 use askama::Template;
@@ -24,12 +26,16 @@ use crate::state::AppState;
 pub fn health(
     status: &SourceStatus,
     cfg: &SourceConfig,
+    needs: Needs,
+    has_position: bool,
     now: DateTime<Utc>,
 ) -> (&'static str, String) {
     if !cfg.enabled {
         ("off", "wyłączone".to_owned())
-    } else if cfg.area.is_empty() {
+    } else if needs == Needs::Area && cfg.area.is_empty() {
         ("warn", "brak obszaru".to_owned())
+    } else if needs == Needs::Position && !has_position {
+        ("warn", "brak pozycji stacji".to_owned())
     } else if status.consecutive_failures > 0 {
         let n = status.consecutive_failures.unsigned_abs();
         ("err", format!("błąd ({n} {})", plural(n, "próba", "próby", "prób")))
@@ -56,6 +62,7 @@ pub(crate) struct SourceView {
     pub(crate) last_run: String,
     pub(crate) last_success: String,
     pub(crate) last_error: Option<String>,
+    pub(crate) shows_area: bool,
     pub(crate) area_text: String,
     pub(crate) interval_s: u64,
     pub(crate) warnings: Vec<WarningRow>,
@@ -69,12 +76,17 @@ fn time_or_never(at: Option<DateTime<Utc>>) -> String {
 pub(crate) async fn load_views(state: &AppState) -> Result<Vec<SourceView>, DbError> {
     let repo = SourceStateRepo::new(state.pool.clone());
     let now = Utc::now();
+    let has_position = matches!(PositionRepo::new(state.pool.clone()).load().await, Ok(Some(_)));
     let mut views = Vec::new();
     for status in repo.statuses().await? {
         let Some(cfg) = repo.config(&status.source_id).await? else {
             continue;
         };
-        let (css, health_text) = health(&status, &cfg, now);
+        let needs = state
+            .modules
+            .get(&status.source_id)
+            .map_or(Needs::Area, |m| m.needs);
+        let (css, health_text) = health(&status, &cfg, needs, has_position, now);
         let warnings = repo
             .active_items(&status.source_id)
             .await?
@@ -98,6 +110,7 @@ pub(crate) async fn load_views(state: &AppState) -> Result<Vec<SourceView>, DbEr
             last_run: time_or_never(status.last_run_at),
             last_success: time_or_never(status.last_success_at),
             last_error: status.last_error.clone(),
+            shows_area: needs == Needs::Area,
             area_text: cfg.area_text,
             interval_s: cfg.interval_s,
             warnings,
@@ -545,8 +558,30 @@ mod tests {
     }
 
     #[test]
+    fn a_position_source_without_a_position_reports_it() {
+        use super::health;
+        use aars_core::module::Needs;
+        use aars_core::source_state::{SourceConfig, SourceStatus};
+        let now = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
+        let cfg = SourceConfig { enabled: true, area_text: String::new(), area: vec![], interval_s: 300 };
+        let status = SourceStatus {
+            source_id: "x".into(),
+            enabled: true,
+            last_run_at: Some(now),
+            last_success_at: Some(now),
+            consecutive_failures: 0,
+            last_error: None,
+        };
+        assert_eq!(health(&status, &cfg, Needs::Position, false, now).1, "brak pozycji stacji");
+        assert_eq!(health(&status, &cfg, Needs::Position, true, now).1, "działa");
+        assert_eq!(health(&status, &cfg, Needs::Nothing, false, now).1, "działa");
+        assert_eq!(health(&status, &cfg, Needs::Area, true, now).1, "brak obszaru");
+    }
+
+    #[test]
     fn health_prefers_stale_over_working_and_reports_failures() {
         use super::health;
+        use aars_core::module::Needs;
         use aars_core::source_state::{SourceConfig, SourceStatus};
         let now = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
         let area = aars_core::area::parse_area("10").unwrap();
@@ -565,23 +600,23 @@ mod tests {
             last_error: None,
         };
         assert_eq!(
-            health(&status(Some(1), 0), &cfg(false, area.clone()), now).1,
+            health(&status(Some(1), 0), &cfg(false, area.clone()), Needs::Area, true, now).1,
             "wyłączone"
         );
         assert_eq!(
-            health(&status(Some(1), 0), &cfg(true, vec![]), now).1,
+            health(&status(Some(1), 0), &cfg(true, vec![]), Needs::Area, true, now).1,
             "brak obszaru"
         );
         assert_eq!(
-            health(&status(Some(1), 0), &cfg(true, area.clone()), now).1,
+            health(&status(Some(1), 0), &cfg(true, area.clone()), Needs::Area, true, now).1,
             "działa"
         );
         assert_eq!(
-            health(&status(Some(1), 3), &cfg(true, area.clone()), now).1,
+            health(&status(Some(1), 3), &cfg(true, area.clone()), Needs::Area, true, now).1,
             "błąd (3 próby)"
         );
         assert_eq!(
-            health(&status(Some(90), 0), &cfg(true, area), now).1,
+            health(&status(Some(90), 0), &cfg(true, area), Needs::Area, true, now).1,
             "przestarzałe"
         );
     }

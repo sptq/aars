@@ -3,9 +3,10 @@
 //! Operator widzi tylko stan. Panel nie zna crate'a źródeł — źródło budzi
 //! `AppState::source_refresh`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use aars_core::error::DbError;
+use aars_core::geo::PositionRepo;
 use aars_core::module::{
     ModuleDescriptor, ModuleError, ModuleKind, ModuleRepo, SettingKind, Toggle,
 };
@@ -32,12 +33,17 @@ pub(crate) struct FieldView {
     pub(crate) key: &'static str,
     pub(crate) label: &'static str,
     pub(crate) help: &'static str,
-    /// `text` | `integer` | `area` | `choice`
+    /// `text` | `integer` | `area` | `choice` | `decimal` | `list`
     pub(crate) kind: &'static str,
     pub(crate) value: String,
     pub(crate) max_len: usize,
     pub(crate) min: i64,
     pub(crate) max: i64,
+    /// Granice `decimal` już z przecinkiem, np. `1,0`.
+    pub(crate) min_text: String,
+    pub(crate) max_text: String,
+    /// Dla `list`: (wartość, etykieta, zaznaczona).
+    pub(crate) checks: Vec<(&'static str, &'static str, bool)>,
     /// (wartość, etykieta)
     pub(crate) options: Vec<(&'static str, &'static str)>,
 }
@@ -74,6 +80,8 @@ fn kind_name(kind: SettingKind) -> &'static str {
         SettingKind::Integer { .. } => "integer",
         SettingKind::Area => "area",
         SettingKind::Choice(_) => "choice",
+        SettingKind::Decimal { .. } => "decimal",
+        SettingKind::List(_) => "list",
     }
 }
 
@@ -82,7 +90,21 @@ fn field_view(spec: &aars_core::module::SettingSpec, value: String) -> FieldView
         SettingKind::Text { max_len } => (max_len, 0, 0, Vec::new()),
         SettingKind::Integer { min, max } => (0, min, max, Vec::new()),
         SettingKind::Area => (0, 0, 0, Vec::new()),
-        SettingKind::Choice(options) => (0, 0, 0, options.to_vec()),
+        SettingKind::Choice(options) | SettingKind::List(options) => (0, 0, 0, options.to_vec()),
+        SettingKind::Decimal { .. } => (0, 0, 0, Vec::new()),
+    };
+    let (min_text, max_text) = match spec.kind {
+        SettingKind::Decimal { min, max } => (
+            format!("{min:.1}").replace('.', ","),
+            format!("{max:.1}").replace('.', ","),
+        ),
+        _ => (String::new(), String::new()),
+    };
+    let checks = if matches!(spec.kind, SettingKind::List(_)) {
+        let chosen: Vec<&str> = value.split(',').map(str::trim).collect();
+        options.iter().map(|(v, l)| (*v, *l, chosen.contains(v))).collect()
+    } else {
+        Vec::new()
     };
     FieldView {
         key: spec.key,
@@ -93,6 +115,9 @@ fn field_view(spec: &aars_core::module::SettingSpec, value: String) -> FieldView
         max_len,
         min,
         max,
+        min_text,
+        max_text,
+        checks,
         options,
     }
 }
@@ -118,7 +143,13 @@ async fn module_view(
             .into_iter()
             .find(|s| s.source_id == m.id);
         match (status, sources.config(m.id).await?) {
-            (Some(status), Some(cfg)) => Some(health(&status, &cfg, Utc::now())),
+            (Some(status), Some(cfg)) => {
+                let has_position = matches!(
+                    PositionRepo::new(state.pool.clone()).load().await,
+                    Ok(Some(_))
+                );
+                Some(health(&status, &cfg, m.needs, has_position, Utc::now()))
+            }
             _ => None,
         }
     } else {
@@ -274,9 +305,19 @@ pub async fn save_settings(
     State(state): State<AppState>,
     current: CurrentUser,
     Path(id): Path<String>,
-    Form(form): Form<HashMap<String, String>>,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Result<Response, AuthRejection> {
     require_role(&current.user, Role::Admin)?;
+    // Pola wyboru listy powtarzają nazwę; powtórzone klucze łączymy przecinkiem.
+    let mut form: BTreeMap<String, String> = BTreeMap::new();
+    for (key, value) in pairs {
+        form.entry(key)
+            .and_modify(|joined| {
+                joined.push(',');
+                joined.push_str(&value);
+            })
+            .or_insert(value);
+    }
     require_csrf(&current.csrf_token, form.get("csrf").map(String::as_str))?;
 
     let Some(m) = state.modules.get(&id).copied() else {
@@ -771,6 +812,44 @@ mod tests {
         // Moduł bez ustawień nie ma formularza.
         let (status, _, _) = post(&app, &cookie, &csrf, "/modules/scheduler/settings", "x=1").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn list_checkboxes_and_decimal_fields_round_trip_through_the_form() {
+        use aars_core::module::{ModuleDescriptor, ModuleKind, ModuleRegistry, Needs, SettingKind, SettingSpec, Toggle};
+        const OPTS: &[(&str, &str)] = &[("a", "Alfa"), ("b", "Beta"), ("c", "Gamma")];
+        const SPECS: &[SettingSpec] = &[
+            SettingSpec { key: "cats", label: "Kategorie", help: "", kind: SettingKind::List(OPTS), default: "a" },
+            SettingSpec { key: "mag", label: "Magnituda", help: "", kind: SettingKind::Decimal { min: 1.0, max: 9.0 }, default: "3.0" },
+        ];
+        let mut st = state().await;
+        st.modules = Arc::new(ModuleRegistry::new(vec![ModuleDescriptor {
+            id: "x-lista",
+            name: "Lista",
+            description: "d",
+            kind: ModuleKind::Scheduler,
+            toggle: Toggle::Switchable,
+            default_enabled: false,
+            needs: Needs::Nothing,
+            settings: SPECS,
+            see_also: None,
+        }]));
+        let (app, cookie, csrf, state) = app_as(Role::Admin, st).await;
+        let (_, html) = get(&app, &cookie, "/modules").await;
+        assert!(html.contains("type=\"checkbox\" name=\"cats\" value=\"a\" checked"), "{html}");
+        assert!(html.contains("name=\"cats\" value=\"b\" >"), "{html}");
+        assert!(html.contains("inputmode=\"decimal\""), "{html}");
+        assert!(html.contains("(1,0–9,0)"), "{html}");
+        let (status, _, body) =
+            post(&app, &cookie, &csrf, "/modules/x-lista/settings", "cats=c&cats=a&mag=4%2C5").await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+        assert_eq!(setting(&state, "module:x-lista:cats").await.as_deref(), Some("a,c"));
+        assert_eq!(setting(&state, "module:x-lista:mag").await.as_deref(), Some("4.5"));
+        let (status, _, body) =
+            post(&app, &cookie, &csrf, "/modules/x-lista/settings", "mag=3").await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+        // Odznaczenie wszystkich pól listy: pole nie przychodzi, więc bez zmian.
+        assert_eq!(setting(&state, "module:x-lista:cats").await.as_deref(), Some("a,c"));
     }
 
     #[tokio::test]
