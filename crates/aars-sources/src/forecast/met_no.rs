@@ -135,6 +135,7 @@ pub fn parse(body: &[u8], now: DateTime<Utc>) -> Result<Forecast, SourceError> {
         provider: Provider::MetNorway,
         current,
         days,
+        hourly: Vec::new(),
     })
 }
 

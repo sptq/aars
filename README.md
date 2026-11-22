@@ -88,7 +88,7 @@ Wszystkie są po instalacji wyłączone; włącza się je tak samo jak `imgw-met
 | `swpc` | NOAA SWPC, skale G/S/R pogody kosmicznej | domena publiczna; „Dane: NOAA SWPC” |
 | `gios-smog` | GIOŚ, ostrzeżenia smogowe w promieniu stacji | CC BY 4.0; „Źródło: GIOŚ” |
 | `emsc` | EMSC, wstrząsy sejsmiczne w promieniu stacji | CC BY 4.0; „Dane: EMSC” |
-| `pogoda` (etap 11b) | Open-Meteo, prognoza dla pozycji stacji: komunikat po przekroczeniu progów (porywy od 75 km/h, mróz od −15 °C, dobowa suma opadów od 30 mm — progi w `/modules`) na dziś lub jutro | CC BY 4.0; „Dane: Open-Meteo.” |
+| `pogoda` (etap 11b) | Open-Meteo, prognoza dla pozycji stacji: komunikat po przekroczeniu progów (porywy od 75 km/h, mróz od −15 °C, dobowa suma opadów od 30 mm — progi w `/modules`) na dziś (z godzin od bieżącej do końca doby) lub jutro | CC BY 4.0; „Dane: Open-Meteo.” |
 
 Zmiana zakresu RSO w etapie 11b (zakres nie zależy już od pola „atak
 z powietrza”, bo ta kategoria jest pobierana zawsze): przy pierwszym cyklu po

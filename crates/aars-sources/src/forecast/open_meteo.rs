@@ -3,7 +3,7 @@
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
 use serde_json::Value;
 
-use super::{Condition, Day, Forecast, Now, Provider};
+use super::{Condition, Day, Forecast, Hour, Now, Provider};
 use crate::source::SourceError;
 
 pub fn url(base: &str, lat: f64, lon: f64) -> String {
@@ -28,6 +28,36 @@ fn column<'a>(daily: &'a Value, key: &str) -> Result<&'a Vec<Value>, SourceError
         .get(key)
         .and_then(Value::as_array)
         .ok_or_else(|| bad(&format!("brak daily.{key}")))
+}
+
+/// Godziny z `hourly` (czas lokalny); brak sekcji albo `time` → pusto,
+/// brak wartości (także krótsza tablica) → luka w tej godzinie.
+fn hourly(root: &Value) -> Vec<Hour> {
+    let Some(hourly) = root.get("hourly").filter(|h| h.is_object()) else {
+        return Vec::new();
+    };
+    let Some(time) = hourly.get("time").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let col = |key: &str| hourly.get(key).and_then(Value::as_array);
+    let (temp, precip, gust) = (
+        col("temperature_2m"),
+        col("precipitation"),
+        col("wind_gusts_10m"),
+    );
+    let at = |c: Option<&Vec<Value>>, i: usize| c.and_then(|c| c.get(i)).and_then(Value::as_f64);
+    time.iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            let local = NaiveDateTime::parse_from_str(t.as_str()?, "%Y-%m-%dT%H:%M").ok()?;
+            Some(Hour {
+                local,
+                temp_c: at(temp, i),
+                precip_mm: at(precip, i),
+                gust_kmh: at(gust, i),
+            })
+        })
+        .collect()
 }
 
 pub fn parse(body: &[u8], fetched: DateTime<Utc>) -> Result<Forecast, SourceError> {
@@ -98,6 +128,7 @@ pub fn parse(body: &[u8], fetched: DateTime<Utc>) -> Result<Forecast, SourceErro
         provider: Provider::OpenMeteo,
         current,
         days,
+        hourly: hourly(&root),
     })
 }
 
@@ -132,6 +163,31 @@ mod tests {
             f.day(date(2026, 11, 22)).unwrap().code,
             Some(Condition::Mzawka)
         );
+    }
+
+    #[test]
+    fn hourly_values_are_parsed_as_local_hours_with_gaps() {
+        let f = parse(OPEN_METEO, at("2026-11-22T18:50:00Z")).unwrap();
+        assert_eq!(f.hourly.len(), 48);
+        let h = &f.hourly[12];
+        assert_eq!(h.local.to_string(), "2026-11-22 12:00:00");
+        assert_eq!(
+            (h.temp_c, h.precip_mm, h.gust_kmh),
+            (Some(6.2), Some(0.0), Some(40.3))
+        );
+
+        let mut v = fixture();
+        v["hourly"]["wind_gusts_10m"][3] = Value::Null;
+        v["hourly"]["temperature_2m"] = json!([1.0]);
+        let f = parse_value(&v).unwrap();
+        assert_eq!(f.hourly.len(), 48);
+        assert_eq!(f.hourly[3].gust_kmh, None);
+        assert_eq!(f.hourly[0].temp_c, Some(1.0));
+        assert_eq!(f.hourly[1].temp_c, None);
+
+        let mut v = fixture();
+        v.as_object_mut().unwrap().remove("hourly");
+        assert!(parse_value(&v).unwrap().hourly.is_empty());
     }
 
     fn fixture() -> Value {

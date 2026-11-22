@@ -3,7 +3,7 @@
 pub mod met_no;
 pub mod open_meteo;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 
 /// Dostawca prognozy; decyduje o atrybucji w treści.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,12 +111,24 @@ pub struct Day {
     pub code: Option<Condition>,
 }
 
+/// Jedna godzina prognozy (tylko Open-Meteo); `local` to czas lokalny
+/// stacji, jak w odpowiedzi, a każda wartość może być luką.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hour {
+    pub local: NaiveDateTime,
+    pub temp_c: Option<f64>,
+    pub precip_mm: Option<f64>,
+    pub gust_kmh: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Forecast {
     pub issued: DateTime<Utc>,
     pub provider: Provider,
     pub current: Option<Now>,
     pub days: Vec<Day>,
+    /// Pusty, gdy dostawca nie dał prognozy godzinowej.
+    pub hourly: Vec<Hour>,
 }
 
 impl Forecast {

@@ -316,7 +316,8 @@ mod tests {
     #[test]
     fn gusts_over_the_threshold_are_one_item_per_day() {
         let f = open_meteo_forecast();
-        let out = alerts::to_output(&f, &ctx_at("2026-11-22T18:50:00Z", &[("gust_kmh", "40")]));
+        // 11:50 lokalnie: dziś liczy się od 11:00, a 12:00 ma porywy 40,3 km/h.
+        let out = alerts::to_output(&f, &ctx_at("2026-11-22T10:50:00Z", &[("gust_kmh", "40")]));
         assert_eq!(out.items.len(), 2);
         let today = item(&out, "gust:2026-11-22");
         assert_eq!(
@@ -343,7 +344,11 @@ mod tests {
         assert_eq!(tomorrow.fingerprint, "gust:40");
         assert_eq!(tomorrow.valid_until, Some(at("2026-11-23T23:00:00Z")));
 
-        let out = alerts::to_output(&f, &ctx_at("2026-11-22T18:50:00Z", &[("gust_kmh", "41")]));
+        let out = alerts::to_output(&f, &ctx_at("2026-11-22T10:50:00Z", &[("gust_kmh", "41")]));
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(out.items[0].key, "gust:2026-11-23");
+        // Wieczorem poranne porywy już minęły: zostaje tylko jutro.
+        let out = alerts::to_output(&f, &ctx_at("2026-11-22T18:50:00Z", &[("gust_kmh", "40")]));
         assert_eq!(out.items.len(), 1);
         assert_eq!(out.items[0].key, "gust:2026-11-23");
     }
@@ -368,7 +373,11 @@ mod tests {
             "frost:-20"
         );
 
-        let f = edited(|v| v["daily"]["precipitation_sum"][0] = 35.2.into());
+        // Dziś: suma opadów z godzin od bieżącej (19:00 lokalnie) do końca doby.
+        let f = edited(|v| {
+            v["hourly"]["precipitation"][20] = 30.0.into();
+            v["hourly"]["precipitation"][23] = 5.2.into();
+        });
         let out = alerts::to_output(&f, &ctx);
         let rain = item(&out, "precip:2026-11-22");
         assert_eq!(rain.fingerprint, "precip:30");
@@ -378,6 +387,58 @@ mod tests {
         assert_eq!(speech::precip_text(7.26), "7,3");
         assert_eq!(speech::precip_text(35.2), "35");
         assert_eq!(speech::precip_text(2.0), "2");
+    }
+
+    #[test]
+    fn in_the_evening_the_morning_minimum_is_not_announced() {
+        // Mróz o 6:00 rano (dobowe minimum też −18 °C), wieczorem już minął.
+        let f = edited(|v| {
+            v["hourly"]["temperature_2m"][6] = (-18.0).into();
+            v["daily"]["temperature_2m_min"][0] = (-18.0).into();
+        });
+        let evening = alerts::to_output(&f, &ctx_at("2026-11-22T18:50:00Z", &[]));
+        assert!(
+            evening.items.iter().all(|i| i.key != "frost:2026-11-22"),
+            "{:?}",
+            evening.items
+        );
+        let dawn = alerts::to_output(&f, &ctx_at("2026-11-22T04:10:00Z", &[]));
+        let frost = item(&dawn, "frost:2026-11-22");
+        assert_eq!(frost.fingerprint, "frost:-15");
+        assert!(
+            frost.text.contains("dziś spadek temperatury do -18 °C."),
+            "{}",
+            frost.text
+        );
+    }
+
+    #[test]
+    fn the_current_hour_still_counts_for_today() {
+        let f = edited(|v| {
+            v["hourly"]["wind_gusts_10m"][18] = 90.0.into();
+            v["hourly"]["wind_gusts_10m"][19] = 80.0.into();
+        });
+        // 19:30 lokalnie: 19:00 się liczy, 18:00 już nie.
+        let out = alerts::to_output(&f, &ctx_at("2026-11-22T18:30:00Z", &[]));
+        let gust = item(&out, "gust:2026-11-22");
+        assert!(
+            gust.text.contains("dziś porywy wiatru do 80 km/h."),
+            "{}",
+            gust.text
+        );
+        assert_eq!(gust.fingerprint, "gust:80");
+    }
+
+    #[test]
+    fn without_hourly_data_today_has_no_alerts() {
+        let f = edited(|v| {
+            v.as_object_mut().unwrap().remove("hourly");
+            v["daily"]["wind_gusts_10m_max"][0] = 99.0.into();
+            v["daily"]["wind_gusts_10m_max"][1] = 99.0.into();
+        });
+        let out = alerts::to_output(&f, &ctx_at("2026-11-22T10:50:00Z", &[]));
+        let keys: Vec<_> = out.items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["gust:2026-11-23"]);
     }
 
     #[test]
