@@ -98,7 +98,29 @@ pub struct AppState {
     pub bulletin_preview: Option<BulletinPreview>,
     /// Jeden podgląd naraz: każdy pyta sieć o wszystkie części.
     pub bulletin_preview_gate: Arc<tokio::sync::Semaphore>,
+    /// Ostrzeżenia meteo dla mapy (etap 11c); `None` = panel bez stacji.
+    pub warnings_map: Option<WarningsMap>,
 }
+
+/// Jedno ostrzeżenie meteo dla jednego powiatu (kod TERYT 4-cyfrowy).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapWarning {
+    pub teryt: String,
+    pub level: u8,
+    pub event: String,
+    pub until: chrono::DateTime<chrono::Utc>,
+}
+
+/// Wszystkie ostrzeżenia z ostatniego udanego pobrania `imgw-meteo`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WarningsSnapshot {
+    pub fetched_at: chrono::DateTime<chrono::Utc>,
+    pub warnings: Vec<MapWarning>,
+}
+
+/// Pamięć ostrzeżeń źródła bez typów z crate'a źródeł; ustawia ją binarka.
+/// `None` = źródło jeszcze nic nie pobrało.
+pub type WarningsMap = Arc<dyn Fn() -> Option<WarningsSnapshot> + Send + Sync>;
 
 /// Wynik podglądu biuletynu bez typów z crate'a źródeł: tekst (albo powód,
 /// dla którego nic by nie poszło) i `(id części, opis wyniku)`.
@@ -150,6 +172,7 @@ impl AppState {
             lan_only: false,
             bulletin_preview: None,
             bulletin_preview_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            warnings_map: None,
         }
     }
 
@@ -220,6 +243,11 @@ impl AppState {
         self
     }
 
+    pub fn with_warnings_map(mut self, map: WarningsMap) -> Self {
+        self.warnings_map = Some(map);
+        self
+    }
+
     pub fn with_bulletin_preview(mut self, preview: BulletinPreview) -> Self {
         self.bulletin_preview = Some(preview);
         self
@@ -266,6 +294,7 @@ impl AppState {
             lan_only: false,
             bulletin_preview: None,
             bulletin_preview_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            warnings_map: None,
         }
     }
 }

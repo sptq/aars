@@ -3,12 +3,14 @@
 pub mod parse;
 pub mod speech;
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use aars_core::module::{ModuleDescriptor, ModuleKind, Needs, SettingKind, SettingSpec, Toggle};
 
 use crate::http;
 use crate::source::{DataSource, FetchFuture, SourceCtx, SourceError, SourceItem, SourceOutput};
+use chrono::{DateTime, Utc};
 use parse::ParsedWarnings;
 
 pub const DEFAULT_URL: &str = "https://danepubliczne.imgw.pl/api/data/warningsmeteo";
@@ -43,9 +45,18 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     see_also: None,
 };
 
+/// Wszystkie ostrzeżenia z ostatniego udanego pobrania (przed filtrem obszaru);
+/// czyta je mapa w panelu.
+#[derive(Debug, Clone)]
+pub struct MeteoSnapshot {
+    pub fetched_at: DateTime<Utc>,
+    pub warnings: Vec<parse::MeteoWarning>,
+}
+
 pub struct ImgwMeteo {
     client: reqwest::Client,
     url: String,
+    memory: Mutex<Option<MeteoSnapshot>>,
 }
 
 impl ImgwMeteo {
@@ -58,7 +69,15 @@ impl ImgwMeteo {
         Ok(Self {
             client,
             url: url.to_owned(),
+            memory: Mutex::new(None),
         })
+    }
+
+    /// Ostatnie udane pobranie; `None`, gdy jeszcze żadnego nie było.
+    pub fn snapshot(&self) -> Option<MeteoSnapshot> {
+        // Blokada tylko wokół odczytu, nigdy przez await; zatruty Mutex odzyskujemy.
+        let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+        memory.clone()
     }
 }
 
@@ -74,7 +93,15 @@ impl DataSource for ImgwMeteo {
     fn fetch<'a>(&'a self, ctx: &'a SourceCtx) -> FetchFuture<'a> {
         Box::pin(async move {
             let body = http::get_limited(&self.client, &self.url, MAX_BODY).await?;
-            Ok(to_output(parse::parse_warnings(&body)?, ctx))
+            let parsed = parse::parse_warnings(&body)?;
+            {
+                let mut memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+                *memory = Some(MeteoSnapshot {
+                    fetched_at: ctx.now,
+                    warnings: parsed.warnings.clone(),
+                });
+            }
+            Ok(to_output(parsed, ctx))
         })
     }
 }
@@ -299,6 +326,62 @@ mod tests {
             let out = source(&server).fetch(&ctx("1061 Łódź")).await.unwrap();
             assert!(out.items.is_empty());
             assert!(out.complete);
+        }
+
+        #[tokio::test]
+        async fn a_fetch_remembers_every_warning_not_only_the_area() {
+            let server = server_with(
+                ResponseTemplate::new(200).set_body_raw(JULY, "application/json; charset=utf-8"),
+            )
+            .await;
+            let src = source(&server);
+            let c = ctx("1061 Łódź");
+            let out = src.fetch(&c).await.unwrap();
+            assert_eq!(out.items.len(), 1);
+            let snap = src.snapshot().unwrap();
+            assert_eq!(snap.warnings.len(), 5);
+            assert_eq!(snap.fetched_at, c.now);
+        }
+
+        #[tokio::test]
+        async fn the_no_warnings_object_is_remembered_as_empty() {
+            let server =
+                server_with(ResponseTemplate::new(200).set_body_raw(BRAK, "application/json"))
+                    .await;
+            let src = source(&server);
+            src.fetch(&ctx("1061 Łódź")).await.unwrap();
+            let snap = src.snapshot().unwrap();
+            assert!(snap.warnings.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_failed_fetch_keeps_the_previous_memory() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/warningsmeteo"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(JULY, "application/json"))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/warningsmeteo"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&server)
+                .await;
+            let src = source(&server);
+            let first = ctx("1061 Łódź");
+            src.fetch(&first).await.unwrap();
+            let mut later = ctx("1061 Łódź");
+            later.now = first.now + chrono::Duration::minutes(5);
+            assert!(src.fetch(&later).await.is_err());
+            let snap = src.snapshot().unwrap();
+            assert_eq!(snap.warnings.len(), 5);
+            assert_eq!(snap.fetched_at, first.now);
+        }
+
+        #[test]
+        fn a_new_source_remembers_nothing() {
+            assert!(ImgwMeteo::new("http://127.0.0.1:1/x").unwrap().snapshot().is_none());
         }
 
         #[tokio::test]
