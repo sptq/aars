@@ -3,6 +3,7 @@
 
 pub mod bulletin;
 pub mod emsc;
+pub mod forecast;
 pub mod gios;
 pub mod http;
 pub mod imgw_meteo;
