@@ -545,9 +545,11 @@ async fn source_preview(config: &Config) -> Result<()> {
     println!("obszar: {}", aars_core::area::area_text(&area));
     let ctx = aars_sources::SourceCtx {
         now: chrono::Utc::now(),
+        area_text: aars_core::area::area_text(&area),
         area,
         position: None,
         settings: std::collections::BTreeMap::new(),
+        tracked_keys: Default::default(),
     };
     let output = source
         .fetch(&ctx)

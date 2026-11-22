@@ -1,6 +1,5 @@
 //! Źródło ostrzeżeń meteorologicznych IMGW (`warningsmeteo`).
 
-pub mod http;
 pub mod parse;
 pub mod speech;
 
@@ -8,6 +7,7 @@ use std::time::Duration;
 
 use aars_core::module::{ModuleDescriptor, ModuleKind, Needs, SettingKind, SettingSpec, Toggle};
 
+use crate::http;
 use crate::source::{DataSource, FetchFuture, SourceCtx, SourceError, SourceItem, SourceOutput};
 use parse::ParsedWarnings;
 
@@ -54,11 +54,7 @@ impl ImgwMeteo {
     }
 
     pub fn with_timeout(url: &str, timeout: Duration) -> Result<Self, SourceError> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .user_agent(concat!("aars/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|e| SourceError::Http(e.to_string()))?;
+        let client = http::client(timeout)?;
         Ok(Self {
             client,
             url: url.to_owned(),
@@ -146,8 +142,10 @@ mod tests {
         SourceCtx {
             now: Utc::now(),
             area: parse_area(area).unwrap(),
+            area_text: aars_core::area::area_text(&parse_area(area).unwrap()),
             position: None,
             settings: Default::default(),
+            tracked_keys: Default::default(),
         }
     }
 

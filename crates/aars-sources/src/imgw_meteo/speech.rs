@@ -2,8 +2,7 @@
 //! normalizacja w `aars-audio::text`.
 
 use aars_core::priority::Priority;
-use chrono::{DateTime, Datelike, LocalResult, NaiveDateTime, TimeZone, Timelike, Utc};
-use chrono_tz::Europe::Warsaw;
+use chrono::{Datelike, NaiveDateTime, Timelike};
 
 use super::parse::MeteoWarning;
 
@@ -22,14 +21,8 @@ pub const MONTHS_GENITIVE: [&str; 12] = [
     "grudnia",
 ];
 
-/// Czas IMGW to `Europe/Warsaw` (R11): niejednoznaczny → wcześniejszy,
-/// nieistniejący → `None`.
-pub fn warsaw_to_utc(t: NaiveDateTime) -> Option<DateTime<Utc>> {
-    match Warsaw.from_local_datetime(&t) {
-        LocalResult::Single(d) | LocalResult::Ambiguous(d, _) => Some(d.with_timezone(&Utc)),
-        LocalResult::None => None,
-    }
-}
+/// Czas IMGW to `Europe/Warsaw` (R11); wspólne z innymi źródłami.
+pub use crate::speech::warsaw_to_utc;
 
 fn day_month(t: NaiveDateTime) -> String {
     let month = MONTHS_GENITIVE
