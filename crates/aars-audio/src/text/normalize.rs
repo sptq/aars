@@ -25,16 +25,36 @@ enum HourCase {
     Nominative,
     Genitive,
     Locative,
-    /// Po „godz.”: sama liczba godziny, bez słowa „godzina”.
-    Bare,
 }
 
 fn hour_case(previous_core: Option<&str>) -> HourCase {
     match previous_core.map(str::to_lowercase).as_deref() {
         Some("od" | "do" | "około") => HourCase::Genitive,
         Some("o" | "po") => HourCase::Locative,
-        Some("godz") => HourCase::Bare,
         _ => HourCase::Nominative,
+    }
+}
+
+/// Rozwinięcie „godz.” zależne od słowa przed nim: słowo „godzina” we
+/// właściwym przypadku, czy godzina idzie w dopełniaczu i czy to zakres
+/// („w godz. 7:00 – 15:00” → „w godzinach siódma – piętnasta”).
+fn godz_expansion(previous_core: Option<&str>) -> (&'static str, bool, bool) {
+    match previous_core.map(str::to_lowercase).as_deref() {
+        Some("od" | "do" | "około") => ("godziny", true, false),
+        Some("o" | "po") => ("godzinie", true, false),
+        Some("w") => ("godzinach", false, true),
+        _ => ("godzina", false, false),
+    }
+}
+
+/// Myślniki między godzinami zakresu.
+const RANGE_DASHES: &[&str] = &["-", "–", "—"];
+
+fn capitalized(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -219,6 +239,35 @@ pub fn normalize(input: &str) -> String {
         let (lead, core, trail) = parts[idx];
 
         let previous_core = idx.checked_sub(1).map(|p| parts[p].1);
+
+        // „godz. 8:30”: skrót rozwinięty w przypadku, którego żąda słowo
+        // przed nim, a godzina w tym samym przypadku, bez drugiego „godzina”.
+        if core.eq_ignore_ascii_case("godz")
+            && trail == "."
+            && let Some(&(next_lead, next_core, next_trail)) = parts.get(idx + 1)
+            && next_lead.is_empty()
+            && let Some((hour, minute)) = clock_time(next_core)
+        {
+            let (word, genitive, range) = godz_expansion(previous_core);
+            let word = if core.starts_with('G') { capitalized(word) } else { word.to_owned() };
+            push_word(&mut out, lead, &word, "");
+            push_word(&mut out, "", &bare_time(hour, minute, genitive), next_trail);
+            idx += 2;
+            if range
+                && next_trail.is_empty()
+                && let Some(dash) = raw.get(idx)
+                && RANGE_DASHES.contains(dash)
+                && let Some(&(end_lead, end_core, end_trail)) = parts.get(idx + 1)
+                && end_lead.is_empty()
+                && let Some((hour, minute)) = clock_time(end_core)
+            {
+                out.push((*dash).to_owned());
+                push_word(&mut out, "", &bare_time(hour, minute, false), end_trail);
+                idx += 2;
+            }
+            continue;
+        }
+
         if let Some(spoken) = spoken_time(core, hour_case(previous_core)) {
             push_word(&mut out, lead, &spoken, trail);
             idx += 1;
@@ -416,6 +465,17 @@ fn unit_form(text: &str, value: &NumberText, genitive: bool) -> &'static str {
 /// po „od/do/po/około" → „godziny …", po „o" → „godzinie …". „24:00" jest
 /// poprawne (koniec doby), „24:30" już nie.
 fn spoken_time(token: &str, case: HourCase) -> Option<String> {
+    let (hour, minute) = clock_time(token)?;
+    let (word, genitive) = match case {
+        HourCase::Nominative => ("godzina", false),
+        HourCase::Genitive => ("godziny", true),
+        HourCase::Locative => ("godzinie", true),
+    };
+    Some(format!("{word} {}", bare_time(hour, minute, genitive)))
+}
+
+/// „H:MM”/„HH:MM” → (godzina, minuta); „24:00” jest poprawne, „24:30” nie.
+fn clock_time(token: &str) -> Option<(u8, u8)> {
     let (h, m) = token.split_once(':')?;
     if h.is_empty() || m.len() != 2 {
         return None;
@@ -425,12 +485,16 @@ fn spoken_time(token: &str, case: HourCase) -> Option<String> {
     if hour > 24 || minute > 59 || (hour == 24 && minute != 0) {
         return None;
     }
+    Some((hour, minute))
+}
 
-    let mut spoken = match case {
-        HourCase::Bare => hour_ordinal(hour).to_string(),
-        HourCase::Nominative => format!("godzina {}", hour_ordinal(hour)),
-        HourCase::Genitive => format!("godziny {}", hour_ordinal_genitive(hour)),
-        HourCase::Locative => format!("godzinie {}", hour_ordinal_genitive(hour)),
+/// Godzina bez słowa „godzina”: „ósma trzydzieści” albo w dopełniaczu
+/// (także dla miejscownika) „ósmej trzydzieści”.
+fn bare_time(hour: u8, minute: u8, genitive: bool) -> String {
+    let mut spoken = if genitive {
+        hour_ordinal_genitive(hour).to_string()
+    } else {
+        hour_ordinal(hour).to_string()
     };
     if minute > 0 {
         if minute < 10 {
@@ -440,7 +504,7 @@ fn spoken_time(token: &str, case: HourCase) -> Option<String> {
             spoken.push_str(&cardinal(minute as i64));
         }
     }
-    Some(spoken)
+    spoken
 }
 
 #[cfg(test)]
@@ -452,10 +516,44 @@ mod tests {
     }
 
     #[test]
-    fn godz_takes_a_bare_hour() {
-        assert_eq!(n("godz. 09:22"), "godz. dziewiąta dwadzieścia dwa");
-        assert_eq!(n("od godz. 18:00"), "od godz. osiemnasta");
+    fn godz_takes_the_case_of_the_word_before_it() {
+        assert_eq!(n("od godz. 8:30"), "od godziny ósmej trzydzieści");
+        assert_eq!(n("do godz. 18:00"), "do godziny osiemnastej");
+        assert_eq!(n("około godz. 6:05"), "około godziny szóstej zero pięć");
+        assert_eq!(n("o godz. 9:00"), "o godzinie dziewiątej");
+        assert_eq!(n("po godz. 21:15"), "po godzinie dwudziestej pierwszej piętnaście");
+        assert_eq!(n("godz. 9:22"), "godzina dziewiąta dwadzieścia dwa");
+        assert_eq!(n("Godz. 09:22"), "Godzina dziewiąta dwadzieścia dwa");
+        assert_eq!(n("w godz. 7:00 – 15:00"), "w godzinach siódma – piętnasta");
+        assert_eq!(n("w godz. 8:00 - 16:00."), "w godzinach ósma - szesnasta.");
+        assert_eq!(n("w godz. 7:00"), "w godzinach siódma");
         assert_eq!(n("18:00"), "godzina osiemnasta");
+        // „godz.” bez godziny za nim zostaje jak jest.
+        assert_eq!(
+            n("czas oczekiwania 22 godz. Kolejka"),
+            "czas oczekiwania dwadzieścia dwa godz. Kolejka"
+        );
+    }
+
+    #[test]
+    fn godz_in_rso_texts_reads_naturally() {
+        // Zdania z fiksów RSO (`aars-sources/tests/fixtures/rso`).
+        assert_eq!(
+            n("od dnia 27 kwietnia (poniedziałek) od godz. 8:30 nastąpi całkowite zamknięcie"),
+            "od dnia dwudziestego siódmego kwietnia (poniedziałek) od godziny ósmej trzydzieści nastąpi całkowite zamknięcie"
+        );
+        assert_eq!(
+            n("od poniedziałku do piątku w godz. 7:00 – 15:00 z Kierownikiem"),
+            "od poniedziałku do piątku w godzinach siódma – piętnasta z Kierownikiem"
+        );
+        assert_eq!(
+            n("Data i godzina wydania: 25.06.2026 - godz. 09:22"),
+            "Data i godzina wydania: 25.06.2026 - godzina dziewiąta dwadzieścia dwa"
+        );
+        assert_eq!(
+            n("Ważność: od godz. 09:23 dnia 25.06.2026"),
+            "Ważność: od godziny dziewiątej dwadzieścia trzy dnia 25.06.2026"
+        );
     }
 
     #[test]
