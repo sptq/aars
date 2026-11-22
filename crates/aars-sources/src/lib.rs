@@ -8,6 +8,7 @@ pub mod gios;
 pub mod http;
 pub mod imgw_meteo;
 pub mod pogoda;
+pub mod propagacja;
 pub mod rso;
 pub mod runner;
 pub mod source;

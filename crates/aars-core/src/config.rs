@@ -87,6 +87,12 @@ pub struct SourcesConfig {
     pub open_meteo_url: String,
     #[serde(default = "default_met_no_url")]
     pub met_no_url: String,
+    #[serde(default = "default_swpc_f107_url")]
+    pub swpc_f107_url: String,
+    #[serde(default = "default_swpc_kp_url")]
+    pub swpc_kp_url: String,
+    #[serde(default = "default_kc2g_url")]
+    pub kc2g_url: String,
 }
 
 fn default_imgw_meteo_url() -> String {
@@ -117,6 +123,18 @@ fn default_met_no_url() -> String {
     "https://api.met.no/weatherapi/locationforecast/2.0/compact".to_owned()
 }
 
+fn default_swpc_f107_url() -> String {
+    "https://services.swpc.noaa.gov/json/f107_cm_flux.json".to_owned()
+}
+
+fn default_swpc_kp_url() -> String {
+    "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json".to_owned()
+}
+
+fn default_kc2g_url() -> String {
+    "https://prop.kc2g.com/api/stations.json".to_owned()
+}
+
 impl SourcesConfig {
     /// Każdy adres musi być URL-em http(s); literówka ma wyjść przy starcie,
     /// nie jako wieczna porażka odpytywania.
@@ -129,6 +147,9 @@ impl SourcesConfig {
             ("emsc_url", &self.emsc_url),
             ("open_meteo_url", &self.open_meteo_url),
             ("met_no_url", &self.met_no_url),
+            ("swpc_f107_url", &self.swpc_f107_url),
+            ("swpc_kp_url", &self.swpc_kp_url),
+            ("kc2g_url", &self.kc2g_url),
         ];
         for (key, url) in pairs {
             let url = url.as_str();
@@ -156,6 +177,9 @@ impl Default for SourcesConfig {
             emsc_url: default_emsc_url(),
             open_meteo_url: default_open_meteo_url(),
             met_no_url: default_met_no_url(),
+            swpc_f107_url: default_swpc_f107_url(),
+            swpc_kp_url: default_swpc_kp_url(),
+            kc2g_url: default_kc2g_url(),
         }
     }
 }
@@ -438,13 +462,19 @@ mod tests {
                 cfg.sources.met_no_url,
                 "https://api.met.no/weatherapi/locationforecast/2.0/compact"
             );
+            assert_eq!(cfg.sources.swpc_f107_url, "https://services.swpc.noaa.gov/json/f107_cm_flux.json");
+            assert_eq!(
+                cfg.sources.swpc_kp_url,
+                "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
+            );
+            assert_eq!(cfg.sources.kc2g_url, "https://prop.kc2g.com/api/stations.json");
             Ok(())
         });
     }
 
     #[test]
     fn every_source_url_is_validated() {
-        for key in ["IMGW_METEO_URL", "RSO_URL", "SWPC_URL", "GIOS_URL", "EMSC_URL", "OPEN_METEO_URL", "MET_NO_URL"] {
+        for key in ["IMGW_METEO_URL", "RSO_URL", "SWPC_URL", "GIOS_URL", "EMSC_URL", "OPEN_METEO_URL", "MET_NO_URL", "SWPC_F107_URL", "SWPC_KP_URL", "KC2G_URL"] {
             figment::Jail::expect_with(|jail| {
                 jail.set_env(format!("AARS_SOURCES__{key}"), "ftp://x");
                 let err = Config::load(None).unwrap_err().to_string();
