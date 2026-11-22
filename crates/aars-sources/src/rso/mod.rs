@@ -4,6 +4,7 @@
 pub mod parse;
 pub mod speech;
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use aars_core::module::{ModuleDescriptor, ModuleKind, Needs, SettingKind, SettingSpec, Toggle};
@@ -168,15 +169,17 @@ impl Rso {
     }
 }
 
+/// Województwo z dwóch pierwszych cyfr kodu obszaru (2 albo 4 cyfry).
+fn voivodeship_of(code: &str) -> Option<&'static (&'static str, &'static str, &'static str)> {
+    let prefix = code.get(..2)?;
+    VOIVODESHIPS.iter().find(|(c, _, _)| *c == prefix)
+}
+
 /// Unikalne slugi województw obszaru w kolejności obszaru.
 fn area_slugs(ctx: &SourceCtx) -> Vec<&'static str> {
     let mut slugs: Vec<&'static str> = Vec::new();
     for entry in &ctx.area {
-        let slug = entry
-            .code
-            .get(..2)
-            .and_then(|c| VOIVODESHIPS.iter().find(|(code, _, _)| *code == c))
-            .map(|(_, slug, _)| *slug);
+        let slug = voivodeship_of(&entry.code).map(|(_, slug, _)| *slug);
         if let Some(slug) = slug
             && !slugs.contains(&slug)
         {
@@ -246,23 +249,43 @@ impl DataSource for Rso {
 }
 
 fn keywords_text(ctx: &SourceCtx) -> String {
-    ctx.settings
-        .get("keywords")
-        .map(|v| v.trim().to_owned())
-        .unwrap_or_default()
+    keywords(ctx).join(",")
 }
 
+const NEGATIONS: [&str; 5] = ["nie jest to", "to nie jest", "nie są to", "to nie są", "to nie"];
+
+/// Próba/ćwiczenie: w TYTULE słowo zaczynające się od „test” albo „ćwicz”,
+/// o ile nie poprzedza go zaprzeczenie („To nie są ćwiczenia”).
 fn mentions_test(n: &News) -> bool {
-    let hay = format!("{} {}", n.title, n.content).to_lowercase();
-    hay.contains("test") || hay.contains("ćwicz")
+    let title = n.title.to_lowercase();
+    for stem in ["test", "ćwicz"] {
+        for (at, _) in title.match_indices(stem) {
+            let before = title.get(..at).unwrap_or_default();
+            if before.chars().next_back().is_some_and(char::is_alphanumeric) {
+                continue;
+            }
+            let before = before.trim_end();
+            if NEGATIONS.iter().any(|neg| before.ends_with(neg)) {
+                continue;
+            }
+            return true;
+        }
+    }
+    false
 }
 
-fn fingerprint(n: &News) -> String {
+fn fingerprint(n: &News, alarm: bool) -> String {
     let clean = crate::speech::clean_text(&n.content);
     let head: String = clean.chars().take(FINGERPRINT_CHARS).collect();
     let digest = Sha256::digest(head.as_bytes());
     let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    format!("{}|{hex}", n.title)
+    // Alarm: id w odcisku, żeby runner (R4) nie scalił nowego komunikatu o
+    // identycznym szablonie ze śledzonym starym.
+    if alarm {
+        format!("{}|{}|{hex}", n.id, n.title)
+    } else {
+        format!("{}|{hex}", n.title)
+    }
 }
 
 /// Czysta funkcja: paczki (kategoria, pozycje) → ogłoszenia dla obszaru.
@@ -275,27 +298,32 @@ pub fn to_output(
     let complete = skipped == 0 && failed_requests == 0;
     let words = keywords(ctx);
     let max_age = max_age(ctx);
+    let attack_ids: HashSet<i64> = batches
+        .iter()
+        .filter(|(cat, _)| cat.is_attack())
+        .flat_map(|(_, list)| list.iter().map(|n| n.id))
+        .collect();
     let mut items: Vec<SourceItem> = Vec::new();
-    for (cat, list) in &batches {
+    for (_, list) in &batches {
         for n in list {
             if items.iter().any(|i| i.key == n.id.to_string()) {
                 continue;
             }
             // Pierwsze województwo obszaru, którego dotyczy pozycja.
             let Some(voivodeship) = ctx.area.iter().find_map(|entry| {
-                let (_, slug, name) = VOIVODESHIPS
-                    .iter()
-                    .find(|(code, _, _)| entry.code.get(..2) == Some(*code))?;
+                let (_, slug, name) = voivodeship_of(&entry.code)?;
                 n.province_slugs.iter().any(|s| s == slug).then_some(*name)
             }) else {
                 continue;
             };
             let key = n.id.to_string();
-            let alarm = n.title.to_lowercase().contains("alert rcb") || cat.is_attack();
+            let alarm = n.title.to_lowercase().contains("alert rcb") || attack_ids.contains(&n.id);
             if !alarm {
                 if !words.is_empty() {
-                    let hay =
-                        format!("{} {} {}", n.title, n.shortcut, n.content).to_lowercase();
+                    let hay = [&n.title, &n.shortcut, &n.content]
+                        .map(|t| crate::speech::clean_text(t))
+                        .join(" ")
+                        .to_lowercase();
                     if !words.iter().any(|w| hay.contains(w.as_str())) {
                         continue;
                     }
@@ -309,7 +337,7 @@ pub fn to_output(
             let text = speech::announcement(n, voivodeship);
             items.push(SourceItem {
                 topic: format!("rso:{}", n.id),
-                fingerprint: fingerprint(n),
+                fingerprint: fingerprint(n, alarm),
                 change_text: speech::change(&text),
                 text,
                 cancel_text: speech::cancel(&n.title),
@@ -492,16 +520,89 @@ mod tests {
 
     #[test]
     fn a_test_alert_does_not_interrupt() {
-        for (title, content) in [("Alert RCB – test", "Treść."), ("Alert RCB", "To jest ćwiczenie? Ćwiczenia syren.")] {
+        let normal = |title: &str, content: &str| {
             let mut n = alert();
             n.title = title.into();
             n.content = content.into();
-            let i = &run(vec![n], ogolne(), &ctx("02", &[])).items[0];
-            assert_eq!((i.priority, i.interrupting), (Priority::Normal, false), "{title}");
-        }
+            let i = run(vec![n], ogolne(), &ctx("02", &[])).items[0].clone();
+            (i.priority, i.interrupting)
+        };
+        let test = (Priority::Normal, false);
+        let real = (Priority::Emergency, true);
+        assert_eq!(normal("Alert RCB – test", "Treść."), test);
+        assert_eq!(normal("Alert RCB – Test", "Treść."), test);
+        assert_eq!(normal("Alert RCB: ćwiczenia", "Treść."), test);
+        assert_eq!(normal("Alert RCB (TEST)", "Treść."), test);
+        assert_eq!(normal("Test syren alarmowych Alert RCB", "Treść."), test);
+        assert_eq!(normal("Alert RCB: protest rolników, utrudnienia", "Treść."), real);
+        assert_eq!(normal("Alert RCB. To nie są ćwiczenia", "Treść."), real);
+        assert_eq!(normal("Alert RCB. Nie jest to test", "Treść."), real);
+        assert_eq!(normal("Alert RCB. To nie jest test", "Treść."), real);
+        assert_eq!(normal("Alert RCB", "To jest ćwiczenie? Ćwiczenia syren. Test."), real);
+        assert_eq!(normal("Alert RCB", "Próba syren: TEST systemu."), real);
+        assert_eq!(normal("Alert RCB atest kontestować", "x"), real);
+    }
+
+    #[test]
+    fn an_attack_item_first_seen_in_another_category_stays_an_alarm() {
         let mut n = alert();
-        n.content = "Próba syren: TEST systemu.".into();
-        assert_eq!(run(vec![n], ogolne(), &ctx("02", &[])).items[0].priority, Priority::Normal);
+        n.title = "Komunikat dla ludności".into();
+        n.updated_at = None;
+        let out = to_output(
+            vec![(ogolne(), vec![n.clone()]), (Category("atak-z-powietrza"), vec![n])],
+            0,
+            0,
+            &ctx("02", &[]),
+        );
+        assert_eq!(out.items.len(), 1);
+        assert_eq!((out.items[0].priority, out.items[0].interrupting), (Priority::Emergency, true));
+    }
+
+    #[test]
+    fn alarm_fingerprints_carry_the_id_plain_ones_do_not() {
+        let fp = |id: i64, title: &str, cat: Category| {
+            let mut n = alert();
+            n.id = id;
+            n.title = title.into();
+            n.updated_at = None;
+            run(vec![n], cat, &ctx("02", &[])).items[0].fingerprint.clone()
+        };
+        assert_ne!(fp(1, "Alert RCB", ogolne()), fp(2, "Alert RCB", ogolne()));
+        assert!(fp(1, "Alert RCB", ogolne()).starts_with("1|Alert RCB|"));
+        let atak = Category("atak-z-powietrza");
+        assert_ne!(fp(1, "Alarm", atak), fp(2, "Alarm", atak));
+        assert_eq!(fp(1, "Woda", ogolne()), fp(2, "Woda", ogolne()));
+        assert!(fp(1, "Woda", ogolne()).starts_with("Woda|"));
+    }
+
+    #[test]
+    fn a_long_title_is_cut_in_the_spoken_text() {
+        let mut n = alert();
+        n.title = "Bardzo długi tytuł komunikatu ".repeat(20);
+        n.content = "Zdanie numer jeden jest tutaj. ".repeat(15);
+        n.updated_at = None;
+        let i = &run(vec![n], ogolne(), &ctx("02", &[])).items[0];
+        assert!(i.text.chars().count() <= 750, "{}", i.text.chars().count());
+        assert!(i.text.starts_with("Komunikat RSO, województwo dolnośląskie. Bardzo długi"));
+        assert!(!i.text.contains("Pełna treść"), "{}", i.text);
+    }
+
+    #[test]
+    fn non_matching_keywords_do_not_filter_an_attack_item() {
+        let mut n = alert();
+        n.title = "Alarm przeciwlotniczy".into();
+        let c = ctx("02", &[("keywords", "xyz")]);
+        assert_eq!(run(vec![n], Category("atak-z-powietrza"), &c).items.len(), 1);
+    }
+
+    #[test]
+    fn keywords_match_cleaned_text() {
+        let mut n = alert();
+        n.title = "Woda".into();
+        n.updated_at = None;
+        n.content = "Awaria &amp; <b>wodociągu</b> w Pieńsku".into();
+        let c = ctx("02", &[("keywords", "awaria & wodociągu")]);
+        assert_eq!(run(vec![n], ogolne(), &c).items.len(), 1);
     }
 
     #[test]
@@ -570,7 +671,7 @@ mod tests {
         let a = alert();
         let fp = |n: News| run(vec![n], ogolne(), &ctx("02", &[])).items[0].fingerprint.clone();
         let base = fp(a.clone());
-        assert!(base.starts_with("Alert RCB|"));
+        assert!(base.starts_with("23521833|Alert RCB|"), "{base}");
         let hex = base.rsplit('|').next().unwrap();
         assert_eq!(hex.len(), 16);
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
@@ -632,6 +733,9 @@ mod tests {
         let src = Rso::new("http://127.0.0.1:1").unwrap();
         let c = ctx("10\n1061 Łódź", &[("categories", "atak-z-powietrza,ogolne"), ("keywords", " woda ")]);
         assert_eq!(src.scope(&c), format!("{}|cat=ogolne,atak-z-powietrza|kw=woda", c.area_text));
+        let a = ctx("02", &[("keywords", "a,b")]);
+        let b = ctx("02", &[("keywords", " a , b ,")]);
+        assert_eq!(src.scope(&a), src.scope(&b));
         // Brak, śmieci i nieznane slugi: domyślne kategorie.
         for raw in [None, Some("zzz"), Some("stany-wod"), Some("")] {
             let settings: Vec<(&str, &str)> = raw.map(|r| ("categories", r)).into_iter().collect();

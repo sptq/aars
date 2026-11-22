@@ -4,6 +4,7 @@ use super::parse::News;
 use crate::speech::{clean_text, truncate_sentence};
 
 const CONTENT_MAX: usize = 600;
+const TITLE_MAX: usize = 150;
 const SUMMARY_MAX: usize = 80;
 
 fn sentence(s: &str) -> String {
@@ -17,7 +18,7 @@ pub fn is_plain_alert_rcb(title: &str) -> bool {
 }
 
 pub fn announcement(n: &News, voivodeship: &str) -> String {
-    let title = clean_text(&n.title);
+    let title = truncate_sentence(&clean_text(&n.title), TITLE_MAX).0;
     let mut text = if is_plain_alert_rcb(&title) {
         format!("Alert RCB, {voivodeship}.")
     } else if title.is_empty() {
