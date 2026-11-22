@@ -22,6 +22,9 @@ natychmiast, a operator może wpisać i nadać własny komunikat z panelu www.
 - źródła danych: ostrzeżenia IMGW dla wybranego obszaru oraz alarmy (komunikaty
   RSO, pogoda kosmiczna NOAA, smog GIOŚ, wstrząsy EMSC) trafiają do kolejki jako
   polski komunikat (sekcja „Źródła danych”),
+- biuletyn o stałych porach lokalnych: pogoda dla pozycji stacji, propagacja
+  KF i obowiązujące ostrzeżenia, z podglądem w panelu i w CLI (sekcja
+  „Biuletyn (etap 11b)”),
 - konfiguracja sprzętu, pozycji stacji i modułów z panelu admina, test PTT
   i test audio, restart stacji jednym przyciskiem (sekcja „Konfiguracja
   z panelu”),
@@ -38,7 +41,7 @@ kierowany na `/login`):
 |---|---|
 | `/`, `/logs`, `/account/password` | viewer |
 | `/sources` (stan, włączanie, „Odśwież teraz”; obszar i interwał tylko do odczytu) | operator |
-| `/modules` (stan modułów) | operator do odczytu, admin do zmian |
+| `/modules` (stan modułów, „Podgląd biuletynu”) | operator do odczytu i podglądu, admin do zmian |
 | `/compose`, `/messages` (lista, nowy, edycja, podgląd audio, nadaj teraz), `/queue` (w tym anulowanie grupy), `/preview` | operator |
 | `/settings`, `/users`, czyszczenie blokady strażnika | admin |
 | `/settings/hardware` (sprzęt), test PTT i test audio, `/station/restart`, `/settings/position` (pozycja stacji) | admin |
@@ -76,7 +79,7 @@ stacji i wypisuje tekst, priorytet oraz postać znormalizowaną do syntezy.
 
 Wszystkie są po instalacji wyłączone; włącza się je tak samo jak `imgw-meteo`.
 `swpc` nie potrzebuje niczego, `rso` (jak `imgw-meteo`) potrzebuje obszaru,
-`gios-smog` i `emsc` — pozycji stacji (ustawienia). Adresy w `[sources]` w `aars.toml`.
+`gios-smog`, `emsc` i `pogoda` — pozycji stacji (ustawienia). Adresy w `[sources]` w `aars.toml`.
 
 | Źródło | Dane | Licencja i atrybucja |
 |---|---|---|
@@ -85,6 +88,69 @@ Wszystkie są po instalacji wyłączone; włącza się je tak samo jak `imgw-met
 | `swpc` | NOAA SWPC, skale G/S/R pogody kosmicznej | domena publiczna; „Dane: NOAA SWPC” |
 | `gios-smog` | GIOŚ, ostrzeżenia smogowe w promieniu stacji | CC BY 4.0; „Źródło: GIOŚ” |
 | `emsc` | EMSC, wstrząsy sejsmiczne w promieniu stacji | CC BY 4.0; „Dane: EMSC” |
+| `pogoda` (etap 11b) | Open-Meteo, prognoza dla pozycji stacji: komunikat po przekroczeniu progów (porywy od 75 km/h, mróz od −15 °C, dobowa suma opadów od 30 mm — progi w `/modules`) na dziś lub jutro | CC BY 4.0; „Dane: Open-Meteo.” |
+
+Zmiana zakresu RSO w etapie 11b (zakres nie zależy już od pola „atak
+z powietrza”, bo ta kategoria jest pobierana zawsze): przy pierwszym cyklu po
+aktualizacji stacje, które miały to pole odznaczone, jednorazowo i po cichu
+porzucają śledzone pozycje RSO (jak przy każdej zmianie obszaru) — bez
+fałszywych odwołań na antenie. Następny cykl zaczyna śledzenie od nowa.
+
+### Biuletyn (etap 11b)
+
+Moduł `bulletin` składa w chwili nadania jeden komunikat z części i wstawia
+go do kolejki (priorytet Zwykły, bez przerywania; nadaje dyspozytor jak
+każdy inny element). Po instalacji jest wyłączony. Na `/modules`
+administrator:
+
+1. ustawia **pory nadania** — HH:MM w **czasie lokalnym** (Europe/Warsaw, nie
+   UTC jak cron), po przecinku, najwyżej 8, domyślnie `07:00,19:00`;
+2. wybiera **części** (kolejność w biuletynie jest stała, nie kolejność
+   zaznaczenia) i opcjonalnie **wstęp** (pusty = „Biuletyn stacji {znak}.”);
+3. włącza moduł.
+
+Pora, która przypadnie w oknie ciszy nocnej (a priorytet Zwykły jest
+poniżej progu ciszy), jest pominięta, nie przesunięta; okno kończące się
+dokładnie o porze jej nie blokuje. Po przestoju stacja nie nadrabia: pora
+spóźniona o więcej niż `misfire_grace_s` (najwyżej 15 min) jest pomijana,
+z kilku zaległych składana jest tylko najnowsza, a restart nie dubluje pory
+już zrobionej. Gdy żadna część nie ma treści, nic nie idzie na antenę.
+
+| Część | Treść | Dane |
+|---|---|---|
+| `pogoda` | teraz, noc, jutro (temperatura, opis, opady, porywy) dla pozycji stacji; bez pozycji część wypada | Open-Meteo (ta sama prognoza co źródło `pogoda`, świeża do 60 min), zapasowo MET Norway |
+| `propagacja` | strumień słoneczny (SFI), indeks K, skale NOAA, najbliższa jonosonda i ocena pasm KF | NOAA SWPC, GIRO przez KC2G |
+| `ostrzezenia` | obowiązujące ostrzeżenia ze źródeł włączonych i nieprzestarzałych, które poszły na antenę (najwyżej 5, reszta jako „Pozostałych ostrzeżeń: n.”); brak = „Brak obowiązujących ostrzeżeń.” | `source_state` stacji |
+
+Każda część ma 20 s na odpowiedź (części liczone równolegle); część, która
+nie zdąży albo zawiedzie, wypada, reszta wychodzi. Progi oceny w części
+`propagacja` są stałe:
+
+- SFI: poniżej 90 niski, 90–149 umiarkowany, od 150 wysoki (dane do 36 h);
+- Kp: poniżej 3 spokojne, 3–4,9 niespokojne, od 5 burza geomagnetyczna (dane do 6 h);
+- jonosonda: najbliższa w promieniu 1200 km, pomiar nie starszy niż 60 min,
+  skalowanie ręczne (`cs == -1`) albo pewność `cs` ≥ 70;
+- łączności bliskie (NVIS, pasma 160/80/60/40/30 m): najwyższe pasmo o dolnej
+  krawędzi poniżej foF2 × 1,0;
+- łączności dalekie (DX, pasma 80…10 m): najwyższe pasmo o dolnej krawędzi
+  poniżej MUF(3000) × 0,85.
+
+Limit długości biuletynu to `min(1500, 10 × limit nadawania w s)` znaków:
+gdy złożony tekst się nie mieści, wypadają całe części od końca (wstęp
+i „Koniec biuletynu.” zostają).
+
+Podgląd — ta sama ścieżka co nadanie, bez zapisu i bez kolejki:
+`aars bulletin preview` drukuje tekst (albo „nic do nadania: powód”) i stan
+każdej części; w panelu przycisk „Podgląd biuletynu” w karcie biuletynu
+(operator) pokazuje to samo z odsłuchem. Podgląd pyta źródła o dane, więc
+naraz trwa najwyżej jeden.
+
+Licencje danych biuletynu (stacja jest niekomercyjna): Open-Meteo CC BY 4.0
+(„Dane: Open-Meteo.”), MET Norway CC BY 4.0 / NLOD („Dane: MET Norway.”),
+NOAA SWPC domena publiczna, jonosondy GIRO przez KC2G CC BY-NC-SA („Dane:
+NOAA, GIRO przez KC2G.”, KC2G tylko gdy jonosonda użyta). Adresy
+(`open_meteo_url`, `met_no_url`, `swpc_f107_url`, `swpc_kp_url`, `kc2g_url`)
+w `[sources]` w `aars.toml`.
 
 ## Konfiguracja z panelu
 
@@ -342,9 +408,8 @@ Kompilacja na Linuksa arm64 z macOS:
 
 Według spec §13:
 
-- etap 11b: źródła IMGW hydro i PAA z kompozytorem biuletynu, moduł pogody
-  (Open-Meteo, zapasowo MET Norway), biuletyn propagacyjny i mapa ostrzeżeń
-  w panelu (11a, źródła alarmowe, jest gotowy).
+- etap 11c: źródła IMGW hydro i PAA oraz mapa ostrzeżeń w panelu (11a,
+  źródła alarmowe, i 11b, biuletyn z pogodą i propagacją, są gotowe).
 
 ## Uruchomienie
 

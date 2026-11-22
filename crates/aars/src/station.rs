@@ -335,6 +335,35 @@ pub async fn source_start_failed(state: &SourceStateRepo, id: &str, reason: &str
     }
 }
 
+/// Źródło dla modułu. `pogoda` to wspólna instancja z biuletynu, więc runner
+/// źródła i część biuletynu dzielą pamięć prognozy; bez niej (błąd budowy
+/// biuletynu, już zapisany) `None` — źródło nie startuje.
+fn source_for(
+    module: &aars_sources::SourceModule,
+    config: &Config,
+    pogoda: Option<&Arc<aars_sources::pogoda::Pogoda>>,
+) -> Option<Result<Arc<dyn aars_sources::DataSource>, aars_sources::SourceError>> {
+    if module.descriptor.id == aars_sources::pogoda::ID {
+        return pogoda.map(|p| Ok(p.clone() as Arc<dyn aars_sources::DataSource>));
+    }
+    Some((module.build)(config))
+}
+
+/// Złożony biuletyn w postaci dla panelu i CLI (bez typów z `aars-sources`).
+pub fn bulletin_preview_view(
+    composed: aars_sources::bulletin::Composed,
+) -> aars_web::state::BulletinPreviewView {
+    aars_web::state::BulletinPreviewView {
+        text: composed.text,
+        parts: composed
+            .parts
+            .iter()
+            .map(|(id, outcome)| ((*id).to_owned(), outcome.describe()))
+            .collect(),
+        skipped_reason: composed.skipped_reason.map(str::to_owned),
+    }
+}
+
 /// Jak często pętla stacji sprawdza `stop` i żądanie restartu.
 const CONTROL_POLL: Duration = Duration::from_millis(50);
 
@@ -647,12 +676,31 @@ async fn run_station(
         tracing::error!(%err, "czyszczenie wygasłych sesji zawiodło");
     }
 
+    // Biuletyn i źródło `pogoda` dzielą jedną instancję (jedna pamięć
+    // prognozy). Błąd budowy wyłącza biuletyn i `pogoda`, reszta działa.
+    let bulletin = match aars_sources::bulletin::build(&config, pool.clone()) {
+        Ok(built) => Some(built),
+        Err(err) => {
+            tracing::error!(%err, "biuletyn nie wystartuje");
+            source_start_failed(
+                &SourceStateRepo::new(pool.clone()),
+                aars_sources::pogoda::ID,
+                &err.to_string(),
+            )
+            .await;
+            None
+        }
+    };
+
     // Źródła są odizolowane: błąd budowy jednego wyłącza tylko je.
     let mut runners = Vec::new();
     let mut refreshers: Vec<(&'static str, Arc<Notify>)> = Vec::new();
     for module in &sources {
         let id = module.descriptor.id;
-        match (module.build)(&config) {
+        let Some(built) = source_for(module, &config, bulletin.as_ref().map(|(_, p)| p)) else {
+            continue;
+        };
+        match built {
             Ok(source) => {
                 let runner = aars_sources::SourceRunner::new(
                     source,
@@ -794,6 +842,19 @@ async fn run_station(
             }
         }));
     }
+    if let Some((bulletin, _)) = &bulletin {
+        let bulletin = bulletin.clone();
+        state = state.with_bulletin_preview(Arc::new(move || {
+            let bulletin = bulletin.clone();
+            Box::pin(async move {
+                bulletin
+                    .compose(chrono::Utc::now())
+                    .await
+                    .map(bulletin_preview_view)
+                    .map_err(|e| e.to_string())
+            })
+        }));
+    }
     let app = aars_web::router(state);
 
     let mut tasks = vec![
@@ -804,6 +865,14 @@ async fn run_station(
         )),
         tokio::spawn(scheduler.run(shutdown.clone())),
     ];
+    // Runner startuje zawsze i sam sprawdza włączenie przy każdym tiku. Tylko
+    // wstawia do kolejki — nadaje dyspozytor (bez stosu nikt).
+    tasks.extend(bulletin.map(|(bulletin, _)| {
+        tokio::spawn(
+            aars_sources::bulletin::BulletinRunner::new(bulletin, queue.clone())
+                .run(shutdown.clone()),
+        )
+    }));
     tasks.extend(poison_task);
     tasks.extend(
         runners
@@ -1658,6 +1727,156 @@ mod tests {
         let exit = tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .expect("stop kończy przebieg w 2 s")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Stop));
+    }
+
+    #[tokio::test]
+    async fn the_weather_source_is_the_bulletin_part_instance() {
+        let config = Config::default();
+        let pool = aars_core::db::test_pool().await;
+        let (_, pogoda) = aars_sources::bulletin::build(&config, pool).unwrap();
+        let modules = aars_sources::modules();
+        let module = modules
+            .iter()
+            .find(|m| m.descriptor.id == aars_sources::pogoda::ID)
+            .unwrap();
+        let source = source_for(module, &config, Some(&pogoda)).unwrap().unwrap();
+        // Ta sama instancja = ta sama pamięć prognozy dla runnera i biuletynu.
+        assert!(std::ptr::addr_eq(
+            Arc::as_ptr(&source),
+            Arc::as_ptr(&pogoda)
+        ));
+        // Bez biuletynu (błąd budowy) `pogoda` nie startuje osobno.
+        assert!(source_for(module, &config, None).is_none());
+        // Inne źródła budują się po staremu.
+        let swpc = modules.iter().find(|m| m.descriptor.id == "swpc").unwrap();
+        assert_eq!(
+            source_for(swpc, &config, None).unwrap().unwrap().id(),
+            "swpc"
+        );
+    }
+
+    #[test]
+    fn a_composed_bulletin_becomes_the_panel_view() {
+        use aars_sources::bulletin::{Composed, PartOutcome};
+        let view = bulletin_preview_view(Composed {
+            text: None,
+            parts: vec![
+                (
+                    "pogoda",
+                    PartOutcome::Empty("brak pozycji stacji".to_owned()),
+                ),
+                ("propagacja", PartOutcome::Failed("x".to_owned())),
+            ],
+            skipped_reason: Some("brak danych"),
+        });
+        assert_eq!(view.text, None);
+        assert_eq!(view.skipped_reason.as_deref(), Some("brak danych"));
+        assert_eq!(
+            view.parts,
+            vec![
+                (
+                    "pogoda".to_owned(),
+                    "pominięta — brak pozycji stacji".to_owned()
+                ),
+                ("propagacja".to_owned(), "błąd — x".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_station_starts_with_the_bulletin_enabled_and_without_network() {
+        let pool = aars_core::db::test_pool().await;
+        let mut config = station_config("bulletin");
+        for url in [
+            &mut config.sources.open_meteo_url,
+            &mut config.sources.met_no_url,
+            &mut config.sources.swpc_f107_url,
+            &mut config.sources.swpc_kp_url,
+            &mut config.sources.kc2g_url,
+        ] {
+            *url = "http://127.0.0.1:1/x".to_owned();
+        }
+        // Pora daleko od teraz: UTC + 6 h czytane jako czas warszawski (UTC+1/+2)
+        // to za 4–5 h, więc nigdy w oknie teraz ± 15 min, w każdej strefie hosta.
+        let far = (chrono::Utc::now() + chrono::TimeDelta::hours(6)).format("%H:%M");
+        put(&pool, "module:bulletin:enabled", "true").await;
+        put(&pool, "module:bulletin:times", &far.to_string()).await;
+        let locator = aars_core::geo::locator_from(50.04, 21.99, 6).unwrap();
+        aars_core::geo::PositionRepo::new(pool.clone())
+            .save(Some(&aars_core::geo::StationPosition {
+                lat: 50.04,
+                lon: 21.99,
+                locator,
+            }))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO source_state (source_id, enabled) VALUES ('pogoda', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let hardware = Arc::new(FakeHardware::new(&[]));
+        let ptt = hardware.ptt.clone();
+        let stop = CancelToken::new();
+        let (task, handle) = start(config, pool.clone(), hardware, stop.clone()).await;
+        assert!(handle.running_hardware().is_some(), "stos nadawczy wstał");
+
+        // Źródło `pogoda` działa (wspólna instancja) i bez sieci tylko notuje porażkę.
+        let repo = SourceStateRepo::new(pool.clone());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let failed = repo
+                    .statuses()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .any(|s| s.source_id == "pogoda" && s.consecutive_failures > 0);
+                if failed {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("źródło pogoda musi spróbować pobrania");
+        // Runner wystartował: minione pory (wczoraj, może dziś) zajął jako
+        // spóźnione, żadnej nie złożył.
+        let fires = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let rows: Vec<(Option<String>, Option<i64>)> =
+                    sqlx::query_as("SELECT skipped_reason, queue_item_id FROM bulletin_fires")
+                        .fetch_all(&pool)
+                        .await
+                        .unwrap();
+                if !rows.is_empty() {
+                    break rows;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("runner biuletynu musi ruszyć");
+        for (reason, item) in &fires {
+            assert_eq!(reason.as_deref(), Some("spóźnione ponad misfire_grace_s"));
+            assert_eq!(*item, None);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let pending = QueueRepo::new(pool.clone()).pending(10).await.unwrap();
+        assert!(pending.is_empty(), "nic przed porą: {pending:?}");
+        assert!(
+            ptt.events().is_empty(),
+            "PTT nie kluczowany: {:?}",
+            ptt.events()
+        );
+
+        stop.cancel();
+        let exit = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
             .unwrap()
             .unwrap();
         assert!(matches!(exit, Exit::Stop));

@@ -545,6 +545,10 @@ pub fn router(state: AppState) -> Router {
         .route("/modules", get(modules_page::page_view))
         .route("/modules/{id}/enabled", post(modules_page::set_enabled))
         .route("/modules/{id}/settings", post(modules_page::save_settings))
+        .route(
+            "/modules/bulletin/preview",
+            post(modules_page::preview_bulletin),
+        )
         .route("/healthz", get(healthz))
         .route("/assets/{*path}", get(assets::serve))
         .layer(axum::middleware::from_fn_with_state(state.clone(), host_check))

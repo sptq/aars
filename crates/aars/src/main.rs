@@ -247,6 +247,9 @@ async fn main() -> Result<()> {
         cli::Command::Source { action } => match action {
             cli::SourceAction::Preview { id } => source_preview(&config, &id).await?,
         },
+        cli::Command::Bulletin { action } => match action {
+            cli::BulletinAction::Preview => bulletin_preview(&config).await?,
+        },
         cli::Command::Run => {
             use aars_core::sink::CancelToken;
             use std::sync::Arc;
@@ -512,6 +515,39 @@ async fn cli_candidate(config: &Config) -> Result<station::Candidate> {
     station::first_candidate(config, &pool).await
 }
 
+/// `aars bulletin preview`: biuletyn złożony na teraz, bez kolejki.
+async fn bulletin_preview(config: &Config) -> Result<()> {
+    let pool = db::connect(&config.storage.db_path)
+        .await
+        .context("otwieranie bazy")?;
+    db::migrate(&pool).await.context("nakładanie migracji")?;
+    let (bulletin, _) = aars_sources::bulletin::build(config, pool)
+        .map_err(|e| anyhow::anyhow!("klient HTTP: {e}"))?;
+    let composed = bulletin
+        .compose(chrono::Utc::now())
+        .await
+        .context("składanie biuletynu")?;
+    for line in bulletin_preview_lines(&station::bulletin_preview_view(composed)) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Wiersze `aars bulletin preview`: tekst albo powód, potem część po części.
+fn bulletin_preview_lines(view: &aars_web::state::BulletinPreviewView) -> Vec<String> {
+    let mut lines = vec![match (&view.text, &view.skipped_reason) {
+        (Some(text), _) => format!("tekst: {text}"),
+        (None, Some(reason)) => format!("nic do nadania: {reason}"),
+        (None, None) => "nic do nadania: brak danych".to_owned(),
+    }];
+    lines.extend(
+        view.parts
+            .iter()
+            .map(|(id, describe)| format!("{id}: {describe}")),
+    );
+    lines
+}
+
 /// `aars source preview`: jedno pobranie, bez zapisu i bez kolejki.
 async fn source_preview(config: &Config, id: &str) -> Result<()> {
     let pool = db::connect(&config.storage.db_path)
@@ -603,6 +639,34 @@ async fn source_preview(config: &Config, id: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_bulletin_preview_prints_the_text_then_each_part() {
+        let view = aars_web::state::BulletinPreviewView {
+            text: Some("Biuletyn stacji. 07:00. Koniec biuletynu.".to_owned()),
+            parts: vec![(
+                "pogoda".to_owned(),
+                "pominięta — brak pozycji stacji".to_owned(),
+            )],
+            skipped_reason: None,
+        };
+        assert_eq!(
+            super::bulletin_preview_lines(&view),
+            [
+                "tekst: Biuletyn stacji. 07:00. Koniec biuletynu.",
+                "pogoda: pominięta — brak pozycji stacji",
+            ]
+        );
+        let view = aars_web::state::BulletinPreviewView {
+            text: None,
+            parts: Vec::new(),
+            skipped_reason: Some("brak danych".to_owned()),
+        };
+        assert_eq!(
+            super::bulletin_preview_lines(&view),
+            ["nic do nadania: brak danych"]
+        );
+    }
+
     #[tokio::test]
     async fn a_source_that_cannot_start_is_recorded_as_failing() {
         let pool = aars_core::db::test_pool().await;

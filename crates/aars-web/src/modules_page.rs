@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use aars_core::error::DbError;
 use aars_core::geo::PositionRepo;
 use aars_core::module::{
-    ModuleDescriptor, ModuleError, ModuleKind, ModuleRepo, SettingKind, Toggle,
+    BULLETIN, ModuleDescriptor, ModuleError, ModuleKind, ModuleRepo, SettingKind, Toggle,
 };
 use aars_core::settings::SettingsRepo;
 use aars_core::source_state::SourceStateRepo;
@@ -26,7 +26,7 @@ use crate::auth::{AuthRejection, CurrentUser, require_csrf, require_role};
 use crate::chrome::Chrome;
 use crate::render::{db_error, page};
 use crate::sources_page::health;
-use crate::state::AppState;
+use crate::state::{AppState, BulletinPreviewView};
 
 /// Pole formularza ustawień wygenerowane z `SettingSpec`.
 pub(crate) struct FieldView {
@@ -65,6 +65,8 @@ pub(crate) struct ModuleView {
     /// Tylko `auto-id`: bieżący znak (pusty = brak).
     pub(crate) ident: Option<String>,
     pub(crate) error: Option<String>,
+    /// Tylko `bulletin`, po `POST /modules/bulletin/preview`.
+    pub(crate) bulletin_preview: Option<BulletinPreviewView>,
 }
 
 #[derive(Template)]
@@ -183,6 +185,7 @@ async fn module_view(
         fields,
         ident: (m.kind == ModuleKind::Ident).then(|| callsign.to_owned()),
         error: None,
+        bulletin_preview: None,
     })
 }
 
@@ -195,6 +198,31 @@ async fn load_views(state: &AppState) -> Result<Vec<ModuleView>, DbError> {
     Ok(views)
 }
 
+/// Strona modułów ze statusem `status`; `edit` zmienia kartę modułu `id`.
+async fn page_with(
+    state: &AppState,
+    current: &CurrentUser,
+    id: &str,
+    status: StatusCode,
+    edit: impl FnOnce(&mut ModuleView),
+) -> Response {
+    let mut modules = match load_views(state).await {
+        Ok(views) => views,
+        Err(err) => return db_error("odczyt modułów zawiódł", &err),
+    };
+    if let Some(view) = modules.iter_mut().find(|v| v.id == id) {
+        edit(view);
+    }
+    (
+        status,
+        page(&ModulesPage {
+            chrome: Chrome::from(current),
+            modules,
+        }),
+    )
+        .into_response()
+}
+
 /// Strona z błędem w karcie modułu `id`; `entered` zastępuje wartości pól.
 async fn page_with_error(
     state: &AppState,
@@ -203,11 +231,7 @@ async fn page_with_error(
     message: String,
     entered: Option<&BTreeMap<String, String>>,
 ) -> Response {
-    let mut modules = match load_views(state).await {
-        Ok(views) => views,
-        Err(err) => return db_error("odczyt modułów zawiódł", &err),
-    };
-    if let Some(view) = modules.iter_mut().find(|v| v.id == id) {
+    page_with(state, current, id, StatusCode::BAD_REQUEST, |view| {
         if let Some(entered) = entered {
             for field in &mut view.fields {
                 if let Some(value) = entered.get(field.key) {
@@ -216,15 +240,8 @@ async fn page_with_error(
             }
         }
         view.error = Some(message);
-    }
-    (
-        StatusCode::BAD_REQUEST,
-        page(&ModulesPage {
-            chrome: Chrome::from(current),
-            modules,
-        }),
-    )
-        .into_response()
+    })
+    .await
 }
 
 /// `GET /modules` (operator: stan; admin: także przełączniki i ustawienia).
@@ -377,10 +394,73 @@ pub async fn save_settings(
     Ok(see_other(format!("/modules#{}", m.id)))
 }
 
+async fn bulletin_message(
+    state: &AppState,
+    current: &CurrentUser,
+    status: StatusCode,
+    message: String,
+) -> Response {
+    page_with(state, current, BULLETIN.id, status, |card| {
+        card.error = Some(message);
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CsrfForm {
+    #[serde(default)]
+    csrf: String,
+}
+
+/// `POST /modules/bulletin/preview` (operator): biuletyn złożony na teraz,
+/// bez kolejki. Jeden podgląd naraz — każdy pyta sieć o wszystkie części.
+pub async fn preview_bulletin(
+    State(state): State<AppState>,
+    current: CurrentUser,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, AuthRejection> {
+    require_role(&current.user, Role::Operator)?;
+    require_csrf(&current.csrf_token, Some(&form.csrf))?;
+    let Some(preview) = state.bulletin_preview.clone() else {
+        return Ok(bulletin_message(
+            &state,
+            &current,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "podgląd biuletynu niedostępny".to_owned(),
+        )
+        .await);
+    };
+    let Ok(_permit) = state.bulletin_preview_gate.clone().try_acquire_owned() else {
+        return Ok(bulletin_message(
+            &state,
+            &current,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "podgląd biuletynu już trwa, spróbuj za chwilę".to_owned(),
+        )
+        .await);
+    };
+    match preview().await {
+        Ok(view) => Ok(
+            page_with(&state, &current, BULLETIN.id, StatusCode::OK, |card| {
+                card.bulletin_preview = Some(view)
+            })
+            .await,
+        ),
+        Err(e) => Ok(bulletin_message(
+            &state,
+            &current,
+            StatusCode::BAD_GATEWAY,
+            format!("podgląd biuletynu zawiódł: {e}"),
+        )
+        .await),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::AppState;
     use crate::router;
+    use crate::state::{BulletinPreview, BulletinPreviewView};
     use crate::tests::{login, state};
     use aars_core::source_state::SourceStateRepo;
     use aars_core::user::{Role, UserRepo};
@@ -513,7 +593,12 @@ mod tests {
         ] {
             assert!(html.contains(needle), "brak {needle}: {html}");
         }
-        assert!(!html.contains("action=\"/modules/"), "{html}");
+        // Operator nie dostaje przełączników ani ustawień — tylko podgląd biuletynu.
+        assert_eq!(html.matches("action=\"/modules/").count(), 1, "{html}");
+        assert!(
+            html.contains("action=\"/modules/bulletin/preview\""),
+            "{html}"
+        );
         // Kolejność rejestru: wbudowane, potem źródło.
         let scheduler = html.find("Harmonogram").unwrap();
         let source = html.find("Ostrzeżenia meteorologiczne IMGW").unwrap();
@@ -864,5 +949,143 @@ mod tests {
             get(&app, &cookie, "/modules").await.0,
             StatusCode::FORBIDDEN
         );
+    }
+
+    fn preview_of(view: BulletinPreviewView) -> BulletinPreview {
+        Arc::new(move || {
+            let view = view.clone();
+            Box::pin(async move { Ok(view) })
+        })
+    }
+
+    fn sample_view() -> BulletinPreviewView {
+        BulletinPreviewView {
+            text: Some("Biuletyn stacji SP9XYZ. 07:00. Koniec biuletynu.".to_owned()),
+            parts: vec![(
+                "pogoda".to_owned(),
+                "pominięta — brak pozycji stacji".to_owned(),
+            )],
+            skipped_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_operator_previews_the_bulletin() {
+        let state = state()
+            .await
+            .with_bulletin_preview(preview_of(sample_view()));
+        let (app, cookie, csrf, _) = app_as(Role::Operator, state).await;
+        let (_, html) = get(&app, &cookie, "/modules").await;
+        assert!(
+            html.contains("action=\"/modules/bulletin/preview\""),
+            "{html}"
+        );
+        assert!(html.contains("Podgląd biuletynu"), "{html}");
+
+        let (status, _, html) = post(&app, &cookie, &csrf, "/modules/bulletin/preview", "").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        for needle in [
+            "Biuletyn stacji SP9XYZ. 07:00. Koniec biuletynu.",
+            "pogoda",
+            "pominięta — brak pozycji stacji",
+            "Odsłuchaj",
+        ] {
+            assert!(html.contains(needle), "brak {needle}: {html}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bulletin_with_nothing_to_say_shows_the_reason() {
+        let view = BulletinPreviewView {
+            text: None,
+            parts: vec![("propagacja".to_owned(), "błąd — x".to_owned())],
+            skipped_reason: Some("brak danych".to_owned()),
+        };
+        let state = state().await.with_bulletin_preview(preview_of(view));
+        let (app, cookie, csrf, _) = app_as(Role::Operator, state).await;
+        let (status, _, html) = post(&app, &cookie, &csrf, "/modules/bulletin/preview", "").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(html.contains("Nic do nadania: brak danych"), "{html}");
+        assert!(html.contains("propagacja: błąd — x"), "{html}");
+        assert!(!html.contains("Odsłuchaj"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn the_bulletin_preview_without_a_callback_is_unavailable() {
+        let (app, cookie, csrf, _) = app_as(Role::Operator, state().await).await;
+        let (status, _, html) = post(&app, &cookie, &csrf, "/modules/bulletin/preview", "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(html.contains("podgląd biuletynu niedostępny"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn one_bulletin_preview_at_a_time() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let preview: BulletinPreview = {
+            let (entered, release, calls) = (entered.clone(), release.clone(), calls.clone());
+            Arc::new(move || {
+                let (entered, release) = (entered.clone(), release.clone());
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                Box::pin(async move {
+                    if first {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    Ok(sample_view())
+                })
+            })
+        };
+        let state = state().await.with_bulletin_preview(preview);
+        let (app, cookie, csrf, _) = app_as(Role::Operator, state).await;
+
+        let slow = {
+            let (app, cookie, csrf) = (app.clone(), cookie.clone(), csrf.clone());
+            tokio::spawn(async move {
+                post(&app, &cookie, &csrf, "/modules/bulletin/preview", "").await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("pierwszy podgląd musi ruszyć");
+
+        let (status, _, html) = post(&app, &cookie, &csrf, "/modules/bulletin/preview", "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            html.contains("podgląd biuletynu już trwa, spróbuj za chwilę"),
+            "{html}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "drugi podgląd nie składa biuletynu"
+        );
+
+        release.notify_one();
+        let (status, _, _) = slow.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) = post(&app, &cookie, &csrf, "/modules/bulletin/preview", "").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_bulletin_preview_error_is_shown() {
+        let preview: BulletinPreview = Arc::new(|| Box::pin(async { Err("x".to_owned()) }));
+        let state = state().await.with_bulletin_preview(preview);
+        let (app, cookie, csrf, _) = app_as(Role::Operator, state).await;
+        let (status, _, html) = post(&app, &cookie, &csrf, "/modules/bulletin/preview", "").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(html.contains("podgląd biuletynu zawiódł: x"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn a_viewer_cannot_preview_the_bulletin() {
+        let state = state()
+            .await
+            .with_bulletin_preview(preview_of(sample_view()));
+        let (app, cookie, csrf, _) = app_as(Role::Viewer, state).await;
+        let (status, _, _) = post(&app, &cookie, &csrf, "/modules/bulletin/preview", "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }

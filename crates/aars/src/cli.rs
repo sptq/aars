@@ -59,6 +59,11 @@ pub enum Command {
         #[command(subcommand)]
         action: SourceAction,
     },
+    /// Biuletyn o porach lokalnych (etap 11b).
+    Bulletin {
+        #[command(subcommand)]
+        action: BulletinAction,
+    },
     /// Uruchamia stację: harmonogram i dyspozytor pracują aż do przerwania.
     Run,
     /// Ustawienia sprzętu z panelu: podgląd i ratunek bez panelu.
@@ -96,6 +101,12 @@ pub enum HardwareAction {
     Show,
     /// Kasuje ustawienia sprzętu z panelu; przy następnym starcie obowiązuje aars.toml.
     Reset,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BulletinAction {
+    /// Składa biuletyn na teraz z bazy i źródeł; nic nie zapisuje ani nie nadaje.
+    Preview,
 }
 
 #[derive(Debug, Subcommand)]
@@ -183,5 +194,17 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["aars", "queue", "add", "x", "--every", "86400"]).is_ok());
+    }
+
+    #[test]
+    fn bulletin_preview_parses() {
+        assert!(matches!(
+            Cli::try_parse_from(["aars", "bulletin", "preview"])
+                .unwrap()
+                .command,
+            Command::Bulletin {
+                action: BulletinAction::Preview
+            }
+        ));
     }
 }

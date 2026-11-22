@@ -94,7 +94,26 @@ pub struct AppState {
     /// włącza ją, gdy `server.allow_remote = false` (domyślnie); testy bez
     /// `ConnectInfo` działają bez niej. `/setup` sprawdza adres zawsze.
     pub lan_only: bool,
+    /// Podgląd biuletynu (etap 11b); `None` = panel bez stacji.
+    pub bulletin_preview: Option<BulletinPreview>,
+    /// Jeden podgląd naraz: każdy pyta sieć o wszystkie części.
+    pub bulletin_preview_gate: Arc<tokio::sync::Semaphore>,
 }
+
+/// Wynik podglądu biuletynu bez typów z crate'a źródeł: tekst (albo powód,
+/// dla którego nic by nie poszło) i `(id części, opis wyniku)`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BulletinPreviewView {
+    pub text: Option<String>,
+    pub parts: Vec<(String, String)>,
+    pub skipped_reason: Option<String>,
+}
+
+pub type BulletinPreviewFuture =
+    Pin<Box<dyn Future<Output = Result<BulletinPreviewView, String>> + Send>>;
+
+/// Składa biuletyn na teraz bez zapisu do kolejki; ustawia go binarka.
+pub type BulletinPreview = Arc<dyn Fn() -> BulletinPreviewFuture + Send + Sync>;
 
 /// „Odśwież teraz” dla źródła: `true`, gdy źródło o tym id istnieje i zostało
 /// obudzone, `false` dla nieznanego id. Panel nie zna crate'a źródeł (spec §3).
@@ -129,6 +148,8 @@ impl AppState {
             host_names: Arc::new(Vec::new()),
             check_hosts: false,
             lan_only: false,
+            bulletin_preview: None,
+            bulletin_preview_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -199,6 +220,11 @@ impl AppState {
         self
     }
 
+    pub fn with_bulletin_preview(mut self, preview: BulletinPreview) -> Self {
+        self.bulletin_preview = Some(preview);
+        self
+    }
+
     pub fn with_preview(mut self, preview: Arc<dyn PreviewRenderer>) -> Self {
         self.preview = Some(preview);
         self
@@ -223,8 +249,8 @@ impl AppState {
                     name: "Ostrzeżenia meteorologiczne IMGW",
                     ..aars_core::module::sample_source("imgw-meteo")
                 });
-                // Źródła alarmowe etapu 11a: w panelu liczy się tylko ich id.
-                for id in ["rso", "swpc", "gios-smog", "emsc"] {
+                // Źródła alarmowe etapu 11a i `pogoda` z 11b: w panelu liczy się tylko ich id.
+                for id in ["rso", "swpc", "gios-smog", "emsc", "pogoda"] {
                     all.push(aars_core::module::sample_source(id));
                 }
                 all
@@ -238,6 +264,8 @@ impl AppState {
             host_names: Arc::new(Vec::new()),
             check_hosts: false,
             lan_only: false,
+            bulletin_preview: None,
+            bulletin_preview_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 }
