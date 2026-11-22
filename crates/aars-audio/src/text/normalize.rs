@@ -285,6 +285,18 @@ pub fn normalize(input: &str) -> String {
             continue;
         }
 
+        // „1. stopień”, „2. stopnia”: liczebnik porządkowy stopnia ostrzeżenia.
+        if trail == "."
+            && lead.is_empty()
+            && let Some(&(next_lead, next_core, _)) = parts.get(idx + 1)
+            && next_lead.is_empty()
+            && let Some(ordinal) = level_ordinal(core, next_core)
+        {
+            out.push(ordinal.to_owned());
+            idx += 1;
+            continue;
+        }
+
         // „do minus 5": przyimek stoi przed słowem „minus".
         let genitive_prev = match previous_core {
             Some(p) if p.eq_ignore_ascii_case("minus") => {
@@ -373,6 +385,23 @@ pub fn normalize(input: &str) -> String {
     }
 
     out.join(" ")
+}
+
+/// „1”–„3” przed formą słowa „stopień” → liczebnik porządkowy w tym samym
+/// przypadku („2.” + „stopnia” → „drugiego”).
+fn level_ordinal(number: &str, noun: &str) -> Option<&'static str> {
+    let forms: [&str; 3] = match noun.to_lowercase().as_str() {
+        "stopień" => ["pierwszy", "drugi", "trzeci"],
+        "stopnia" => ["pierwszego", "drugiego", "trzeciego"],
+        "stopniu" | "stopniem" => ["pierwszym", "drugim", "trzecim"],
+        _ => return None,
+    };
+    match number {
+        "1" => Some(forms[0]),
+        "2" => Some(forms[1]),
+        "3" => Some(forms[2]),
+        _ => None,
+    }
 }
 
 /// Wartość liczbowa jako tekst: część całkowita i opcjonalna dziesiętna.
@@ -524,6 +553,17 @@ mod tests {
 
     fn n(s: &str) -> String {
         normalize(s)
+    }
+
+    #[test]
+    fn a_level_ordinal_is_read_as_an_ordinal() {
+        assert_eq!(n("Burze, 1. stopień"), "Burze, pierwszy stopień");
+        assert_eq!(n("Upał, 2. stopień; Burze, 3. stopień."), "Upał, drugi stopień; Burze, trzeci stopień.");
+        assert_eq!(n("ostrzeżenie 2. stopnia"), "ostrzeżenie drugiego stopnia");
+        assert_eq!(n("przy 3. stopniu"), "przy trzecim stopniu");
+        assert_eq!(n("z 1. stopniem"), "z pierwszym stopniem");
+        // Poza 1–3 i bez kropki nie zgadujemy.
+        assert_eq!(n("1 stopień"), "jeden stopień");
     }
 
     #[test]
