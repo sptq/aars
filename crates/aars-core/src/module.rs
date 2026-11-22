@@ -194,6 +194,7 @@ fn comma(n: f64) -> String {
 /// Części biuletynu (wartość, etykieta); kolejność w biuletynie jest stała.
 pub const BULLETIN_PARTS: &[(&str, &str)] = &[
     ("pogoda", "Pogoda dla pozycji stacji"),
+    ("wody", "Stany wód w okolicy"),
     ("propagacja", "Warunki propagacji KF"),
     ("ostrzezenia", "Obowiązujące ostrzeżenia"),
 ];
@@ -625,6 +626,10 @@ mod tests {
         let mut input = defaults.clone();
         input.insert("parts".into(), "ostrzezenia,pogoda".into());
         assert_eq!(m.validate(&input).unwrap()["parts"], "pogoda,ostrzezenia");
+        input.insert("parts".into(), "ostrzezenia,wody,pogoda".into());
+        assert_eq!(m.validate(&input).unwrap()["parts"], "pogoda,wody,ostrzezenia");
+        assert_eq!(BULLETIN_PARTS[1], ("wody", "Stany wód w okolicy"));
+        assert_eq!(m.settings[1].default, "pogoda,propagacja,ostrzezenia");
     }
 
     #[test]

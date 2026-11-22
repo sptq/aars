@@ -8,6 +8,7 @@ pub mod gios;
 pub mod http;
 pub mod imgw_hydro;
 pub mod imgw_meteo;
+pub mod imgw_wodowskazy;
 pub mod pogoda;
 pub mod propagacja;
 pub mod rso;
@@ -36,6 +37,10 @@ fn build_imgw_meteo(config: &Config) -> Result<Arc<dyn DataSource>, SourceError>
 
 fn build_imgw_hydro(config: &Config) -> Result<Arc<dyn DataSource>, SourceError> {
     Ok(Arc::new(imgw_hydro::ImgwHydro::new(&config.sources.imgw_hydro_url)?))
+}
+
+fn build_imgw_wodowskazy(config: &Config) -> Result<Arc<dyn DataSource>, SourceError> {
+    Ok(Arc::new(imgw_wodowskazy::ImgwWodowskazy::new(&config.sources.imgw_hydro_stations_url)?))
 }
 
 fn build_rso(config: &Config) -> Result<Arc<dyn DataSource>, SourceError> {
@@ -68,6 +73,7 @@ pub fn modules() -> Vec<SourceModule> {
         SourceModule { descriptor: emsc::DESCRIPTOR, build: build_emsc },
         SourceModule { descriptor: pogoda::DESCRIPTOR, build: build_pogoda },
         SourceModule { descriptor: imgw_hydro::DESCRIPTOR, build: build_imgw_hydro },
+        SourceModule { descriptor: imgw_wodowskazy::DESCRIPTOR, build: build_imgw_wodowskazy },
     ]
 }
 
@@ -80,7 +86,7 @@ mod tests {
     fn all_sources_are_registered_in_order() {
         let all = modules();
         let ids: Vec<_> = all.iter().map(|m| m.descriptor.id).collect();
-        assert_eq!(ids, ["imgw-meteo", "rso", "swpc", "gios-smog", "emsc", "pogoda", "imgw-hydro"]);
+        assert_eq!(ids, ["imgw-meteo", "rso", "swpc", "gios-smog", "emsc", "pogoda", "imgw-hydro", "imgw-wodowskazy"]);
         for m in &all {
             let built = (m.build)(&Config::default()).unwrap();
             assert_eq!(built.id(), m.descriptor.id);

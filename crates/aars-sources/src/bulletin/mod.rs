@@ -20,7 +20,7 @@ use sqlx::SqlitePool;
 
 use crate::source::SourceError;
 use crate::speech::{truncate_sentence, warsaw_hhmm};
-use crate::{pogoda, propagacja};
+use crate::{imgw_wodowskazy, pogoda, propagacja};
 
 pub use ostrzezenia::Ostrzezenia;
 pub use runner::{BulletinRunner, BulletinTick, due_fires};
@@ -31,8 +31,22 @@ pub struct PartCtx {
     pub now: DateTime<Utc>,
     pub position: Option<StationPosition>,
     pub settings: BTreeMap<String, String>,
+    /// Ustawienia źródeł `source:*` bez prefiksu `source:`
+    /// (`"imgw-wodowskazy:radius_km"` → `"25"`).
+    pub sources: BTreeMap<String, String>,
     pub active_alerts: Vec<TrackedItem>,
     pub alert_sources: AlertSourceHealth,
+}
+
+impl PartCtx {
+    /// Ustawienia jednego źródła, klucze bez `"{id}:"`.
+    pub fn source_settings(&self, source_id: &str) -> BTreeMap<String, String> {
+        let prefix = format!("{source_id}:");
+        self.sources
+            .iter()
+            .filter_map(|(k, v)| Some((k.strip_prefix(&prefix)?.to_owned(), v.clone())))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -237,6 +251,9 @@ impl Bulletin {
             .unwrap_or_default();
         let chosen = |id: &str| selected.iter().any(|p| p == id);
         let position = PositionRepo::new(self.pool.clone()).load().await?;
+        let sources = SettingsRepo::new(self.pool.clone())
+            .kv_prefix("source:")
+            .await?;
         let (active_alerts, alert_sources) = if chosen("ostrzezenia") {
             let repo = SourceStateRepo::new(self.pool.clone());
             (
@@ -254,6 +271,7 @@ impl Bulletin {
             now,
             position,
             settings,
+            sources,
             active_alerts,
             alert_sources,
         });
@@ -311,19 +329,31 @@ fn outcome(
     }
 }
 
-/// Biuletyn stacji: jedna `Pogoda` (ta sama instancja trafia do runnera
-/// źródeł), `Propagacja`, `Ostrzezenia`.
-pub fn build(
-    cfg: &Config,
-    pool: SqlitePool,
-) -> Result<(Arc<Bulletin>, Arc<pogoda::Pogoda>), SourceError> {
+/// Złożony biuletyn i instancje, które dzieli z runnerem źródeł.
+pub struct BuiltBulletin {
+    pub bulletin: Arc<Bulletin>,
+    pub pogoda: Arc<pogoda::Pogoda>,
+    pub wodowskazy: Arc<imgw_wodowskazy::ImgwWodowskazy>,
+}
+
+/// Biuletyn stacji: jedna `Pogoda` i jedna `ImgwWodowskazy` (te same
+/// instancje trafiają do runnera źródeł), `Propagacja`, `Ostrzezenia`.
+pub fn build(cfg: &Config, pool: SqlitePool) -> Result<BuiltBulletin, SourceError> {
     let pogoda = Arc::new(pogoda::Pogoda::new(&cfg.sources)?);
+    let wodowskazy = Arc::new(imgw_wodowskazy::ImgwWodowskazy::new(
+        &cfg.sources.imgw_hydro_stations_url,
+    )?);
     let parts: Vec<Arc<dyn BulletinPart>> = vec![
         pogoda.clone(),
+        wodowskazy.clone(),
         Arc::new(propagacja::Propagacja::new(&cfg.sources)?),
         Arc::new(Ostrzezenia),
     ];
-    Ok((Arc::new(Bulletin::new(pool, parts)), pogoda))
+    Ok(BuiltBulletin {
+        bulletin: Arc::new(Bulletin::new(pool, parts)),
+        pogoda,
+        wodowskazy,
+    })
 }
 
 #[cfg(test)]
@@ -406,6 +436,30 @@ mod tests {
         assert_eq!(length_limit(60), 500);
         assert_eq!(length_limit(10), 0);
         assert_eq!(length_limit(5), 0);
+    }
+
+    #[test]
+    fn source_settings_strip_the_source_id() {
+        let ctx = PartCtx {
+            now: Utc::now(),
+            position: None,
+            settings: BTreeMap::new(),
+            sources: [
+                ("imgw-wodowskazy:radius_km", "30"),
+                ("imgw-wodowskazy:stations", "1"),
+                ("imgw-wodowskazy-x:radius_km", "9"),
+                ("imgw-meteo:area", "18"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+            active_alerts: Vec::new(),
+            alert_sources: AlertSourceHealth::default(),
+        };
+        let s = ctx.source_settings("imgw-wodowskazy");
+        assert_eq!(s.len(), 2);
+        assert_eq!(s["radius_km"], "30");
+        assert_eq!(s["stations"], "1");
     }
 
     #[test]

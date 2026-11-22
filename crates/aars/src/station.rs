@@ -335,18 +335,42 @@ pub async fn source_start_failed(state: &SourceStateRepo, id: &str, reason: &str
     }
 }
 
-/// Źródło dla modułu. `pogoda` to wspólna instancja z biuletynu, więc runner
-/// źródła i część biuletynu dzielą pamięć prognozy; bez niej (błąd budowy
-/// biuletynu, już zapisany) `None` — źródło nie startuje.
+/// Instancje źródeł współdzielone z biuletynem (jedna pamięć danych dla
+/// runnera i części); `None` po błędzie budowy biuletynu.
+#[derive(Default)]
+struct SharedSources {
+    pogoda: Option<Arc<aars_sources::pogoda::Pogoda>>,
+    wodowskazy: Option<Arc<aars_sources::imgw_wodowskazy::ImgwWodowskazy>>,
+}
+
+impl SharedSources {
+    fn from_bulletin(built: Option<&aars_sources::bulletin::BuiltBulletin>) -> Self {
+        Self {
+            pogoda: built.map(|b| b.pogoda.clone()),
+            wodowskazy: built.map(|b| b.wodowskazy.clone()),
+        }
+    }
+}
+
+/// Źródło dla modułu. `pogoda` i `imgw-wodowskazy` to wspólne instancje z
+/// biuletynu, więc runner źródła i część biuletynu dzielą pamięć; bez nich
+/// (błąd budowy biuletynu, już zapisany) `None` — źródło nie startuje.
 fn source_for(
     module: &aars_sources::SourceModule,
     config: &Config,
-    pogoda: Option<&Arc<aars_sources::pogoda::Pogoda>>,
+    shared: &SharedSources,
 ) -> Option<Result<Arc<dyn aars_sources::DataSource>, aars_sources::SourceError>> {
-    if module.descriptor.id == aars_sources::pogoda::ID {
-        return pogoda.map(|p| Ok(p.clone() as Arc<dyn aars_sources::DataSource>));
+    match module.descriptor.id {
+        aars_sources::pogoda::ID => shared
+            .pogoda
+            .as_ref()
+            .map(|p| Ok(p.clone() as Arc<dyn aars_sources::DataSource>)),
+        aars_sources::imgw_wodowskazy::ID => shared
+            .wodowskazy
+            .as_ref()
+            .map(|w| Ok(w.clone() as Arc<dyn aars_sources::DataSource>)),
+        _ => Some((module.build)(config)),
     }
-    Some((module.build)(config))
 }
 
 /// Złożony biuletyn w postaci dla panelu i CLI (bez typów z `aars-sources`).
@@ -676,8 +700,8 @@ async fn run_station(
         tracing::error!(%err, "czyszczenie wygasłych sesji zawiodło");
     }
 
-    // Biuletyn i źródło `pogoda` dzielą jedną instancję (jedna pamięć
-    // prognozy). Błąd budowy wyłącza biuletyn i `pogoda`, reszta działa.
+    // Biuletyn i źródła `pogoda`, `imgw-wodowskazy` dzielą instancje (jedna
+    // pamięć danych). Błąd budowy wyłącza biuletyn i oba źródła, reszta działa.
     let bulletin = match aars_sources::bulletin::build(&config, pool.clone()) {
         Ok(built) => Some(built),
         Err(err) => {
@@ -686,22 +710,21 @@ async fn run_station(
                 %err,
                 "biuletyn nie wystartuje: {err}"
             );
-            source_start_failed(
-                &SourceStateRepo::new(pool.clone()),
-                aars_sources::pogoda::ID,
-                &err.to_string(),
-            )
-            .await;
+            for id in [aars_sources::pogoda::ID, aars_sources::imgw_wodowskazy::ID] {
+                source_start_failed(&SourceStateRepo::new(pool.clone()), id, &err.to_string())
+                    .await;
+            }
             None
         }
     };
+    let shared = SharedSources::from_bulletin(bulletin.as_ref());
 
     // Źródła są odizolowane: błąd budowy jednego wyłącza tylko je.
     let mut runners = Vec::new();
     let mut refreshers: Vec<(&'static str, Arc<Notify>)> = Vec::new();
     for module in &sources {
         let id = module.descriptor.id;
-        let Some(built) = source_for(module, &config, bulletin.as_ref().map(|(_, p)| p)) else {
+        let Some(built) = source_for(module, &config, &shared) else {
             continue;
         };
         match built {
@@ -846,8 +869,8 @@ async fn run_station(
             }
         }));
     }
-    if let Some((bulletin, _)) = &bulletin {
-        let bulletin = bulletin.clone();
+    if let Some(built) = &bulletin {
+        let bulletin = built.bulletin.clone();
         state = state.with_bulletin_preview(Arc::new(move || {
             let bulletin = bulletin.clone();
             Box::pin(async move {
@@ -871,9 +894,9 @@ async fn run_station(
     ];
     // Runner startuje zawsze i sam sprawdza włączenie przy każdym tiku. Tylko
     // wstawia do kolejki — nadaje dyspozytor (bez stosu nikt).
-    tasks.extend(bulletin.map(|(bulletin, _)| {
+    tasks.extend(bulletin.map(|built| {
         tokio::spawn(
-            aars_sources::bulletin::BulletinRunner::new(bulletin, queue.clone())
+            aars_sources::bulletin::BulletinRunner::new(built.bulletin, queue.clone())
                 .run(shutdown.clone()),
         )
     }));
@@ -1740,24 +1763,30 @@ mod tests {
     async fn the_weather_source_is_the_bulletin_part_instance() {
         let config = Config::default();
         let pool = aars_core::db::test_pool().await;
-        let (_, pogoda) = aars_sources::bulletin::build(&config, pool).unwrap();
+        let built = aars_sources::bulletin::build(&config, pool).unwrap();
+        let shared = SharedSources::from_bulletin(Some(&built));
+        let none = SharedSources::default();
         let modules = aars_sources::modules();
-        let module = modules
-            .iter()
-            .find(|m| m.descriptor.id == aars_sources::pogoda::ID)
-            .unwrap();
-        let source = source_for(module, &config, Some(&pogoda)).unwrap().unwrap();
+        let by_id = |id: &str| modules.iter().find(|m| m.descriptor.id == id).unwrap();
+        let module = by_id(aars_sources::pogoda::ID);
+        let source = source_for(module, &config, &shared).unwrap().unwrap();
         // Ta sama instancja = ta sama pamięć prognozy dla runnera i biuletynu.
         assert!(std::ptr::addr_eq(
             Arc::as_ptr(&source),
-            Arc::as_ptr(&pogoda)
+            Arc::as_ptr(&built.pogoda)
         ));
-        // Bez biuletynu (błąd budowy) `pogoda` nie startuje osobno.
-        assert!(source_for(module, &config, None).is_none());
+        let gauges = by_id(aars_sources::imgw_wodowskazy::ID);
+        let source = source_for(gauges, &config, &shared).unwrap().unwrap();
+        assert!(std::ptr::addr_eq(
+            Arc::as_ptr(&source),
+            Arc::as_ptr(&built.wodowskazy)
+        ));
+        // Bez biuletynu (błąd budowy) współdzielone źródła nie startują osobno.
+        assert!(source_for(module, &config, &none).is_none());
+        assert!(source_for(gauges, &config, &none).is_none());
         // Inne źródła budują się po staremu.
-        let swpc = modules.iter().find(|m| m.descriptor.id == "swpc").unwrap();
         assert_eq!(
-            source_for(swpc, &config, None).unwrap().unwrap().id(),
+            source_for(by_id("swpc"), &config, &none).unwrap().unwrap().id(),
             "swpc"
         );
     }

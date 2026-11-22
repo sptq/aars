@@ -630,6 +630,7 @@ mod tests {
                 now: at(now),
                 position: pos,
                 settings: BTreeMap::new(),
+                sources: BTreeMap::new(),
                 active_alerts: Vec::new(),
                 alert_sources: Default::default(),
             }

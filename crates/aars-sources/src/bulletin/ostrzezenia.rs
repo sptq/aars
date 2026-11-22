@@ -139,6 +139,7 @@ mod tests {
             now: Utc::now(),
             position: None,
             settings: BTreeMap::new(),
+            sources: BTreeMap::new(),
             active_alerts: alerts,
             alert_sources,
         }

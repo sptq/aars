@@ -104,7 +104,7 @@ fn assert_speakable(text: &str) {
 async fn the_bulletin_reads_the_fixtures_into_one_text() {
     let server = server().await;
     let pool = station().await;
-    let (bulletin, _pogoda) = build(&config(&server), pool.clone()).unwrap();
+    let bulletin = build(&config(&server), pool.clone()).unwrap().bulletin;
 
     let now = at("2026-11-22T19:00:00Z");
     // Bez włączonego źródła ostrzeżeń część milczy — nie mówi „brak ostrzeżeń”.

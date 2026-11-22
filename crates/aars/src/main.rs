@@ -521,8 +521,9 @@ async fn bulletin_preview(config: &Config) -> Result<()> {
         .await
         .context("otwieranie bazy")?;
     db::migrate(&pool).await.context("nakładanie migracji")?;
-    let (bulletin, _) = aars_sources::bulletin::build(config, pool)
-        .map_err(|e| anyhow::anyhow!("klient HTTP: {e}"))?;
+    let bulletin = aars_sources::bulletin::build(config, pool)
+        .map_err(|e| anyhow::anyhow!("klient HTTP: {e}"))?
+        .bulletin;
     let composed = bulletin
         .compose(chrono::Utc::now())
         .await
