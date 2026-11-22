@@ -17,9 +17,11 @@ pub const DEFAULT_URL: &str = "https://danepubliczne.imgw.pl/api/data/warningsme
 pub const MAX_BODY: usize = 2 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 
+pub const ID: &str = "imgw-meteo";
+
 /// Opis modułu dla panelu (R13): klucze `source:imgw-meteo:*` jak w etapie 8.
 pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
-    id: "imgw-meteo",
+    id: ID,
     name: "Ostrzeżenia meteorologiczne IMGW",
     description: "Ostrzeżenia meteorologiczne IMGW dla obszaru stacji, ogłaszane po zmianie.",
     kind: ModuleKind::Source,
@@ -83,7 +85,7 @@ impl ImgwMeteo {
 
 impl DataSource for ImgwMeteo {
     fn id(&self) -> &'static str {
-        "imgw-meteo"
+        ID
     }
 
     fn default_interval(&self) -> Duration {

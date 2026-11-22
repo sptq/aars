@@ -451,7 +451,10 @@ kończy się czymś, co da się uruchomić i sprawdzić.
     zrealizowano jako biuletyn — kompozytor, części `pogoda`, `propagacja`,
     `ostrzezenia` i źródło progowe `pogoda`
     ([projekt](2026-11-22-etap-11b-biuletyn-design.md)); `imgw-hydro`, `paa`
-    i mapa w panelu przeszły do **11c**. Dalej pierwotny opis zakresu
+    i mapa w panelu przeszły do **11c**. Dopisek po 11c: **11c** zrealizowano
+    jako `imgw-hydro`, `imgw-wodowskazy`, część `wody` i mapę ostrzeżeń meteo
+    w panelu ([projekt](2026-11-22-etap-11c-hydro-mapa-design.md)); **PAA
+    odłożone** (brak publicznego API). Dalej pierwotny opis zakresu
     11b+11c. **Pierwotnie 11b (dziś 11b + 11c)** (`imgw-hydro`,
     `paa`, kompozytor biuletynu, biuletyn propagacyjny, mapa i moduł pogody
     z otwartego API

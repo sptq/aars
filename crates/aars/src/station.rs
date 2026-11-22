@@ -341,6 +341,8 @@ pub async fn source_start_failed(state: &SourceStateRepo, id: &str, reason: &str
 struct SharedSources {
     pogoda: Option<Arc<aars_sources::pogoda::Pogoda>>,
     wodowskazy: Option<Arc<aars_sources::imgw_wodowskazy::ImgwWodowskazy>>,
+    /// Instancja `imgw-meteo` dla runnera i mapy ostrzeżeń w panelu.
+    meteo: Option<Arc<aars_sources::imgw_meteo::ImgwMeteo>>,
 }
 
 impl SharedSources {
@@ -348,13 +350,40 @@ impl SharedSources {
         Self {
             pogoda: built.map(|b| b.pogoda.clone()),
             wodowskazy: built.map(|b| b.wodowskazy.clone()),
+            meteo: None,
         }
     }
 }
 
-/// Źródło dla modułu. `pogoda` i `imgw-wodowskazy` to wspólne instancje z
-/// biuletynu, więc runner źródła i część biuletynu dzielą pamięć; bez nich
-/// (błąd budowy biuletynu, już zapisany) `None` — źródło nie startuje.
+/// Ostrzeżenia z pamięci `imgw-meteo` w postaci dla mapy: jeden wpis na parę
+/// (ostrzeżenie, powiat); brak stopnia = 1, czas końca nieistniejący w
+/// Warszawie = wpis pominięty.
+pub fn warnings_snapshot(
+    snapshot: aars_sources::imgw_meteo::MeteoSnapshot,
+) -> aars_web::state::WarningsSnapshot {
+    let mut warnings = Vec::new();
+    for w in &snapshot.warnings {
+        let Some(until) = aars_sources::speech::warsaw_to_utc(w.valid_until) else {
+            continue;
+        };
+        for teryt in &w.teryt {
+            warnings.push(aars_web::state::MapWarning {
+                teryt: teryt.clone(),
+                level: w.level.unwrap_or(1),
+                event: w.event.clone(),
+                until,
+            });
+        }
+    }
+    aars_web::state::WarningsSnapshot {
+        fetched_at: snapshot.fetched_at,
+        warnings,
+    }
+}
+
+/// Źródło dla modułu. `pogoda`, `imgw-wodowskazy` i `imgw-meteo` to wspólne
+/// instancje (biuletyn albo mapa), więc runner źródła i odbiorca dzielą
+/// pamięć; bez nich (błąd budowy, już zapisany) `None` — źródło nie startuje.
 fn source_for(
     module: &aars_sources::SourceModule,
     config: &Config,
@@ -369,6 +398,10 @@ fn source_for(
             .wodowskazy
             .as_ref()
             .map(|w| Ok(w.clone() as Arc<dyn aars_sources::DataSource>)),
+        aars_sources::imgw_meteo::ID => shared
+            .meteo
+            .as_ref()
+            .map(|m| Ok(m.clone() as Arc<dyn aars_sources::DataSource>)),
         _ => Some((module.build)(config)),
     }
 }
@@ -717,7 +750,18 @@ async fn run_station(
             None
         }
     };
-    let shared = SharedSources::from_bulletin(bulletin.as_ref());
+    let mut shared = SharedSources::from_bulletin(bulletin.as_ref());
+    match aars_sources::imgw_meteo::ImgwMeteo::new(&config.sources.imgw_meteo_url) {
+        Ok(meteo) => shared.meteo = Some(Arc::new(meteo)),
+        Err(err) => {
+            source_start_failed(
+                &SourceStateRepo::new(pool.clone()),
+                aars_sources::imgw_meteo::ID,
+                &err.to_string(),
+            )
+            .await;
+        }
+    }
 
     // Źródła są odizolowane: błąd budowy jednego wyłącza tylko je.
     let mut runners = Vec::new();
@@ -867,6 +911,11 @@ async fn run_station(
                 }
                 None => false,
             }
+        }));
+    }
+    if let Some(meteo) = shared.meteo.clone() {
+        state = state.with_warnings_map(Arc::new(move || {
+            meteo.snapshot().map(warnings_snapshot)
         }));
     }
     if let Some(built) = &bulletin {
@@ -1789,6 +1838,65 @@ mod tests {
             source_for(by_id("swpc"), &config, &none).unwrap().unwrap().id(),
             "swpc"
         );
+    }
+
+    #[tokio::test]
+    async fn the_meteo_source_is_the_map_instance() {
+        let config = Config::default();
+        let meteo = Arc::new(
+            aars_sources::imgw_meteo::ImgwMeteo::new(&config.sources.imgw_meteo_url).unwrap(),
+        );
+        let shared = SharedSources {
+            meteo: Some(meteo.clone()),
+            ..SharedSources::default()
+        };
+        let modules = aars_sources::modules();
+        let module = modules
+            .iter()
+            .find(|m| m.descriptor.id == aars_sources::imgw_meteo::ID)
+            .unwrap();
+        let source = source_for(module, &config, &shared).unwrap().unwrap();
+        // Ta sama instancja = ta sama pamięć ostrzeżeń dla runnera i mapy.
+        assert!(std::ptr::addr_eq(Arc::as_ptr(&source), Arc::as_ptr(&meteo)));
+        // Bez instancji (błąd budowy, już zapisany) źródło nie startuje.
+        assert!(source_for(module, &config, &SharedSources::default()).is_none());
+    }
+
+    #[test]
+    fn a_meteo_snapshot_becomes_map_warnings() {
+        const JULY: &[u8] =
+            include_bytes!("../../aars-sources/tests/fixtures/imgw/warningsmeteo-2026-07-23.json");
+        let parsed = aars_sources::imgw_meteo::parse::parse_warnings(JULY).unwrap();
+        let total: usize = parsed.warnings.iter().map(|w| w.teryt.len()).sum();
+        let fetched_at = chrono::Utc::now();
+        let snap = warnings_snapshot(aars_sources::imgw_meteo::MeteoSnapshot {
+            fetched_at,
+            warnings: parsed.warnings.clone(),
+        });
+        assert_eq!(snap.fetched_at, fetched_at);
+        assert_eq!(snap.warnings.len(), total);
+        let until = chrono::DateTime::parse_from_rfc3339("2026-07-23T20:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(snap.warnings.iter().any(|w| w.teryt == "1806"
+            && w.level == 1
+            && w.event == "Burze"
+            && w.until == until));
+        // Stopień nieznany → 1; czas nieistniejący w Warszawie → pominięte.
+        let mut base = parsed.warnings[0].clone();
+        base.teryt = vec!["1801".into()];
+        let mut no_level = base.clone();
+        no_level.level = None;
+        let mut gap = base.clone();
+        gap.valid_until =
+            chrono::NaiveDateTime::parse_from_str("2026-03-29 02:30:00", "%Y-%m-%d %H:%M:%S")
+                .unwrap();
+        let snap = warnings_snapshot(aars_sources::imgw_meteo::MeteoSnapshot {
+            fetched_at,
+            warnings: vec![no_level, gap],
+        });
+        assert_eq!(snap.warnings.len(), 1);
+        assert_eq!(snap.warnings[0].level, 1);
     }
 
     #[test]

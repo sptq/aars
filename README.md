@@ -24,7 +24,10 @@ natychmiast, a operator może wpisać i nadać własny komunikat z panelu www.
   polski komunikat (sekcja „Źródła danych”),
 - biuletyn o stałych porach lokalnych: pogoda dla pozycji stacji, propagacja
   KF i obowiązujące ostrzeżenia, z podglądem w panelu i w CLI (sekcja
-  „Biuletyn (etap 11b)”),
+  „Biuletyn (etap 11b)”), z częścią o stanach wód z wodowskazów IMGW,
+- źródła hydrologiczne IMGW (ostrzeżenia, przekroczenia stanów na
+  wodowskazach) i mapa ostrzeżeń meteo w panelu (sekcje „Źródła danych”
+  i „Mapa ostrzeżeń (etap 11c)”),
 - konfiguracja sprzętu, pozycji stacji i modułów z panelu admina, test PTT
   i test audio, restart stacji jednym przyciskiem (sekcja „Konfiguracja
   z panelu”),
@@ -88,7 +91,12 @@ Wszystkie są po instalacji wyłączone; włącza się je tak samo jak `imgw-met
 | `swpc` | NOAA SWPC, skale G/S/R pogody kosmicznej | domena publiczna; „Dane: NOAA SWPC” |
 | `gios-smog` | GIOŚ, ostrzeżenia smogowe w promieniu stacji | CC BY 4.0; „Źródło: GIOŚ” |
 | `emsc` | EMSC, wstrząsy sejsmiczne w promieniu stacji | CC BY 4.0; „Dane: EMSC” |
+| `imgw-hydro` (etap 11c) | IMGW-PIB, ostrzeżenia hydrologiczne dla województw obszaru (stopnie 1–3; susza nie jest ogłaszana); obszar jak w `imgw-meteo`, powiat oznacza całe województwo | „Źródło: IMGW-PIB.” |
+| `imgw-wodowskazy` (etap 11c) | IMGW-PIB, stany wodowskazów w promieniu stacji (domyślnie 25 km) albo z listy `id_stacji`: komunikat po przekroczeniu stanu ostrzegawczego i alarmowego z danych IMGW; pomiar starszy niż 3 h jest pomijany, stan bez nowego pomiaru wygasa po dobie | „Źródło: IMGW-PIB.” |
 | `pogoda` (etap 11b) | Open-Meteo, prognoza dla pozycji stacji: komunikat po przekroczeniu progów (porywy od 75 km/h, mróz od −15 °C, dobowa suma opadów od 30 mm — progi w `/modules`) na dziś (z godzin od bieżącej do końca doby) lub jutro | CC BY 4.0; „Dane: Open-Meteo.” |
+
+Źródłem pochodzenia danych jest IMGW-PIB; dane zostały przetworzone
+(regulamin IMGW-PIB; dotyczy też `imgw-meteo` i mapy ostrzeżeń).
 
 Zmiana zakresu RSO w etapie 11b (zakres nie zależy już od pola „atak
 z powietrza”, bo ta kategoria jest pobierana zawsze): przy pierwszym cyklu po
@@ -121,6 +129,7 @@ już zrobionej. Gdy żadna część nie ma treści, nic nie idzie na antenę.
 | `pogoda` | teraz, noc, jutro (temperatura, opis, opady, porywy) dla pozycji stacji; bez pozycji część wypada | Open-Meteo (ta sama prognoza co źródło `pogoda`, świeża do 60 min), zapasowo MET Norway |
 | `propagacja` | strumień słoneczny (SFI), indeks K, skale NOAA, najbliższa jonosonda i ocena pasm KF | NOAA SWPC, GIRO przez KC2G |
 | `ostrzezenia` | obowiązujące ostrzeżenia ze źródeł włączonych i nieprzestarzałych, które poszły na antenę oraz czekające w kolejce (najwyżej 5, reszta — także bez opisu — jako „Pozostałych ostrzeżeń: n.”); brak = „Brak obowiązujących ostrzeżeń.”, a gdy część źródeł jest niedostępna — „Brak ostrzeżeń z dostępnych źródeł. Część źródeł ostrzeżeń jest niedostępna.”; bez żadnego włączonego źródła część wypada | `source_state` stacji |
+| `wody` (etap 11c) | do 3 najbliższych wodowskazów ze świeżym pomiarem (ustawienia źródła `imgw-wodowskazy`), z dopiskiem o stanie ostrzegawczym/alarmowym; susza hydrologiczna w 11c nie jest podawana (dopasowanie po województwie dawałoby ją prawie zawsze) | IMGW-PIB (ta sama instancja co źródło, dane świeże do 20 min) |
 
 Każda część ma 20 s na odpowiedź (części liczone równolegle); część, która
 nie zdąży albo zawiedzie, wypada, reszta wychodzi. Progi oceny w części
@@ -152,6 +161,15 @@ NOAA SWPC domena publiczna, jonosondy GIRO przez KC2G CC BY-NC-SA („Dane:
 NOAA, GIRO przez KC2G.”, KC2G tylko gdy jonosonda użyta). Adresy
 (`open_meteo_url`, `met_no_url`, `swpc_f107_url`, `swpc_kp_url`, `kc2g_url`)
 w `[sources]` w `aars.toml`.
+
+### Mapa ostrzeżeń (etap 11c)
+
+Strona `/map` w panelu (dla każdej roli) koloruje powiaty stopniem
+najwyższego ostrzeżenia meteo z ostatniego pobrania źródła `imgw-meteo` i
+zaznacza obszar stacji. Gdy źródło jest wyłączone, dane są nieaktualne, po
+restarcie nie było jeszcze pobrania albo stacja nie ma obszaru, mapa pokazuje
+baner zamiast „brak ostrzeżeń”. Podkład OSM ładuje przeglądarka; granice
+powiatów pochodzą z PRG (GUGiK) i są przygotowane skryptem `tools/powiaty/`.
 
 ## Konfiguracja z panelu
 
@@ -409,8 +427,9 @@ Kompilacja na Linuksa arm64 z macOS:
 
 Według spec §13:
 
-- etap 11c: źródła IMGW hydro i PAA oraz mapa ostrzeżeń w panelu (11a,
-  źródła alarmowe, i 11b, biuletyn z pogodą i propagacją, są gotowe).
+- PAA odłożone: portal `monitoring.paa.gov.pl` nie ma udokumentowanego
+  publicznego API ani licencji danych; wraca po kontakcie z PAA. Mapa hydro
+  i RSO/GIOŚ na mapie — poza zakresem (11a, 11b i 11c są gotowe).
 
 ## Uruchomienie
 
