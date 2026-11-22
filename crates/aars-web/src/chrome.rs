@@ -95,6 +95,10 @@ pub fn plural<'a>(n: u64, one: &'a str, few: &'a str, many: &'a str) -> &'a str 
 pub fn source_label(id: &str) -> &str {
     match id {
         "imgw-meteo" => "Ostrzeżenia meteorologiczne IMGW",
+        "rso" => "Regionalny System Ostrzegania (RSO)",
+        "swpc" => "Pogoda kosmiczna NOAA",
+        "gios-smog" => "Alerty smogowe GIOŚ",
+        "emsc" => "Wstrząsy sejsmiczne (EMSC)",
         other => other,
     }
 }
@@ -179,6 +183,10 @@ mod tests {
             assert_eq!(audit_action_label(key), label);
         }
         assert_eq!(source_label("imgw-meteo"), "Ostrzeżenia meteorologiczne IMGW");
+        assert_eq!(source_label("rso"), "Regionalny System Ostrzegania (RSO)");
+        assert_eq!(source_label("swpc"), "Pogoda kosmiczna NOAA");
+        assert_eq!(source_label("gios-smog"), "Alerty smogowe GIOŚ");
+        assert_eq!(source_label("emsc"), "Wstrząsy sejsmiczne (EMSC)");
         assert_eq!(source_label("inne"), "inne");
     }
 

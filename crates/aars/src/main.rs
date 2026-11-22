@@ -525,26 +525,30 @@ async fn source_preview(config: &Config, id: &str) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("nieznane źródło: {id}"))?;
     let source = (module.build)(config).map_err(|e| anyhow::anyhow!("klient HTTP: {e}"))?;
     let needs = source.needs();
-    // `SourceStateRepo::config` zamienia zepsuty obszar na pusty, a tu trzeba
-    // je odróżnić, więc czytamy surowy zapis.
-    let raw: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
-        .bind(format!("source:{}:area", source.id()))
-        .fetch_optional(&pool)
-        .await
-        .context("odczyt obszaru źródła")?;
-    let area = match aars_core::area::parse_area(raw.as_deref().unwrap_or_default()) {
-        Ok(area) => area,
-        Err(reason) => {
-            println!("nieprawidłowy obszar: {reason}");
+    let area = if needs == aars_core::module::Needs::Area {
+        // `SourceStateRepo::config` zamienia zepsuty obszar na pusty, a tu trzeba
+        // je odróżnić, więc czytamy surowy zapis.
+        let raw: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+            .bind(format!("source:{}:area", source.id()))
+            .fetch_optional(&pool)
+            .await
+            .context("odczyt obszaru źródła")?;
+        let area = match aars_core::area::parse_area(raw.as_deref().unwrap_or_default()) {
+            Ok(area) => area,
+            Err(reason) => {
+                println!("nieprawidłowy obszar: {reason}");
+                return Ok(());
+            }
+        };
+        if area.is_empty() {
+            println!("brak obszaru — ustaw go w panelu (/sources) albo w tabeli settings");
             return Ok(());
         }
+        println!("obszar: {}", aars_core::area::area_text(&area));
+        area
+    } else {
+        Vec::new()
     };
-    if needs == aars_core::module::Needs::Area && area.is_empty() {
-        println!("brak obszaru — ustaw go w panelu (/sources) albo w tabeli settings");
-        return Ok(());
-    }
-
-    println!("obszar: {}", aars_core::area::area_text(&area));
     let position = if needs == aars_core::module::Needs::Position {
         let found = aars_core::geo::PositionRepo::new(pool.clone())
             .load()

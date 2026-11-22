@@ -20,6 +20,11 @@ voices_dir = "/var/lib/aars/voices"
 # Adres API ostrzeżeń meteo IMGW. Włączanie źródła, obszar i interwał ustawia
 # się w panelu (/modules); źródło po instalacji jest wyłączone.
 imgw_meteo_url = "https://danepubliczne.imgw.pl/api/data/warningsmeteo"
+# Adresy pozostałych źródeł (wartości domyślne; odkomentuj, by zmienić):
+# rso_url = "https://komunikaty.tvp.pl/komunikatyxml"
+# swpc_url = "https://services.swpc.noaa.gov/products/noaa-scales.json"
+# gios_url = "https://api.gios.gov.pl/pjp-api/v1/rest"
+# emsc_url = "https://www.seismicportal.eu/fdsnws/event/1/query"
 
 # Ustawiane w panelu (Ustawienia → Sprzęt). Wartości tutaj są tylko startowe; panel ma pierwszeństwo.
 #

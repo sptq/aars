@@ -75,8 +75,8 @@ stacji i wypisuje tekst, priorytet oraz postać znormalizowaną do syntezy.
 ### Źródła alarmowe (etap 11a)
 
 Wszystkie są po instalacji wyłączone; włącza się je tak samo jak `imgw-meteo`.
-Źródła bez obszaru (`rso`, `swpc`) działają od razu, `gios-smog` i `emsc`
-potrzebują pozycji stacji (ustawienia). Adresy w `[sources]` w `aars.toml`.
+`swpc` nie potrzebuje niczego, `rso` (jak `imgw-meteo`) potrzebuje obszaru,
+`gios-smog` i `emsc` — pozycji stacji (ustawienia). Adresy w `[sources]` w `aars.toml`.
 
 | Źródło | Dane | Licencja i atrybucja |
 |---|---|---|

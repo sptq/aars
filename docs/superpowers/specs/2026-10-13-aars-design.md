@@ -447,9 +447,9 @@ kończy się czymś, co da się uruchomić i sprawdzić.
     na żądanie admina: suma kontrolna, podmiana binarki, restart, powrót do
     poprzedniej wersji, gdy nowa nie wstanie; nigdy w trakcie nadawania.
 11. Etap 11 jest podzielony. **11a** (alarmy: `rso`, `swpc`, `gios-smog`, `emsc`):
-    [projekt](2026-11-22-etap-11a-alarmy-design.md). **11b** (kompozytor
-    biuletynu, moduł pogody, `imgw-hydro`, `paa`, biuletyn propagacyjny, mapa):
-    `imgw-hydro`, `paa`, kompozytor biuletynu, moduł pogody z otwartego API
+    [projekt](2026-11-22-etap-11a-alarmy-design.md). **11b** (`imgw-hydro`,
+    `paa`, kompozytor biuletynu, biuletyn propagacyjny, mapa i moduł pogody
+    z otwartego API
     po współrzędnych stacji: Open-Meteo (bez klucza, CC BY 4.0 — „Źródło:
     Open-Meteo”), zapasowo MET Norway (`api.met.no`, wymaga User-Agent
     z kontaktem); prognoza o ustalonych godzinach i komunikat po przekroczeniu
