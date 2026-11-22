@@ -25,12 +25,15 @@ enum HourCase {
     Nominative,
     Genitive,
     Locative,
+    /// Po „godz.”: sama liczba godziny, bez słowa „godzina”.
+    Bare,
 }
 
 fn hour_case(previous_core: Option<&str>) -> HourCase {
     match previous_core.map(str::to_lowercase).as_deref() {
         Some("od" | "do" | "około") => HourCase::Genitive,
         Some("o" | "po") => HourCase::Locative,
+        Some("godz") => HourCase::Bare,
         _ => HourCase::Nominative,
     }
 }
@@ -173,6 +176,8 @@ const ABBREVIATIONS: &[(&str, &str)] = &[
     ("PM10", "P M dziesięć"),
     ("PM2,5", "P M dwa i pół"),
     ("PM2.5", "P M dwa i pół"),
+    ("MUF", "M U F"),
+    ("KC2G", "K C dwa G"),
 ];
 
 /// Interpunkcja, która może poprzedzać słowo.
@@ -422,6 +427,7 @@ fn spoken_time(token: &str, case: HourCase) -> Option<String> {
     }
 
     let mut spoken = match case {
+        HourCase::Bare => hour_ordinal(hour).to_string(),
         HourCase::Nominative => format!("godzina {}", hour_ordinal(hour)),
         HourCase::Genitive => format!("godziny {}", hour_ordinal_genitive(hour)),
         HourCase::Locative => format!("godzinie {}", hour_ordinal_genitive(hour)),
@@ -443,6 +449,19 @@ mod tests {
 
     fn n(s: &str) -> String {
         normalize(s)
+    }
+
+    #[test]
+    fn godz_takes_a_bare_hour() {
+        assert_eq!(n("godz. 09:22"), "godz. dziewiąta dwadzieścia dwa");
+        assert_eq!(n("od godz. 18:00"), "od godz. osiemnasta");
+        assert_eq!(n("18:00"), "godzina osiemnasta");
+    }
+
+    #[test]
+    fn muf_and_kc2g_are_spelled() {
+        assert_eq!(n("MUF 10,6 megaherca."), "M U F dziesięć przecinek sześć megaherca.");
+        assert_eq!(n("GIRO przez KC2G."), "GIRO przez K C dwa G.");
     }
 
     #[test]

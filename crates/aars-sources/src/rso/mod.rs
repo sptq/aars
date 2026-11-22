@@ -124,6 +124,17 @@ fn categories(ctx: &SourceCtx) -> Vec<Category> {
     if chosen.is_empty() { parse(DEFAULT_CATEGORIES) } else { chosen }
 }
 
+/// Kategorie faktycznie pobierane: wybrane plus zawsze atak z powietrza,
+/// w kolejności `CATEGORIES`.
+fn fetched_categories(ctx: &SourceCtx) -> Vec<Category> {
+    let chosen = categories(ctx);
+    CATEGORIES
+        .iter()
+        .map(|(slug, _)| Category(slug))
+        .filter(|c| c.is_attack() || chosen.contains(c))
+        .collect()
+}
+
 fn categories_text(cats: &[Category]) -> String {
     cats.iter().map(|c| c.0).collect::<Vec<_>>().join(",")
 }
@@ -202,7 +213,7 @@ impl DataSource for Rso {
         format!(
             "{}|cat={}|kw={}",
             ctx.area_text,
-            categories_text(&categories(ctx)),
+            categories_text(&fetched_categories(ctx)),
             keywords_text(ctx)
         )
     }
@@ -210,10 +221,7 @@ impl DataSource for Rso {
     fn fetch<'a>(&'a self, ctx: &'a SourceCtx) -> FetchFuture<'a> {
         Box::pin(async move {
             // Atak z powietrza zawsze: odznaczenie go nie może zgubić alarmu.
-            let mut cats = categories(ctx);
-            if !cats.iter().any(|c| c.is_attack()) {
-                cats.push(Category(ATTACK));
-            }
+            let cats = fetched_categories(ctx);
             let mut batches = Vec::new();
             let mut skipped = 0;
             let mut failed = 0;
@@ -832,8 +840,17 @@ mod tests {
             let c = ctx("02", &settings);
             assert_eq!(src.scope(&c), format!("{}|cat=ogolne,atak-z-powietrza|kw=", c.area_text));
         }
+    }
+
+    #[test]
+    fn the_attack_toggle_does_not_change_the_scope() {
+        let src = Rso::new("http://127.0.0.1:1").unwrap();
+        let with = ctx("02", &[("categories", "ogolne,atak-z-powietrza")]);
+        let without = ctx("02", &[("categories", "ogolne")]);
+        assert_eq!(src.scope(&with), src.scope(&without));
+        assert_eq!(src.scope(&without), format!("{}|cat=ogolne,atak-z-powietrza|kw=", without.area_text));
         let c = ctx("02", &[("categories", "stany-wod,hydrologiczne")]);
-        assert!(src.scope(&c).contains("|cat=hydrologiczne|"));
+        assert!(src.scope(&c).contains("|cat=atak-z-powietrza,hydrologiczne|"));
     }
 
     mod http_tests {
