@@ -8,7 +8,7 @@
 {% block content %}
 <div class="card">
   <h2>Ostrzeżenia meteorologiczne IMGW</h2>
-  <p id="map-banner" class="error" hidden></p>
+  <p id="map-banner" class="error">Ładowanie mapy…</p>
   <div id="warnings-map" data-tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png" data-geojson="/assets/powiaty.geojson" data-src="/map/data" style="height:560px;margin-bottom:0.5rem"></div>
   <p id="map-note" class="error" hidden></p>
   <noscript><p class="error">Mapa wymaga JavaScriptu — bez niego nie pokazuje ostrzeżeń.</p></noscript>

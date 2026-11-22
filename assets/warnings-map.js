@@ -1,20 +1,27 @@
 // Mapa ostrzeżeń meteo IMGW na stronie /map (etap 11c).
 // Jedyna zależność to Leaflet (`window.L`, zwendorowany). Granice powiatów
 // pobieramy raz, dane ostrzeżeń z /map/data przy starcie i co 5 minut.
-// Kolorujemy tylko przy stanie "ok": przy każdym innym stanie albo błędzie
-// pobrania mapa nie może wyglądać jak „brak ostrzeżeń”, więc baner i żadnych
-// kolorów.
+// Kolorujemy tylko przy stanie "ok" i danych młodszych niż 30 minut: przy
+// każdym innym stanie, błędzie albo zawieszonym pobraniu mapa nie może
+// wyglądać jak „brak ostrzeżeń” ani pokazywać starych kolorów, więc baner
+// i żadnych kolorów. Baner „Ładowanie mapy…” stoi w HTML-u od początku —
+// bez JS albo Leafletu zostaje widoczny.
 (function () {
   'use strict';
 
   var REFRESH_MS = 300 * 1000;
+  var FETCH_TIMEOUT_MS = 20 * 1000;
+  var MAX_AGE_MS = 30 * 60 * 1000;
+  var TICK_MS = 30 * 1000;
   var COLORS = { 1: '#ffd400', 2: '#ff8c00', 3: '#d7191c' };
   var BANNERS = {
     disabled: 'Źródło ostrzeżeń meteo wyłączone — mapa nie pokazuje bieżących ostrzeżeń.',
     stale: 'Źródło ostrzeżeń meteo nieaktualne — mapa nie pokazuje bieżących ostrzeżeń.',
     never_no_area: 'Ustaw obszar źródła ostrzeżeń meteo — bez niego źródło nic nie pobiera, a mapa nie pokazuje ostrzeżeń.',
     never: 'Źródło ostrzeżeń meteo jeszcze nic nie pobrało od startu stacji — mapa nie pokazuje bieżących ostrzeżeń.',
-    error: 'Nie udało się pobrać danych mapy.'
+    old: 'Dane mapy są starsze niż 30 minut — mapa nie pokazuje bieżących ostrzeżeń.',
+    error: 'Nie udało się pobrać danych mapy.',
+    noleaflet: 'Nie udało się załadować biblioteki mapy — mapa nie pokazuje ostrzeżeń.'
   };
 
   function pad(n) {
@@ -32,11 +39,18 @@
 
   function start() {
     var el = document.getElementById('warnings-map');
-    if (!el || !window.L) {
+    var banner = document.getElementById('map-banner');
+    if (!el) {
+      return;
+    }
+    if (!window.L) {
+      if (banner) {
+        banner.textContent = BANNERS.noleaflet;
+        banner.hidden = false;
+      }
       return;
     }
     var L = window.L;
-    var banner = document.getElementById('map-banner');
     var fetched = document.getElementById('map-fetched');
     var note = document.getElementById('map-note');
 
@@ -62,6 +76,7 @@
     var byTeryt = {}; // teryt → lista ostrzeżeń (tylko przy "ok")
     var marker = null;
     var placed = false; // widok ustawiony raz, potem użytkownik przewija sam
+    var latest = 0; // numer ostatniego wysłanego pobrania /map/data
 
     function showBanner(text) {
       if (!banner) {
@@ -113,7 +128,7 @@
       var list = byTeryt[String(props.teryt || '')] || [];
       if (!list.length) {
         var none = document.createElement('div');
-        none.textContent = data && data.state === 'ok' ? 'Brak ostrzeżeń.' : 'Mapa nie pokazuje bieżących ostrzeżeń.';
+        none.textContent = data && data.state === 'ok' && !tooOld(data) ? 'Brak ostrzeżeń.' : 'Mapa nie pokazuje bieżących ostrzeżeń.';
         box.appendChild(none);
       }
       list.forEach(function (w) {
@@ -148,9 +163,19 @@
       placed = true;
     }
 
+    // Stan "ok", ale pobranie po stronie stacji starsze niż 30 minut (np.
+    // karta przeglądarki uśpiona albo odświeżanie zawisło).
+    function tooOld(d) {
+      if (!d || d.state !== 'ok') {
+        return false;
+      }
+      var at = Date.parse(d.fetched_at);
+      return isNaN(at) || Date.now() - at > MAX_AGE_MS;
+    }
+
     function paint() {
       byTeryt = {};
-      if (data && data.state === 'ok') {
+      if (data && data.state === 'ok' && !tooOld(data)) {
         (data.warnings || []).forEach(function (w) {
           var key = String(w.teryt);
           (byTeryt[key] = byTeryt[key] || []).push(w);
@@ -180,7 +205,7 @@
 
     function bannerFor(d) {
       if (d.state === 'ok') {
-        return '';
+        return tooOld(d) ? BANNERS.old : '';
       }
       if (d.state === 'never') {
         return d.area && d.area.length ? BANNERS.never : BANNERS.never_no_area;
@@ -198,8 +223,20 @@
       paint();
     }
 
+    // Każde pobranie ma numer; odpowiedź starsza niż ostatnio wysłane
+    // pobranie jest ignorowana. Zawieszone pobranie przerywamy po 20 s.
     function load() {
-      fetch(el.dataset.src, { credentials: 'same-origin', headers: { Accept: 'application/json' } })
+      latest += 1;
+      var seq = latest;
+      var controller = new AbortController();
+      var timer = window.setTimeout(function () {
+        controller.abort();
+      }, FETCH_TIMEOUT_MS);
+      fetch(el.dataset.src, {
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json' },
+        signal: controller.signal
+      })
         .then(function (res) {
           if (!res.ok) {
             throw new Error('HTTP ' + res.status);
@@ -207,6 +244,10 @@
           return res.json();
         })
         .then(function (d) {
+          window.clearTimeout(timer);
+          if (seq !== latest) {
+            return;
+          }
           if (!d || typeof d.state !== 'string') {
             throw new Error('zły kształt danych');
           }
@@ -218,7 +259,20 @@
           }
           paint();
         })
-        .catch(failed);
+        .catch(function () {
+          window.clearTimeout(timer);
+          if (seq === latest) {
+            failed();
+          }
+        });
+    }
+
+    // Sprawdzenie wieku danych bez pobierania: co 30 s i po powrocie do karty.
+    function checkAge() {
+      if (tooOld(data)) {
+        showBanner(bordersFailed ? BANNERS.error : BANNERS.old);
+        paint();
+      }
     }
 
     fetch(el.dataset.geojson, { credentials: 'same-origin' })
@@ -245,6 +299,13 @@
 
     load();
     window.setInterval(load, REFRESH_MS);
+    window.setInterval(checkAge, TICK_MS);
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible') {
+        checkAge();
+        load();
+      }
+    });
   }
 
   if (document.readyState === 'loading') {

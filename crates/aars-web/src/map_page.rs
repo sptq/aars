@@ -382,8 +382,27 @@ mod tests {
             "Źródłem pochodzenia danych jest IMGW-PIB; dane zostały przetworzone",
             "Granice: PRG, GUGiK",
             "href=\"/map\"",
+            // Bez JS albo Leafletu komunikat zostaje widoczny; JS go chowa.
+            "<p id=\"map-banner\" class=\"error\">Ładowanie mapy…</p>",
         ] {
             assert!(html.contains(needle), "brak {needle}");
+        }
+    }
+
+    /// Skrypt mapy: zawieszone pobranie przerwane po 20 s, starsza odpowiedź
+    /// nie nadpisuje nowszej, dane starsze niż 30 min nie barwią mapy.
+    #[test]
+    fn the_map_script_guards_against_hung_and_old_data() {
+        const JS: &str = include_str!("../../../assets/warnings-map.js");
+        for needle in [
+            "new AbortController()",
+            "FETCH_TIMEOUT_MS = 20 * 1000",
+            "seq !== latest",
+            "MAX_AGE_MS = 30 * 60 * 1000",
+            "'visibilitychange'",
+            "BANNERS.old",
+        ] {
+            assert!(JS.contains(needle), "brak {needle}");
         }
     }
 }
