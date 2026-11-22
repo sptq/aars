@@ -143,7 +143,11 @@ pub fn to_output(gauges: &[Gauge], ctx: &SourceCtx) -> SourceOutput {
         let Some((level, measured)) = fresh_reading(g, ctx.now) else {
             continue;
         };
-        fresh.insert(&g.id);
+        // Bez progów nie wiadomo, czy stan spadł; taka stacja nie jest
+        // „świeża” dla kompletności, więc nie da fałszywego odwołania.
+        if g.warning_cm.or(g.alarm_cm).is_some() {
+            fresh.insert(&g.id);
+        }
         let Some(e) = g.exceedance() else {
             continue;
         };
@@ -538,6 +542,21 @@ mod tests {
             assert!(o.items.iter().all(|i| i.key != "153180120"));
             assert!(o.items.iter().any(|i| i.key == "154180100"));
         }
+        // Progi zniknęły z odpowiedzi ("", null, "0"): to nie jest „poniżej
+        // progu”, więc odpowiedź niekompletna, bez fałszywego odwołania.
+        for junk in [
+            serde_json::json!(""),
+            serde_json::Value::Null,
+            serde_json::json!("0"),
+        ] {
+            let no_thresholds = edited("153180120", &|w| {
+                w["stan_ostrzegawczy"] = junk.clone();
+                w["stan_alarmowy"] = junk.clone();
+            });
+            let o = run(&no_thresholds);
+            assert!(!o.complete, "{junk}");
+            assert!(o.items.iter().all(|i| i.key != "153180120"));
+        }
         // Świeży pomiar poniżej progu: odwołanie możliwe, odpowiedź kompletna.
         let below = edited("153180120", &|w| w["stan_wody"] = "500".into());
         let o = run(&below);
@@ -548,6 +567,24 @@ mod tests {
             w["stan_wody_data_pomiaru"] = "2026-11-22 17:00:00".into()
         });
         assert!(run(&old).complete);
+    }
+
+    #[test]
+    fn an_alarm_only_gauge_cancels_below_the_alarm_level() {
+        let g = edited("153180120", &|w| {
+            w["stan_ostrzegawczy"] = serde_json::Value::Null;
+            w["stan_wody"] = "575".into();
+        });
+        let o = to_output(&g, &ctx(&[("stations", "153180120")]));
+        assert_eq!(
+            item(&o, "153180120").cancel_text,
+            "Wodowskaz Hel: stan wody spadł poniżej stanu alarmowego."
+        );
+        let o = to_output(&gauges(), &ctx(&[("stations", "154180100")]));
+        assert_eq!(
+            item(&o, "154180100").cancel_text,
+            "Wodowskaz Władysławowo: stan wody spadł poniżej stanu ostrzegawczego."
+        );
     }
 
     #[test]

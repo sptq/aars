@@ -30,10 +30,18 @@ pub fn change(announcement: &str) -> String {
     format!("Zmiana stanu wody. {announcement}")
 }
 
+/// Odwołanie: poniżej najniższego progu, jaki stacja ma (sam alarmowy →
+/// „alarmowego”).
 pub fn cancellation(g: &Gauge) -> String {
+    let lowest = if g.warning_cm.is_none() && g.alarm_cm.is_some() {
+        Exceedance::Alarm
+    } else {
+        Exceedance::Warning
+    };
     format!(
-        "Wodowskaz {}: stan wody spadł poniżej stanu ostrzegawczego.",
-        g.name
+        "Wodowskaz {}: stan wody spadł poniżej stanu {}.",
+        g.name,
+        lowest.adjective_genitive()
     )
 }
 
