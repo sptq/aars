@@ -163,6 +163,16 @@ const ABBREVIATIONS: &[(&str, &str)] = &[
     ("IMGW", "I M G W"),
     ("PAA", "P A A"),
     ("KSE", "K S E"),
+    ("RCB", "R C B"),
+    ("RSO", "R S O"),
+    ("NOAA", "N O A A"),
+    ("SWPC", "S W P C"),
+    ("EMSC", "E M S C"),
+    ("GIOŚ", "G I O Ś"),
+    ("KF", "K F"),
+    ("PM10", "P M dziesięć"),
+    ("PM2,5", "P M dwa i pół"),
+    ("PM2.5", "P M dwa i pół"),
 ];
 
 /// Interpunkcja, która może poprzedzać słowo.
@@ -600,6 +610,23 @@ mod tests {
         assert_eq!(n("kierunek N"), "kierunek północny");
         assert_eq!(n("kierunek SW"), "kierunek południowo-zachodni");
         assert_eq!(n("IMGW ostrzega"), "I M G W ostrzega");
+    }
+
+    #[test]
+    fn source_acronyms_are_spelled_letter_by_letter() {
+        assert_eq!(n("Alert RCB."), "Alert R C B.");
+        assert_eq!(n("Komunikat RSO:"), "Komunikat R S O:");
+        assert_eq!(n("Dane: NOAA SWPC."), "Dane: N O A A S W P C.");
+        assert_eq!(n("Dane: EMSC."), "Dane: E M S C.");
+        assert_eq!(n("Źródło: GIOŚ."), "Źródło: G I O Ś.");
+        assert_eq!(n("pasma KF"), "pasma K F");
+    }
+
+    #[test]
+    fn particulate_names_are_spoken() {
+        assert_eq!(n("pył zawieszony PM10."), "pył zawieszony P M dziesięć.");
+        assert_eq!(n("PM2,5"), "P M dwa i pół");
+        assert_eq!(n("(PM2.5)"), "(P M dwa i pół)");
     }
 
     #[test]
