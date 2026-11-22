@@ -2,13 +2,20 @@
 
 const ATTRIBUTION: &str = "Dane: NOAA SWPC.";
 
-fn adjective(level: u8) -> &'static str {
-    match level {
-        1 => "Słaba",
-        2 => "Umiarkowana",
-        3 => "Silna",
-        4 => "Bardzo silna",
-        _ => "Ekstremalna",
+/// Przymiotnik zgodny z rzeczownikiem: „burza” (G, S) liczba pojedyncza,
+/// „zaniki” (R) mnoga.
+fn adjective(scale: char, level: u8) -> &'static str {
+    match (scale == 'R', level) {
+        (false, 1) => "Słaba",
+        (false, 2) => "Umiarkowana",
+        (false, 3) => "Silna",
+        (false, 4) => "Bardzo silna",
+        (false, _) => "Ekstremalna",
+        (true, 1) => "Słabe",
+        (true, 2) => "Umiarkowane",
+        (true, 3) => "Silne",
+        (true, 4) => "Bardzo silne",
+        (true, _) => "Ekstremalne",
     }
 }
 
@@ -35,13 +42,17 @@ fn effects(scale: char, level: u8) -> &'static str {
 
 /// Opis słowny do panelu, np. „silna burza geomagnetyczna”.
 pub fn label(scale: char, level: u8) -> String {
-    format!("{} {}", adjective(level).to_lowercase(), phenomenon(scale))
+    format!(
+        "{} {}",
+        adjective(scale, level).to_lowercase(),
+        phenomenon(scale)
+    )
 }
 
 pub fn announcement(scale: char, level: u8) -> String {
     format!(
         "Uwaga, pogoda kosmiczna. {} {}, poziom {scale}{level} w skali NOAA. {} {ATTRIBUTION}",
-        adjective(level),
+        adjective(scale, level),
         phenomenon(scale),
         effects(scale, level)
     )

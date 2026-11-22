@@ -135,7 +135,8 @@ impl DataSource for Swpc {
             let mut episodes = self
                 .episodes
                 .lock()
-                .map_err(|_| SourceError::Parse("zatruty stan epizodów".to_owned()))?;
+                // Zatruty Mutex: stan epizodów jest prosty, więc go odzyskujemy.
+                .unwrap_or_else(|e| e.into_inner());
             if ctx.now - scales.stamp > MAX_AGE {
                 return Err(SourceError::Parse("nieaktualne dane SWPC".to_owned()));
             }
@@ -258,6 +259,20 @@ mod tests {
     }
 
     #[test]
+    fn the_defaults_match_the_descriptor() {
+        let d = |k: &str| {
+            DESCRIPTOR
+                .settings
+                .iter()
+                .find(|s| s.key == k)
+                .map(|s| s.default)
+        };
+        assert_eq!(d("g_min"), Some(DEFAULTS.0.to_string().as_str()));
+        assert_eq!(d("s_min"), Some(DEFAULTS.1.to_string().as_str()));
+        assert_eq!(d("r_min"), Some(DEFAULTS.2.to_string().as_str()));
+    }
+
+    #[test]
     fn the_quiet_fixture_has_no_items() {
         let out = run(QUIET, &ctx(), &mut Episodes::new());
         assert!(out.items.is_empty());
@@ -304,7 +319,7 @@ mod tests {
         let keys: Vec<_> = out.items.iter().map(|i| i.key.as_str()).collect();
         assert_eq!(keys, ["S", "R"]);
         assert!(out.items[0].text.contains("burza radiacyjna, poziom S2 w skali NOAA. Możliwe zaniki łączności KF w rejonach polarnych."));
-        assert!(out.items[1].text.contains("zaniki łączności radiowej, poziom R3 w skali NOAA. Zaniki łączności na pasmach KF po dziennej stronie Ziemi."));
+        assert!(out.items[1].text.contains("Silne zaniki łączności radiowej, poziom R3 w skali NOAA. Zaniki łączności na pasmach KF po dziennej stronie Ziemi."));
         assert_eq!(
             out.items[1].cancel_text,
             "Zaniki łączności radiowej ustały. Dane: NOAA SWPC."
