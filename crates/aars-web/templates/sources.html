@@ -18,7 +18,7 @@
       <tr><th>Interwał</th><td>{{ s.interval_s }} s</td></tr>
     </tbody>
   </table>
-  {% if chrome.is_admin %}<p><small style="color:var(--muted)">Obszar i interwał ustawia administrator: <a href="/modules#{{ s.id }}">Zmień w Moduły</a></small></p>{% endif %}
+  {% if chrome.is_admin %}<p><small style="color:var(--muted)">{% if s.shows_area %}Obszar i interwał ustawia administrator{% else %}Ustawienia źródła zmienia administrator na stronie Moduły{% endif %}: <a href="/modules#{{ s.id }}">Zmień w Moduły</a></small></p>{% endif %}
   <div style="margin-top:0.6rem">
     <form method="post" action="/sources/{{ s.id }}/enabled" style="display:inline">
       <input type="hidden" name="csrf" value="{{ chrome.csrf }}">

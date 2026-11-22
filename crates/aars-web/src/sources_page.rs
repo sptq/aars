@@ -484,6 +484,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_source_without_an_area_points_the_admin_to_its_module_settings() {
+        use aars_core::module::{ModuleDescriptor, ModuleRegistry, Needs, sample_source};
+        let mut st = state().await;
+        st.modules = Arc::new(ModuleRegistry::new(vec![
+            sample_source("imgw-meteo"),
+            ModuleDescriptor { needs: Needs::Nothing, ..sample_source("swpc") },
+        ]));
+        let (app, cookie, _, state) = app_as(Role::Admin, st).await;
+        aars_core::module::ModuleRepo::new(state.pool.clone()).register(&state.modules).await.unwrap();
+        let repo = SourceStateRepo::new(state.pool.clone());
+        repo.save_config("imgw-meteo", "10", 600).await.unwrap();
+        repo.save_config("swpc", "", 300).await.unwrap();
+        let (_, html) = get(&app, &cookie, "/sources").await;
+        let swpc = html.split("Pogoda kosmiczna NOAA").nth(1).unwrap();
+        let swpc = swpc.split("Aktywne ostrzeżenia").next().unwrap();
+        assert!(swpc.contains("Ustawienia źródła zmienia administrator"), "{swpc}");
+        assert!(swpc.contains("href=\"/modules#swpc\""), "{swpc}");
+        assert!(!swpc.contains("Obszar i interwał"), "{swpc}");
+        let imgw = html.split("Ostrzeżenia meteorologiczne IMGW").nth(1).unwrap();
+        let imgw = imgw.split("Aktywne ostrzeżenia").next().unwrap();
+        assert!(imgw.contains("Obszar i interwał ustawia administrator"), "{imgw}");
+    }
+
+    #[tokio::test]
     async fn a_viewer_cannot_open_sources() {
         let (app, cookie, _csrf, _state) = app_as(Role::Viewer, state().await).await;
         let (status, _) = get(&app, &cookie, "/sources").await;

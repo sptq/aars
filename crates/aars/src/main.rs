@@ -562,12 +562,17 @@ async fn source_preview(config: &Config, id: &str) -> Result<()> {
     } else {
         None
     };
+    // Te same ustawienia modułu, które dostaje runner (próg, promień, kategorie…).
+    let settings = aars_core::settings::SettingsRepo::new(pool.clone())
+        .kv_prefix(&format!("source:{}:", source.id()))
+        .await
+        .context("odczyt ustawień źródła")?;
     let ctx = aars_sources::SourceCtx {
         now: chrono::Utc::now(),
         area_text: aars_core::area::area_text(&area),
         area,
         position,
-        settings: std::collections::BTreeMap::new(),
+        settings,
         tracked_keys: Default::default(),
     };
     let output = source

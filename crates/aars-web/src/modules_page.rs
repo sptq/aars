@@ -100,6 +100,12 @@ fn field_view(spec: &aars_core::module::SettingSpec, value: String) -> FieldView
         ),
         _ => (String::new(), String::new()),
     };
+    // Kanonicznie „3.0”; w formularzu po polsku „3,0” (walidacja przyjmuje oba).
+    let value = if matches!(spec.kind, SettingKind::Decimal { .. }) {
+        value.replace('.', ",")
+    } else {
+        value
+    };
     let checks = if matches!(spec.kind, SettingKind::List(_)) {
         let chosen: Vec<&str> = value.split(',').map(str::trim).collect();
         options.iter().map(|(v, l)| (*v, *l, chosen.contains(v))).collect()
@@ -845,6 +851,9 @@ mod tests {
         assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
         assert_eq!(setting(&state, "module:x-lista:cats").await.as_deref(), Some("a,c"));
         assert_eq!(setting(&state, "module:x-lista:mag").await.as_deref(), Some("4.5"));
+        // Formularz pokazuje przecinek dziesiętny, tak jak opis zakresu.
+        let (_, html) = get(&app, &cookie, "/modules").await;
+        assert!(html.contains("inputmode=\"decimal\" value=\"4,5\""), "{html}");
         let (status, _, body) =
             post(&app, &cookie, &csrf, "/modules/x-lista/settings", "mag=3").await;
         assert_eq!(status, StatusCode::SEE_OTHER, "{body}");

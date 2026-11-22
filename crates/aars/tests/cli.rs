@@ -476,3 +476,56 @@ fn update_status_and_guard_work_without_an_installation() {
     assert!(!out.status.success(), "powrót bez poprzedniej wersji to błąd");
     assert!(String::from_utf8_lossy(&out.stderr).contains("brak poprzedniej wersji"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn source_preview_uses_the_module_settings_from_the_database() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let dir = std::env::temp_dir().join(format!("aars-src-set-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("src.db");
+    let _ = std::fs::remove_file(&db);
+
+    // G2 jest poniżej domyślnego progu G3; ogłoszenie pojawi się tylko,
+    // gdy podgląd weźmie próg G2 z bazy.
+    let now = chrono::Utc::now();
+    let body = serde_json::json!({"0": {
+        "DateStamp": now.format("%Y-%m-%d").to_string(),
+        "TimeStamp": now.format("%H:%M:%S").to_string(),
+        "R": {"Scale": "0"}, "S": {"Scale": "0"}, "G": {"Scale": "2"}
+    }});
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/s.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    let url = format!("{}/s.json", server.uri());
+
+    let db2 = db.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let migrate = aars().env("AARS_STORAGE__DB_PATH", &db2).arg("migrate").output().unwrap();
+        assert!(migrate.status.success());
+        let set = std::process::Command::new("sqlite3")
+            .arg(&db2)
+            .arg("INSERT OR REPLACE INTO settings (key, value) VALUES ('source:swpc:g_min', '2');")
+            .status()
+            .unwrap();
+        assert!(set.success());
+        aars()
+            .env("AARS_STORAGE__DB_PATH", &db2)
+            .env("AARS_SOURCES__SWPC_URL", &url)
+            .args(["source", "preview", "swpc"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("G2"), "stdout: {stdout}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
