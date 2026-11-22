@@ -426,7 +426,7 @@ pub async fn preview_bulletin(
             &state,
             &current,
             StatusCode::SERVICE_UNAVAILABLE,
-            "podgląd biuletynu niedostępny".to_owned(),
+            "biuletyn nie wystartował — zobacz dziennik".to_owned(),
         )
         .await);
     };
@@ -1015,7 +1015,7 @@ mod tests {
         let (app, cookie, csrf, _) = app_as(Role::Operator, state().await).await;
         let (status, _, html) = post(&app, &cookie, &csrf, "/modules/bulletin/preview", "").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(html.contains("podgląd biuletynu niedostępny"), "{html}");
+        assert!(html.contains("biuletyn nie wystartował — zobacz dziennik"), "{html}");
     }
 
     #[tokio::test]

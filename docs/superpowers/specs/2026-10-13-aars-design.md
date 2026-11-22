@@ -452,7 +452,7 @@ kończy się czymś, co da się uruchomić i sprawdzić.
     `ostrzezenia` i źródło progowe `pogoda`
     ([projekt](2026-11-22-etap-11b-biuletyn-design.md)); `imgw-hydro`, `paa`
     i mapa w panelu przeszły do **11c**. Dalej pierwotny opis zakresu
-    11b+11c. **11b** (`imgw-hydro`,
+    11b+11c. **Pierwotnie 11b (dziś 11b + 11c)** (`imgw-hydro`,
     `paa`, kompozytor biuletynu, biuletyn propagacyjny, mapa i moduł pogody
     z otwartego API
     po współrzędnych stacji: Open-Meteo (bez klucza, CC BY 4.0 — „Źródło:

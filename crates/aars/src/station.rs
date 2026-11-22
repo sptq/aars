@@ -681,7 +681,11 @@ async fn run_station(
     let bulletin = match aars_sources::bulletin::build(&config, pool.clone()) {
         Ok(built) => Some(built),
         Err(err) => {
-            tracing::error!(%err, "biuletyn nie wystartuje");
+            tracing::error!(
+                source = aars_core::module::BULLETIN.id,
+                %err,
+                "biuletyn nie wystartuje: {err}"
+            );
             source_start_failed(
                 &SourceStateRepo::new(pool.clone()),
                 aars_sources::pogoda::ID,
