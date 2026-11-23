@@ -251,6 +251,13 @@ const RESTYLED: &[&str] = &[
     "sources.html",
     "modules.html",
     "map.html",
+    "settings.html",
+    "hardware.html",
+    "restart_card.html",
+    "update.html",
+    "users.html",
+    "logs.html",
+    "password.html",
 ];
 
 #[test]

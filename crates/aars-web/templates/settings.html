@@ -8,41 +8,41 @@
 {% block content %}
 <div class="card">
   <h2>Ustawienia stacji</h2>
-  <p style="color:var(--muted)">Znak, tryb i odstęp identyfikacji, limit czasu nadawania oraz polityka spóźnień wchodzą w życie po restarcie stacji. Okno ciszy działa od razu (sprawdzane co 30 s).</p>
+  <p class="muted">Znak, tryb i odstęp identyfikacji, limit czasu nadawania oraz polityka spóźnień wchodzą w życie po restarcie stacji. Okno ciszy działa od razu (sprawdzane co 30 s).</p>
   {% if let Some(message) = error %}<p class="error">{{ message }}</p>{% endif %}
   {% if saved %}<p class="badge on">Zapisano.</p>{% endif %}
-  {% if no_callsign %}<p class="error">Uwaga: bez znaku wywoławczego stacja nadaje bez identyfikacji.</p>{% endif %}
+  {% if no_callsign %}<p class="alert">Uwaga: bez znaku wywoławczego stacja nadaje bez identyfikacji.</p>{% endif %}
   <form method="post" action="/settings">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-    <div style="margin-bottom:0.8rem">
+    <div class="field">
       <label for="callsign">Znak wywoławczy (3–10 znaków: A–Z, 0–9 lub /)</label>
       <input id="callsign" name="callsign" value="{{ callsign }}" maxlength="10">
     </div>
-    <div style="margin-bottom:0.8rem">
+    <div class="field">
       <label for="id_mode">Tryb identyfikacji</label>
       <select id="id_mode" name="id_mode">
         <option value="voice" {% if id_mode == "voice" %}selected{% endif %}>Głosem (TTS)</option>
         <option value="cw" {% if id_mode == "cw" %}selected{% endif %}>Telegrafią (CW)</option>
       </select>
     </div>
-    <div style="margin-bottom:0.8rem">
+    <div class="field">
       <label for="id_interval_s">Odstęp identyfikacji (s, 60–3600)</label>
       <input id="id_interval_s" name="id_interval_s" type="number" min="60" max="3600" value="{{ id_interval_s }}" required>
     </div>
-    <div style="margin-bottom:0.8rem">
+    <div class="field">
       <label for="tx_max_duration_s">Limit czasu nadawania (s, 10–600)</label>
       <input id="tx_max_duration_s" name="tx_max_duration_s" type="number" min="10" max="600" value="{{ tx_max_duration_s }}" required>
     </div>
-    <div style="margin-bottom:0.8rem">
+    <div class="field">
       <label for="misfire_grace_s">Tolerancja spóźnień harmonogramu (s, 0–86400)</label>
       <input id="misfire_grace_s" name="misfire_grace_s" type="number" min="0" max="86400" value="{{ misfire_grace_s }}" required>
     </div>
-    <div style="margin-bottom:0.8rem">
+    <div class="field">
       <label for="quiet_hours">Okno ciszy, czas lokalny (HH:MM-HH:MM; puste = brak)</label>
       <input id="quiet_hours" name="quiet_hours" value="{{ quiet_hours }}" placeholder="22:00-06:00">
-      {% if !quiet_hint.is_empty() %}<small style="color:var(--muted)">{{ quiet_hint }}</small>{% endif %}
+      {% if !quiet_hint.is_empty() %}<small class="help">{{ quiet_hint }}</small>{% endif %}
     </div>
-    <div style="margin-bottom:1rem">
+    <div class="field">
       <label for="quiet_min_priority">W ciszy nadają tylko komunikaty o priorytecie co najmniej</label>
       <select id="quiet_min_priority" name="quiet_min_priority">
         <option value="emergency" {% if quiet_min_priority == "emergency" %}selected{% endif %}>Alarmowy</option>
@@ -56,12 +56,12 @@
 </div>
 <div class="card" id="polozenie">
   <h2>Położenie stacji</h2>
-  {% if let Some(text) = position.text %}<p><span class="badge on">{{ text }}</span></p>{% else %}<p style="color:var(--muted)">Pozycja nie jest ustawiona.</p>{% endif %}
+  {% if let Some(text) = position.text %}<p><span class="badge on">{{ text }}</span></p>{% else %}<p class="muted">Pozycja nie jest ustawiona.</p>{% endif %}
   {% if let Some(message) = position.error %}<p class="error">{{ message }}</p>{% endif %}
-  <p style="color:var(--muted)">Szerokość i długość w stopniach (np. 51.75900) albo lokator QTH (4, 6 lub 8 znaków, np. JO91RS). Używają jej moduły pogodowe.</p>
+  <p class="muted">Szerokość i długość w stopniach (np. 51.75900) albo lokator QTH (4, 6 lub 8 znaków, np. JO91RS). Używają jej moduły pogodowe.</p>
   <form method="post" action="/settings/position">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-    <div style="display:flex;gap:0.8rem;flex-wrap:wrap;margin-bottom:0.8rem">
+    <div class="row">
       <div>
         <label for="lat">Szerokość (°N, −90…90)</label>
         <input id="lat" name="lat" value="{{ position.lat }}" inputmode="decimal" placeholder="51.75900">
@@ -75,10 +75,10 @@
         <input id="locator" name="locator" value="{{ position.locator }}" maxlength="8" placeholder="JO91RS">
       </div>
     </div>
-    <div id="station-map" data-lat="{{ position.map_lat }}" data-lon="{{ position.map_lon }}" data-tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png" style="height:320px;margin-bottom:0.5rem"></div>
+    <div id="station-map" class="station-map" data-lat="{{ position.map_lat }}" data-lon="{{ position.map_lon }}" data-tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png"></div>
     <p id="map-note" hidden class="error"></p>
-    <noscript><p style="color:var(--muted)">Mapa wymaga JavaScriptu — formularz działa bez niej.</p></noscript>
-    <p style="color:var(--muted)">Kliknięcie w mapę albo przeciągnięcie znacznika wpisuje współrzędne; lokator wyliczy stacja przy zapisie. Wszystkie pola puste usuwają pozycję.</p>
+    <noscript><p class="muted">Mapa wymaga JavaScriptu — formularz działa bez niej.</p></noscript>
+    <p class="muted">Kliknięcie w mapę albo przeciągnięcie znacznika wpisuje współrzędne; lokator wyliczy stacja przy zapisie. Wszystkie pola puste usuwają pozycję.</p>
     <button type="submit">Zapisz położenie</button>
   </form>
 </div>

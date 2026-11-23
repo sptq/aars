@@ -379,7 +379,7 @@ mod tests {
         assert!(!body.contains("<script>alert"), "{body}");
         // Askama escapuje encjami liczbowymi (`&#60;` zamiast `&lt;`).
         assert!(body.contains("&#60;script&#62;alert(1)"), "{body}");
-        assert!(body.contains("white-space:pre-wrap"), "{body}");
+        assert!(body.contains("class=\"release-notes\""), "{body}");
     }
 
     #[tokio::test]
