@@ -57,6 +57,13 @@
       </ul>
     </nav>
     <button type="button" class="ghost theme-toggle" data-theme-toggle>Motyw: systemowy</button>
+    <div class="sidebar-user">
+      <span>{{ chrome.username }} · {{ chrome.role }}</span>
+      <form method="post" action="/logout">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <button class="ghost" type="submit">Wyloguj</button>
+      </form>
+    </div>
   </aside>
 {%- endif %}
   <main class="content {% block main_class %}{% endblock %}">{% block content %}{% endblock %}</main>

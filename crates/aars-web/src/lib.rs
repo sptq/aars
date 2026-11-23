@@ -1909,4 +1909,40 @@ pub(crate) mod tests {
         assert!(css.contains("@media (max-width: 899px)"), "{css}");
         assert!(css.contains(".menu-toggle:checked"), "{css}");
     }
+
+    /// Blok reguły `selector { … }` z app.css (do pierwszego `}`).
+    fn css_rule(css: &str, selector: &str) -> String {
+        let start = css.find(&format!("{selector} {{")).unwrap_or_else(|| panic!("brak {selector}"));
+        let end = css[start..].find('}').map_or(css.len(), |e| start + e);
+        css[start..end].to_owned()
+    }
+
+    #[tokio::test]
+    async fn the_status_bar_stays_on_screen_and_fits_a_phone() {
+        let css = String::from_utf8(
+            crate::assets::Assets::get("app.css").unwrap().data.into_owned(),
+        )
+        .unwrap();
+        let bar = css_rule(&css, ".statusbar");
+        assert!(bar.contains("position: sticky;"), "{bar}");
+        assert!(bar.contains("top: 0;"), "{bar}");
+        assert!(bar.contains("z-index:"), "{bar}");
+        assert!(css.contains("--statusbar-h:"), "{css}");
+        let sidebar = css_rule(&css, ".sidebar");
+        assert!(sidebar.contains("top: var(--statusbar-h);"), "{sidebar}");
+        assert!(sidebar.contains("max-height: calc(100vh - var(--statusbar-h));"), "{sidebar}");
+        assert!(!sidebar.contains("min-height: 100vh"), "{sidebar}");
+        // Łamanie wiersza na telefonie dotyczy tylko paska stanu, nie ramy hasła tymczasowego.
+        assert!(css.contains("#statusbar::after"), "{css}");
+        assert!(!css.contains(".statusbar::after"), "{css}");
+
+        // Na telefonie użytkownik i Wyloguj są w menu (bez JS przez checkbox).
+        let (app, cookie, _csrf, _state) = logged_in(Role::Operator).await;
+        let (_, html) = get_html(&app, &cookie, "/").await;
+        let menu = html.find("class=\"sidebar\"").expect("menu boczne");
+        let user = html[menu..].find("class=\"sidebar-user\"").expect("użytkownik w menu");
+        let tail = &html[menu + user..];
+        assert!(tail.contains("u · Operator"), "{html}");
+        assert!(tail.contains("action=\"/logout\""), "{html}");
+    }
 }
