@@ -116,3 +116,18 @@ mod tests {
         assert!(checked > 5, "nie znaleziono szablonów w {}", dir.display());
     }
 }
+
+#[cfg(test)]
+mod demo_tests {
+    #[test]
+    fn the_demo_does_not_touch_hardware() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let source = std::fs::read_to_string(format!("{root}/examples/panel_demo.rs")).unwrap();
+        for banned in ["with_station", "with_probe", "with_update", "with_preview", "serial", "gpio", "cpal"] {
+            assert!(!source.contains(banned), "przykład używa {banned}");
+        }
+        assert!(source.contains("127.0.0.1"));
+        let bin = std::fs::read_to_string(format!("{root}/../aars/Cargo.toml")).unwrap();
+        assert!(!bin.contains("panel_demo"));
+    }
+}
