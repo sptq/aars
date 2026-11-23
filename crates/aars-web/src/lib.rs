@@ -639,6 +639,9 @@ async fn host_check(
 mod role_matrix;
 
 #[cfg(test)]
+mod ui_checks;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use aars_core::priority::Priority;

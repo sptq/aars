@@ -94,6 +94,20 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn the_theme_script_and_the_icon_sprite_are_embedded() {
+        let (status, mime) = content_type("/assets/theme.js").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(mime.contains("javascript"), "{mime}");
+        let (status, mime) = content_type("/assets/icons.svg").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(mime, "image/svg+xml");
+        let script = String::from_utf8(super::Assets::get("theme.js").unwrap().data.into_owned()).unwrap();
+        for needle in ["aars-theme", "try", "data-theme-toggle"] {
+            assert!(script.contains(needle), "theme.js bez {needle}");
+        }
+    }
+
     /// Spec D5: panel działa bez internetu, więc szablony nie ładują skryptów
     /// ani stylów z innych serwerów (podkład mapy to obrazki, nie kod).
     #[test]
