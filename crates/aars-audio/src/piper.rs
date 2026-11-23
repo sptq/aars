@@ -40,6 +40,10 @@ impl PiperSynth {
 }
 
 impl Synthesizer for PiperSynth {
+    fn identity(&self) -> String {
+        format!("piper|{}|{}", self.model, self.target_sample_rate)
+    }
+
     fn synthesize(&self, text: &str, voice: &VoiceParams) -> Result<Pcm, SynthError> {
         let spoken = normalize(text);
         if spoken.is_empty() {
@@ -114,6 +118,12 @@ mod tests {
         assert!(pcm.duration().as_millis() > 500, "zbyt krótkie: {:?}", pcm.duration());
         let peak = pcm.samples.iter().map(|s| s.unsigned_abs()).max().unwrap();
         assert!(peak > 1000, "audio praktycznie ciche, szczyt {peak}");
+    }
+
+    #[test]
+    fn the_identity_names_the_model_and_the_rate() {
+        let synth = PiperSynth::new("piper", "/v/gosia.onnx", 48_000);
+        assert_eq!(synth.identity(), "piper|/v/gosia.onnx|48000");
     }
 
     #[test]

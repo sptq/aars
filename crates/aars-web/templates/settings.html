@@ -1,5 +1,10 @@
 {% extends "base.html" %}
 {% block title %}AARS — ustawienia{% endblock %}
+{% block head %}
+  <link rel="stylesheet" href="/assets/vendor/leaflet/leaflet.css">
+  <script src="/assets/vendor/leaflet/leaflet.js" defer></script>
+  <script src="/assets/station-map.js" defer></script>
+{% endblock %}
 {% block content %}
 <div class="card">
   <h2>Ustawienia stacji</h2>
@@ -49,15 +54,37 @@
     <button type="submit">Zapisz</button>
   </form>
 </div>
-<div class="card">
-  <h2>Sprzęt (tylko do odczytu)</h2>
-  <p style="color:var(--muted)">Zmiana sprzętu to edycja pliku aars.toml i restart stacji, nie panel.</p>
-  <table>
-    <tbody>
-      {% for (name, value) in hardware %}
-      <tr><th>{{ name }}</th><td>{{ value }}</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+<div class="card" id="polozenie">
+  <h2>Położenie stacji</h2>
+  {% if let Some(text) = position.text %}<p><span class="badge on">{{ text }}</span></p>{% else %}<p style="color:var(--muted)">Pozycja nie jest ustawiona.</p>{% endif %}
+  {% if let Some(message) = position.error %}<p class="error">{{ message }}</p>{% endif %}
+  <p style="color:var(--muted)">Szerokość i długość w stopniach (np. 51.75900) albo lokator QTH (4, 6 lub 8 znaków, np. JO91RS). Używają jej moduły pogodowe.</p>
+  <form method="post" action="/settings/position">
+    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+    <div style="display:flex;gap:0.8rem;flex-wrap:wrap;margin-bottom:0.8rem">
+      <div>
+        <label for="lat">Szerokość (°N, −90…90)</label>
+        <input id="lat" name="lat" value="{{ position.lat }}" inputmode="decimal" placeholder="51.75900">
+      </div>
+      <div>
+        <label for="lon">Długość (°E, −180…180)</label>
+        <input id="lon" name="lon" value="{{ position.lon }}" inputmode="decimal" placeholder="19.45600">
+      </div>
+      <div>
+        <label for="locator">Lokator QTH</label>
+        <input id="locator" name="locator" value="{{ position.locator }}" maxlength="8" placeholder="JO91RS">
+      </div>
+    </div>
+    <div id="station-map" data-lat="{{ position.map_lat }}" data-lon="{{ position.map_lon }}" data-tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png" style="height:320px;margin-bottom:0.5rem"></div>
+    <p id="map-note" hidden class="error"></p>
+    <noscript><p style="color:var(--muted)">Mapa wymaga JavaScriptu — formularz działa bez niej.</p></noscript>
+    <p style="color:var(--muted)">Kliknięcie w mapę albo przeciągnięcie znacznika wpisuje współrzędne; lokator wyliczy stacja przy zapisie. Wszystkie pola puste usuwają pozycję.</p>
+    <button type="submit">Zapisz położenie</button>
+  </form>
 </div>
+<div class="card">
+  <h2>Sprzęt</h2>
+  <p>Urządzenie audio, PTT, głos i adres panelu ustawia się na stronie <a href="/settings/hardware">Sprzęt</a>. Zmiany wchodzą po restarcie stacji.</p>
+</div>
+{% include "restart_card.html" %}
 {% endblock %}

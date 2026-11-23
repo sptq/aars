@@ -100,6 +100,12 @@ impl WatchdogMarker {
         self.shared.poisoned.load(Ordering::SeqCst)
     }
 
+    /// Odtwarza lepką flagę po restarcie: nowy strażnik zaczyna czysty, a
+    /// blokada z bazy musi dalej odcinać także odtwarzanie lokalne.
+    pub fn mark_poisoned(&self) {
+        self.shared.poisoned.store(true, Ordering::SeqCst);
+    }
+
     /// Zdejmuje lepką flagę. Wywoływane wyłącznie z panelu, przez człowieka.
     pub fn clear_poison(&self) {
         self.shared.poisoned.store(false, Ordering::SeqCst);

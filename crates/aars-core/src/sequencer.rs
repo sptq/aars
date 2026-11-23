@@ -1,7 +1,8 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::interlock::{Interlocks, RefusalReason};
 use crate::priority::Priority;
@@ -43,16 +44,27 @@ pub enum SeqEvent {
     Started { id: i64 },
     Finished { id: i64, outcome: TxOutcome, played: Duration },
     Refused { id: i64, reason: RefusalReason },
+    /// Pominięte, bo sekwencer się zamyka: PTT nie drgnęło.
+    Skipped { id: i64 },
 }
 
 pub enum SeqCmd {
     Transmit(TransmitRequest),
+    /// Odtworzenie na wyjściu audio bez podnoszenia PTT (test audio, R11).
+    /// Odpowiedź: ile zagrano albo błąd.
+    PlayLocal { pcm: Pcm, reply: oneshot::Sender<Result<Duration, String>> },
     Shutdown,
 }
+
+/// Najdłuższe odtwarzanie lokalne (R11): test audio nie może grać bez końca.
+pub const LOCAL_PLAY_LIMIT: Duration = Duration::from_secs(15);
 
 /// Stan trwającego nadania, widoczny dla `SequencerHandle`, żeby umiał
 /// zdecydować o przerwaniu.
 type Current = Arc<std::sync::Mutex<Option<(Priority, CancelToken)>>>;
+
+/// Token trwającego odtwarzania lokalnego (`PlayLocal`).
+type Local = Arc<std::sync::Mutex<Option<CancelToken>>>;
 
 pub struct Sequencer;
 
@@ -60,7 +72,24 @@ pub struct SequencerHandle {
     cmd: mpsc::UnboundedSender<SeqCmd>,
     events: mpsc::UnboundedReceiver<SeqEvent>,
     current: Current,
+    local: Local,
+    /// Ustawiane przy zamykaniu: komendy czekające za `Shutdown` nie mogą
+    /// już podnieść PTT.
+    closing: Arc<AtomicBool>,
+    /// Tylko do awaryjnego `force_unkey` przez `PttReleaser`.
+    ptt: Arc<dyn PttBackend>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Awaryjne opuszczenie PTT sekwencera z zewnątrz, gdy jego wątek wisi
+/// (Ctrl-C po nieudanym joinie). Umie tylko `force_unkey`, nigdy `key`.
+#[derive(Clone)]
+pub struct PttReleaser(Arc<dyn PttBackend>);
+
+impl PttReleaser {
+    pub fn force_unkey(&self) {
+        self.0.force_unkey();
+    }
 }
 
 impl Sequencer {
@@ -74,16 +103,50 @@ impl Sequencer {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SeqCmd>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<SeqEvent>();
         let current: Current = Arc::new(std::sync::Mutex::new(None));
+        let local: Local = Arc::new(std::sync::Mutex::new(None));
+        let closing = Arc::new(AtomicBool::new(false));
 
         let worker_current = current.clone();
+        let worker_local = local.clone();
+        let worker_closing = closing.clone();
+        let handle_ptt = ptt.clone();
         let thread = std::thread::Builder::new()
             .name("aars-sequencer".to_owned())
             .spawn(move || {
                 while let Some(cmd) = cmd_rx.blocking_recv() {
                     match cmd {
                         SeqCmd::Shutdown => break,
+                        SeqCmd::PlayLocal { pcm, reply } => {
+                            let result = if worker_closing.load(Ordering::SeqCst) {
+                                Err("sekwencer się zamyka".to_owned())
+                            } else if ptt.name() == "vox" {
+                                // R12 jako niezmiennik sekwencera: przy VOX
+                                // dźwięk na wyjściu sam kluczuje nadajnik.
+                                Err("przy VOX odtwarzanie lokalne nadaje na antenę".to_owned())
+                            } else if watchdog.as_ref().is_some_and(|w| w.is_poisoned())
+                                || interlocks.snapshot().poisoned
+                            {
+                                // Po interwencji strażnika nie wiemy, czy PTT
+                                // naprawdę opadło — dźwięk mógłby iść na antenę.
+                                Err("blokada watchdoga: odtwarzanie niedostępne".to_owned())
+                            } else {
+                                let cancel = CancelToken::new();
+                                *worker_local.lock().expect("mutex sekwencera") =
+                                    Some(cancel.clone());
+                                let result = play_local(ptt.as_ref(), sink.as_ref(), &pcm, &cancel);
+                                *worker_local.lock().expect("mutex sekwencera") = None;
+                                result
+                            };
+                            let _ = reply.send(result);
+                        }
                         SeqCmd::Transmit(request) => {
                             let id = request.id;
+                            if worker_closing.load(Ordering::SeqCst) {
+                                // Zamykanie: nic nowego nie wchodzi na antenę.
+                                tracing::warn!(id, "nadanie pominięte, sekwencer się zamyka");
+                                let _ = event_tx.send(SeqEvent::Skipped { id });
+                                continue;
+                            }
                             // Strażnik pyta się pierwszy: binarka przenosi
                             // jego flagę do interlocków z opóźnieniem, a po
                             // interwencji nie wolno nadać ani jednej sekundy.
@@ -103,18 +166,22 @@ impl Sequencer {
                             *worker_current.lock().expect("mutex sekwencera") =
                                 Some((request.priority, cancel.clone()));
 
-                            let (outcome, played) = transmit_one(
+                            let result = transmit_one(
                                 ptt.as_ref(),
                                 sink.as_ref(),
                                 &request,
                                 &config,
-                                &cancel,
+                                Stop { cancel: &cancel, closing: &worker_closing },
                                 watchdog.as_ref(),
                                 &event_tx,
                             );
 
                             *worker_current.lock().expect("mutex sekwencera") = None;
-                            let _ = event_tx.send(SeqEvent::Finished { id, outcome, played });
+                            let event = match result {
+                                Some((outcome, played)) => SeqEvent::Finished { id, outcome, played },
+                                None => SeqEvent::Skipped { id },
+                            };
+                            let _ = event_tx.send(event);
                         }
                     }
                 }
@@ -124,8 +191,34 @@ impl Sequencer {
             })
             .expect("uruchomienie wątku sekwencera");
 
-        SequencerHandle { cmd: cmd_tx, events: event_rx, current, thread: Some(thread) }
+        SequencerHandle {
+            cmd: cmd_tx,
+            events: event_rx,
+            current,
+            local,
+            closing,
+            ptt: handle_ptt,
+            thread: Some(thread),
+        }
     }
+}
+
+/// Test audio (R11): najpierw opuszcza PTT, a gdy to się nie uda, nic nie
+/// gra. Nigdy nie podnosi PTT i nie oznacza nadawania u strażnika.
+/// Odtwarzanie jest ucięte po `LOCAL_PLAY_LIMIT`.
+fn play_local(
+    ptt: &dyn PttBackend,
+    sink: &dyn AudioSink,
+    pcm: &Pcm,
+    cancel: &CancelToken,
+) -> Result<Duration, String> {
+    if let Err(err) = ptt.unkey() {
+        tracing::error!(%err, "test audio: nie udało się opuścić PTT, nie gram");
+        ptt.force_unkey();
+        return Err(format!("nie udało się opuścić PTT: {err}"));
+    }
+    cancel.expire_at(Instant::now() + LOCAL_PLAY_LIMIT);
+    sink.play(pcm, cancel).map(|report| report.played).map_err(|err| err.to_string())
 }
 
 /// Strażnik RAII: każde wyjście z nadania — sukces, błąd, panika —
@@ -147,6 +240,14 @@ impl Drop for PttGuard<'_> {
     }
 }
 
+/// Co może zatrzymać nadanie: jego token (przerwanie, limit) i zamykanie
+/// sekwencera.
+#[derive(Clone, Copy)]
+struct Stop<'a> {
+    cancel: &'a CancelToken,
+    closing: &'a AtomicBool,
+}
+
 /// `event_tx` dostaje `Started` dopiero po udanym podniesieniu PTT:
 /// zdarzenie „zaczęliśmy nadawać" dla nadania, które nigdy nie weszło na
 /// antenę, wprowadzałoby w błąd panel i dziennik.
@@ -155,20 +256,29 @@ fn transmit_one(
     sink: &dyn AudioSink,
     request: &TransmitRequest,
     config: &SequencerConfig,
-    cancel: &CancelToken,
+    stop: Stop<'_>,
     watchdog: Option<&WatchdogMarker>,
     event_tx: &mpsc::UnboundedSender<SeqEvent>,
-) -> (TxOutcome, Duration) {
+) -> Option<(TxOutcome, Duration)> {
     let full = match assemble(request, config) {
         Ok(pcm) => pcm,
-        Err(err) => return (TxOutcome::Failed(err), Duration::ZERO),
+        Err(err) => return Some((TxOutcome::Failed(err), Duration::ZERO)),
     };
+
+    // Ostatnie sprawdzenie tuż przed podniesieniem: zamknięcie albo
+    // przerwanie, które przyszło po sprawdzeniu interlocków, nie może
+    // dać ani chwili nośnej (`None` = pominięte, PTT nie drgnęło).
+    let cancel = stop.cancel;
+    if stop.closing.load(Ordering::SeqCst) || cancel.is_cancelled() {
+        tracing::warn!(id = request.id, "nadanie pominięte tuż przed podniesieniem PTT");
+        return None;
+    }
 
     if let Err(err) = ptt.key() {
         tracing::error!(%err, id = request.id, "nie udało się podnieść PTT");
         // Guard nie powstał, więc wymuszamy stan bezpieczny wprost.
         ptt.force_unkey();
-        return (TxOutcome::Failed(err.to_string()), Duration::ZERO);
+        return Some((TxOutcome::Failed(err.to_string()), Duration::ZERO));
     }
     // Guard powstaje przed znacznikiem: gdyby cokolwiek dalej spanikowało,
     // PTT i tak opadnie, a znacznik zostanie zdjęty.
@@ -188,7 +298,7 @@ fn transmit_one(
         Ok(report) => report,
         Err(err) => {
             tracing::error!(%err, id = request.id, "błąd wyjścia audio");
-            return (TxOutcome::Failed(err.to_string()), started.elapsed());
+            return Some((TxOutcome::Failed(err.to_string()), started.elapsed()));
         }
     };
 
@@ -202,13 +312,13 @@ fn transmit_one(
             limit_s = config.tx_max_duration.as_secs(),
             "nadanie ucięte na twardym limicie czasu"
         );
-        return (TxOutcome::Failed(TX_TIMEOUT_ERROR.to_owned()), report.played);
+        return Some((TxOutcome::Failed(TX_TIMEOUT_ERROR.to_owned()), report.played));
     }
 
     std::thread::sleep(config.tx_tail);
 
     let outcome = if report.cancelled { TxOutcome::Aborted } else { TxOutcome::Ok };
-    (outcome, report.played)
+    Some((outcome, report.played))
 }
 
 /// Składa nadanie: znak, cisza, treść, cisza, znak (spec §4.1, §4.5).
@@ -272,15 +382,62 @@ impl SequencerHandle {
         self.cmd.send(SeqCmd::Transmit(request)).map_err(|_| "sekwencer nie żyje".to_owned())
     }
 
+    /// Odtwarza PCM na wyjściu audio bez podnoszenia PTT (R11). Odpowiedź
+    /// przychodzi po zakończeniu odtwarzania.
+    pub fn play_local(
+        &self,
+        pcm: Pcm,
+    ) -> Result<oneshot::Receiver<Result<Duration, String>>, String> {
+        let (reply, receiver) = oneshot::channel();
+        self.cmd
+            .send(SeqCmd::PlayLocal { pcm, reply })
+            .map_err(|_| "sekwencer nie żyje".to_owned())?;
+        Ok(receiver)
+    }
+
+    /// Przerywa trwające nadanie albo odtwarzanie lokalne (Ctrl-C). PTT
+    /// opada przez strażnika RAII w wątku sekwencera.
+    pub fn abort_current(&self) {
+        if let Some((_, cancel)) = self.current.lock().expect("mutex sekwencera").as_ref() {
+            cancel.cancel();
+        }
+        if let Some(cancel) = self.local.lock().expect("mutex sekwencera").as_ref() {
+            cancel.cancel();
+        }
+    }
+
+    /// Uchwyt do awaryjnego opuszczenia PTT, ważny także po `shutdown`.
+    pub fn releaser(&self) -> PttReleaser {
+        PttReleaser(self.ptt.clone())
+    }
+
+    /// Od tej chwili sekwencer nie podnosi już PTT dla czekających komend
+    /// (dostają `Skipped`). Trwające nadanie nie jest tym przerywane.
+    pub fn close(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+    }
+
     pub async fn next_event(&mut self) -> Option<SeqEvent> {
         self.events.recv().await
     }
 
+    /// Zamyka sekwencer i czeka na koniec jego wątku (join). Trwające
+    /// nadanie dochodzi do końca (albo do limitu); komendy czekające za nim
+    /// już nie podnoszą PTT.
     pub fn shutdown(mut self) {
+        self.closing.store(true, Ordering::SeqCst);
         let _ = self.cmd.send(SeqCmd::Shutdown);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+impl Drop for SequencerHandle {
+    fn drop(&mut self) {
+        // Porzucony uchwyt: wątek dokończy bieżące nadanie i wyjdzie, ale nie
+        // weźmie już niczego z bufora komend.
+        self.closing.store(true, Ordering::SeqCst);
     }
 }
 
@@ -704,5 +861,159 @@ mod tests {
         let keys_after = ptt.events().iter().filter(|e| **e == PttEvent::Key).count();
         assert_eq!(keys_before, keys_after, "po interwencji PTT nie może się podnieść");
         watchdog.stop();
+    }
+
+    #[tokio::test]
+    async fn play_local_never_keys_and_is_bounded() {
+        let rig = guarded_rig(Duration::from_secs(10), false);
+
+        let began = Instant::now();
+        let reply = rig.handle.play_local(Pcm::silence(48_000, Duration::from_secs(20))).unwrap();
+        let played = reply.await.expect("sekwencer odpowiada").expect("odtworzenie udane");
+        let took = began.elapsed();
+
+        assert!(played <= Duration::from_millis(15_200), "grało {played:?} mimo limitu 15 s");
+        // Dolna granica na zegarze ściennym: FakeSink śpi dłużej niż bufor,
+        // więc liczba zagranych próbek bywa mniejsza niż upływ czasu.
+        assert!(took >= Duration::from_secs(14), "trwało tylko {took:?}");
+        assert!(took <= Duration::from_millis(15_500), "trwało {took:?}");
+        assert!(!rig.ptt.events().contains(&PttEvent::Key), "{:?}", rig.ptt.events());
+        assert_eq!(rig.ptt.events(), vec![PttEvent::Unkey], "test audio najpierw opuszcza PTT");
+        assert_eq!(
+            *rig.sink.keyed_while_playing.lock().unwrap(),
+            vec![false],
+            "test audio nie oznacza nadawania u strażnika"
+        );
+        assert!(!rig.marker.is_keyed());
+        rig.watchdog.stop();
+    }
+
+    #[tokio::test]
+    async fn abort_current_cuts_local_playback() {
+        let rig = guarded_rig(Duration::from_secs(10), false);
+
+        let reply = rig.handle.play_local(Pcm::silence(48_000, Duration::from_secs(10))).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        rig.handle.abort_current();
+        let played = tokio::time::timeout(Duration::from_secs(1), reply)
+            .await
+            .expect("przerwane odtwarzanie wraca szybko")
+            .unwrap()
+            .unwrap();
+
+        assert!(played < Duration::from_secs(1), "grało {played:?}");
+        rig.watchdog.stop();
+    }
+
+    #[tokio::test]
+    async fn a_transmission_queued_behind_shutdown_never_keys() {
+        let mut rig = rig();
+        let mut long = request(1, Priority::Normal);
+        long.body = Pcm::silence(48_000, Duration::from_millis(300));
+        rig.handle.transmit(long).await.unwrap();
+        assert!(matches!(rig.handle.next_event().await.unwrap(), SeqEvent::Started { id: 1 }));
+        rig.handle.transmit(request(2, Priority::Normal)).await.unwrap();
+
+        rig.handle.shutdown();
+
+        let keys = rig.ptt.events().iter().filter(|e| **e == PttEvent::Key).count();
+        assert_eq!(keys, 1, "po zamknięciu sekwencer nie bierze kolejnych nadań: {:?}", rig.ptt.events());
+        assert!(!rig.ptt.is_keyed());
+    }
+
+    /// Interlocki, które w chwili sprawdzania ustawiają flagę zamykania
+    /// sekwencera: model Ctrl-C, który ląduje między interlockami a `key()`.
+    struct ClosingInterlocks {
+        inner: InMemoryInterlocks,
+        closing: Mutex<Option<Arc<AtomicBool>>>,
+    }
+
+    impl Interlocks for ClosingInterlocks {
+        fn snapshot(&self) -> crate::interlock::InterlockState {
+            if let Some(flag) = self.closing.lock().unwrap().as_ref() {
+                flag.store(true, Ordering::SeqCst);
+            }
+            self.inner.snapshot()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_close_landing_after_the_interlock_check_never_keys() {
+        let ptt = Arc::new(FakePtt::new());
+        let interlocks = Arc::new(ClosingInterlocks {
+            inner: InMemoryInterlocks::permissive(),
+            closing: Mutex::new(None),
+        });
+        let mut handle = Sequencer::spawn(
+            ptt.clone(),
+            Arc::new(FakeSink::new()),
+            interlocks.clone(),
+            SequencerConfig {
+                tx_tail: Duration::from_millis(1),
+                tx_max_duration: Duration::from_secs(10),
+                id_interval: Duration::from_secs(600),
+            },
+            None,
+        );
+        *interlocks.closing.lock().unwrap() = Some(handle.closing.clone());
+
+        handle.transmit(request(1, Priority::Normal)).await.unwrap();
+        let event = handle.next_event().await.unwrap();
+
+        assert_eq!(event, SeqEvent::Skipped { id: 1 });
+        assert!(ptt.events().is_empty(), "PTT nie może drgnąć: {:?}", ptt.events());
+    }
+
+    /// PTT udające backend VOX (nazwa jak w `aars-ptt`).
+    struct VoxPtt(FakePtt);
+
+    impl PttBackend for VoxPtt {
+        fn key(&self) -> Result<(), crate::ptt::PttError> {
+            self.0.key()
+        }
+        fn unkey(&self) -> Result<(), crate::ptt::PttError> {
+            self.0.unkey()
+        }
+        fn force_unkey(&self) {
+            self.0.force_unkey()
+        }
+        fn name(&self) -> &'static str {
+            "vox"
+        }
+    }
+
+    #[tokio::test]
+    async fn play_local_is_refused_on_a_vox_backend() {
+        let ptt = Arc::new(VoxPtt(FakePtt::new()));
+        let sink = Arc::new(FakeSink::new());
+        let handle = Sequencer::spawn(
+            ptt.clone(),
+            sink.clone(),
+            Arc::new(InMemoryInterlocks::permissive()),
+            SequencerConfig {
+                tx_tail: Duration::from_millis(1),
+                tx_max_duration: Duration::from_secs(10),
+                id_interval: Duration::from_secs(600),
+            },
+            None,
+        );
+
+        let result = handle.play_local(Pcm::silence(48_000, Duration::from_millis(200))).unwrap().await.unwrap();
+
+        assert!(matches!(&result, Err(why) if why.contains("VOX")), "{result:?}");
+        assert_eq!(sink.played_samples(), 0, "przy VOX nic nie gra");
+        assert!(ptt.0.events().is_empty(), "{:?}", ptt.0.events());
+    }
+
+    #[tokio::test]
+    async fn the_releaser_forces_the_ptt_down() {
+        let rig = rig();
+        let releaser = rig.handle.releaser();
+        rig.ptt.key().unwrap();
+
+        releaser.force_unkey();
+
+        assert!(!rig.ptt.is_keyed());
+        assert_eq!(rig.ptt.events(), vec![PttEvent::Key, PttEvent::ForceUnkey]);
     }
 }

@@ -27,4 +27,6 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 aars-core = { path = "../aars-core", features = ["testing"] }
+aars-web = { path = "../aars-web", features = ["testing"] }
+tower.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

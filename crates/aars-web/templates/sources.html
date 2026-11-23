@@ -18,6 +18,7 @@
       <tr><th>Interwał</th><td>{{ s.interval_s }} s</td></tr>
     </tbody>
   </table>
+  {% if chrome.is_admin %}<p><small style="color:var(--muted)">Obszar i interwał ustawia administrator: <a href="/modules#{{ s.id }}">Zmień w Moduły</a></small></p>{% endif %}
   <div style="margin-top:0.6rem">
     <form method="post" action="/sources/{{ s.id }}/enabled" style="display:inline">
       <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
@@ -45,22 +46,6 @@
   </table>
   {% endif %}
 
-  {% if chrome.is_admin %}
-  <h3 style="margin-top:1rem">Ustawienia (administrator)</h3>
-  <form method="post" action="/sources/{{ s.id }}/settings">
-    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-    <div style="margin-bottom:0.8rem">
-      <label for="area-{{ s.id }}">Obszar</label>
-      <textarea id="area-{{ s.id }}" name="area" rows="5" placeholder="1061 Łódź&#10;10">{{ s.area_text }}</textarea>
-      <small style="color:var(--muted)">Jedna linia (albo wpis po średniku) na obszar: dwucyfrowy kod województwa (np. <code>10</code>) albo czterocyfrowy kod powiatu z nazwą, którą stacja ma wypowiadać (np. <code>1061 Łódź</code>). Najwyżej 40 wpisów; puste pole to brak obszaru — źródło nic nie ogłasza.</small>
-    </div>
-    <div style="margin-bottom:0.8rem">
-      <label for="interval-{{ s.id }}">Interwał odpytywania (s, 60–3600)</label>
-      <input id="interval-{{ s.id }}" name="interval_s" type="number" min="60" max="3600" value="{{ s.interval_s }}" required>
-    </div>
-    <button type="submit">Zapisz</button>
-  </form>
-  {% endif %}
 </div>
 {% endfor %}
 {% endblock %}

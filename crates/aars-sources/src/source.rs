@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use aars_core::area::AreaEntry;
+use aars_core::geo::StationPosition;
 use aars_core::priority::Priority;
 use chrono::{DateTime, Utc};
 
@@ -20,6 +22,10 @@ pub trait DataSource: Send + Sync {
 pub struct SourceCtx {
     pub now: DateTime<Utc>,
     pub area: Vec<AreaEntry>,
+    /// Pozycja stacji (R20); `None`, gdy nieustawiona albo nieczytelna.
+    pub position: Option<StationPosition>,
+    /// Ustawienia modułu bez prefiksu `source:{id}:`.
+    pub settings: BTreeMap<String, String>,
 }
 
 pub struct SourceOutput {

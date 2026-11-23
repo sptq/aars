@@ -41,6 +41,19 @@ impl Pcm {
     }
 }
 
+/// Sinus o zadanej częstotliwości, długości i poziomie szczytowym (dBFS).
+/// Służy do testu audio stacji (R11): słychać go nawet wtedy, gdy synteza
+/// nie działa.
+pub fn tone(sample_rate: u32, hz: f32, duration: Duration, dbfs: f32) -> Pcm {
+    let count = (duration.as_secs_f64() * sample_rate as f64).round() as usize;
+    let amplitude = f64::from(i16::MAX) * 10f64.powf(f64::from(dbfs.min(0.0)) / 20.0);
+    let step = 2.0 * std::f64::consts::PI * f64::from(hz) / f64::from(sample_rate);
+    let samples = (0..count)
+        .map(|i| (amplitude * (step * i as f64).sin()).round() as i16)
+        .collect();
+    Pcm { samples, sample_rate }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VoiceParams {
     /// Nazwa głosu; `None` znaczy głos domyślny z konfiguracji.
@@ -57,6 +70,12 @@ impl Default for VoiceParams {
 
 pub trait Synthesizer: Send + Sync {
     fn synthesize(&self, text: &str, voice: &VoiceParams) -> Result<Pcm, SynthError>;
+
+    /// Tożsamość syntezatora (model, częstotliwość) wchodzi do klucza cache,
+    /// żeby zmiana głosu albo częstotliwości nie oddała starego audio (R19).
+    fn identity(&self) -> String {
+        String::new()
+    }
 }
 
 /// Syntezator testowy: deterministyczny ton o długości proporcjonalnej do
@@ -64,11 +83,18 @@ pub trait Synthesizer: Send + Sync {
 pub struct FakeSynth {
     sample_rate: u32,
     requests: Mutex<Vec<String>>,
+    identity: String,
 }
 
 impl FakeSynth {
     pub fn new(sample_rate: u32) -> Self {
-        Self { sample_rate, requests: Mutex::new(Vec::new()) }
+        Self { sample_rate, requests: Mutex::new(Vec::new()), identity: String::new() }
+    }
+
+    /// Tożsamość do klucza cache (testy zmiany głosu).
+    pub fn with_identity(mut self, id: &str) -> Self {
+        self.identity = id.to_owned();
+        self
     }
 
     /// Teksty, o których syntezę ktoś poprosił, w kolejności.
@@ -78,6 +104,10 @@ impl FakeSynth {
 }
 
 impl Synthesizer for FakeSynth {
+    fn identity(&self) -> String {
+        self.identity.clone()
+    }
+
     fn synthesize(&self, text: &str, _voice: &VoiceParams) -> Result<Pcm, SynthError> {
         self.requests.lock().expect("mutex fake'a").push(text.to_owned());
 
@@ -136,5 +166,23 @@ mod tests {
         assert!(c.samples.len() > a.samples.len(), "dłuższy tekst to dłuższe audio");
 
         assert_eq!(synth.requests(), vec!["ostrzeżenie", "ostrzeżenie", "ostrzeżenie dłuższe"]);
+    }
+
+    #[test]
+    fn a_tone_has_the_requested_length_frequency_and_level() {
+        let pcm = tone(48_000, 1000.0, Duration::from_millis(500), -6.0);
+
+        assert_eq!(pcm.sample_rate, 48_000);
+        assert_eq!(pcm.samples.len(), 24_000);
+        let peak = pcm.samples.iter().map(|s| s.unsigned_abs()).max().unwrap();
+        // −6 dBFS to połowa pełnej skali (16 422 przy 32 767).
+        assert!((16_000..=16_500).contains(&peak), "szczyt {peak}");
+        // 1 kHz przez 0,5 s to 500 okresów, czyli ~1000 przejść przez zero.
+        let crossings = pcm
+            .samples
+            .windows(2)
+            .filter(|w| (w[0] < 0) != (w[1] < 0))
+            .count();
+        assert!((990..=1010).contains(&crossings), "przejść przez zero: {crossings}");
     }
 }

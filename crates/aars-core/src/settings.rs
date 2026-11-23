@@ -1,5 +1,7 @@
 //! Parametry stacji z tabeli `settings` (spec §9) i okno ciszy nocnej.
 
+use std::collections::BTreeMap;
+
 use chrono::NaiveTime;
 use sqlx::SqlitePool;
 
@@ -88,6 +90,51 @@ pub struct SettingsRepo {
 impl SettingsRepo {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    pub async fn kv_get(&self, key: &str) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    pub async fn kv_put(&self, key: &str, value: &str) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Klucze z danym prefiksem, w wyniku bez prefiksu.
+    pub async fn kv_prefix(&self, prefix: &str) -> Result<BTreeMap<String, String>, DbError> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT key, value FROM settings WHERE substr(key, 1, ?) = ?")
+                .bind(prefix.chars().count() as i64)
+                .bind(prefix)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(k, v)| (k[prefix.len()..].to_owned(), v))
+            .collect())
+    }
+
+    pub async fn kv_delete_prefix(&self, prefix: &str) -> Result<u64, DbError> {
+        Ok(
+            sqlx::query("DELETE FROM settings WHERE substr(key, 1, ?) = ?")
+                .bind(prefix.chars().count() as i64)
+                .bind(prefix)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
     }
 
     async fn get(&self, key: &str) -> Result<String, DbError> {
@@ -239,6 +286,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v, "true");
+    }
+
+    #[tokio::test]
+    async fn kv_helpers_upsert_and_strip_prefixes() {
+        let repo = SettingsRepo::new(crate::db::test_pool().await);
+        assert_eq!(repo.kv_get("x:a").await.unwrap(), None);
+        repo.kv_put("x:a", "1").await.unwrap();
+        repo.kv_put("x:a", "2").await.unwrap();
+        repo.kv_put("x:b", "3").await.unwrap();
+        repo.kv_put("y:c", "4").await.unwrap();
+        assert_eq!(repo.kv_get("x:a").await.unwrap().as_deref(), Some("2"));
+        let got = repo.kv_prefix("x:").await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got["b"], "3");
+        assert_eq!(repo.kv_delete_prefix("x:").await.unwrap(), 2);
+        assert_eq!(repo.kv_get("y:c").await.unwrap().as_deref(), Some("4"));
     }
 
     #[test]

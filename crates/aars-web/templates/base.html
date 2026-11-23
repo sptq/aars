@@ -6,6 +6,7 @@
   <title>{% block title %}AARS{% endblock %}</title>
   <link rel="stylesheet" href="/assets/app.css">
   <script src="/assets/vendor/htmx.min.js" defer></script>
+  {% block head %}{% endblock %}
 </head>
 <body>
 <header>
@@ -15,9 +16,11 @@
     {% if chrome.can_operate %}<a href="/compose">Nadaj</a>
     <a href="/messages">Komunikaty</a>
     <a href="/queue">Kolejka</a>
-    <a href="/sources">Źródła</a>{% endif %}
+    <a href="/sources">Źródła</a>
+    <a href="/modules">Moduły</a>{% endif %}
     <a href="/logs">Dzienniki</a>
     {% if chrome.is_admin %}<a href="/settings">Ustawienia</a>
+    <a href="/settings/hardware">Sprzęt</a>
     <a href="/users">Użytkownicy</a>{% endif %}
     <span class="badge warn">{{ chrome.username }} · {{ chrome.role }}</span>
     <form method="post" action="/logout" style="margin:0">

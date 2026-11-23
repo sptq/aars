@@ -107,4 +107,37 @@ mod tests {
         let pool = test_pool().await;
         migrate(&pool).await.expect("powtórna migracja nie może się wywalić");
     }
+
+    #[tokio::test]
+    async fn migration_0005_applies_on_a_version_4_database_with_rows() {
+        let options = SqliteConnectOptions::new().in_memory(true).foreign_keys(true);
+        let pool = SqlitePoolOptions::new().max_connections(1).connect_with(options).await.unwrap();
+        let mut old = sqlx::migrate::Migrator::DEFAULT;
+        old.migrations = MIGRATOR.migrations.iter().filter(|m| m.version <= 4).cloned().collect::<Vec<_>>().into();
+        old.run(&pool).await.unwrap();
+        sqlx::query("UPDATE settings SET value = '600' WHERE key = 'source:imgw-meteo:interval_s'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages (id, title, kind, body_template, priority) VALUES (1, 'stary', 'manual', 'tekst', 2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        migrate(&pool).await.expect("0005 na bazie w wersji 4");
+
+        let kept: String =
+            sqlx::query_scalar("SELECT value FROM settings WHERE key = 'source:imgw-meteo:interval_s'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(kept, "600");
+        let sched: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'module:scheduler:enabled'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sched, "true");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1);
+    }
 }

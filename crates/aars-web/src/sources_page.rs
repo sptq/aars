@@ -1,10 +1,10 @@
-//! Strona źródeł danych: stan, aktywne ostrzeżenia, włączanie, „odśwież teraz”
-//! oraz (tylko admin) obszar i interwał. Panel nie zna crate'a źródeł — wołanie
+//! Strona źródeł danych: stan, aktywne ostrzeżenia, włączanie i „odśwież
+//! teraz”. Obszar i interwał są tu tylko do odczytu — zmienia je administrator
+//! na stronie „Moduły” (etap 9, R15). Panel nie zna crate'a źródeł — wołanie
 //! runnera idzie przez `AppState::source_refresh`.
 
-use aars_core::area::{area_text, parse_area};
 use aars_core::error::DbError;
-use aars_core::source_state::{INTERVAL_RANGE, SourceConfig, SourceStateRepo, SourceStatus};
+use aars_core::source_state::{SourceConfig, SourceStateRepo, SourceStatus};
 use aars_core::user::Role;
 use askama::Template;
 use axum::Form;
@@ -143,16 +143,6 @@ pub struct CsrfOnly {
     csrf: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct SettingsForm {
-    #[serde(default)]
-    csrf: String,
-    #[serde(default)]
-    area: String,
-    #[serde(default)]
-    interval_s: String,
-}
-
 fn unknown_source() -> Response {
     (StatusCode::NOT_FOUND, "nie ma takiego źródła").into_response()
 }
@@ -226,49 +216,6 @@ pub async fn refresh(
         return Ok(unknown_source());
     }
     audit(&state, current.user.id, "source_refresh", &id).await;
-    Ok(Redirect::to("/sources").into_response())
-}
-
-pub async fn save_settings(
-    State(state): State<AppState>,
-    current: CurrentUser,
-    Path(id): Path<String>,
-    Form(form): Form<SettingsForm>,
-) -> Result<Response, AuthRejection> {
-    require_role(&current.user, Role::Admin)?;
-    require_csrf(&current.csrf_token, Some(&form.csrf))?;
-
-    match exists(&state, &id).await {
-        Ok(true) => {}
-        Ok(false) => return Ok(unknown_source()),
-        Err(err) => return Ok(server_error("odczyt źródła zawiódł", &err)),
-    }
-    let entries = match parse_area(&form.area) {
-        Ok(entries) => entries,
-        Err(error) => return Ok((StatusCode::BAD_REQUEST, error).into_response()),
-    };
-    let interval = match form.interval_s.trim().parse::<u64>() {
-        Ok(v) if INTERVAL_RANGE.contains(&v) => v,
-        _ => return Ok((StatusCode::BAD_REQUEST, "interwał: 60–3600 s").into_response()),
-    };
-    let text = area_text(&entries);
-    if let Err(err) = SourceStateRepo::new(state.pool.clone())
-        .save_config(&id, &text, interval)
-        .await
-    {
-        return Ok(server_error("zapis ustawień źródła zawiódł", &err));
-    }
-    audit(
-        &state,
-        current.user.id,
-        "source_settings",
-        &format!(
-            "{id}: {} {}, interwał {interval} s",
-            entries.len(),
-            plural(entries.len() as u64, "wpis", "wpisy", "wpisów")
-        ),
-    )
-    .await;
     Ok(Redirect::to("/sources").into_response())
 }
 
@@ -414,24 +361,16 @@ mod tests {
     #[tokio::test]
     async fn the_admin_page_renders_a_working_source_with_warnings() {
         let state = state().await.with_source_refresh(Arc::new(|_| true));
-        let (app, cookie, csrf, state) = app_as(Role::Admin, state).await;
-        let fields = format!("area={}&interval_s=300", encode("1061 Łódź"));
-        post(
-            &app,
-            &cookie,
-            &csrf,
-            "/sources/imgw-meteo/settings",
-            &fields,
-        )
-        .await;
+        let (app, cookie, _csrf, state) = app_as(Role::Admin, state).await;
         let repo = SourceStateRepo::new(state.pool.clone());
+        repo.save_config("imgw-meteo", "1061 Łódź", 300).await.unwrap();
         repo.set_enabled("imgw-meteo", true).await.unwrap();
         repo.record_success("imgw-meteo", Utc::now()).await.unwrap();
         active_warning(&state).await;
         let (status, html) = get(&app, &cookie, "/sources").await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("działa"), "{html}");
-        assert!(html.contains("Interwał odpytywania"), "{html}");
+        assert!(html.contains("Zmień w Moduły"), "{html}");
         if let Ok(path) = std::env::var("SOURCES_PAGE_OUT") {
             std::fs::write(path, &html).unwrap();
         }
@@ -492,77 +431,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_admin_saves_area_and_interval() {
+    async fn the_sources_page_shows_the_area_read_only_with_a_link_for_the_admin() {
         let (app, cookie, csrf, state) = app_as(Role::Admin, state().await).await;
-        let fields = format!("area={}&interval_s=600", encode("1061 Łódź\n10"));
-        let (status, body) = post(
-            &app,
-            &cookie,
-            &csrf,
-            "/sources/imgw-meteo/settings",
-            &fields,
-        )
-        .await;
-        assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
-        let cfg = SourceStateRepo::new(state.pool.clone())
-            .config("imgw-meteo")
+        SourceStateRepo::new(state.pool.clone())
+            .save_config("imgw-meteo", "1061 Łódź", 600)
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(cfg.area.len(), 2);
-        assert_eq!(cfg.interval_s, 600);
-        assert_eq!(audit_count(&state, "source_settings").await, 1);
         let (_, html) = get(&app, &cookie, "/sources").await;
-        assert!(html.contains("name=\"area\""), "admin dostaje formularz");
-    }
-
-    #[tokio::test]
-    async fn a_county_without_a_name_is_refused_and_nothing_changes() {
-        let (app, cookie, csrf, state) = app_as(Role::Admin, state().await).await;
-        let (status, _) = post(
-            &app,
-            &cookie,
-            &csrf,
-            "/sources/imgw-meteo/settings",
-            "area=1061&interval_s=600",
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        let cfg = SourceStateRepo::new(state.pool.clone())
-            .config("imgw-meteo")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(cfg.area_text, "");
-        assert_eq!(audit_count(&state, "source_settings").await, 0);
-    }
-
-    #[tokio::test]
-    async fn an_interval_out_of_range_is_refused() {
-        let (app, cookie, csrf, state) = app_as(Role::Admin, state().await).await;
-        let fields = format!("area={}&interval_s=30", encode("10"));
-        let (status, body) = post(
-            &app,
-            &cookie,
-            &csrf,
-            "/sources/imgw-meteo/settings",
-            &fields,
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.contains("60–3600"), "{body}");
-        let cfg = SourceStateRepo::new(state.pool.clone())
-            .config("imgw-meteo")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(cfg.area_text, "");
-    }
-
-    #[tokio::test]
-    async fn an_operator_cannot_change_the_area() {
-        let (app, cookie, csrf, state) = app_as(Role::Operator, state().await).await;
-        let fields = format!("area={}&interval_s=600", encode("10"));
+        assert!(html.contains("1061 Łódź"), "{html}");
+        assert!(html.contains("600 s"), "{html}");
+        assert!(html.contains("href=\"/modules#imgw-meteo\""), "{html}");
+        assert!(html.contains("Zmień w Moduły"), "{html}");
+        assert!(!html.contains("name=\"area\""), "{html}");
+        assert!(!html.contains("/sources/imgw-meteo/settings"), "{html}");
+        // Stara trasa zapisu zniknęła (R15).
+        let fields = format!("area={}&interval_s=900", encode("10"));
         let (status, _) = post(
             &app,
             &cookie,
@@ -571,13 +454,20 @@ mod tests {
             &fields,
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+            "{status}"
+        );
         let cfg = SourceStateRepo::new(state.pool.clone())
             .config("imgw-meteo")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(cfg.area_text, "");
+        assert_eq!(cfg.interval_s, 600);
+
+        let (app, cookie, _, _) = app_as(Role::Operator, crate::tests::state().await).await;
+        let (_, html) = get(&app, &cookie, "/sources").await;
+        assert!(!html.contains("Zmień w Moduły"), "operator nie dostaje linku: {html}");
     }
 
     #[tokio::test]
@@ -590,13 +480,13 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_source_is_404() {
         let (app, cookie, csrf, _state) = app_as(Role::Admin, state().await).await;
-        for path in ["enabled", "refresh", "settings"] {
+        for path in ["enabled", "refresh"] {
             let (status, _) = post(
                 &app,
                 &cookie,
                 &csrf,
                 &format!("/sources/nie-ma/{path}"),
-                "enabled=1&area=&interval_s=300",
+                "enabled=1",
             )
             .await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
