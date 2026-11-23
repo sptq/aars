@@ -165,6 +165,7 @@ pub fn source_label(id: &str) -> &str {
         "swpc" => "Pogoda kosmiczna NOAA",
         "gios-smog" => "Alerty smogowe GIOŚ",
         "emsc" => "Wstrząsy sejsmiczne (EMSC)",
+        "pogoda" => "Pogoda (Open-Meteo)",
         other => other,
     }
 }
@@ -255,6 +256,7 @@ mod tests {
         assert_eq!(source_label("swpc"), "Pogoda kosmiczna NOAA");
         assert_eq!(source_label("gios-smog"), "Alerty smogowe GIOŚ");
         assert_eq!(source_label("emsc"), "Wstrząsy sejsmiczne (EMSC)");
+        assert_eq!(source_label("pogoda"), "Pogoda (Open-Meteo)");
         assert_eq!(source_label("inne"), "inne");
     }
 

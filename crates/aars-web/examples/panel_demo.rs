@@ -333,6 +333,8 @@ mod tests {
         assert!(body.contains(QUEUE_TEXTS[0]), "{body}");
         assert!(body.contains("aktywne ostrzeżenia: 1"), "{body}");
         assert!(body.contains("Burze z gradem, 1. stopień"), "{body}");
+        assert!(body.contains(">Pogoda (Open-Meteo)</a>"), "{body}");
+        assert!(!body.contains(">pogoda</a>"), "{body}");
     }
 
     #[tokio::test]

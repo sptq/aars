@@ -137,7 +137,15 @@ mod demo_tests {
     fn the_demo_does_not_touch_hardware() {
         let root = env!("CARGO_MANIFEST_DIR");
         let source = std::fs::read_to_string(format!("{root}/examples/panel_demo.rs")).unwrap();
-        for banned in ["with_station", "with_probe", "with_update", "with_preview", "serial", "gpio", "cpal"] {
+        for banned in [
+            "with_station",
+            "with_probe",
+            "with_update",
+            "with_preview",
+            "serial",
+            "gpio",
+            "cpal",
+        ] {
             assert!(!source.contains(banned), "przykład używa {banned}");
         }
         assert!(source.contains("127.0.0.1"));
