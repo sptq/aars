@@ -222,6 +222,13 @@ log "Nazwa hosta: aars (Imager może ją nadpisać)"
 echo aars > "$ROOT/etc/hostname"
 sed -i 's/^127\.0\.1\.1[[:space:]].*/127.0.1.1\taars/' "$ROOT/etc/hosts"
 
+# Zegar w pasku panelu i cisza nocna liczą się w strefie systemu, a godziny
+# biuletynu w czasie polskim; bez tego obraz startowałby w UTC.
+log "Strefa czasowa: Europe/Warsaw (Imager może ją nadpisać)"
+[ -e "$ROOT/usr/share/zoneinfo/Europe/Warsaw" ] || die "brak Europe/Warsaw w obrazie (tzdata)"
+ln -sfn /usr/share/zoneinfo/Europe/Warsaw "$ROOT/etc/localtime"
+echo Europe/Warsaw > "$ROOT/etc/timezone"
+
 log "Test dymny w chroocie"
 got="$(in_root /opt/aars/current/aars --version)"
 [ "$got" = "aars $VERSION" ] || die "aars --version w obrazie: \"$got\", oczekiwane \"aars $VERSION\""
