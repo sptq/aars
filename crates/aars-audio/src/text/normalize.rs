@@ -35,6 +35,31 @@ fn hour_case(previous_core: Option<&str>) -> HourCase {
     }
 }
 
+/// Rozwinięcie „godz.” zależne od słowa przed nim: słowo „godzina” we
+/// właściwym przypadku, czy godzina idzie w dopełniaczu i czy to zakres
+/// („w godz. 7:00 – 15:00” → „w godzinach siódma – piętnasta”; „w godz. 7:00”
+/// bez zakresu → „w godzinie siódmej”).
+fn godz_expansion(previous_core: Option<&str>, range_follows: bool) -> (&'static str, bool, bool) {
+    match previous_core.map(str::to_lowercase).as_deref() {
+        Some("od" | "do" | "około" | "z") => ("godziny", true, false),
+        Some("o" | "po") => ("godzinie", true, false),
+        Some("w") if range_follows => ("godzinach", false, true),
+        Some("w") => ("godzinie", true, false),
+        _ => ("godzina", false, false),
+    }
+}
+
+/// Myślniki między godzinami zakresu.
+const RANGE_DASHES: &[&str] = &["-", "–", "—"];
+
+fn capitalized(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// Przyimki, po których liczebnik stoi w dopełniaczu („do 30 mm").
 fn takes_genitive_number(previous_core: Option<&str>) -> bool {
     matches!(
@@ -163,6 +188,22 @@ const ABBREVIATIONS: &[(&str, &str)] = &[
     ("IMGW", "I M G W"),
     ("PAA", "P A A"),
     ("KSE", "K S E"),
+    ("RCB", "R C B"),
+    ("RSO", "R S O"),
+    ("NOAA", "N O A A"),
+    ("SWPC", "S W P C"),
+    ("EMSC", "E M S C"),
+    ("GIOŚ", "G I O Ś"),
+    ("KF", "K F"),
+    ("PM10", "P M dziesięć"),
+    ("PM2,5", "P M dwa i pół"),
+    ("PM2.5", "P M dwa i pół"),
+    ("MUF", "M U F"),
+    ("KC2G", "K C dwa G"),
+    ("IMGW-PIB", "I M G W P I B"),
+    ("RP", "R P"),
+    ("Płd", "Południowy"),
+    ("nr", "numer"),
 ];
 
 /// Interpunkcja, która może poprzedzać słowo.
@@ -204,8 +245,54 @@ pub fn normalize(input: &str) -> String {
         let (lead, core, trail) = parts[idx];
 
         let previous_core = idx.checked_sub(1).map(|p| parts[p].1);
+
+        // „godz. 8:30”: skrót rozwinięty w przypadku, którego żąda słowo
+        // przed nim, a godzina w tym samym przypadku, bez drugiego „godzina”.
+        if core.eq_ignore_ascii_case("godz")
+            && trail == "."
+            && let Some(&(next_lead, next_core, next_trail)) = parts.get(idx + 1)
+            && next_lead.is_empty()
+            && let Some((hour, minute)) = clock_time(next_core)
+        {
+            let range_follows = next_trail.is_empty()
+                && raw.get(idx + 2).is_some_and(|dash| RANGE_DASHES.contains(dash))
+                && parts.get(idx + 3).is_some_and(|&(end_lead, end_core, _)| {
+                    end_lead.is_empty() && clock_time(end_core).is_some()
+                });
+            let (word, genitive, range) = godz_expansion(previous_core, range_follows);
+            let word = if core.starts_with('G') { capitalized(word) } else { word.to_owned() };
+            push_word(&mut out, lead, &word, "");
+            push_word(&mut out, "", &bare_time(hour, minute, genitive), next_trail);
+            idx += 2;
+            if range
+                && next_trail.is_empty()
+                && let Some(dash) = raw.get(idx)
+                && RANGE_DASHES.contains(dash)
+                && let Some(&(end_lead, end_core, end_trail)) = parts.get(idx + 1)
+                && end_lead.is_empty()
+                && let Some((hour, minute)) = clock_time(end_core)
+            {
+                out.push((*dash).to_owned());
+                push_word(&mut out, "", &bare_time(hour, minute, false), end_trail);
+                idx += 2;
+            }
+            continue;
+        }
+
         if let Some(spoken) = spoken_time(core, hour_case(previous_core)) {
             push_word(&mut out, lead, &spoken, trail);
+            idx += 1;
+            continue;
+        }
+
+        // „1. stopień”, „2. stopnia”: liczebnik porządkowy stopnia ostrzeżenia.
+        if trail == "."
+            && lead.is_empty()
+            && let Some(&(next_lead, next_core, _)) = parts.get(idx + 1)
+            && next_lead.is_empty()
+            && let Some(ordinal) = level_ordinal(core, next_core)
+        {
+            out.push(ordinal.to_owned());
             idx += 1;
             continue;
         }
@@ -298,6 +385,23 @@ pub fn normalize(input: &str) -> String {
     }
 
     out.join(" ")
+}
+
+/// „1”–„3” przed formą słowa „stopień” → liczebnik porządkowy w tym samym
+/// przypadku („2.” + „stopnia” → „drugiego”).
+fn level_ordinal(number: &str, noun: &str) -> Option<&'static str> {
+    let forms: [&str; 3] = match noun.to_lowercase().as_str() {
+        "stopień" => ["pierwszy", "drugi", "trzeci"],
+        "stopnia" => ["pierwszego", "drugiego", "trzeciego"],
+        "stopniu" | "stopniem" => ["pierwszym", "drugim", "trzecim"],
+        _ => return None,
+    };
+    match number {
+        "1" => Some(forms[0]),
+        "2" => Some(forms[1]),
+        "3" => Some(forms[2]),
+        _ => None,
+    }
 }
 
 /// Wartość liczbowa jako tekst: część całkowita i opcjonalna dziesiętna.
@@ -401,6 +505,17 @@ fn unit_form(text: &str, value: &NumberText, genitive: bool) -> &'static str {
 /// po „od/do/po/około" → „godziny …", po „o" → „godzinie …". „24:00" jest
 /// poprawne (koniec doby), „24:30" już nie.
 fn spoken_time(token: &str, case: HourCase) -> Option<String> {
+    let (hour, minute) = clock_time(token)?;
+    let (word, genitive) = match case {
+        HourCase::Nominative => ("godzina", false),
+        HourCase::Genitive => ("godziny", true),
+        HourCase::Locative => ("godzinie", true),
+    };
+    Some(format!("{word} {}", bare_time(hour, minute, genitive)))
+}
+
+/// „H:MM”/„HH:MM” → (godzina, minuta); „24:00” jest poprawne, „24:30” nie.
+fn clock_time(token: &str) -> Option<(u8, u8)> {
     let (h, m) = token.split_once(':')?;
     if h.is_empty() || m.len() != 2 {
         return None;
@@ -410,11 +525,16 @@ fn spoken_time(token: &str, case: HourCase) -> Option<String> {
     if hour > 24 || minute > 59 || (hour == 24 && minute != 0) {
         return None;
     }
+    Some((hour, minute))
+}
 
-    let mut spoken = match case {
-        HourCase::Nominative => format!("godzina {}", hour_ordinal(hour)),
-        HourCase::Genitive => format!("godziny {}", hour_ordinal_genitive(hour)),
-        HourCase::Locative => format!("godzinie {}", hour_ordinal_genitive(hour)),
+/// Godzina bez słowa „godzina”: „ósma trzydzieści” albo w dopełniaczu
+/// (także dla miejscownika) „ósmej trzydzieści”.
+fn bare_time(hour: u8, minute: u8, genitive: bool) -> String {
+    let mut spoken = if genitive {
+        hour_ordinal_genitive(hour).to_string()
+    } else {
+        hour_ordinal(hour).to_string()
     };
     if minute > 0 {
         if minute < 10 {
@@ -424,7 +544,7 @@ fn spoken_time(token: &str, case: HourCase) -> Option<String> {
             spoken.push_str(&cardinal(minute as i64));
         }
     }
-    Some(spoken)
+    spoken
 }
 
 #[cfg(test)]
@@ -433,6 +553,82 @@ mod tests {
 
     fn n(s: &str) -> String {
         normalize(s)
+    }
+
+    #[test]
+    fn a_level_ordinal_is_read_as_an_ordinal() {
+        assert_eq!(n("Burze, 1. stopień"), "Burze, pierwszy stopień");
+        assert_eq!(n("Upał, 2. stopień; Burze, 3. stopień."), "Upał, drugi stopień; Burze, trzeci stopień.");
+        assert_eq!(n("ostrzeżenie 2. stopnia"), "ostrzeżenie drugiego stopnia");
+        assert_eq!(n("przy 3. stopniu"), "przy trzecim stopniu");
+        assert_eq!(n("z 1. stopniem"), "z pierwszym stopniem");
+        // Poza 1–3 i bez kropki nie zgadujemy.
+        assert_eq!(n("1 stopień"), "jeden stopień");
+    }
+
+    #[test]
+    fn godz_takes_the_case_of_the_word_before_it() {
+        assert_eq!(n("od godz. 8:30"), "od godziny ósmej trzydzieści");
+        assert_eq!(n("do godz. 18:00"), "do godziny osiemnastej");
+        assert_eq!(n("około godz. 6:05"), "około godziny szóstej zero pięć");
+        assert_eq!(n("o godz. 9:00"), "o godzinie dziewiątej");
+        assert_eq!(n("po godz. 21:15"), "po godzinie dwudziestej pierwszej piętnaście");
+        assert_eq!(n("godz. 9:22"), "godzina dziewiąta dwadzieścia dwa");
+        assert_eq!(n("Godz. 09:22"), "Godzina dziewiąta dwadzieścia dwa");
+        assert_eq!(n("w godz. 7:00 – 15:00"), "w godzinach siódma – piętnasta");
+        assert_eq!(n("w godz. 8:00 - 16:00."), "w godzinach ósma - szesnasta.");
+        assert_eq!(n("18:00"), "godzina osiemnasta");
+        // „godz.” bez godziny za nim zostaje jak jest.
+        assert_eq!(
+            n("czas oczekiwania 22 godz. Kolejka"),
+            "czas oczekiwania dwadzieścia dwa godz. Kolejka"
+        );
+    }
+
+    #[test]
+    fn godz_after_w_is_singular_unless_a_range_follows() {
+        assert_eq!(n("w godz. 7:00"), "w godzinie siódmej");
+        assert_eq!(n("w godz. 7:00."), "w godzinie siódmej.");
+        assert_eq!(n("w godz. 7:00 – 15:00"), "w godzinach siódma – piętnasta");
+    }
+
+    #[test]
+    fn godz_after_z_is_genitive() {
+        assert_eq!(n("Pomiar z godz. 20:20."), "Pomiar z godziny dwudziestej dwadzieścia.");
+    }
+
+    #[test]
+    fn imgw_pib_rp_and_nr_are_spelled() {
+        assert_eq!(n("Źródło: IMGW-PIB."), "Źródło: I M G W P I B.");
+        assert_eq!(n("wody wewnętrzne RP - Bałtyk Płd,"), "wody wewnętrzne R P - Bałtyk Południowy,");
+        assert_eq!(n("nr 140"), "numer sto czterdzieści");
+    }
+
+    #[test]
+    fn godz_in_rso_texts_reads_naturally() {
+        // Zdania z fiksów RSO (`aars-sources/tests/fixtures/rso`).
+        assert_eq!(
+            n("od dnia 27 kwietnia (poniedziałek) od godz. 8:30 nastąpi całkowite zamknięcie"),
+            "od dnia dwudziestego siódmego kwietnia (poniedziałek) od godziny ósmej trzydzieści nastąpi całkowite zamknięcie"
+        );
+        assert_eq!(
+            n("od poniedziałku do piątku w godz. 7:00 – 15:00 z Kierownikiem"),
+            "od poniedziałku do piątku w godzinach siódma – piętnasta z Kierownikiem"
+        );
+        assert_eq!(
+            n("Data i godzina wydania: 25.06.2026 - godz. 09:22"),
+            "Data i godzina wydania: 25.06.2026 - godzina dziewiąta dwadzieścia dwa"
+        );
+        assert_eq!(
+            n("Ważność: od godz. 09:23 dnia 25.06.2026"),
+            "Ważność: od godziny dziewiątej dwadzieścia trzy dnia 25.06.2026"
+        );
+    }
+
+    #[test]
+    fn muf_and_kc2g_are_spelled() {
+        assert_eq!(n("MUF 10,6 megaherca."), "M U F dziesięć przecinek sześć megaherca.");
+        assert_eq!(n("GIRO przez KC2G."), "GIRO przez K C dwa G.");
     }
 
     #[test]
@@ -600,6 +796,23 @@ mod tests {
         assert_eq!(n("kierunek N"), "kierunek północny");
         assert_eq!(n("kierunek SW"), "kierunek południowo-zachodni");
         assert_eq!(n("IMGW ostrzega"), "I M G W ostrzega");
+    }
+
+    #[test]
+    fn source_acronyms_are_spelled_letter_by_letter() {
+        assert_eq!(n("Alert RCB."), "Alert R C B.");
+        assert_eq!(n("Komunikat RSO:"), "Komunikat R S O:");
+        assert_eq!(n("Dane: NOAA SWPC."), "Dane: N O A A S W P C.");
+        assert_eq!(n("Dane: EMSC."), "Dane: E M S C.");
+        assert_eq!(n("Źródło: GIOŚ."), "Źródło: G I O Ś.");
+        assert_eq!(n("pasma KF"), "pasma K F");
+    }
+
+    #[test]
+    fn particulate_names_are_spoken() {
+        assert_eq!(n("pył zawieszony PM10."), "pył zawieszony P M dziesięć.");
+        assert_eq!(n("PM2,5"), "P M dwa i pół");
+        assert_eq!(n("(PM2.5)"), "(P M dwa i pół)");
     }
 
     #[test]

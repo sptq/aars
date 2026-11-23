@@ -1,11 +1,12 @@
 {% extends "base.html" %}
 {% block title %}AARS — nadaj komunikat{% endblock %}
+{% block heading %}Nadaj komunikat{% endblock %}
 {% block content %}
 <div class="card">
   <h2>Nadaj komunikat</h2>
   <form method="post" action="/compose">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-    <div style="margin-bottom:0.9rem">
+    <div class="field">
       <label for="text">Treść</label>
       <textarea id="text" name="text" required
                 placeholder="Uwaga, ostrzeżenie meteorologiczne..."></textarea>
@@ -29,14 +30,14 @@
         <input id="every" name="every" type="number" value="600" min="0" max="86400">
       </div>
     </div>
-    <label style="display:flex;gap:0.5rem;align-items:center;margin-bottom:1rem">
-      <input type="checkbox" name="interrupting" value="1" style="width:auto">
+    <label class="check">
+      <input type="checkbox" name="interrupting" value="1">
       Przerwij trwające nadanie o niższym priorytecie
     </label>
-    <div style="margin-bottom:1rem">
+    <div class="preview">
       <button type="button" class="ghost" id="preview-btn">Odsłuchaj</button>
-      <span id="preview-note" style="color:var(--muted)"></span>
-      <audio id="preview-audio" controls style="width:100%;margin-top:0.5rem"></audio>
+      <span id="preview-note" class="preview-note"></span>
+      <audio id="preview-audio" controls></audio>
     </div>
     <button type="submit">Do kolejki</button>
   </form>

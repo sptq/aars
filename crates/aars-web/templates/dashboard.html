@@ -1,34 +1,101 @@
 {% extends "base.html" %}
+{% import "macros.html" as m %}
 {% block title %}AARS — pulpit{% endblock %}
+{% block heading %}Pulpit{% endblock %}
 {% block content %}
+{% if no_admin %}
+<p class="alert">Brak konta administratora — załóż je w kreatorze <a href="/setup">/setup</a> (tylko z sieci lokalnej stacji).</p>
+{% endif %}
+{% if let Some(e) = tx_unavailable %}
+<p class="alert">Nadawanie niedostępne: {{ e }}{% if chrome.is_admin %} <a href="/settings/hardware">Ustawienia sprzętu</a>{% endif %}</p>
+{% endif %}
+{% if chrome.is_admin %}{% if let Some(e) = last_good_note %}
+<p class="alert">Działa ostatnia działająca konfiguracja — ustawienia z panelu nie dały się zastosować: {{ e }}</p>
+{% endif %}{% endif %}
+
+<div class="tiles">
+  <section class="tile" id="tile-tx">
+    <h3><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg#i-power"></use></svg> Nadawanie</h3>
+    <p class="tile-value"><span class="badge {{ tx.css() }}">{{ tx.label() }}</span></p>
+    {% if poisoned %}<p><span class="badge err">watchdog — wymaga resetu</span></p>{% endif %}
+    {% if poisoned && chrome.is_admin %}
+    <form method="post" action="/watchdog/clear" class="tile-action">
+      <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+      <button type="submit" class="danger">Zdejmij blokadę watchdoga</button>
+    </form>
+    {% endif %}
+    {% if chrome.can_operate %}
+    <div class="tile-action">
+    {% call m::tx_switch(chrome.csrf, tx_enabled, true, chrome.back) %}{% endcall %}
+    </div>
+    {% endif %}
+  </section>
+
+  <section class="tile" id="tile-queue">
+    <h3><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg#i-queue"></use></svg> Kolejka</h3>
+    {% if queue_error.is_some() %}
+    <p class="error">Nie udało się odczytać kolejki.</p>
+    {% else %}
+    <p class="tile-value">{{ queue_count }}</p>
+    {% if let Some(next) = queue_next %}
+    <p class="muted">najbliższe: {{ next }}</p>
+    {% else %}
+    <p class="muted">nic nie czeka</p>
+    {% endif %}
+    {% if chrome.can_operate %}<p><a href="/queue">Pełna kolejka</a></p>{% endif %}
+    {% endif %}
+  </section>
+
+  <section class="tile" id="tile-sources">
+    <h3><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg#i-sources"></use></svg> Źródła</h3>
+    {% if sources_error.is_some() %}
+    <p class="error">Nie udało się odczytać stanu źródeł.</p>
+    {% else %}
+    <p class="tile-value">{{ sources_ok }} <span class="tile-unit">{{ self.sources_ok_verb() }}</span></p>
+    <p>{% if sources_problem > 0 %}<span class="badge warn">{{ sources_problem }} z problemem</span>{% else %}<span class="muted">bez problemów</span>{% endif %}</p>
+    {% endif %}
+  </section>
+
+  <section class="tile" id="tile-bulletin">
+    <h3><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg#i-clock"></use></svg> Najbliższy biuletyn</h3>
+    <p class="tile-value">{{ next_bulletin }}</p>
+    <p class="muted">czas polski</p>
+  </section>
+</div>
+
 <div class="card">
-  <h2>Stan nadawania</h2>
-  {% if let Some(e) = tx_unavailable %}
-  <p class="error">Nadawanie niedostępne: {{ e }}{% if chrome.is_admin %} <a href="/settings/hardware">Ustawienia sprzętu</a>{% endif %}</p>
+  <h2>Aktywne ostrzeżenia</h2>
+  {% if sources_error.is_some() %}
+  <p class="error">Nie udało się odczytać ostrzeżeń.</p>
+  {% else if warnings.is_empty() %}
+  <p class="empty">Brak aktywnych ostrzeżeń.</p>
+  {% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Źródło</th><th>Ostrzeżenie</th><th>Priorytet</th><th>Ważne do</th></tr></thead>
+    <tbody>
+      {% for (source, w) in warnings %}
+      <tr><td>{{ source }}</td><td>{{ w.summary }}</td><td>{{ w.priority }}</td><td>{{ w.valid_until }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
   {% endif %}
-  {% if chrome.is_admin %}{% if let Some(e) = last_good_note %}
-  <p class="error">Działa ostatnia działająca konfiguracja — ustawienia z panelu nie dały się zastosować: {{ e }}</p>
-  {% endif %}{% endif %}
-  <p>
-    Nadawanie:
-    {% if tx_enabled %}<span class="badge on">włączone</span>
-    {% else %}<span class="badge off">wyłączone</span>{% endif %}
-    {% if poisoned %}<span class="badge off">watchdog — wymaga resetu</span>{% endif %}
-  </p>
-  {% if poisoned && chrome.is_admin %}
-  <form method="post" action="/watchdog/clear" style="margin-top:0.6rem">
-    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-    <button type="submit" class="danger">Zdejmij blokadę watchdoga</button>
-  </form>
-  {% endif %}
-  {% if chrome.can_operate %}
-  <form method="post" action="/tx-enabled" style="margin-top:0.6rem">
-    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-    <input type="hidden" name="enabled" value="{% if tx_enabled %}0{% else %}1{% endif %}">
-    <button type="submit" class="{% if tx_enabled %}danger{% endif %}">
-      {% if tx_enabled %}Zatrzymaj nadawanie{% else %}Włącz nadawanie{% endif %}
-    </button>
-  </form>
+</div>
+
+<div class="card">
+  <h2>Ostatnie nadania</h2>
+  {% if let Some(note) = recent_error %}
+  <p class="error">{{ note }}</p>
+  {% else if recent.is_empty() %}
+  <p class="empty">Brak nadań.</p>
+  {% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Czas</th><th>Wynik</th><th>Długość</th><th>Treść</th></tr></thead>
+    <tbody>
+      {% for row in recent %}
+      <tr><td>{{ row.at }}</td><td>{{ row.result }}</td><td>{{ row.seconds }} s</td><td>{% if row.without_item %}<em class="muted">{{ row.text }}</em>{% else %}{{ row.text }}{% endif %}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
   {% endif %}
 </div>
 
@@ -37,7 +104,7 @@
   {% if let Some(note) = sources_error %}
   <p class="error">{{ note }}</p>
   {% else %}
-  <table>
+  <div class="table-wrap"><table>
     <tbody>
       {% for s in sources %}
       <tr>
@@ -47,7 +114,7 @@
       </tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
   {% endif %}
 </div>
 

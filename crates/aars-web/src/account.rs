@@ -31,10 +31,10 @@ pub struct PasswordForm {
     confirm: String,
 }
 
-pub async fn password_page(current: CurrentUser) -> Response {
+pub async fn password_page(State(state): State<AppState>, current: CurrentUser) -> Response {
     page(&PasswordPage {
         must_change: current.user.must_change_password,
-        chrome: Chrome::from(&current),
+        chrome: Chrome::load(&state, &current).await,
         error: None,
     })
 }
@@ -46,12 +46,13 @@ pub async fn password_submit(
 ) -> Result<Response, AuthRejection> {
     require_csrf(&current.csrf_token, Some(&form.csrf))?;
 
+    let chrome = Chrome::load(&state, &current).await;
     let refuse = |message: &str| {
         (
             StatusCode::BAD_REQUEST,
             page(&PasswordPage {
                 must_change: current.user.must_change_password,
-                chrome: Chrome::from(&current),
+                chrome: chrome.clone(),
                 error: Some(message.to_owned()),
             }),
         )
@@ -384,5 +385,20 @@ mod tests {
             assert_eq!(status, StatusCode::SEE_OTHER);
             assert_eq!(location.as_deref(), Some("/login"));
         }
+    }
+
+    #[tokio::test]
+    async fn a_temporary_password_hides_the_menu_and_the_status_bar() {
+        let (app, _) = setup(true).await;
+        let (_, cookie) = login(&app, "stare-haslo").await;
+        let (status, _, html) = send(&app, get("/account/password", &cookie.unwrap())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!html.contains("id=\"statusbar\""), "{html}");
+        assert!(!html.contains("href=\"/sources\""), "{html}");
+        assert!(!html.contains("href=\"/map\""), "{html}");
+        assert!(!html.contains("aria-label=\"Menu główne\""), "{html}");
+        assert!(html.contains("u · Podgląd"), "{html}");
+        assert!(html.contains("Wyloguj"), "{html}");
+        assert!(html.contains("AARS 0.0.0-test"), "{html}");
     }
 }

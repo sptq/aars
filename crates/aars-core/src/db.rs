@@ -65,6 +65,7 @@ mod tests {
         for expected in [
             "audio_cache",
             "audit_log",
+            "bulletin_fires",
             "messages",
             "queue_items",
             "schedule_fires",
@@ -139,5 +140,36 @@ mod tests {
         assert_eq!(sched, "true");
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages").fetch_one(&pool).await.unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn migration_0006_applies_on_a_version_5_database() {
+        let options = SqliteConnectOptions::new().in_memory(true).foreign_keys(true);
+        let build = || async {
+            let pool = SqlitePoolOptions::new().max_connections(1).connect_with(options.clone()).await.unwrap();
+            let mut old = sqlx::migrate::Migrator::DEFAULT;
+            old.migrations = MIGRATOR.migrations.iter().filter(|m| m.version <= 5).cloned().collect::<Vec<_>>().into();
+            old.run(&pool).await.unwrap();
+            pool
+        };
+        let value = |pool: SqlitePool| async move {
+            sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = 'module:bulletin:enabled'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+        };
+
+        let with_row = build().await;
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('module:bulletin:enabled', 'true')")
+            .execute(&with_row)
+            .await
+            .unwrap();
+        migrate(&with_row).await.expect("0006 na bazie w wersji 5");
+        assert_eq!(value(with_row.clone()).await.as_deref(), Some("true"));
+        sqlx::query("SELECT fire_at FROM bulletin_fires").fetch_all(&with_row).await.unwrap();
+
+        let without_row = build().await;
+        migrate(&without_row).await.expect("0006 na bazie w wersji 5");
+        assert_eq!(value(without_row).await.as_deref(), Some("false"));
     }
 }

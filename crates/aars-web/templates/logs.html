@@ -1,34 +1,35 @@
 {% extends "base.html" %}
 {% block title %}AARS — dzienniki{% endblock %}
+{% block heading %}Dzienniki{% endblock %}
 {% block content %}
 <div class="card">
   <h2>Ostatnie nadania</h2>
   {% if transmissions.is_empty() %}
-  <p style="color:var(--muted)">Nic jeszcze nie nadano.</p>
+  <p class="empty">Nic jeszcze nie nadano.</p>
   {% else %}
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr><th>Czas</th><th>Wynik</th><th>Długość</th><th>Treść</th></tr></thead>
     <tbody>
       {% for row in transmissions %}
-      <tr><td>{{ row.at }}</td><td>{{ row.result }}</td><td>{{ row.seconds }} s</td><td>{% if row.without_item %}<em style="color:var(--muted)">{{ row.text }}</em>{% else %}{{ row.text }}{% endif %}</td></tr>
+      <tr><td>{{ row.at }}</td><td>{{ row.result }}</td><td>{{ row.seconds }} s</td><td>{% if row.without_item %}<em class="muted">{{ row.text }}</em>{% else %}{{ row.text }}{% endif %}</td></tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
   {% endif %}
 </div>
 <div class="card">
   <h2>Dziennik audytu</h2>
   {% if audit.is_empty() %}
-  <p style="color:var(--muted)">Brak wpisów.</p>
+  <p class="empty">Brak wpisów.</p>
   {% else %}
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr><th>Czas</th><th>Użytkownik</th><th>Akcja</th><th>Szczegóły</th></tr></thead>
     <tbody>
       {% for row in audit %}
       <tr><td>{{ row.at }}</td><td>{{ row.user }}</td><td>{{ row.action }}</td><td>{{ row.detail }}</td></tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
   {% endif %}
 </div>
 {% endblock %}

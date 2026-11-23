@@ -3,9 +3,12 @@ use aars_core::user::Role;
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 
 use crate::auth::CurrentUser;
+use crate::state::AppState;
+use crate::status::{StatusBar, load_status, safe_back};
 
-/// Wspólna rama każdej strony panelu: kto jest zalogowany, jaki ma token CSRF
-/// i które pozycje nawigacji mu przysługują.
+/// Wspólna rama każdej strony panelu: kto jest zalogowany, jaki ma token CSRF,
+/// które pozycje nawigacji mu przysługują i co pokazuje pasek stanu.
+#[derive(Clone)]
 pub struct Chrome {
     pub username: String,
     /// Polska nazwa roli do plakietki w nagłówku.
@@ -13,17 +16,81 @@ pub struct Chrome {
     pub csrf: String,
     pub can_operate: bool,
     pub is_admin: bool,
+    /// Wersja produktu w stopce (każda rola, R17).
+    pub version: &'static str,
+    /// Ścieżka żądania.
+    pub path: String,
+    /// Dokąd wraca wyłącznik nadawania: ścieżka strony dla `GET`, inaczej `/`
+    /// (strona po `POST` nie ma pod swoim adresem `GET`, D6).
+    pub back: String,
+    /// Dane paska stanu; `None` we fragmentach, które paska nie renderują.
+    pub status: Option<StatusBar>,
+    /// Klucz bieżącej pozycji menu (`nav_section`).
+    pub section: &'static str,
+    /// Hasło tymczasowe (D8): rama bez menu i paska stanu.
+    pub locked: bool,
 }
 
-impl From<&CurrentUser> for Chrome {
-    fn from(current: &CurrentUser) -> Self {
+impl Chrome {
+    /// Rama bez paska stanu — tylko dla fragmentów htmx.
+    pub fn bare(current: &CurrentUser) -> Chrome {
         Chrome {
             username: current.user.username.clone(),
             role: role_label(current.user.role),
             csrf: current.csrf_token.clone(),
             can_operate: current.user.role.can(Role::Operator),
             is_admin: current.user.role.can(Role::Admin),
+            version: current.version,
+            path: current.path.clone(),
+            back: if current.is_get {
+                safe_back(Some(&current.path)).to_owned()
+            } else {
+                "/".to_owned()
+            },
+            status: None,
+            section: nav_section(&current.path),
+            locked: current.user.must_change_password,
         }
+    }
+
+    /// Rama strony z paskiem stanu (odczyt lokalny, nigdy nie zawodzi).
+    pub async fn load(state: &AppState, current: &CurrentUser) -> Chrome {
+        Chrome {
+            status: Some(load_status(state, Local::now()).await),
+            ..Chrome::bare(current)
+        }
+    }
+}
+
+/// Pozycja menu bocznego, do której należy ścieżka (`aria-current`);
+/// ścieżka spoza menu → `""`.
+pub fn nav_section(path: &str) -> &'static str {
+    let under = |prefix: &str| {
+        path.strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    };
+    if path == "/" {
+        "dashboard"
+    } else if under("/settings/hardware") {
+        "hardware"
+    } else if under("/settings/update") {
+        "update"
+    } else if path == "/settings" || under("/settings/position") {
+        "settings"
+    } else {
+        [
+            ("/compose", "compose"),
+            ("/messages", "messages"),
+            ("/queue", "queue"),
+            ("/sources", "sources"),
+            ("/modules", "modules"),
+            ("/map", "map"),
+            ("/users", "users"),
+            ("/logs", "logs"),
+        ]
+        .into_iter()
+        .find(|(prefix, _)| under(prefix))
+        .map_or("", |(_, key)| key)
     }
 }
 
@@ -66,6 +133,12 @@ pub fn audit_action_label(action: &str) -> &str {
         "position" => "pozycja stacji",
         "module_enabled" => "moduł wł./wył.",
         "module_settings" => "ustawienia modułu",
+        "update_install" => "aktualizacja zlecona",
+        "update_installed" => "aktualizacja zainstalowana",
+        "update_rolled_back" => "aktualizacja cofnięta",
+        "update_failed" => "aktualizacja nieudana",
+        "first_admin" => "pierwsze konto admina",
+        "admin_reset" => "reset kont admina",
         other => other,
     }
 }
@@ -86,6 +159,13 @@ pub fn plural<'a>(n: u64, one: &'a str, few: &'a str, many: &'a str) -> &'a str 
 pub fn source_label(id: &str) -> &str {
     match id {
         "imgw-meteo" => "Ostrzeżenia meteorologiczne IMGW",
+        "imgw-hydro" => "Ostrzeżenia hydrologiczne IMGW",
+        "imgw-wodowskazy" => "Stany wodowskazów IMGW",
+        "rso" => "Regionalny System Ostrzegania (RSO)",
+        "swpc" => "Pogoda kosmiczna NOAA",
+        "gios-smog" => "Alerty smogowe GIOŚ",
+        "emsc" => "Wstrząsy sejsmiczne (EMSC)",
+        "pogoda" => "Pogoda (Open-Meteo)",
         other => other,
     }
 }
@@ -170,7 +250,43 @@ mod tests {
             assert_eq!(audit_action_label(key), label);
         }
         assert_eq!(source_label("imgw-meteo"), "Ostrzeżenia meteorologiczne IMGW");
+        assert_eq!(source_label("imgw-hydro"), "Ostrzeżenia hydrologiczne IMGW");
+        assert_eq!(source_label("imgw-wodowskazy"), "Stany wodowskazów IMGW");
+        assert_eq!(source_label("rso"), "Regionalny System Ostrzegania (RSO)");
+        assert_eq!(source_label("swpc"), "Pogoda kosmiczna NOAA");
+        assert_eq!(source_label("gios-smog"), "Alerty smogowe GIOŚ");
+        assert_eq!(source_label("emsc"), "Wstrząsy sejsmiczne (EMSC)");
+        assert_eq!(source_label("pogoda"), "Pogoda (Open-Meteo)");
         assert_eq!(source_label("inne"), "inne");
+    }
+
+    #[test]
+    fn nav_section_maps_paths_to_menu_entries() {
+        assert_eq!(nav_section("/"), "dashboard");
+        assert_eq!(nav_section("/messages/3/edit"), "messages");
+        assert_eq!(nav_section("/settings"), "settings");
+        assert_eq!(nav_section("/settings/position"), "settings");
+        assert_eq!(nav_section("/settings/hardware"), "hardware");
+        assert_eq!(nav_section("/settings/update"), "update");
+        assert_eq!(nav_section("/account/password"), "");
+        for (path, key) in [
+            ("/compose", "compose"),
+            ("/messages", "messages"),
+            ("/messages/new", "messages"),
+            ("/queue", "queue"),
+            ("/sources", "sources"),
+            ("/modules", "modules"),
+            ("/map", "map"),
+            ("/settings/hardware/test-ptt", "hardware"),
+            ("/settings/update/check", "update"),
+            ("/users", "users"),
+            ("/logs", "logs"),
+            ("/messagesx", ""),
+            ("/settingsx", ""),
+            ("/fragments/status", ""),
+        ] {
+            assert_eq!(nav_section(path), key, "{path}");
+        }
     }
 
     #[test]

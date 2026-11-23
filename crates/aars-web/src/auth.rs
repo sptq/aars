@@ -14,6 +14,12 @@ pub const SESSION_COOKIE: &str = "aars_session";
 pub struct CurrentUser {
     pub user: User,
     pub csrf_token: String,
+    /// Wersja produktu do stopki strony (z `AppState`).
+    pub version: &'static str,
+    /// Ścieżka żądania — cel powrotu wyłącznika w pasku stanu (D6).
+    pub path: String,
+    /// Żądanie `GET`: tylko pod taką ścieżkę wolno wrócić po wyłączniku.
+    pub is_get: bool,
 }
 
 /// Odpowiedź dla żądania bez sesji, bez uprawnień albo bez tokenu CSRF.
@@ -82,7 +88,13 @@ impl FromRequestParts<AppState> for CurrentUser {
         if user.must_change_password && !allowed_while_password_unchanged(parts.uri.path()) {
             return Err(AuthRejection::MustChangePassword);
         }
-        Ok(CurrentUser { user, csrf_token })
+        Ok(CurrentUser {
+            user,
+            csrf_token,
+            version: state.version,
+            path: parts.uri.path().to_owned(),
+            is_get: parts.method == axum::http::Method::GET,
+        })
     }
 }
 

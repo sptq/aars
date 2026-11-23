@@ -2,7 +2,10 @@ mod cli;
 mod probe;
 mod radio;
 mod render;
+mod service;
+mod setup;
 mod station;
+mod update;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -242,7 +245,10 @@ async fn main() -> Result<()> {
             }
         }
         cli::Command::Source { action } => match action {
-            cli::SourceAction::Preview => source_preview(&config).await?,
+            cli::SourceAction::Preview { id } => source_preview(&config, &id).await?,
+        },
+        cli::Command::Bulletin { action } => match action {
+            cli::BulletinAction::Preview => bulletin_preview(&config).await?,
         },
         cli::Command::Run => {
             use aars_core::sink::CancelToken;
@@ -251,29 +257,142 @@ async fn main() -> Result<()> {
             let pool = db::connect(&config.storage.db_path).await.context("otwieranie bazy")?;
             db::migrate(&pool).await.context("nakładanie migracji")?;
 
-            // Jeden `stop` na cały proces: Ctrl-C kończy także stację, która
-            // właśnie czeka na koniec nadania przed restartem.
+            // R13: reset kont admina plikiem z partycji boot. Tylko w trybie
+            // kreatora — przy haśle z konsoli nikt nie założyłby nowego admina.
+            let reset_flag = setup::reset_flag_path(&config.storage.db_path);
+            if config.setup.first_admin == aars_core::config::FirstAdmin::Wizard {
+                match setup::reset_admins(&reset_flag, &pool).await {
+                    Ok(Some(n)) => tracing::warn!(
+                        disabled = n,
+                        "reset kont admina z partycji boot — załóż konto w kreatorze /setup"
+                    ),
+                    Ok(None) => {}
+                    Err(err) => tracing::error!("reset kont admina nie powiódł się: {err}"),
+                }
+            } else if reset_flag.exists() {
+                tracing::warn!(
+                    flag = %reset_flag.display(),
+                    "prośba o reset admina pominięta: działa tylko z setup.first_admin = \"wizard\""
+                );
+            }
+
+            // Jeden `stop` na cały proces: Ctrl-C i SIGTERM (`systemctl stop`)
+            // kończą także stację, która właśnie czeka na koniec nadania
+            // przed restartem. Bez SIGTERM systemd zabiłby proces, zanim
+            // sekwencer opuści PTT (R10e).
             let stop = CancelToken::new();
             let on_signal = stop.clone();
+            let signals = service::StopSignals::register().context("nasłuch SIGINT i SIGTERM")?;
             tokio::spawn(async move {
-                match tokio::signal::ctrl_c().await {
-                    Ok(()) => {
-                        tracing::info!("zatrzymuję stację");
-                        on_signal.cancel();
-                    }
-                    Err(err) => tracing::error!(%err, "oczekiwanie na Ctrl-C zawiodło"),
-                }
+                signals.wait().await;
+                tracing::info!("zatrzymuję stację");
+                on_signal.cancel();
             });
+
+            if service::under_systemd() {
+                tracing::info!(
+                    version = service::VERSION,
+                    "praca pod systemd — powiadomienia włączone"
+                );
+            }
+            let notifier: Arc<dyn service::Notifier> =
+                Arc::new(service::ReadyOnce::new(service::SystemdNotifier));
+            // Watchdog systemd tyka przez całe życie procesu, także podczas
+            // drenażu przed restartem: wykrywa zatrzymany runtime, nie stan
+            // nadawania (strażnik TX ma własny wątek).
+            if let Some(interval) = service::watchdog_interval() {
+                let notifier = notifier.clone();
+                tokio::spawn(async move {
+                    loop {
+                        notifier.watchdog();
+                        tokio::time::sleep(interval).await;
+                    }
+                });
+            }
 
             let factory: Arc<dyn station::HardwareFactory> = Arc::new(station::RealHardware);
             let probe: Arc<dyn aars_core::hardware::probe::HardwareProbe> = Arc::new(probe::HostProbe);
-            while let station::Exit::Restart =
-                station::run_once(&config, &pool, factory.clone(), probe.clone(), stop.clone())
+            // Wynik instalacji albo powrotu z poprzedniego startu idzie do
+            // audytu raz, zanim stacja wstanie (R18).
+            let update_paths = update::paths::UpdatePaths::from_config(&config);
+            if let Some(last) = update::health::audit_last_result(&update_paths, &pool).await {
+                tracing::info!(
+                    action = last.audit_action(),
+                    version = %last.version,
+                    "wynik aktualizacji zapisany w audycie"
+                );
+            }
+            // Działające `aars run` trzyma blokadę, więc ręczny powrót
+            // (`aars update rollback`) odmówi (przegląd 5–7 M-7).
+            // Pod systemd brak blokady kończy start: bez niej ręczny powrót
+            // nie wie, czy usługa działa (przegląd 8–9 M-5). Poza usługą
+            // (praca deweloperska) tylko ostrzeżenie; `rollback` odmówi wtedy
+            // bez `--force`.
+            let _service_lock = match update::paths::hold_service_lock(&update_paths) {
+                Ok(lock) => Some(lock),
+                Err(err) if service::under_systemd() => {
+                    anyhow::bail!("blokada usługi: {err}");
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "blokada usługi niedostępna (poza systemd)");
+                    None
+                }
+            };
+            let health = Arc::new(update::health::HealthCell::default());
+            // R9: po 60 s od gotowości próba nowej wersji dostaje
+            // potwierdzenie albo werdykt.
+            tokio::spawn(update::health::confirm_task(
+                update_paths,
+                health.clone(),
+                service::VERSION.to_owned(),
+                stop.clone(),
+            ));
+
+            let mut updating = false;
+            let run_result: Result<()> = async {
+                loop {
+                    match station::run_once(
+                        &config,
+                        &pool,
+                        factory.clone(),
+                        probe.clone(),
+                        stop.clone(),
+                        notifier.clone(),
+                        health.clone(),
+                    )
                     .await?
-            {
-                tracing::info!("restart stacji w procesie");
+                    {
+                        station::Exit::Restart => tracing::info!("restart stacji w procesie"),
+                        station::Exit::Update => {
+                            notifier.stopping();
+                            tracing::info!(
+                                "kończę proces — aktualizację zainstaluje strażnik przy starcie"
+                            );
+                            updating = true;
+                            break;
+                        }
+                        // Werdykt `bad` po bieżącym nadaniu: błąd procesu niżej.
+                        station::Exit::Unhealthy | station::Exit::Stop => break,
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            // Żądanie przeżywa proces tylko przy końcu „aktualizacja”: przy
+            // zatrzymaniu, werdykcie albo błędzie instalacja odpaliłaby się
+            // przy przypadkowym starcie, bez admina (przegląd 8–9 I-1).
+            if !updating {
+                update::discard_request(
+                    &update::paths::UpdatePaths::from_config(&config),
+                    "proces kończy się bez aktualizacji",
+                );
+            }
+            run_result?;
+            if let Some(reason) = health.fatal() {
+                anyhow::bail!("nowa wersja niezdrowa, strażnik wróci do poprzedniej: {reason}");
             }
         }
+        cli::Command::Update { action } => update::cli(&config, action).await?,
         cli::Command::Hardware { action } => {
             use aars_core::hardware::HardwareRepo;
 
@@ -396,49 +515,110 @@ async fn cli_candidate(config: &Config) -> Result<station::Candidate> {
     station::first_candidate(config, &pool).await
 }
 
-/// `aars source preview`: jedno pobranie, bez zapisu i bez kolejki.
-async fn source_preview(config: &Config) -> Result<()> {
-    use aars_sources::DataSource;
+/// `aars bulletin preview`: biuletyn złożony na teraz, bez kolejki.
+async fn bulletin_preview(config: &Config) -> Result<()> {
+    let pool = db::connect(&config.storage.db_path)
+        .await
+        .context("otwieranie bazy")?;
+    db::migrate(&pool).await.context("nakładanie migracji")?;
+    let bulletin = aars_sources::bulletin::build(config, pool)
+        .map_err(|e| anyhow::anyhow!("klient HTTP: {e}"))?
+        .bulletin;
+    let composed = bulletin
+        .compose(chrono::Utc::now())
+        .await
+        .context("składanie biuletynu")?;
+    for line in bulletin_preview_lines(&station::bulletin_preview_view(composed)) {
+        println!("{line}");
+    }
+    Ok(())
+}
 
+/// Wiersze `aars bulletin preview`: tekst albo powód, potem część po części.
+fn bulletin_preview_lines(view: &aars_web::state::BulletinPreviewView) -> Vec<String> {
+    let mut lines = vec![match (&view.text, &view.skipped_reason) {
+        (Some(text), _) => format!("tekst: {text}"),
+        (None, Some(reason)) => format!("nic do nadania: {reason}"),
+        (None, None) => "nic do nadania: brak danych".to_owned(),
+    }];
+    lines.extend(
+        view.parts
+            .iter()
+            .map(|(id, describe)| format!("{id}: {describe}")),
+    );
+    lines
+}
+
+/// `aars source preview`: jedno pobranie, bez zapisu i bez kolejki.
+async fn source_preview(config: &Config, id: &str) -> Result<()> {
     let pool = db::connect(&config.storage.db_path)
         .await
         .context("otwieranie bazy")?;
     db::migrate(&pool).await.context("nakładanie migracji")?;
 
-    let source = aars_sources::imgw_meteo::ImgwMeteo::new(&config.sources.imgw_meteo_url)
-        .map_err(|e| anyhow::anyhow!("klient HTTP: {e}"))?;
-    // `SourceStateRepo::config` zamienia zepsuty obszar na pusty, a tu trzeba
-    // je odróżnić, więc czytamy surowy zapis.
-    let raw: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
-        .bind(format!("source:{}:area", source.id()))
-        .fetch_optional(&pool)
-        .await
-        .context("odczyt obszaru źródła")?;
-    let area = match aars_core::area::parse_area(raw.as_deref().unwrap_or_default()) {
-        Ok(area) => area,
-        Err(reason) => {
-            println!("nieprawidłowy obszar: {reason}");
+    let module = aars_sources::modules()
+        .into_iter()
+        .find(|m| m.descriptor.id == id)
+        .ok_or_else(|| anyhow::anyhow!("nieznane źródło: {id}"))?;
+    let source = (module.build)(config).map_err(|e| anyhow::anyhow!("klient HTTP: {e}"))?;
+    let needs = source.needs();
+    let area = if needs == aars_core::module::Needs::Area {
+        // `SourceStateRepo::config` zamienia zepsuty obszar na pusty, a tu trzeba
+        // je odróżnić, więc czytamy surowy zapis.
+        let raw: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+            .bind(format!("source:{}:area", source.id()))
+            .fetch_optional(&pool)
+            .await
+            .context("odczyt obszaru źródła")?;
+        let area = match aars_core::area::parse_area(raw.as_deref().unwrap_or_default()) {
+            Ok(area) => area,
+            Err(reason) => {
+                println!("nieprawidłowy obszar: {reason}");
+                return Ok(());
+            }
+        };
+        if area.is_empty() {
+            println!("brak obszaru — ustaw go w panelu (/sources) albo w tabeli settings");
             return Ok(());
         }
+        println!("obszar: {}", aars_core::area::area_text(&area));
+        area
+    } else {
+        Vec::new()
     };
-    if area.is_empty() {
-        println!("brak obszaru — ustaw go w panelu (/sources) albo w tabeli settings");
-        return Ok(());
-    }
-
-    println!("obszar: {}", aars_core::area::area_text(&area));
+    let position = if needs == aars_core::module::Needs::Position {
+        let found = aars_core::geo::PositionRepo::new(pool.clone())
+            .load()
+            .await
+            .context("odczyt pozycji stacji")?;
+        if found.is_none() {
+            println!("brak pozycji stacji — ustaw ją w panelu (/settings)");
+            return Ok(());
+        }
+        found
+    } else {
+        None
+    };
+    // Te same ustawienia modułu, które dostaje runner (próg, promień, kategorie…).
+    let settings = aars_core::settings::SettingsRepo::new(pool.clone())
+        .kv_prefix(&format!("source:{}:", source.id()))
+        .await
+        .context("odczyt ustawień źródła")?;
     let ctx = aars_sources::SourceCtx {
         now: chrono::Utc::now(),
+        area_text: aars_core::area::area_text(&area),
         area,
-        position: None,
-        settings: std::collections::BTreeMap::new(),
+        position,
+        settings,
+        tracked_keys: Default::default(),
+        tracked: Default::default(),
     };
     let output = source
         .fetch(&ctx)
         .await
         .map_err(|e| anyhow::anyhow!("pobieranie: {e}"))?;
     if output.items.is_empty() {
-        println!("brak ostrzeżeń dla obszaru");
+        println!("brak pozycji ze źródła");
     }
     for item in &output.items {
         println!(
@@ -461,6 +641,34 @@ async fn source_preview(config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_bulletin_preview_prints_the_text_then_each_part() {
+        let view = aars_web::state::BulletinPreviewView {
+            text: Some("Biuletyn stacji. 07:00. Koniec biuletynu.".to_owned()),
+            parts: vec![(
+                "pogoda".to_owned(),
+                "pominięta — brak pozycji stacji".to_owned(),
+            )],
+            skipped_reason: None,
+        };
+        assert_eq!(
+            super::bulletin_preview_lines(&view),
+            [
+                "tekst: Biuletyn stacji. 07:00. Koniec biuletynu.",
+                "pogoda: pominięta — brak pozycji stacji",
+            ]
+        );
+        let view = aars_web::state::BulletinPreviewView {
+            text: None,
+            parts: Vec::new(),
+            skipped_reason: Some("brak danych".to_owned()),
+        };
+        assert_eq!(
+            super::bulletin_preview_lines(&view),
+            ["nic do nadania: brak danych"]
+        );
+    }
+
     #[tokio::test]
     async fn a_source_that_cannot_start_is_recorded_as_failing() {
         let pool = aars_core::db::test_pool().await;

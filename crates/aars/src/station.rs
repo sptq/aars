@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 use tokio::sync::{Notify, oneshot};
 
-use aars_core::config::{AudioConfig, Config, PttBackendKind, PttConfig};
+use aars_core::config::{AudioConfig, Config, FirstAdmin, PttBackendKind, PttConfig};
 use aars_core::dispatcher::{
     Dispatcher, DispatcherConfig, DispatcherControl, StationTest, TestOutcome,
 };
@@ -27,6 +27,8 @@ use aars_web::state::{NO_RADIO, StationControl, TestFuture};
 
 use crate::radio::{self, RadioStack};
 use crate::render;
+use crate::service::{self, Notifier};
+use crate::update::health::HealthCell;
 
 /// Skąd stacja bierze sprzęt. Jedyna droga do PTT i karty (D2); testy
 /// podmieniają ją na fałszywkę.
@@ -238,6 +240,12 @@ pub fn hardware_show_lines(
 
 pub enum Exit {
     Restart,
+    /// Koniec procesu po bieżącym nadaniu: aktualizację zainstaluje strażnik
+    /// przy następnym starcie (etap 10, R10a).
+    Update,
+    /// Nowa wersja w próbie dostała werdykt `bad` (R9): koniec procesu po
+    /// bieżącym nadaniu, błędem, a strażnik wraca do poprzedniej wersji.
+    Unhealthy,
     Stop,
 }
 
@@ -245,10 +253,33 @@ pub enum Exit {
 pub struct StationHandle {
     control: Option<DispatcherControl>,
     restart: CancelToken,
+    update: CancelToken,
+    /// Przebieg stacji wyszedł z pętli: prośba o aktualizację do tego
+    /// uchwytu już nie zakończy procesu (przegląd 8–9 I-1).
+    closed: CancelToken,
     status: ApplyStatus,
     hardware: Option<HardwareSettings>,
     station: StationSettings,
     tx_tail: Duration,
+}
+
+impl crate::update::control::UpdateTarget for StationHandle {
+    /// Prośba o zakończenie procesu po bieżącym nadaniu (R10a): ta sama
+    /// droga co restart, ale `run_once` zwraca `Exit::Update`.
+    ///
+    /// `false`, gdy ten przebieg już się skończył (np. restart w procesie
+    /// wygrał): wtedy nikt nie zakończy procesu, a żądanie trzeba wycofać.
+    /// Kolejność (najpierw `update`, potem odczyt `closed`) pasuje do pętli,
+    /// która po `closed` sprawdza `update` jeszcze raz.
+    fn request_update(&self) -> bool {
+        self.update.cancel();
+        if self.closed.is_cancelled() {
+            tracing::warn!("prośba o aktualizację do zakończonego przebiegu stacji — wycofana");
+            return false;
+        }
+        tracing::info!("zlecono aktualizację — stacja skończy po bieżącym nadaniu");
+        true
+    }
 }
 
 /// Najkrótsze oczekiwanie panelu na test PTT: przy krótszym radio mogłoby
@@ -304,28 +335,278 @@ pub async fn source_start_failed(state: &SourceStateRepo, id: &str, reason: &str
     }
 }
 
+/// Instancje źródeł współdzielone z biuletynem (jedna pamięć danych dla
+/// runnera i części); `None` po błędzie budowy biuletynu.
+#[derive(Default)]
+struct SharedSources {
+    pogoda: Option<Arc<aars_sources::pogoda::Pogoda>>,
+    wodowskazy: Option<Arc<aars_sources::imgw_wodowskazy::ImgwWodowskazy>>,
+    /// Instancja `imgw-meteo` dla runnera i mapy ostrzeżeń w panelu.
+    meteo: Option<Arc<aars_sources::imgw_meteo::ImgwMeteo>>,
+}
+
+impl SharedSources {
+    fn from_bulletin(built: Option<&aars_sources::bulletin::BuiltBulletin>) -> Self {
+        Self {
+            pogoda: built.map(|b| b.pogoda.clone()),
+            wodowskazy: built.map(|b| b.wodowskazy.clone()),
+            meteo: None,
+        }
+    }
+}
+
+/// Ostrzeżenia z pamięci `imgw-meteo` w postaci dla mapy: jeden wpis na parę
+/// (ostrzeżenie, powiat); brak stopnia = 1, czas końca nieistniejący w
+/// Warszawie = wpis pominięty, ostrzeżenie jeszcze nieobowiązujące też.
+pub fn warnings_snapshot(
+    snapshot: aars_sources::imgw_meteo::MeteoSnapshot,
+    now: chrono::DateTime<chrono::Utc>,
+) -> aars_web::state::WarningsSnapshot {
+    let mut warnings = Vec::new();
+    for w in &snapshot.warnings {
+        let Some(until) = aars_sources::speech::warsaw_to_utc(w.valid_until) else {
+            continue;
+        };
+        // Ostrzeżenie, które jeszcze nie obowiązuje, nie barwi mapy (popup
+        // nie podaje początku). Początek nieistniejący w Warszawie — pokazujemy.
+        if aars_sources::speech::warsaw_to_utc(w.valid_from).is_some_and(|from| from > now) {
+            continue;
+        }
+        for teryt in &w.teryt {
+            warnings.push(aars_web::state::MapWarning {
+                teryt: teryt.clone(),
+                level: w.level.unwrap_or(1),
+                event: w.event.clone(),
+                until,
+            });
+        }
+    }
+    aars_web::state::WarningsSnapshot {
+        fetched_at: snapshot.fetched_at,
+        warnings,
+    }
+}
+
+/// Źródło dla modułu. `pogoda`, `imgw-wodowskazy` i `imgw-meteo` to wspólne
+/// instancje (biuletyn albo mapa), więc runner źródła i odbiorca dzielą
+/// pamięć; bez nich (błąd budowy, już zapisany) `None` — źródło nie startuje.
+fn source_for(
+    module: &aars_sources::SourceModule,
+    config: &Config,
+    shared: &SharedSources,
+) -> Option<Result<Arc<dyn aars_sources::DataSource>, aars_sources::SourceError>> {
+    match module.descriptor.id {
+        aars_sources::pogoda::ID => shared
+            .pogoda
+            .as_ref()
+            .map(|p| Ok(p.clone() as Arc<dyn aars_sources::DataSource>)),
+        aars_sources::imgw_wodowskazy::ID => shared
+            .wodowskazy
+            .as_ref()
+            .map(|w| Ok(w.clone() as Arc<dyn aars_sources::DataSource>)),
+        aars_sources::imgw_meteo::ID => shared
+            .meteo
+            .as_ref()
+            .map(|m| Ok(m.clone() as Arc<dyn aars_sources::DataSource>)),
+        _ => Some((module.build)(config)),
+    }
+}
+
+/// Złożony biuletyn w postaci dla panelu i CLI (bez typów z `aars-sources`).
+pub fn bulletin_preview_view(
+    composed: aars_sources::bulletin::Composed,
+) -> aars_web::state::BulletinPreviewView {
+    aars_web::state::BulletinPreviewView {
+        text: composed.text,
+        parts: composed
+            .parts
+            .iter()
+            .map(|(id, outcome)| ((*id).to_owned(), outcome.describe()))
+            .collect(),
+        skipped_reason: composed.skipped_reason.map(str::to_owned),
+    }
+}
+
 /// Jak często pętla stacji sprawdza `stop` i żądanie restartu.
 const CONTROL_POLL: Duration = Duration::from_millis(50);
 
 /// Jeden przebieg stacji: od zbudowania stosu do zatrzymania albo restartu.
+/// `notifier.ready()` idzie w każdym przebiegu po nasłuchu panelu; to, że
+/// systemd dostaje `READY=1` raz na proces, zapewnia `service::ReadyOnce`.
 pub async fn run_once(
     base: &Config,
     pool: &SqlitePool,
     factory: Arc<dyn HardwareFactory>,
     probe: Arc<dyn HardwareProbe>,
     stop: CancelToken,
+    notifier: Arc<dyn Notifier>,
+    health: Arc<HealthCell>,
 ) -> Result<Exit> {
-    run_station(base, pool, factory, probe, stop, None).await
+    run_station(base, pool, factory, probe, stop, notifier, health, None).await
 }
 
+/// Zapas drenażu ponad limit strażnika TX: zamknięcie strumienia, join
+/// wątku sekwencera i zapis wyniku. W testach krótszy, żeby test
+/// zawieszonego drenażu nie trwał pół minuty.
+const SERVICE_DRAIN_MARGIN: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
+const DRAIN_MARGIN: Duration = SERVICE_DRAIN_MARGIN;
+#[cfg(test)]
+const DRAIN_MARGIN: Duration = Duration::from_secs(2);
+
+/// Adresy interfejsów stacji dla kreatora `/setup` (R12). Błąd listy daje
+/// pustą listę: zostają stałe sieci lokalne (RFC 1918, link-local, ULA).
+fn local_nets() -> Vec<aars_core::netlocal::LocalNet> {
+    match if_addrs::get_if_addrs() {
+        Ok(interfaces) => interfaces
+            .into_iter()
+            .map(|iface| {
+                let prefix = match &iface.addr {
+                    if_addrs::IfAddr::V4(v4) => v4.prefixlen,
+                    if_addrs::IfAddr::V6(v6) => v6.prefixlen,
+                };
+                aars_core::netlocal::LocalNet {
+                    addr: iface.ip(),
+                    prefix,
+                }
+            })
+            .collect(),
+        Err(err) => {
+            tracing::warn!(%err, "lista interfejsów sieci niedostępna — kreator zna tylko stałe sieci lokalne");
+            Vec::new()
+        }
+    }
+}
+
+/// Domeny lokalne, pod którymi router albo DHCP zwykle ogłasza nazwę
+/// hosta (przegląd końcowy M-1). Żadna nie jest delegowana w publicznym
+/// DNS, więc nie otwiera DNS rebinding. Inne (np. `fritz.box`, który jest
+/// w publicznej strefie `.box`) dopisuje się w `server.allowed_hosts`.
+const LOCAL_SUFFIXES: [&str; 5] = ["local", "lan", "home", "home.arpa", "localdomain"];
+
+/// Nazwy, pod którymi panel jest stacją (`Host` kreatora, obrona przed DNS
+/// rebinding): nazwa hosta, `{nazwa}.{domena lokalna}` (`LOCAL_SUFFIXES`) i
+/// nazwy hostów z adresów nasłuchu. Literały IP i `{nazwa}-{N}.local` po
+/// kolizji w avahi sprawdza panel sam.
+fn station_host_names(host: &str, binds: &[&str]) -> Vec<String> {
+    let base = host.trim_end_matches('.').trim_end_matches(".local").to_ascii_lowercase();
+    let mut names = vec![base.clone()];
+    names.extend(LOCAL_SUFFIXES.iter().map(|suffix| format!("{base}.{suffix}")));
+    for bind in binds {
+        let name = match bind.rsplit_once(':') {
+            Some((name, _)) => name.trim_start_matches('[').trim_end_matches(']'),
+            None => bind,
+        };
+        if !name.is_empty() && name.parse::<std::net::IpAddr>().is_err() {
+            names.push(name.to_ascii_lowercase());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Nazwa hosta do komunikatu o kreatorze; `aars` (R14), gdy nieznana.
+fn local_host_name() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: bufor ma podaną długość, a `gethostname` pisze najwyżej tyle.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            if let Ok(name) = std::str::from_utf8(&buf[..end])
+                && !name.is_empty()
+            {
+                return name.to_owned();
+            }
+        }
+    }
+    "aars".to_owned()
+}
+
+/// Adres kreatora do logu i `STATUS=`: przy nasłuchu na wszystkich adresach
+/// `http://{host}.local:{port}/setup` (avahi, R14), inaczej sam adres.
+fn setup_url(bound: std::net::SocketAddr, host: &str) -> String {
+    if bound.ip().is_unspecified() {
+        let host = host.trim_end_matches(".local");
+        format!("http://{host}.local:{}/setup", bound.port())
+    } else {
+        format!("http://{bound}/setup")
+    }
+}
+
+/// Nasłuch panelu. Obraz słucha na `[::]:8080` (przegląd końcowy M-2):
+/// jedno gniazdo przyjmuje IPv6 i IPv4 (jako `::ffff:a.b.c.d`). Gniazdo
+/// `[::]` ma jawnie `IPV6_V6ONLY = 0` (przegląd N-2), więc IPv4 działa także
+/// przy `net.ipv6.bindv6only = 1`. Gdy jądro nie ma IPv6 (`ipv6.disable=1`),
+/// `[::]` nie wstanie — wtedy panel słucha na `0.0.0.0` tego samego portu,
+/// żeby właściciel nie stracił dostępu.
+async fn bind_panel(bind: &str) -> std::io::Result<tokio::net::TcpListener> {
+    match bind_once(bind).await {
+        Ok(listener) => Ok(listener),
+        Err(err) => match ipv4_fallback(bind, &err) {
+            Some(v4) => {
+                tracing::warn!(%err, %bind, fallback = %v4, "IPv6 niedostępne — panel słucha tylko na IPv4");
+                tokio::net::TcpListener::bind(v4).await
+            }
+            None => Err(err),
+        },
+    }
+}
+
+/// `[::]:port` przez `socket2` z `IPV6_V6ONLY = 0`; każdy inny adres
+/// zwykłym `bind` tokio.
+async fn bind_once(bind: &str) -> std::io::Result<tokio::net::TcpListener> {
+    match bind.parse::<std::net::SocketAddr>() {
+        Ok(addr) if addr.is_ipv6() && addr.ip().is_unspecified() => dual_stack(addr),
+        _ => tokio::net::TcpListener::bind(bind).await,
+    }
+}
+
+fn dual_stack(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(false)?;
+    // Jak `TcpListener::bind` tokio na Uniksie: szybki restart usługi.
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(socket.into())
+}
+
+/// `[::]:port` → `0.0.0.0:port`, gdy błąd nie dotyczy portu (zajęty albo
+/// bez uprawnień — tam IPv4 nic nie zmieni).
+fn ipv4_fallback(bind: &str, err: &std::io::Error) -> Option<std::net::SocketAddr> {
+    use std::io::ErrorKind;
+    let addr: std::net::SocketAddr = bind.parse().ok()?;
+    let port_problem = matches!(err.kind(), ErrorKind::AddrInUse | ErrorKind::PermissionDenied);
+    (addr.is_ipv6() && addr.ip().is_unspecified() && !port_problem)
+        .then(|| std::net::SocketAddr::from(([0, 0, 0, 0], addr.port())))
+}
+
+/// Stan dla systemd, gdy stacja działa bez stosu nadawczego (R6).
+const RADIO_LESS_STATUS: &str =
+    "stacja działa bez nadawania — żadna konfiguracja sprzętu nie wstała";
+
+// Argumenty to niezależne zależności przebiegu (sprzęt, sonda, sygnały,
+// systemd, zdrowie, uchwyt dla testów); struktura dla nich nic by nie dała.
+#[allow(clippy::too_many_arguments)]
 async fn run_station(
     base: &Config,
     pool: &SqlitePool,
     factory: Arc<dyn HardwareFactory>,
     probe: Arc<dyn HardwareProbe>,
     stop: CancelToken,
+    notifier: Arc<dyn Notifier>,
+    health: Arc<HealthCell>,
     ready: Option<oneshot::Sender<Arc<StationHandle>>>,
 ) -> Result<Exit> {
+    health.set_dispatcher_alive(false);
+    // Do wejścia w pętlę ocena próby czeka (przegląd 5–7 I-2).
+    health.set_restarting(true);
     let sources = aars_sources::modules();
     let mut descriptors = aars_core::module::builtin();
     descriptors.extend(sources.iter().map(|m| m.descriptor));
@@ -351,6 +632,8 @@ async fn run_station(
     }
     let first = cands[0].clone();
     let (built, errors) = build_first(cands, factory.as_ref(), pool).await;
+    let radio_less = built.is_none();
+    health.set_radio(!radio_less, join_errors(&errors));
     let (stack, config, origin) = match built {
         Some((stack, cand)) => (Some(stack), cand.config, cand.origin),
         None => {
@@ -360,7 +643,7 @@ async fn run_station(
     };
 
     // Panel: `bind` kandydata, a przy błędzie `bind` z pliku (R6).
-    let listener = match tokio::net::TcpListener::bind(&config.server.bind).await {
+    let listener = match bind_panel(&config.server.bind).await {
         Ok(listener) => listener,
         Err(err) if config.server.bind != base.server.bind => {
             let note = format!(
@@ -373,7 +656,7 @@ async fn run_station(
                 audit_system(pool, "hardware_apply_failed", &note).await;
             }
             notes.push(note);
-            tokio::net::TcpListener::bind(&base.server.bind)
+            bind_panel(&base.server.bind)
                 .await
                 .with_context(|| format!("nasłuch na {}", base.server.bind))?
         }
@@ -384,6 +667,7 @@ async fn run_station(
     let bound = listener
         .local_addr()
         .map_or_else(|_| config.server.bind.clone(), |a| a.to_string());
+    let setup_url = listener.local_addr().ok().map(|a| setup_url(a, &local_host_name()));
 
     let mut status = ApplyStatus {
         origin,
@@ -427,12 +711,25 @@ async fn run_station(
     let shutdown = CancelToken::new();
     let drain = CancelToken::new();
     let restart = CancelToken::new();
+    let update = CancelToken::new();
+    let closed = CancelToken::new();
+    // Żądanie sprzed tego przebiegu nie przyszło z tego przebiegu: strażnik
+    // już je widział albo poprzedni przebieg nie zakończył procesu
+    // (przegląd 8–9 I-1). Nie może czekać na przypadkowy start.
+    crate::update::discard_request(
+        &crate::update::paths::UpdatePaths::from_config(base),
+        "żądanie sprzed startu tego przebiegu stacji",
+    );
 
     let users = aars_core::user::UserRepo::new(pool.clone());
-    if let Some(password) = users
-        .ensure_bootstrap_admin()
-        .await
-        .context("konto startowe")?
+    // R12: tryb pierwszego konta tylko z pliku (`base`). W trybie `wizard`
+    // hasła na konsoli nie ma — konto zakłada kreator `/setup`.
+    let wizard = base.setup.first_admin == FirstAdmin::Wizard;
+    if !wizard
+        && let Some(password) = users
+            .ensure_bootstrap_admin()
+            .await
+            .context("konto startowe")?
     {
         // Jedyny moment, w którym to hasło jest widoczne.
         println!("== konto startowe: admin / {password}");
@@ -442,12 +739,45 @@ async fn run_station(
         tracing::error!(%err, "czyszczenie wygasłych sesji zawiodło");
     }
 
+    // Biuletyn i źródła `pogoda`, `imgw-wodowskazy` dzielą instancje (jedna
+    // pamięć danych). Błąd budowy wyłącza biuletyn i oba źródła, reszta działa.
+    let bulletin = match aars_sources::bulletin::build(&config, pool.clone()) {
+        Ok(built) => Some(built),
+        Err(err) => {
+            tracing::error!(
+                source = aars_core::module::BULLETIN.id,
+                %err,
+                "biuletyn nie wystartuje: {err}"
+            );
+            for id in [aars_sources::pogoda::ID, aars_sources::imgw_wodowskazy::ID] {
+                source_start_failed(&SourceStateRepo::new(pool.clone()), id, &err.to_string())
+                    .await;
+            }
+            None
+        }
+    };
+    let mut shared = SharedSources::from_bulletin(bulletin.as_ref());
+    match aars_sources::imgw_meteo::ImgwMeteo::new(&config.sources.imgw_meteo_url) {
+        Ok(meteo) => shared.meteo = Some(Arc::new(meteo)),
+        Err(err) => {
+            source_start_failed(
+                &SourceStateRepo::new(pool.clone()),
+                aars_sources::imgw_meteo::ID,
+                &err.to_string(),
+            )
+            .await;
+        }
+    }
+
     // Źródła są odizolowane: błąd budowy jednego wyłącza tylko je.
     let mut runners = Vec::new();
     let mut refreshers: Vec<(&'static str, Arc<Notify>)> = Vec::new();
     for module in &sources {
         let id = module.descriptor.id;
-        match (module.build)(&config) {
+        let Some(built) = source_for(module, &config, &shared) else {
+            continue;
+        };
+        match built {
             Ok(source) => {
                 let runner = aars_sources::SourceRunner::new(
                     source,
@@ -471,12 +801,17 @@ async fn run_station(
     let mut poison_task = None;
     let mut watchdog = None;
     let mut watchdog_marker = None;
+    // Bez stosu nie ma nadań, więc i drenażu; wartość tylko dla porządku.
+    let mut drain_limit = Duration::ZERO;
     if let Some(RadioStack {
         sequencer,
         watchdog: wd,
         interlocks: locks,
+        watchdog_limit,
     }) = stack
     {
+        drain_limit = watchdog_limit + DRAIN_MARGIN;
+        health.set_drain_limit(drain_limit);
         let renderer = Arc::new(render::PiperRenderer::new(
             cache.clone(),
             synth.clone(),
@@ -520,6 +855,8 @@ async fn run_station(
     let handle = Arc::new(StationHandle {
         control,
         restart: restart.clone(),
+        update: update.clone(),
+        closed: closed.clone(),
         status: status.clone(),
         hardware,
         station: station.clone(),
@@ -535,12 +872,39 @@ async fn run_station(
         },
     );
 
+    // Aktualizacja z panelu (R10, R11): `releases_url` tylko z pliku, więc
+    // z `base`, a nie z konfiguracji z nadpisaniami panelu.
+    let update_control: Arc<dyn aars_web::state::UpdateControl> =
+        Arc::new(crate::update::control::UpdateHandle::new(
+            base,
+            crate::update::control::UpdateDeps {
+                pool: pool.clone(),
+                queue: queue.clone(),
+                interlocks: interlocks.clone(),
+                station: handle.clone(),
+                last: crate::update::health::stored_last_result(pool).await,
+            },
+        ));
     let mut state = aars_web::AppState::new(pool.clone(), queue.clone(), interlocks.clone(), false)
         .with_preview(preview)
         .with_station(handle.clone())
+        .with_update(update_control)
+        .with_first_admin(base.setup.first_admin)
+        .with_local_nets(local_nets())
+        .with_host_names({
+            let mut names =
+                station_host_names(&local_host_name(), &[&base.server.bind, &config.server.bind]);
+            // `server.allowed_hosts` tylko z pliku (`base`), jak ścieżki.
+            names.extend(base.server.allowed_hosts.iter().map(|n| n.to_ascii_lowercase()));
+            names
+        })
+        .with_host_check(true)
+        // `server.allow_remote` tylko z pliku (`base`), jak `allowed_hosts`.
+        .with_lan_only(!base.server.allow_remote)
         .with_probe(probe)
         .with_modules(registry.clone())
-        .with_base_config(Arc::new(base.clone()));
+        .with_base_config(Arc::new(base.clone()))
+        .with_version(service::VERSION);
     if let Some(marker) = watchdog_marker.clone() {
         state = state.with_watchdog_clear(Arc::new(move || marker.clear_poison()));
     }
@@ -555,6 +919,26 @@ async fn run_station(
             }
         }));
     }
+    if let Some(meteo) = shared.meteo.clone() {
+        state = state.with_warnings_map(Arc::new(move || {
+            meteo
+                .snapshot()
+                .map(|snap| warnings_snapshot(snap, chrono::Utc::now()))
+        }));
+    }
+    if let Some(built) = &bulletin {
+        let bulletin = built.bulletin.clone();
+        state = state.with_bulletin_preview(Arc::new(move || {
+            let bulletin = bulletin.clone();
+            Box::pin(async move {
+                bulletin
+                    .compose(chrono::Utc::now())
+                    .await
+                    .map(bulletin_preview_view)
+                    .map_err(|e| e.to_string())
+            })
+        }));
+    }
     let app = aars_web::router(state);
 
     let mut tasks = vec![
@@ -565,6 +949,14 @@ async fn run_station(
         )),
         tokio::spawn(scheduler.run(shutdown.clone())),
     ];
+    // Runner startuje zawsze i sam sprawdza włączenie przy każdym tiku. Tylko
+    // wstawia do kolejki — nadaje dyspozytor (bez stosu nikt).
+    tasks.extend(bulletin.map(|built| {
+        tokio::spawn(
+            aars_sources::bulletin::BulletinRunner::new(built.bulletin, queue.clone())
+                .run(shutdown.clone()),
+        )
+    }));
     tasks.extend(poison_task);
     tasks.extend(
         runners
@@ -573,7 +965,9 @@ async fn run_station(
     );
     let server_shutdown = shutdown.clone();
     tasks.push(tokio::spawn(async move {
-        let graceful = axum::serve(listener, app).with_graceful_shutdown(async move {
+        // Adres klienta dla kreatora `/setup` (sieć lokalna, R12).
+        let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+        let graceful = axum::serve(listener, service).with_graceful_shutdown(async move {
             while !server_shutdown.is_cancelled() {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -589,6 +983,21 @@ async fn run_station(
         misfire_grace_s = station.misfire_grace_s,
         "stacja uruchomiona, Ctrl-C kończy"
     );
+    // R9: panel nasłuchuje, a stos nadawczy jest zbudowany albo stacja
+    // świadomie przeszła w tryb bez nadawania.
+    notifier.ready();
+    health.mark_ready();
+    if radio_less {
+        notifier.status(RADIO_LESS_STATUS);
+    }
+    if wizard && !users.has_enabled_admin().await.unwrap_or(true) {
+        let text = format!(
+            "brak konta administratora — otwórz {} w sieci lokalnej",
+            setup_url.as_deref().unwrap_or("/setup")
+        );
+        tracing::warn!("{text}");
+        notifier.status(&text);
+    }
     if let Some(ready) = ready {
         let _ = ready.send(handle.clone());
     }
@@ -604,34 +1013,97 @@ async fn run_station(
             dispatcher_failed = true;
             break Exit::Stop;
         }
+        // Aktualizacja przed restartem: obie idą tą samą drogą drenażu, a
+        // `Update` i tak kończy proces (przegląd 8–9 I-1).
+        if update.is_cancelled() {
+            break Exit::Update;
+        }
         if restart.is_cancelled() {
             break Exit::Restart;
         }
+        // Werdykt `bad` nie przerywa nadania (I-2): ta sama droga co restart.
+        if health.fatal().is_some() {
+            break Exit::Unhealthy;
+        }
+        // R9: dyspozytor pracuje, gdy jego pętla tyka. W trakcie nadania nie
+        // tyka, ale nadanie trwa najwyżej do limitu strażnika.
+        let alive = match (&dispatcher_task, &handle.control) {
+            (Some(task), Some(control)) => {
+                !task.is_finished() && control.since_beat() <= drain_limit
+            }
+            _ => true,
+        };
+        health.set_dispatcher_alive(alive);
+        health.set_restarting(false);
         tokio::time::sleep(CONTROL_POLL).await;
     };
+    // Prośba o aktualizację, która przyszła tuż po odczycie `update` w pętli,
+    // zobaczy `closed` albo zostanie zauważona tutaj — nigdy nie przepada.
+    closed.cancel();
+    let exit = match exit {
+        Exit::Restart if update.is_cancelled() => Exit::Update,
+        other => other,
+    };
+    if matches!(exit, Exit::Restart) {
+        // Drenaż i budowa następnego przebiegu to nie „dyspozytor stoi”.
+        // Najpierw `restarting`, potem `alive = false`: ocena próby czyta je
+        // w tej kolejności (przegląd 8–9 M-2).
+        health.set_restarting(true);
+    }
+    health.set_dispatcher_alive(false);
+    // `STOPPING=1` tylko przy zatrzymaniu na żądanie (Ctrl-C, SIGTERM).
+    // Panika dyspozytora i werdykt „zła wersja” kończą proces błędem, który
+    // systemd ma podnieść, więc nie udają zatrzymania (przegląd 1–4, M-2).
+    let stop_requested = || stop.is_cancelled() && health.fatal().is_none();
+    if matches!(exit, Exit::Stop) && !dispatcher_failed && stop_requested() {
+        notifier.stopping();
+    }
 
     // Panika dyspozytora zostawia wątek sekwencera bez joina (I-2): wtedy
     // nie wolno otwierać tego samego PTT drugi raz w tym samym procesie.
-    if let (Exit::Restart, Some(task)) = (&exit, dispatcher_task.as_mut()) {
+    if let (Exit::Restart | Exit::Update | Exit::Unhealthy, Some(task)) =
+        (&exit, dispatcher_task.as_mut())
+    {
         // R4: dyspozytor nie bierze nic nowego, dokańcza nadanie i robi join
         // wątku sekwencera. Strażnik i most działają dalej. Ctrl-C w tym
         // czasie przerywa nadanie jak zwykle.
         tracing::info!("restart: czekam na koniec bieżącego nadania");
         drain.cancel();
+        // Drenaż ma limit (przegląd 1–4, I-1): po limicie strażnika TX i
+        // zapasie wątek sekwencera wisi (np. zawieszona karta). Watchdog
+        // systemd i tak tyka, więc bez limitu stacja milczałaby bez końca.
+        // Kończymy proces błędem; jądro zwolni PTT i kartę, a
+        // `Restart=always` podniesie go na czysto.
+        let give_up = tokio::time::Instant::now() + drain_limit;
+        let mut joined_cleanly = false;
         loop {
             tokio::select! {
                 joined = &mut *task => {
                     dispatcher_failed = joined.is_err();
+                    joined_cleanly = true;
                     break;
                 }
                 () = tokio::time::sleep(CONTROL_POLL) => {
-                    if stop.is_cancelled() {
+                    if stop.is_cancelled() && !shutdown.is_cancelled() {
+                        if stop_requested() {
+                            notifier.stopping();
+                        }
                         shutdown.cancel();
+                    }
+                    if !stop.is_cancelled() && tokio::time::Instant::now() >= give_up {
+                        tracing::error!(
+                            limit_s = drain_limit.as_secs(),
+                            "nadanie nie skończyło się w limicie drenażu — kończę proces błędem"
+                        );
+                        dispatcher_failed = true;
+                        break;
                     }
                 }
             }
         }
-        dispatcher_task = None;
+        if joined_cleanly {
+            dispatcher_task = None;
+        }
         // Po zwykłym drenażu wątek sekwencera jest dołączony i znacznik czysty.
         // Znacznik w górze bez Ctrl-C znaczy, że joina nie było (np. nie
         // wystartował wątek `aars-seq-join`): stary wątek trzyma jeszcze PTT
@@ -721,6 +1193,37 @@ mod tests {
     use aars_core::ptt::{FakePtt, PttEvent};
     use aars_core::sink::FakeSink;
     use aars_core::synth::FakeSynth;
+
+    use crate::service::{FakeNotifier, Notifier, ReadyOnce};
+    use crate::update::control::UpdateTarget;
+
+    /// `TimeoutStopSec` w `aars.service` musi objąć najdłuższe nadanie: po
+    /// SIGTERM sekwencer zwykle opuszcza PTT w ~150 ms, ale po panice
+    /// dyspozytora stacja czeka na strażnika TX, a drenaż ma zapas
+    /// `SERVICE_DRAIN_MARGIN`. SIGKILL wcześniej zostawiłby PTT jądru.
+    /// Górne granice z walidacji panelu: `tx_max_duration_s` ≤ 600
+    /// (`settings.rs`), `ptt.tx_tail_ms` ≤ 2000 (`hardware/mod.rs`).
+    #[test]
+    fn the_service_stop_timeout_covers_the_longest_transmission() {
+        let unit = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/systemd/aars.service"
+        ))
+        .unwrap();
+        let stop: u64 = unit
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("TimeoutStopSec="))
+            .expect("TimeoutStopSec w aars.service")
+            .parse()
+            .expect("TimeoutStopSec w sekundach");
+        let longest = radio::watchdog_limit(Duration::from_secs(600), Duration::from_millis(2000))
+            + SERVICE_DRAIN_MARGIN;
+        assert!(
+            Duration::from_secs(stop) >= longest,
+            "TimeoutStopSec={stop} < {} s",
+            longest.as_secs()
+        );
+    }
 
     struct FakeHardware {
         fail_devices: Vec<String>,
@@ -1009,6 +1512,11 @@ mod tests {
         config.server.bind = "127.0.0.1:0".to_owned();
         config.storage.cache_dir =
             std::env::temp_dir().join(format!("aars-station-{tag}-{}", std::process::id()));
+        // Testy nie dotykają /var/lib ani /opt.
+        let update = std::env::temp_dir().join(format!("aars-update-{tag}-{}", std::process::id()));
+        config.update.state_dir = update.join("state");
+        config.update.guard_dir = update.join("guard");
+        config.update.install_root = update.join("opt");
         config
     }
 
@@ -1018,6 +1526,42 @@ mod tests {
         hardware: Arc<FakeHardware>,
         stop: CancelToken,
     ) -> (tokio::task::JoinHandle<Result<Exit>>, Arc<StationHandle>) {
+        start_with(
+            config,
+            pool,
+            hardware,
+            stop,
+            Arc::new(FakeNotifier::default()),
+        )
+        .await
+    }
+
+    async fn start_with(
+        config: Config,
+        pool: SqlitePool,
+        hardware: Arc<FakeHardware>,
+        stop: CancelToken,
+        notifier: Arc<dyn Notifier>,
+    ) -> (tokio::task::JoinHandle<Result<Exit>>, Arc<StationHandle>) {
+        start_full(
+            config,
+            pool,
+            hardware,
+            stop,
+            notifier,
+            Arc::new(HealthCell::default()),
+        )
+        .await
+    }
+
+    async fn start_full(
+        config: Config,
+        pool: SqlitePool,
+        hardware: Arc<FakeHardware>,
+        stop: CancelToken,
+        notifier: Arc<dyn Notifier>,
+        health: Arc<HealthCell>,
+    ) -> (tokio::task::JoinHandle<Result<Exit>>, Arc<StationHandle>) {
         let (ready_tx, ready_rx) = oneshot::channel();
         let probe: Arc<dyn HardwareProbe> = Arc::new(aars_core::hardware::probe::FakeProbe {
             audio: Ok(vec![]),
@@ -1025,7 +1569,17 @@ mod tests {
             gpio: Ok(vec![]),
         });
         let task = tokio::spawn(async move {
-            run_station(&config, &pool, hardware, probe, stop, Some(ready_tx)).await
+            run_station(
+                &config,
+                &pool,
+                hardware,
+                probe,
+                stop,
+                notifier,
+                health,
+                Some(ready_tx),
+            )
+            .await
         });
         let handle = tokio::time::timeout(Duration::from_secs(10), ready_rx)
             .await
@@ -1106,6 +1660,142 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_requested_mid_transmission_waits_for_the_unkey() {
+        let pool = aars_core::db::test_pool().await;
+        let queue = QueueRepo::new(pool.clone());
+        let mut ids = Vec::new();
+        for text in [
+            "komunikat testowy trwa sekundy",
+            "drugi komunikat w kolejce",
+        ] {
+            ids.extend(
+                queue
+                    .enqueue(aars_core::queue::EnqueueRequest {
+                        message_id: None,
+                        // FakeSynth: 50 ms na znak, ~1,5 s audio.
+                        rendered_text: text.to_owned(),
+                        priority: Priority::Normal,
+                        interrupting: false,
+                        not_before: None,
+                        expires_at: None,
+                        repeat_count: 1,
+                        repeat_interval: Duration::ZERO,
+                        created_by: None,
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        let hardware = Arc::new(FakeHardware::new(&[]));
+        let ptt = hardware.ptt.clone();
+        let health = Arc::new(HealthCell::default());
+        let (task, handle) = start_full(
+            station_config("update"),
+            pool.clone(),
+            hardware,
+            CancelToken::new(),
+            Arc::new(FakeNotifier::default()),
+            health.clone(),
+        )
+        .await;
+        assert!(health.radio_up());
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ptt.is_keyed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("zadanie musi wejść na antenę");
+        assert!(health.dispatcher_alive());
+        assert!(handle.request_update());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !task.is_finished() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "aktualizacja musi zakończyć przebieg"
+            );
+            assert!(
+                ptt.is_keyed() || !task.is_finished(),
+                "przebieg nie kończy się przy wciśniętym PTT"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!ptt.is_keyed(), "run_once wraca dopiero po opuszczeniu PTT");
+        let exit = task.await.unwrap().unwrap();
+        assert!(matches!(exit, Exit::Update));
+        assert!(
+            !health.dispatcher_alive(),
+            "po drenażu dyspozytor nie pracuje"
+        );
+
+        let transitions: Vec<PttEvent> = ptt
+            .events()
+            .into_iter()
+            .filter(|e| *e != PttEvent::ForceUnkey)
+            .collect();
+        assert_eq!(
+            transitions,
+            vec![PttEvent::Key, PttEvent::Unkey],
+            "{:?}",
+            ptt.events()
+        );
+        let result: String =
+            sqlx::query_scalar("SELECT result FROM tx_log WHERE queue_item_id = ?")
+                .bind(ids[0])
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(result, "ok", "aktualizacja nie może przerwać nadania");
+        let second: String = sqlx::query_scalar("SELECT state FROM queue_items WHERE id = ?")
+            .bind(ids[1])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(second, "pending", "drugie zadanie czeka na nową wersję");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drain_stuck_on_a_hung_output_ends_the_process_with_an_error() {
+        let pool = aars_core::db::test_pool().await;
+        // Strażnik: 1 s + 0 ogona + 2 s zapasu; drenaż: to plus zapas testowy.
+        put(&pool, "tx_max_duration_s", "1").await;
+        enqueue_one(&pool, "komunikat na zawieszoną kartę").await;
+        let hardware = Arc::new(FakeHardware::new(&[]));
+        let ptt = hardware.ptt.clone();
+        *hardware.sink.lock().unwrap() = Some(Arc::new(HangsLong));
+        let mut config = station_config("hung-drain");
+        config.ptt.tx_tail_ms = 0;
+        let (task, handle) = start(config, pool.clone(), hardware, CancelToken::new()).await;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ptt.is_keyed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("zadanie musi wejść na antenę");
+        let requested = std::time::Instant::now();
+        handle.request_restart();
+
+        // Limit drenażu (3 s + 2 s) i ograniczony join po zatrzymaniu (5 s).
+        let result = tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .expect("drenaż nie może czekać bez końca")
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "zawieszony drenaż to błąd procesu, nie restart"
+        );
+        assert!(
+            requested.elapsed() >= Duration::from_secs(4),
+            "najpierw czekamy na limit"
+        );
+        assert!(!ptt.is_keyed(), "PTT opuszczone");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_ends_the_loop() {
         let pool = aars_core::db::test_pool().await;
         let stop = CancelToken::new();
@@ -1121,6 +1811,259 @@ mod tests {
         let exit = tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .expect("stop kończy przebieg w 2 s")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Stop));
+    }
+
+    #[tokio::test]
+    async fn the_weather_source_is_the_bulletin_part_instance() {
+        let config = Config::default();
+        let pool = aars_core::db::test_pool().await;
+        let built = aars_sources::bulletin::build(&config, pool).unwrap();
+        let shared = SharedSources::from_bulletin(Some(&built));
+        let none = SharedSources::default();
+        let modules = aars_sources::modules();
+        let by_id = |id: &str| modules.iter().find(|m| m.descriptor.id == id).unwrap();
+        let module = by_id(aars_sources::pogoda::ID);
+        let source = source_for(module, &config, &shared).unwrap().unwrap();
+        // Ta sama instancja = ta sama pamięć prognozy dla runnera i biuletynu.
+        assert!(std::ptr::addr_eq(
+            Arc::as_ptr(&source),
+            Arc::as_ptr(&built.pogoda)
+        ));
+        let gauges = by_id(aars_sources::imgw_wodowskazy::ID);
+        let source = source_for(gauges, &config, &shared).unwrap().unwrap();
+        assert!(std::ptr::addr_eq(
+            Arc::as_ptr(&source),
+            Arc::as_ptr(&built.wodowskazy)
+        ));
+        // Bez biuletynu (błąd budowy) współdzielone źródła nie startują osobno.
+        assert!(source_for(module, &config, &none).is_none());
+        assert!(source_for(gauges, &config, &none).is_none());
+        // Inne źródła budują się po staremu.
+        assert_eq!(
+            source_for(by_id("swpc"), &config, &none).unwrap().unwrap().id(),
+            "swpc"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_meteo_source_is_the_map_instance() {
+        let config = Config::default();
+        let meteo = Arc::new(
+            aars_sources::imgw_meteo::ImgwMeteo::new(&config.sources.imgw_meteo_url).unwrap(),
+        );
+        let shared = SharedSources {
+            meteo: Some(meteo.clone()),
+            ..SharedSources::default()
+        };
+        let modules = aars_sources::modules();
+        let module = modules
+            .iter()
+            .find(|m| m.descriptor.id == aars_sources::imgw_meteo::ID)
+            .unwrap();
+        let source = source_for(module, &config, &shared).unwrap().unwrap();
+        // Ta sama instancja = ta sama pamięć ostrzeżeń dla runnera i mapy.
+        assert!(std::ptr::addr_eq(Arc::as_ptr(&source), Arc::as_ptr(&meteo)));
+        // Bez instancji (błąd budowy, już zapisany) źródło nie startuje.
+        assert!(source_for(module, &config, &SharedSources::default()).is_none());
+    }
+
+    #[test]
+    fn a_meteo_snapshot_becomes_map_warnings() {
+        const JULY: &[u8] =
+            include_bytes!("../../aars-sources/tests/fixtures/imgw/warningsmeteo-2026-07-23.json");
+        let parsed = aars_sources::imgw_meteo::parse::parse_warnings(JULY).unwrap();
+        let total: usize = parsed.warnings.iter().map(|w| w.teryt.len()).sum();
+        let fetched_at = chrono::Utc::now();
+        let snap = warnings_snapshot(
+            aars_sources::imgw_meteo::MeteoSnapshot {
+                fetched_at,
+                warnings: parsed.warnings.clone(),
+            },
+            fetched_at,
+        );
+        assert_eq!(snap.fetched_at, fetched_at);
+        assert_eq!(snap.warnings.len(), total);
+        let until = chrono::DateTime::parse_from_rfc3339("2026-07-23T20:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(snap.warnings.iter().any(|w| w.teryt == "1806"
+            && w.level == 1
+            && w.event == "Burze"
+            && w.until == until));
+        // Stopień nieznany → 1; czas nieistniejący w Warszawie → pominięte.
+        let mut base = parsed.warnings[0].clone();
+        base.teryt = vec!["1801".into()];
+        let mut no_level = base.clone();
+        no_level.level = None;
+        let mut gap = base.clone();
+        gap.valid_until =
+            chrono::NaiveDateTime::parse_from_str("2026-03-29 02:30:00", "%Y-%m-%d %H:%M:%S")
+                .unwrap();
+        let snap = warnings_snapshot(
+            aars_sources::imgw_meteo::MeteoSnapshot {
+                fetched_at,
+                warnings: vec![no_level, gap],
+            },
+            fetched_at,
+        );
+        assert_eq!(snap.warnings.len(), 1);
+        assert_eq!(snap.warnings[0].level, 1);
+    }
+
+    #[test]
+    fn a_warning_not_yet_in_force_is_left_off_the_map() {
+        const JULY: &[u8] =
+            include_bytes!("../../aars-sources/tests/fixtures/imgw/warningsmeteo-2026-07-23.json");
+        let parsed = aars_sources::imgw_meteo::parse::parse_warnings(JULY).unwrap();
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let mut base = parsed.warnings[0].clone();
+        base.teryt = vec!["1801".into()];
+        let from = |s: &str| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap()
+        };
+        let mut started = base.clone();
+        started.valid_from = from("2026-07-23 08:00:00");
+        started.event = "Teraz".into();
+        let mut later = base.clone();
+        later.valid_from = from("2026-07-23 10:00:01");
+        later.event = "Później".into();
+        let snap = warnings_snapshot(
+            aars_sources::imgw_meteo::MeteoSnapshot {
+                fetched_at: at("2026-07-23T07:00:00Z"),
+                warnings: vec![started, later],
+            },
+            at("2026-07-23T08:00:00Z"),
+        );
+        let events: Vec<&str> = snap.warnings.iter().map(|w| w.event.as_str()).collect();
+        assert_eq!(events, ["Teraz"]);
+    }
+
+    #[test]
+    fn a_composed_bulletin_becomes_the_panel_view() {
+        use aars_sources::bulletin::{Composed, PartOutcome};
+        let view = bulletin_preview_view(Composed {
+            text: None,
+            parts: vec![
+                (
+                    "pogoda",
+                    PartOutcome::Empty("brak pozycji stacji".to_owned()),
+                ),
+                ("propagacja", PartOutcome::Failed("x".to_owned())),
+            ],
+            skipped_reason: Some("brak danych"),
+        });
+        assert_eq!(view.text, None);
+        assert_eq!(view.skipped_reason.as_deref(), Some("brak danych"));
+        assert_eq!(
+            view.parts,
+            vec![
+                (
+                    "pogoda".to_owned(),
+                    "pominięta — brak pozycji stacji".to_owned()
+                ),
+                ("propagacja".to_owned(), "błąd — x".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_station_starts_with_the_bulletin_enabled_and_without_network() {
+        let pool = aars_core::db::test_pool().await;
+        let mut config = station_config("bulletin");
+        for url in [
+            &mut config.sources.open_meteo_url,
+            &mut config.sources.met_no_url,
+            &mut config.sources.swpc_f107_url,
+            &mut config.sources.swpc_kp_url,
+            &mut config.sources.kc2g_url,
+        ] {
+            *url = "http://127.0.0.1:1/x".to_owned();
+        }
+        // Pora daleko od teraz: UTC + 6 h czytane jako czas warszawski (UTC+1/+2)
+        // to za 4–5 h, więc nigdy w oknie teraz ± 15 min, w każdej strefie hosta.
+        let far = (chrono::Utc::now() + chrono::TimeDelta::hours(6)).format("%H:%M");
+        put(&pool, "module:bulletin:enabled", "true").await;
+        put(&pool, "module:bulletin:times", &far.to_string()).await;
+        let locator = aars_core::geo::locator_from(50.04, 21.99, 6).unwrap();
+        aars_core::geo::PositionRepo::new(pool.clone())
+            .save(Some(&aars_core::geo::StationPosition {
+                lat: 50.04,
+                lon: 21.99,
+                locator,
+            }))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO source_state (source_id, enabled) VALUES ('pogoda', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let hardware = Arc::new(FakeHardware::new(&[]));
+        let ptt = hardware.ptt.clone();
+        let stop = CancelToken::new();
+        let (task, handle) = start(config, pool.clone(), hardware, stop.clone()).await;
+        assert!(handle.running_hardware().is_some(), "stos nadawczy wstał");
+
+        // Źródło `pogoda` działa (wspólna instancja) i bez sieci tylko notuje porażkę.
+        let repo = SourceStateRepo::new(pool.clone());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let failed = repo
+                    .statuses()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .any(|s| s.source_id == "pogoda" && s.consecutive_failures > 0);
+                if failed {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("źródło pogoda musi spróbować pobrania");
+        // Runner wystartował: minione pory (wczoraj, może dziś) zajął jako
+        // spóźnione, żadnej nie złożył.
+        let fires = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let rows: Vec<(Option<String>, Option<i64>)> =
+                    sqlx::query_as("SELECT skipped_reason, queue_item_id FROM bulletin_fires")
+                        .fetch_all(&pool)
+                        .await
+                        .unwrap();
+                if !rows.is_empty() {
+                    break rows;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("runner biuletynu musi ruszyć");
+        for (reason, item) in &fires {
+            assert_eq!(reason.as_deref(), Some("spóźnione ponad misfire_grace_s"));
+            assert_eq!(*item, None);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let pending = QueueRepo::new(pool.clone()).pending(10).await.unwrap();
+        assert!(pending.is_empty(), "nic przed porą: {pending:?}");
+        assert!(
+            ptt.events().is_empty(),
+            "PTT nie kluczowany: {:?}",
+            ptt.events()
+        );
+
+        stop.cancel();
+        let exit = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
             .unwrap()
             .unwrap();
         assert!(matches!(exit, Exit::Stop));
@@ -1195,6 +2138,157 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    fn trial_paths(dir: &std::path::Path) -> crate::update::paths::UpdatePaths {
+        let paths = crate::update::paths::UpdatePaths {
+            install_root: dir.join("opt"),
+            guard_dir: dir.join("guard"),
+            state_dir: dir.join("state"),
+            db_path: dir.join("aars.db"),
+        };
+        std::fs::create_dir_all(&paths.guard_dir).unwrap();
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        crate::update::install::write_trial(
+            &paths,
+            &aars_core::update::Trial {
+                format: 1,
+                version: "0.11.0".to_owned(),
+                previous: "0.10.0".to_owned(),
+                installed_at: String::new(),
+                attempts: 1,
+                radio_was_up: true,
+            },
+        )
+        .unwrap();
+        paths
+    }
+
+    async fn tx_results(pool: &SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT result FROM tx_log ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn wait_keyed(ptt: &FakePtt) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ptt.is_keyed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("zadanie musi wejść na antenę");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restart_during_the_trial_and_a_long_transmission_is_not_a_bad_verdict() {
+        // Przegląd 5–7 I-2: chwila oceny trafia w drenaż przed restartem.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = trial_paths(dir.path());
+        let pool = aars_core::db::test_pool().await;
+        // FakeSynth: 50 ms na znak, ~3 s audio.
+        enqueue_one(&pool, "komunikat testowy trwa kilka dobrych sekund na antenie").await;
+        let hardware = Arc::new(FakeHardware::new(&[]));
+        let ptt = hardware.ptt.clone();
+        let health = Arc::new(HealthCell::default());
+        let stop = CancelToken::new();
+        let fake = Arc::new(FakeNotifier::default());
+        let config = station_config("trial-restart");
+        let (task, handle) = start_full(
+            config.clone(),
+            pool.clone(),
+            hardware.clone(),
+            stop.clone(),
+            fake.clone(),
+            health.clone(),
+        )
+        .await;
+        wait_keyed(&ptt).await;
+        handle.request_restart();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !health.restarting() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("drenaż oznacza restart");
+        // Ocena teraz: czas próby minął, a stacja właśnie drenuje.
+        let confirm = tokio::spawn(crate::update::health::confirm_after(
+            paths.clone(),
+            health.clone(),
+            "0.11.0".to_owned(),
+            stop.clone(),
+            Duration::ZERO,
+        ));
+        let exit = tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Restart));
+        assert!(!stop.is_cancelled(), "nadanie nie zostało przerwane przez stop");
+        assert_eq!(tx_results(&pool).await, vec!["ok".to_owned()]);
+        assert!(!paths.verdict().exists(), "w trakcie restartu nie ma werdyktu");
+
+        // Następny przebieg w tym samym procesie.
+        let (task, _handle) = start_full(
+            config,
+            pool.clone(),
+            Arc::new(FakeHardware::new(&[])),
+            stop.clone(),
+            fake,
+            health.clone(),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), confirm)
+            .await
+            .expect("ocena po restarcie")
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(paths.confirmed()).unwrap(), "0.11.0");
+        assert!(!paths.verdict().exists());
+        assert!(health.fatal().is_none());
+        stop.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bad_verdict_during_a_transmission_waits_for_the_unkey() {
+        // Przegląd 5–7 I-2, pkt 2: werdykt przy działającym stosie kończy
+        // przez drenaż, a nie przez `stop`.
+        let pool = aars_core::db::test_pool().await;
+        enqueue_one(&pool, "komunikat testowy trwa kilka sekund").await;
+        enqueue_one(&pool, "drugie zadanie nie wchodzi").await;
+        let hardware = Arc::new(FakeHardware::new(&[]));
+        let ptt = hardware.ptt.clone();
+        let health = Arc::new(HealthCell::default());
+        let stop = CancelToken::new();
+        let fake = Arc::new(FakeNotifier::default());
+        let (task, _handle) = start_full(
+            station_config("bad-verdict"),
+            pool.clone(),
+            hardware,
+            stop.clone(),
+            fake.clone(),
+            health.clone(),
+        )
+        .await;
+        wait_keyed(&ptt).await;
+        health.set_fatal("bad 0.11.0: dyspozytor nie pracuje".to_owned());
+        let exit = tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Unhealthy));
+        assert!(!ptt.is_keyed());
+        assert!(!stop.is_cancelled());
+        assert_eq!(tx_results(&pool).await, vec!["ok".to_owned()]);
+        assert!(
+            !fake.events().contains(&"STOPPING=1".to_owned()),
+            "{:?}",
+            fake.events()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1547,5 +2641,499 @@ mod tests {
         assert!(matches!(exit, Exit::Stop));
         assert!(!ptt.is_keyed(), "PTT opuszczone przez ograniczony join");
         assert_eq!(get(&pool, "poisoned").await.as_deref(), Some("false"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_is_sent_once_after_the_panel_listens() {
+        let pool = aars_core::db::test_pool().await;
+        let fake = Arc::new(FakeNotifier::default());
+        let notifier: Arc<dyn Notifier> = Arc::new(ReadyOnce::new(fake.clone()));
+        let config = station_config("ready");
+
+        let (task, handle) = start_with(
+            config.clone(),
+            pool.clone(),
+            Arc::new(FakeHardware::new(&[])),
+            CancelToken::new(),
+            notifier.clone(),
+        )
+        .await;
+        // `ready` idzie po nasłuchu panelu i zbudowaniu stosu.
+        assert_eq!(fake.events(), vec!["READY=1".to_owned()]);
+
+        handle.request_restart();
+        let exit = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Restart));
+        assert!(
+            !fake.events().contains(&"STOPPING=1".to_owned()),
+            "restart w procesie to nie zatrzymanie: {:?}",
+            fake.events()
+        );
+
+        let stop = CancelToken::new();
+        let (task, _handle) = start_with(
+            config,
+            pool,
+            Arc::new(FakeHardware::new(&[])),
+            stop.clone(),
+            notifier,
+        )
+        .await;
+        stop.cancel();
+        let exit = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Stop));
+
+        assert_eq!(
+            fake.events(),
+            vec![
+                "READY=1".to_owned(),
+                "STATUS=restart w procesie".to_owned(),
+                "STOPPING=1".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unhealthy_exit_does_not_announce_stopping() {
+        // Werdykt „zła wersja” kończy proces błędem przez ten sam `stop`.
+        // systemd nie może dostać `STOPPING=1`, bo to nie jest zatrzymanie
+        // na żądanie (przegląd 1–4, M-2).
+        let pool = aars_core::db::test_pool().await;
+        let fake = Arc::new(FakeNotifier::default());
+        let health = Arc::new(HealthCell::default());
+        let stop = CancelToken::new();
+        let (task, _handle) = start_full(
+            station_config("fatal-no-stopping"),
+            pool,
+            Arc::new(FakeHardware::new(&[])),
+            stop.clone(),
+            fake.clone(),
+            health.clone(),
+        )
+        .await;
+        health.set_fatal("nadawanie nie wstało".to_owned());
+        stop.cancel();
+        let exit = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Stop));
+        assert_eq!(fake.events(), vec!["READY=1".to_owned()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wizard_mode_prints_no_password_and_points_to_setup() {
+        let pool = aars_core::db::test_pool().await;
+        let fake = Arc::new(FakeNotifier::default());
+        let mut config = station_config("wizard");
+        config.setup.first_admin = FirstAdmin::Wizard;
+        let stop = CancelToken::new();
+        let (task, _handle) = start_with(
+            config,
+            pool.clone(),
+            Arc::new(FakeHardware::new(&[])),
+            stop.clone(),
+            fake.clone(),
+        )
+        .await;
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(users, 0, "w trybie wizard nie ma konta startowego");
+        let status = fake
+            .events()
+            .into_iter()
+            .find(|e| e.starts_with("STATUS=brak konta administratora"))
+            .expect("STATUS z adresem kreatora");
+        assert!(status.contains("http://127.0.0.1:"), "{status}");
+        assert!(status.ends_with("/setup w sieci lokalnej"), "{status}");
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn station_host_names_cover_the_hostname_mdns_and_the_bind_host() {
+        assert_eq!(
+            station_host_names("Stacja", &["0.0.0.0:8080", "panel.lan:8080"]),
+            vec![
+                "panel.lan",
+                "stacja",
+                "stacja.home",
+                "stacja.home.arpa",
+                "stacja.lan",
+                "stacja.local",
+                "stacja.localdomain"
+            ]
+        );
+        assert_eq!(
+            station_host_names("aars.local", &["[::]:8080"]),
+            vec!["aars", "aars.home", "aars.home.arpa", "aars.lan", "aars.local", "aars.localdomain"]
+        );
+    }
+
+    #[test]
+    fn only_an_unavailable_ipv6_wildcard_falls_back_to_ipv4() {
+        use std::io::{Error, ErrorKind};
+        let unavailable = Error::from(ErrorKind::AddrNotAvailable);
+        assert_eq!(
+            ipv4_fallback("[::]:8080", &unavailable),
+            Some("0.0.0.0:8080".parse().unwrap())
+        );
+        assert_eq!(ipv4_fallback("[::]:8080", &Error::from(ErrorKind::AddrInUse)), None);
+        assert_eq!(ipv4_fallback("0.0.0.0:8080", &unavailable), None);
+        assert_eq!(ipv4_fallback("[fe80::1]:8080", &unavailable), None);
+    }
+
+    #[tokio::test]
+    async fn the_image_bind_accepts_ipv4_clients() {
+        // `[::]` jednym gniazdem (M-2). Bez IPv6 w środowisku testu działa
+        // zapasowe `0.0.0.0`; tak samo zachowa się stacja.
+        let listener = bind_panel("[::]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.map(|(_, peer)| peer) });
+        let _client = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let peer = accept.await.unwrap().unwrap();
+        let ip = match peer.ip() {
+            std::net::IpAddr::V6(v6) => std::net::IpAddr::V4(v6.to_ipv4_mapped().expect("IPv4 jako ::ffff:")),
+            v4 => v4,
+        };
+        assert_eq!(ip, std::net::IpAddr::from([127, 0, 0, 1]));
+        assert!(aars_core::netlocal::is_local_client(peer.ip(), &[]));
+    }
+
+    #[tokio::test]
+    async fn the_wildcard_socket_is_dual_stack_regardless_of_bindv6only() {
+        // N-2: `IPV6_V6ONLY` ustawione jawnie na 0, nie z sysctl.
+        let Ok(listener) = dual_stack("[::]:0".parse().unwrap()) else {
+            return; // środowisko bez IPv6: stacja użyje zapasu `0.0.0.0`
+        };
+        let socket = socket2::SockRef::from(&listener);
+        assert!(!socket.only_v6().unwrap());
+        assert!(listener.local_addr().unwrap().is_ipv6());
+    }
+
+    #[test]
+    fn the_setup_url_names_the_host_when_listening_everywhere() {
+        let any: std::net::SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        assert_eq!(setup_url(any, "aars"), "http://aars.local:8080/setup");
+        assert_eq!(setup_url(any, "stacja.local"), "http://stacja.local:8080/setup");
+        let one: std::net::SocketAddr = "192.168.1.2:8080".parse().unwrap();
+        assert_eq!(setup_url(one, "aars"), "http://192.168.1.2:8080/setup");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_is_sent_in_radio_less_mode_too() {
+        let pool = aars_core::db::test_pool().await;
+        let fake = Arc::new(FakeNotifier::default());
+        let stop = CancelToken::new();
+        let (task, handle) = start_with(
+            station_config("ready-noradio"),
+            pool,
+            Arc::new(FakeHardware::new(&["default"])),
+            stop.clone(),
+            fake.clone(),
+        )
+        .await;
+        assert_eq!(handle.apply_status().origin, ConfigOrigin::None);
+
+        let events = fake.events();
+        assert_eq!(
+            events.first().map(String::as_str),
+            Some("READY=1"),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.starts_with("STATUS=") && e.contains("bez nadawania")),
+            "{events:?}"
+        );
+
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Przegląd 8–9 I-1: restart i aktualizacja naraz dają `Exit::Update`,
+    /// a prośba do zakończonego przebiegu jest odrzucana. Żądanie sprzed
+    /// przebiegu znika przy jego starcie.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_racing_a_restart_wins_and_a_stale_handle_refuses() {
+        let config = station_config("race");
+        let paths = crate::update::paths::UpdatePaths::from_config(&config);
+        std::fs::create_dir_all(paths.staging().join("0.11.0")).unwrap();
+        std::fs::write(paths.request(), "0.11.0\n").unwrap();
+
+        let pool = aars_core::db::test_pool().await;
+        let (task, handle) =
+            start(config.clone(), pool.clone(), Arc::new(FakeHardware::new(&[])), CancelToken::new()).await;
+        assert!(!paths.request().exists(), "stare żądanie wycofane przy starcie przebiegu");
+        assert!(!paths.staging().exists());
+
+        handle.restart.cancel();
+        assert!(handle.request_update());
+        let exit = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Update), "aktualizacja wygrywa z restartem");
+        assert!(!handle.request_update(), "przebieg zakończony — prośba odrzucona");
+
+        // Restart sam: prośba do starego uchwytu po końcu przebiegu przepada.
+        let (task, handle) =
+            start(config, pool, Arc::new(FakeHardware::new(&[])), CancelToken::new()).await;
+        handle.restart.cancel();
+        let exit = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Restart));
+        assert!(!handle.request_update());
+    }
+
+    /// Kryterium wyjścia etapu 10 (Task 13): aktualizacja zlecona w trakcie
+    /// nadania czeka na `Unkey`, strażnik instaluje, zdrowa wersja zostaje
+    /// potwierdzona, a następna, która nie zbudowała stosu nadawczego
+    /// (wcześniej działał), wraca do poprzedniej razem z kopią bazy i trafia
+    /// do audytu. Czas próby jest symulowany (`judge` z `CONFIRM_AFTER`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_installs_after_the_transmission_and_a_broken_one_rolls_back() {
+        use aars_core::update::{CONFIRM_AFTER, ResultKind};
+        use aars_web::state::UpdateControl;
+
+        use crate::update::control::{UpdateDeps, UpdateHandle};
+        use crate::update::fetch::ReleaseClient;
+        use crate::update::guard::{GuardAction, run_guard};
+        use crate::update::health::{Verdict, audit_last_result, judge};
+        use crate::update::install::{NoOwner, SmokeTest};
+        use crate::update::paths::{UpdatePaths, installed_version, swap_link, write_atomic_nofollow};
+        use crate::update::read_trial;
+        use crate::update::testkit::{TestKey, release_archive, release_server};
+
+        /// Wersja z `VERSION` obok binarki: bez uruchamiania świeżo
+        /// zapisanego pliku (ETXTBSY przy równoległych testach na Linuksie).
+        struct VersionSmoke;
+        impl SmokeTest for VersionSmoke {
+            fn version_of(&self, binary: &std::path::Path) -> Result<String, String> {
+                installed_version(binary.parent().unwrap()).ok_or_else(|| "brak VERSION".to_owned())
+            }
+        }
+
+        struct NoStation;
+        impl UpdateTarget for NoStation {
+            fn request_update(&self) -> bool {
+                true
+            }
+        }
+
+        async fn open(path: &std::path::Path) -> SqlitePool {
+            let pool = aars_core::db::connect(path).await.unwrap();
+            aars_core::db::migrate(&pool).await.unwrap();
+            pool
+        }
+
+        async fn marker(pool: &SqlitePool) -> Option<String> {
+            SettingsRepo::new(pool.clone()).kv_get("test:marker").await.unwrap()
+        }
+
+        fn handle(
+            paths: &UpdatePaths,
+            server: &wiremock::MockServer,
+            key: &TestKey,
+            running: &str,
+            pool: &SqlitePool,
+            station: Arc<dyn UpdateTarget>,
+        ) -> UpdateHandle {
+            UpdateHandle::with_client(
+                paths.clone(),
+                Some(ReleaseClient::new(&server.uri(), key.trusted()).unwrap()),
+                running,
+                None,
+                UpdateDeps {
+                    pool: pool.clone(),
+                    queue: Arc::new(QueueRepo::new(pool.clone())),
+                    interlocks: Arc::new(aars_core::interlock::InMemoryInterlocks::permissive()),
+                    station,
+                    last: None,
+                },
+            )
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = UpdatePaths {
+            install_root: dir.path().join("opt/aars"),
+            guard_dir: dir.path().join("var/lib/aars-update"),
+            state_dir: dir.path().join("var/lib/aars/update"),
+            db_path: dir.path().join("var/lib/aars/aars.db"),
+        };
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let first = paths.releases().join("0.10.0");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::write(first.join("aars"), "#!/bin/sh\necho \"aars 0.10.0\"\n").unwrap();
+        std::fs::write(first.join("VERSION"), "0.10.0\n").unwrap();
+        swap_link(&paths.current(), std::path::Path::new("releases/0.10.0")).unwrap();
+        let now: chrono::DateTime<chrono::Utc> = "2026-11-21T12:00:00Z".parse().unwrap();
+        let key = TestKey::generate();
+        let guard = |paths: &UpdatePaths| run_guard(paths, Some(&key.trusted()), &VersionSmoke, &NoOwner, now);
+
+        // 1. Stacja 0.10.0 nadaje ~1,5 s; admin zleca 0.11.0 w trakcie.
+        let pool = open(&paths.db_path).await;
+        aars_core::user::UserRepo::new(pool.clone())
+            .create("admin", "dlugie-haslo-1", aars_core::user::Role::Admin)
+            .await
+            .unwrap();
+        let queue = QueueRepo::new(pool.clone());
+        let mut ids = Vec::new();
+        for text in ["komunikat testowy trwa sekundy", "drugi komunikat w kolejce"] {
+            ids.extend(
+                queue
+                    .enqueue(aars_core::queue::EnqueueRequest {
+                        message_id: None,
+                        rendered_text: text.to_owned(),
+                        priority: Priority::Normal,
+                        interrupting: false,
+                        not_before: None,
+                        expires_at: None,
+                        repeat_count: 1,
+                        repeat_interval: Duration::ZERO,
+                        created_by: None,
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut config = station_config("exit10");
+        config.storage.db_path = paths.db_path.clone();
+        config.update.install_root = paths.install_root.clone();
+        config.update.guard_dir = paths.guard_dir.clone();
+        config.update.state_dir = paths.state_dir.clone();
+        let hardware = Arc::new(FakeHardware::new(&[]));
+        let ptt = hardware.ptt.clone();
+        let (task, station) = start_full(
+            config,
+            pool.clone(),
+            hardware,
+            CancelToken::new(),
+            Arc::new(FakeNotifier::default()),
+            Arc::new(HealthCell::default()),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ptt.is_keyed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("zadanie musi wejść na antenę");
+        let server = release_server(&key, "0.11.0", &release_archive("0.11.0")).await;
+        let update = handle(&paths, &server, &key, "0.10.0", &pool, station.clone());
+        update.install("0.11.0", "admin").await.unwrap();
+        assert!(ptt.is_keyed(), "pobranie i sprawdzenie idą w trakcie nadania (R10d)");
+        let exit = tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .expect("aktualizacja musi zakończyć przebieg")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Update));
+        assert!(!ptt.is_keyed());
+        let transitions: Vec<PttEvent> =
+            ptt.events().into_iter().filter(|e| *e != PttEvent::ForceUnkey).collect();
+        assert_eq!(transitions, vec![PttEvent::Key, PttEvent::Unkey]);
+        let result: String = sqlx::query_scalar("SELECT result FROM tx_log WHERE queue_item_id = ?")
+            .bind(ids[0])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(result, "ok", "aktualizacja nie przerywa nadania");
+        let second: String = sqlx::query_scalar("SELECT state FROM queue_items WHERE id = ?")
+            .bind(ids[1])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(second, "pending", "drugie zadanie nie zostało wzięte");
+        drop(update);
+        pool.close().await;
+
+        // 2. Strażnik (ExecStartPre) instaluje 0.11.0 i otwiera próbę.
+        assert_eq!(guard(&paths), vec![GuardAction::Installed("0.11.0".to_owned())]);
+        assert_eq!(installed_version(&paths.current()).as_deref(), Some("0.11.0"));
+        assert_eq!(installed_version(&paths.previous()).as_deref(), Some("0.10.0"));
+        let trial = read_trial(&paths).expect("próba trwa");
+        // Pierwszy start liczy się od razu (trzy starty, przegląd 5–7 M-1).
+        assert_eq!((trial.version.as_str(), trial.attempts), ("0.11.0", 1));
+        assert!(trial.radio_was_up, "0.10.0 zbudowała stos nadawczy");
+
+        // 3. Po 60 s zdrowej pracy: potwierdzenie, strażnik zamyka próbę.
+        let healthy = HealthCell::default();
+        healthy.set_radio(true, None);
+        healthy.set_dispatcher_alive(true);
+        assert_eq!(judge(Some(&trial), "0.11.0", &healthy, CONFIRM_AFTER), Verdict::Confirm);
+        write_atomic_nofollow(&paths.confirmed(), b"0.11.0").unwrap();
+        assert_eq!(guard(&paths), vec![GuardAction::Confirmed("0.11.0".to_owned())]);
+        assert!(read_trial(&paths).is_none());
+
+        // 4. Stacja 0.11.0 nadaje (stos z panelu) i dostaje 0.12.0.
+        let pool = open(&paths.db_path).await;
+        let kv = SettingsRepo::new(pool.clone());
+        kv.kv_put("hw_state:origin", "panel").await.unwrap();
+        kv.kv_put("test:marker", "przed 0.12.0").await.unwrap();
+        let server = release_server(&key, "0.12.0", &release_archive("0.12.0")).await;
+        handle(&paths, &server, &key, "0.11.0", &pool, Arc::new(NoStation))
+            .install("0.12.0", "admin")
+            .await
+            .unwrap();
+        pool.close().await;
+        assert_eq!(guard(&paths), vec![GuardAction::Installed("0.12.0".to_owned())]);
+        let trial = read_trial(&paths).expect("próba 0.12.0");
+        assert!(trial.radio_was_up, "0.11.0 nadawała");
+
+        // 0.12.0 pisze do bazy, ale nie buduje stosu nadawczego.
+        let pool = open(&paths.db_path).await;
+        SettingsRepo::new(pool.clone()).kv_put("test:marker", "po 0.12.0").await.unwrap();
+        pool.close().await;
+        let broken = HealthCell::default();
+        broken.set_radio(false, Some("karta nie wstała".to_owned()));
+        broken.set_dispatcher_alive(true);
+        let Verdict::Bad(reason) = judge(Some(&trial), "0.12.0", &broken, CONFIRM_AFTER) else {
+            panic!("wersja bez stosu nadawczego nie może być potwierdzona");
+        };
+        assert!(reason.starts_with("bad 0.12.0: nadawanie nie wstało"), "{reason}");
+        write_atomic_nofollow(&paths.verdict(), reason.as_bytes()).unwrap();
+
+        // Strażnik wraca do 0.11.0 z kopią bazy sprzed instalacji.
+        assert_eq!(guard(&paths), vec![GuardAction::RolledBack("0.11.0".to_owned())]);
+        assert_eq!(installed_version(&paths.current()).as_deref(), Some("0.11.0"));
+        assert!(read_trial(&paths).is_none());
+        let pool = open(&paths.db_path).await;
+        assert_eq!(marker(&pool).await.as_deref(), Some("przed 0.12.0"), "baza z kopii");
+        let last = audit_last_result(&paths, &pool).await.expect("wynik powrotu");
+        assert_eq!(last.kind, ResultKind::RolledBack);
+        let audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'update_rolled_back' AND user_id IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audits, 1);
+        assert!(audit_last_result(&paths, &pool).await.is_none(), "raz");
     }
 }

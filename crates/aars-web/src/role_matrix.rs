@@ -61,6 +61,17 @@ const POSTS: &[(&str, u8)] = &[
     ("/queue/group/g/cancel", OPERATOR),
     ("/sources/imgw-meteo/enabled", OPERATOR),
     ("/sources/imgw-meteo/refresh", OPERATOR),
+    ("/sources/rso/enabled", OPERATOR),
+    ("/sources/rso/refresh", OPERATOR),
+    ("/sources/swpc/enabled", OPERATOR),
+    ("/sources/swpc/refresh", OPERATOR),
+    ("/sources/gios-smog/enabled", OPERATOR),
+    ("/sources/gios-smog/refresh", OPERATOR),
+    ("/sources/emsc/enabled", OPERATOR),
+    ("/sources/emsc/refresh", OPERATOR),
+    ("/sources/pogoda/enabled", OPERATOR),
+    ("/sources/pogoda/refresh", OPERATOR),
+    ("/modules/bulletin/preview", OPERATOR),
     ("/watchdog/clear", ADMIN),
     ("/settings", ADMIN),
     ("/settings/hardware", ADMIN),
@@ -68,9 +79,23 @@ const POSTS: &[(&str, u8)] = &[
     ("/settings/hardware/test-audio", ADMIN),
     ("/settings/position", ADMIN),
     ("/station/restart", ADMIN),
+    ("/settings/update/check", ADMIN),
+    ("/settings/update/install", ADMIN),
     ("/modules/scheduler/enabled", ADMIN),
     ("/modules/imgw-meteo/enabled", ADMIN),
     ("/modules/imgw-meteo/settings", ADMIN),
+    ("/modules/rso/enabled", ADMIN),
+    ("/modules/rso/settings", ADMIN),
+    ("/modules/swpc/enabled", ADMIN),
+    ("/modules/swpc/settings", ADMIN),
+    ("/modules/gios-smog/enabled", ADMIN),
+    ("/modules/gios-smog/settings", ADMIN),
+    ("/modules/emsc/enabled", ADMIN),
+    ("/modules/emsc/settings", ADMIN),
+    ("/modules/pogoda/enabled", ADMIN),
+    ("/modules/pogoda/settings", ADMIN),
+    ("/modules/bulletin/enabled", ADMIN),
+    ("/modules/bulletin/settings", ADMIN),
     ("/users", ADMIN),
     ("/users/1/role", ADMIN),
     ("/users/1/disabled", ADMIN),
@@ -90,7 +115,11 @@ async fn request(
     csrf: &str,
     body: &str,
 ) -> (StatusCode, Option<String>) {
-    let mut builder = Request::builder().method(method).uri(path);
+    // `Host` jak z przeglądarki: kreator `/setup` odrzuca żądania bez niego.
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::HOST, "127.0.0.1:8080");
     if let Some(cookie) = cookie {
         builder = builder.header(header::COOKIE, cookie);
     }
@@ -116,6 +145,11 @@ type Session = (u8, Option<(String, String)>);
 
 async fn sessions() -> (Router, AppState, Vec<Session>, i64) {
     let state = state().await;
+    // Migracja zasiewa tylko `imgw-meteo`; reszta źródeł rejestruje się jak na stacji.
+    aars_core::module::ModuleRepo::new(state.pool.clone())
+        .register(&state.modules)
+        .await
+        .unwrap();
     let users = UserRepo::new(state.pool.clone());
     for (name, role) in [
         ("v", Role::Viewer),
@@ -156,7 +190,10 @@ async fn every_get_route_enforces_its_minimum_role() {
     let routes = [
         get("/", VIEWER),
         get("/logs", VIEWER),
+        get("/map", VIEWER),
+        get("/map/data", VIEWER),
         get("/fragments/queue", VIEWER),
+        get("/fragments/status", VIEWER),
         get("/account/password", VIEWER),
         get("/compose", OPERATOR),
         get("/messages", OPERATOR),
@@ -176,6 +213,7 @@ async fn every_get_route_enforces_its_minimum_role() {
         get("/modules", OPERATOR),
         get("/settings", ADMIN),
         get("/settings/hardware", ADMIN),
+        get("/settings/update", ADMIN),
         get("/users", ADMIN),
     ];
     let mut failures = Vec::new();
@@ -200,6 +238,94 @@ async fn every_get_route_enforces_its_minimum_role() {
                     route.path
                 ));
             }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Pierwsze wczytanie każdej strony w ramie przez każdą rolę, która ma do
+/// niej prawo: (ścieżka, poziom, status, HTML).
+async fn framed_pages() -> Vec<(String, u8, StatusCode, String)> {
+    let (app, _state, cookies, id) = sessions().await;
+    let edit = format!("/messages/{id}/edit");
+    let pages = [
+        ("/", VIEWER),
+        ("/logs", VIEWER),
+        ("/map", VIEWER),
+        ("/account/password", VIEWER),
+        ("/compose", OPERATOR),
+        ("/messages", OPERATOR),
+        ("/messages/new", OPERATOR),
+        (edit.as_str(), OPERATOR),
+        ("/queue", OPERATOR),
+        ("/sources", OPERATOR),
+        ("/modules", OPERATOR),
+        ("/settings", ADMIN),
+        ("/settings/hardware", ADMIN),
+        ("/settings/update", ADMIN),
+        ("/users", ADMIN),
+    ];
+    let mut out = Vec::new();
+    for (path, min) in pages {
+        for (level, session) in &cookies {
+            let Some((cookie, _)) = session else { continue };
+            if *level < min {
+                continue;
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let html = String::from_utf8_lossy(&body).into_owned();
+            out.push((path.to_owned(), *level, status, html));
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn every_page_shows_the_status_bar_on_first_load() {
+    let mut failures = Vec::new();
+    for (path, level, status, html) in framed_pages().await {
+        let ok = status == StatusCode::OK
+            && html.contains("id=\"statusbar\"")
+            && html.contains("Nadawanie:")
+            && html.contains("class=\"badge ");
+        if !ok {
+            failures.push(format!("GET {path} (poziom {level}): {status}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[tokio::test]
+async fn every_page_has_exactly_one_page_title() {
+    let mut failures = Vec::new();
+    for (path, level, status, html) in framed_pages().await {
+        let h1 = html.matches("<h1").count();
+        let in_main = html
+            .find("<main")
+            .and_then(|main| html[main..].find('>').map(|e| main + e + 1))
+            .is_some_and(|open| {
+                html[open..]
+                    .trim_start()
+                    .starts_with("<h1 class=\"page-title\">")
+            });
+        if status != StatusCode::OK || h1 != 1 || !in_main {
+            failures.push(format!(
+                "GET {path} (poziom {level}): {status}, <h1: {h1}, w <main>: {in_main}"
+            ));
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
@@ -311,6 +437,18 @@ async fn every_post_route_enforces_its_role_with_a_valid_csrf_token() {
         ("/queue/group/g/cancel", OPERATOR, 200),
         ("/sources/imgw-meteo/enabled", OPERATOR, 303),
         ("/sources/imgw-meteo/refresh", OPERATOR, 503),
+        ("/sources/rso/enabled", OPERATOR, 303),
+        ("/sources/rso/refresh", OPERATOR, 503),
+        ("/sources/swpc/enabled", OPERATOR, 303),
+        ("/sources/swpc/refresh", OPERATOR, 503),
+        ("/sources/gios-smog/enabled", OPERATOR, 303),
+        ("/sources/gios-smog/refresh", OPERATOR, 503),
+        ("/sources/emsc/enabled", OPERATOR, 303),
+        ("/sources/emsc/refresh", OPERATOR, 503),
+        ("/sources/pogoda/enabled", OPERATOR, 303),
+        ("/sources/pogoda/refresh", OPERATOR, 503),
+        // Stan testowy nie ma wywołania zwrotnego podglądu.
+        ("/modules/bulletin/preview", OPERATOR, 503),
         ("/watchdog/clear", ADMIN, 303),
         ("/settings", ADMIN, 400),
         ("/settings/hardware", ADMIN, 400),
@@ -320,10 +458,27 @@ async fn every_post_route_enforces_its_role_with_a_valid_csrf_token() {
         // Ciało nie ma pól pozycji: wszystkie puste kasują pozycję.
         ("/settings/position", ADMIN, 303),
         ("/station/restart", ADMIN, 503),
+        // Stan testowy nie ma sterownika aktualizacji.
+        ("/settings/update/check", ADMIN, 503),
+        // `confirm=b` to nie „tak”: 400 przed sprawdzeniem sterownika.
+        ("/settings/update/install", ADMIN, 400),
         ("/modules/scheduler/enabled", ADMIN, 303),
         ("/modules/imgw-meteo/enabled", ADMIN, 303),
         // `interval_s=5` jest poza zakresem 60–3600.
         ("/modules/imgw-meteo/settings", ADMIN, 400),
+        ("/modules/rso/enabled", ADMIN, 303),
+        ("/modules/rso/settings", ADMIN, 400),
+        ("/modules/swpc/enabled", ADMIN, 303),
+        ("/modules/swpc/settings", ADMIN, 400),
+        ("/modules/gios-smog/enabled", ADMIN, 303),
+        ("/modules/gios-smog/settings", ADMIN, 400),
+        ("/modules/emsc/enabled", ADMIN, 303),
+        ("/modules/emsc/settings", ADMIN, 400),
+        ("/modules/pogoda/enabled", ADMIN, 303),
+        ("/modules/pogoda/settings", ADMIN, 400),
+        ("/modules/bulletin/enabled", ADMIN, 303),
+        // Ciało nie ma pól biuletynu: bez zmian.
+        ("/modules/bulletin/settings", ADMIN, 303),
         ("/users", ADMIN, 200),
         ("/users/999/role", ADMIN, 404),
         ("/users/999/disabled", ADMIN, 404),
@@ -380,4 +535,29 @@ async fn a_post_without_the_csrf_field_is_refused_and_changes_nothing() {
         .unwrap()
         .len();
     assert_eq!(count, 1, "brak tokenu nie może utworzyć definicji");
+}
+
+/// Wyjątek od macierzy: `/setup` (kreator pierwszego konta, R12) działa bez
+/// sesji, więc nie ma go w listach wyżej. Chronią go własne warunki: tryb
+/// `wizard`, brak włączonego admina, sieć lokalna i CSRF double-submit
+/// (testy w `setup_page`). W domyślnym trybie `console` i przy istniejącym
+/// adminie nie istnieje dla nikogo — także dla zalogowanego admina.
+#[tokio::test]
+async fn setup_is_outside_the_session_matrix_and_hidden_by_default() {
+    let (app, _state, cookies, _id) = sessions().await;
+    for (name, level) in ROLES {
+        let cookie = cookies
+            .iter()
+            .find(|(l, _)| *l == level)
+            .and_then(|(_, c)| c.as_ref().map(|(cookie, _)| cookie.clone()));
+        for method in ["GET", "POST"] {
+            let (status, location) =
+                request(&app, method, "/setup", cookie.as_deref(), "zly", POST_BODY).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{method} /setup jako {name}: {location:?}"
+            );
+        }
+    }
 }

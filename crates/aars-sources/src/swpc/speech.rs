@@ -1,0 +1,72 @@
+//! Teksty ogłoszeń pogody kosmicznej (G/S/R).
+
+const ATTRIBUTION: &str = "Dane: NOAA SWPC.";
+
+/// Przymiotnik zgodny z rzeczownikiem: „burza” (G, S) liczba pojedyncza,
+/// „zaniki” (R) mnoga.
+fn adjective(scale: char, level: u8) -> &'static str {
+    match (scale == 'R', level) {
+        (false, 1) => "Słaba",
+        (false, 2) => "Umiarkowana",
+        (false, 3) => "Silna",
+        (false, 4) => "Bardzo silna",
+        (false, _) => "Ekstremalna",
+        (true, 1) => "Słabe",
+        (true, 2) => "Umiarkowane",
+        (true, 3) => "Silne",
+        (true, 4) => "Bardzo silne",
+        (true, _) => "Ekstremalne",
+    }
+}
+
+fn phenomenon(scale: char) -> &'static str {
+    match scale {
+        'G' => "burza geomagnetyczna",
+        'S' => "burza radiacyjna",
+        _ => "zaniki łączności radiowej",
+    }
+}
+
+fn effects(scale: char, level: u8) -> &'static str {
+    match (scale, level) {
+        ('G', 1 | 2) => {
+            "Możliwe pogorszenie propagacji na pasmach KF, zwłaszcza na trasach północnych."
+        }
+        ('G', _) => {
+            "Możliwe pogorszenie propagacji na pasmach KF, zwłaszcza na trasach północnych. Możliwa zorza widoczna w Polsce i łączności przez zorzę na pasmach sześciu i dwóch metrów."
+        }
+        ('S', _) => "Możliwe zaniki łączności KF w rejonach polarnych.",
+        _ => "Zaniki łączności na pasmach KF po dziennej stronie Ziemi.",
+    }
+}
+
+/// Opis słowny do panelu, np. „silna burza geomagnetyczna”.
+pub fn label(scale: char, level: u8) -> String {
+    format!(
+        "{} {}",
+        adjective(scale, level).to_lowercase(),
+        phenomenon(scale)
+    )
+}
+
+pub fn announcement(scale: char, level: u8) -> String {
+    format!(
+        "Uwaga, pogoda kosmiczna. {} {}, poziom {scale}{level} w skali NOAA. {} {ATTRIBUTION}",
+        adjective(scale, level),
+        phenomenon(scale),
+        effects(scale, level)
+    )
+}
+
+pub fn change(scale: char, level: u8) -> String {
+    format!("Wzrost poziomu. {}", announcement(scale, level))
+}
+
+pub fn cancellation(scale: char) -> String {
+    let head = match scale {
+        'G' => "Burza geomagnetyczna wygasła.",
+        'S' => "Burza radiacyjna wygasła.",
+        _ => "Zaniki łączności radiowej ustały.",
+    };
+    format!("{head} {ATTRIBUTION}")
+}

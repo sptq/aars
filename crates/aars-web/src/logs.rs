@@ -19,13 +19,13 @@ struct LogsPage {
     audit: Vec<AuditRow>,
 }
 
-struct TxRow {
-    at: String,
-    result: String,
-    seconds: String,
-    text: String,
+pub(crate) struct TxRow {
+    pub(crate) at: String,
+    pub(crate) result: String,
+    pub(crate) seconds: String,
+    pub(crate) text: String,
     /// Wiersz bez zadania z kolejki (test PTT): `text` to notka.
-    without_item: bool,
+    pub(crate) without_item: bool,
 }
 
 struct AuditRow {
@@ -51,7 +51,7 @@ fn result_label(result: &str) -> &str {
     }
 }
 
-fn tx_row(row: TxLogRow) -> TxRow {
+pub(crate) fn tx_row(row: TxLogRow) -> TxRow {
     let without_item = row.queue_item_id.is_none();
     // Nadanie spoza kolejki (test PTT) nie ma treści: pokazujemy notkę.
     let text = if without_item { row.note } else { row.text };
@@ -110,7 +110,7 @@ pub async fn page_view(
         Err(response) => return Ok(response),
     };
     Ok(page(&LogsPage {
-        chrome: Chrome::from(&current),
+        chrome: Chrome::load(&state, &current).await,
         transmissions,
         audit,
     }))

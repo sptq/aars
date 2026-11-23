@@ -27,6 +27,12 @@ pub struct InterlockState {
     pub quiet_min_priority: Priority,
 }
 
+/// Czy cisza nocna zatrzymuje komunikat o tym priorytecie. Jedna reguła dla
+/// blokady nadawania i dla biuletynu.
+pub fn quiet_refuses(quiet_now: bool, quiet_min_priority: Priority, priority: Priority) -> bool {
+    quiet_now && quiet_min_priority.outranks(priority)
+}
+
 pub trait Interlocks: Send + Sync {
     fn snapshot(&self) -> InterlockState;
 
@@ -42,7 +48,7 @@ pub trait Interlocks: Send + Sync {
         if state.inhibited {
             return Err(RefusalReason::Inhibited);
         }
-        if state.quiet_now && state.quiet_min_priority.outranks(priority) {
+        if quiet_refuses(state.quiet_now, state.quiet_min_priority, priority) {
             return Err(RefusalReason::QuietHours);
         }
         Ok(())
@@ -113,6 +119,13 @@ mod tests {
         locks.set_tx_enabled(true);
         locks.set_inhibited(true);
         assert_eq!(locks.check(Priority::Emergency), Err(RefusalReason::Inhibited));
+    }
+
+    #[test]
+    fn quiet_refuses_only_lower_priorities() {
+        assert!(quiet_refuses(true, Priority::High, Priority::Normal));
+        assert!(!quiet_refuses(true, Priority::Normal, Priority::Normal));
+        assert!(!quiet_refuses(false, Priority::Emergency, Priority::Normal));
     }
 
     #[test]

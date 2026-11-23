@@ -1,16 +1,17 @@
 {% extends "base.html" %}
 {% block title %}AARS — komunikat{% endblock %}
+{% block heading %}Komunikaty{% endblock %}
 {% block content %}
 <div class="card">
   <h2>{% if id.is_some() %}Edycja komunikatu{% else %}Nowy komunikat{% endif %}</h2>
   <form method="post" action="{% if let Some(id) = id %}/messages/{{ id }}{% else %}/messages{% endif %}"
         id="message-form">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-    <div style="margin-bottom:0.9rem">
+    <div class="field">
       <label for="title">Tytuł</label>
       <input id="title" name="title" required value="{{ title }}">
     </div>
-    <div style="margin-bottom:0.9rem">
+    <div class="field">
       <label for="text">Treść</label>
       <textarea id="text" name="text" required>{{ text }}</textarea>
     </div>
@@ -33,8 +34,8 @@
         <input id="every" name="every" type="number" value="{{ every }}" min="0" max="86400">
       </div>
     </div>
-    <label style="display:flex;gap:0.5rem;align-items:center;margin-bottom:1rem">
-      <input type="checkbox" name="interrupting" value="1" style="width:auto"
+    <label class="check">
+      <input type="checkbox" name="interrupting" value="1"
              {% if interrupting %}checked{% endif %}>
       Przerwij trwające nadanie o niższym priorytecie
     </label>
@@ -56,16 +57,18 @@
         <input id="cron" name="cron" placeholder="0 18 * * *" value="{{ cron }}">
       </div>
     </div>
-    <p id="next-hint" style="color:var(--muted)"
+    <p id="next-hint" class="hint"
        hx-get="/messages/next" hx-include="#message-form"
        hx-trigger="load, input from:#message-form, change from:#message-form"></p>
-    <div style="margin-bottom:1rem">
+    <div class="preview">
       <button type="button" class="ghost" id="preview-btn">Odsłuchaj</button>
-      <span id="preview-note" style="color:var(--muted)"></span>
-      <audio id="preview-audio" controls style="width:100%;margin-top:0.5rem"></audio>
+      <span id="preview-note" class="preview-note"></span>
+      <audio id="preview-audio" controls></audio>
     </div>
-    <button type="submit">Zapisz</button>
-    <a href="/messages">Anuluj</a>
+    <div class="row-actions">
+      <button type="submit">Zapisz</button>
+      <a href="/messages">Anuluj</a>
+    </div>
   </form>
 </div>
 

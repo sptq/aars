@@ -412,6 +412,13 @@ Cross-compile na `aarch64-unknown-linux-gnu` (cargo-zigbuild), unit systemd z
 `Restart=always`, użytkownik bez uprawnień z dostępem do grup `audio` i `gpio`.
 Baza i cache w `/var/lib/aars`. `/healthz` dla nadzoru zewnętrznego.
 
+*Dopisek (etap 10, 2026-11-21):* zamiast cargo-zigbuild binarka jest
+budowana natywnie na runnerze GitHub `ubuntu-24.04-arm` (`cpal` wymaga
+`libasound` dla aarch64, którego Zig nie ma). Obraz to oficjalny Raspberry Pi
+OS Lite 64-bit **Trixie** rozszerzony w chroocie (Piper 1.8.0 w venv, głos
+`pl_PL-darkman-medium`, `aars.service` z `Type=notify`). Bookworm nie jest
+wspierany (glibc 2.36). Szczegóły: plan etapu 10, R1–R3 i R15.
+
 ## 13. Etapy
 
 Plan implementacji w `docs/superpowers/plans/` dzieli pracę na etapy; każdy
@@ -439,13 +446,46 @@ kończy się czymś, co da się uruchomić i sprawdzić.
     kreator pierwszego admina w panelu); autoaktualizacja z GitHub Releases
     na żądanie admina: suma kontrolna, podmiana binarki, restart, powrót do
     poprzedniej wersji, gdy nowa nie wstanie; nigdy w trakcie nadawania.
-11. `imgw-hydro`, `paa`, kompozytor biuletynu, moduł pogody z otwartego API
+11. Etap 11 jest podzielony. **11a** (alarmy: `rso`, `swpc`, `gios-smog`, `emsc`):
+    [projekt](2026-11-22-etap-11a-alarmy-design.md). Dopisek po 11b: **11b**
+    zrealizowano jako biuletyn — kompozytor, części `pogoda`, `propagacja`,
+    `ostrzezenia` i źródło progowe `pogoda`
+    ([projekt](2026-11-22-etap-11b-biuletyn-design.md)); `imgw-hydro`, `paa`
+    i mapa w panelu przeszły do **11c**. Dopisek po 11c: **11c** zrealizowano
+    jako `imgw-hydro`, `imgw-wodowskazy`, część `wody` i mapę ostrzeżeń meteo
+    w panelu ([projekt](2026-11-22-etap-11c-hydro-mapa-design.md)); **PAA
+    odłożone** (brak publicznego API). Dalej pierwotny opis zakresu
+    11b+11c. **Pierwotnie 11b (dziś 11b + 11c)** (`imgw-hydro`,
+    `paa`, kompozytor biuletynu, biuletyn propagacyjny, mapa i moduł pogody
+    z otwartego API
     po współrzędnych stacji: Open-Meteo (bez klucza, CC BY 4.0 — „Źródło:
     Open-Meteo”), zapasowo MET Norway (`api.met.no`, wymaga User-Agent
     z kontaktem); prognoza o ustalonych godzinach i komunikat po przekroczeniu
     progów (wiatr, mróz, opady) ustawianych w panelu; mapa w panelu: powiaty
     pod ostrzeżeniem IMGW kolorem stopnia + pozycja stacji (granice powiatów
     z PRG GUGiK, uproszczone). Oba API sprawdzone zapytaniem 2026-11-20.
+    Do tego etapu dochodzą źródła krytyczne z researchu 2026-11-20
+    (`reports/Publiczne API danych krytycznych.md`, poza repo):
+    - `rso`: Regionalny System Ostrzegania (`komunikaty.tvp.pl/komunikatyxml`,
+      JSON, bez klucza) — jedyny maszynowy kanał Alertów RCB, komunikatów
+      sanepidu o wodzie, testów syren i „ataku z powietrza”; filtr województwo
+      w URL, powiat/gmina dopasowane w treści; priorytet alarmowy dla Alert RCB
+      i ataku z powietrza;
+    - `swpc`: pogoda kosmiczna NOAA (`noaa-scales.json` jako wyzwalacz G/S/R,
+      `alerts.json` jako treść), format JSON po zmianie z 2026, nieznany
+      schemat to błąd źródła, nie pusty wynik;
+    - `gios-smog`: alerty smogowe GIOŚ (`/pjp-api/v1/rest/levels/getWarnings`,
+      CC BY 4.0, limit 2 zapytania/min), najbliższa stacja liczona lokalnie;
+    - `emsc`: wstrząsy z EMSC FDSN (CC BY 4.0, rozwiązania IGF PAN), próg
+      magnitudy i promienia w ustawieniach modułu (LGOM i GZW mają częste
+      wstrząsy górnicze).
+12. Źródła uzupełniające: MeteoAlarm jako zapas dla `imgw-meteo`, IMGW
+    `warningshydro` (susza tylko w biuletynie), `osmet-teryt`, PSE `pdgsz`
+    (po potwierdzeniu znaczenia wartości), Kp z GFZ, biuletyn propagacyjny
+    (hamqsl, KC2G — usługi hobbystyczne, tylko biuletyn z limitem wieku
+    danych). Później, warunkowo: awarie PGE/Tauron, TOPR, GDACS/CEMS, RSO CAP
+    (token od administratora RSO). Odrzucone: Blitzortung (zakaz użycia
+    ostrzegawczego), EFAS i EURDEP (tylko partnerzy), IBL i PERUN (brak API).
 
 (2026-11-20, właściciel: „rób od razu obraz na raspberry pi… moduł autoupdate…
 panel admina… zmienne… znak stacji… jakie funkcje uruchamiamy — system

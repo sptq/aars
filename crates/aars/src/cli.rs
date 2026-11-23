@@ -59,6 +59,11 @@ pub enum Command {
         #[command(subcommand)]
         action: SourceAction,
     },
+    /// Biuletyn o porach lokalnych (etap 11b).
+    Bulletin {
+        #[command(subcommand)]
+        action: BulletinAction,
+    },
     /// Uruchamia stację: harmonogram i dyspozytor pracują aż do przerwania.
     Run,
     /// Ustawienia sprzętu z panelu: podgląd i ratunek bez panelu.
@@ -66,6 +71,28 @@ pub enum Command {
         #[command(subcommand)]
         action: HardwareAction,
     },
+    /// Aktualizacja z wydań GitHub: stan, strażnik startu, powrót.
+    Update {
+        #[command(subcommand)]
+        action: UpdateAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum UpdateAction {
+    /// Wersja bieżąca i poprzednia, trwająca próba i ostatni wynik.
+    Status,
+    /// Strażnik startu (root, z `ExecStartPre` usługi); zawsze kończy się kodem 0.
+    Guard,
+    /// Ręczny powrót do poprzedniej wersji razem z kopią bazy (root).
+    Rollback {
+        /// Powrót mimo nieznanego stanu usługi (brak pliku blokady). Tylko
+        /// po sprawdzeniu, że `systemctl is-active aars` mówi `inactive`.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Sprawdza najnowsze wydanie; niczego nie pobiera poza manifestem.
+    Check,
 }
 
 #[derive(Debug, Subcommand)]
@@ -77,9 +104,19 @@ pub enum HardwareAction {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum SourceAction {
-    /// Jedno pobranie z obszarem z bazy; nic nie zapisuje ani nie nadaje.
+pub enum BulletinAction {
+    /// Składa biuletyn na teraz z bazy i źródeł; nic nie zapisuje ani nie nadaje.
     Preview,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SourceAction {
+    /// Jedno pobranie z obszarem i pozycją z bazy; nic nie zapisuje ani nie nadaje.
+    Preview {
+        /// Identyfikator źródła (np. `swpc`, `emsc`).
+        #[arg(default_value = "imgw-meteo")]
+        id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -157,5 +194,17 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["aars", "queue", "add", "x", "--every", "86400"]).is_ok());
+    }
+
+    #[test]
+    fn bulletin_preview_parses() {
+        assert!(matches!(
+            Cli::try_parse_from(["aars", "bulletin", "preview"])
+                .unwrap()
+                .command,
+            Command::Bulletin {
+                action: BulletinAction::Preview
+            }
+        ));
     }
 }

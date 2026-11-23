@@ -4,14 +4,16 @@ use std::sync::Arc;
 
 use crate::preview::PreviewRenderer;
 
-use aars_core::config::Config;
+use aars_core::config::{Config, FirstAdmin};
 use aars_core::dispatcher::{StationTest, TestOutcome};
 use aars_core::hardware::probe::HardwareProbe;
 use aars_core::hardware::{ApplyStatus, HardwareSettings};
 use aars_core::interlock::InMemoryInterlocks;
 use aars_core::module::ModuleRegistry;
+use aars_core::netlocal::LocalNet;
 use aars_core::queue::QueueRepo;
 use aars_core::settings::StationSettings;
+use aars_core::update::{Available, UpdateRefusal, UpdateStatus};
 use sqlx::SqlitePool;
 
 pub type TestFuture<'a> = Pin<Box<dyn Future<Output = TestOutcome> + Send + 'a>>;
@@ -31,6 +33,20 @@ pub trait StationControl: Send + Sync {
     fn request_restart(&self);
     /// Bez stosu nadawczego: `TestOutcome::Unsupported(NO_RADIO)`.
     fn run_test(&self, test: StationTest) -> TestFuture<'_>;
+}
+
+pub type UpdateFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Aktualizacja z panelu (etap 10, R10, R11, R18). Pobieranie, weryfikacja
+/// i instalacja żyją w binarce; panel zna tylko ten trait i czyste typy z
+/// `aars_core::update`, więc nie zależy od kodu aktualizacji.
+pub trait UpdateControl: Send + Sync {
+    fn status(&self) -> UpdateStatus;
+    /// Najnowsze wydanie; `None` = brak nowszego od działającego.
+    fn check(&self) -> UpdateFuture<'_, Result<Option<Available>, UpdateRefusal>>;
+    /// Pobiera i sprawdza wydanie `version`, potem prosi stację o
+    /// zakończenie po bieżącym nadaniu; instaluje strażnik przy starcie.
+    fn install(&self, version: &str, by: &str) -> UpdateFuture<'_, Result<(), UpdateRefusal>>;
 }
 
 /// Wszystko, czego panel potrzebuje od rdzenia. Panel nie trzyma uchwytu do
@@ -57,7 +73,69 @@ pub struct AppState {
     pub base_config: Arc<Config>,
     /// Budzi źródło danych o podanym id; `None`, gdy panel działa bez źródeł.
     pub source_refresh: Option<SourceRefresh>,
+    /// Wersja produktu do stopki i `/healthz` (R17); ustawia ją binarka.
+    pub version: &'static str,
+    /// Aktualizacja z panelu (etap 10); `None` = panel bez stacji.
+    pub update: Option<Arc<dyn UpdateControl>>,
+    /// Jak powstaje pierwsze konto admina (R12); `Wizard` włącza `/setup`.
+    pub first_admin: FirstAdmin,
+    /// Adresy interfejsów stacji do sprawdzania „sieci lokalnej” (R12).
+    pub local_nets: Arc<Vec<LocalNet>>,
+    /// Nazwy stacji dopuszczone w `Host` kreatora (DNS rebinding): nazwa
+    /// hosta, `{nazwa}.local`, host z `server.bind`. Literały IP i
+    /// `localhost` przechodzą zawsze.
+    pub host_names: Arc<Vec<String>>,
+    /// Kontrola `Host` na całym panelu (przegląd 8–9 M-4). Stacja ją
+    /// włącza; testy bez nagłówka `Host` działają bez niej. `/setup`
+    /// sprawdza `Host` zawsze.
+    pub check_hosts: bool,
+    /// Cały panel tylko dla klientów z sieci lokalnej (przegląd N-1), ta
+    /// sama reguła co kreator (`is_local_client` z `local_nets`). Stacja
+    /// włącza ją, gdy `server.allow_remote = false` (domyślnie); testy bez
+    /// `ConnectInfo` działają bez niej. `/setup` sprawdza adres zawsze.
+    pub lan_only: bool,
+    /// Podgląd biuletynu (etap 11b); `None` = panel bez stacji.
+    pub bulletin_preview: Option<BulletinPreview>,
+    /// Jeden podgląd naraz: każdy pyta sieć o wszystkie części.
+    pub bulletin_preview_gate: Arc<tokio::sync::Semaphore>,
+    /// Ostrzeżenia meteo dla mapy (etap 11c); `None` = panel bez stacji.
+    pub warnings_map: Option<WarningsMap>,
 }
+
+/// Jedno ostrzeżenie meteo dla jednego powiatu (kod TERYT 4-cyfrowy).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapWarning {
+    pub teryt: String,
+    pub level: u8,
+    pub event: String,
+    pub until: chrono::DateTime<chrono::Utc>,
+}
+
+/// Wszystkie ostrzeżenia z ostatniego udanego pobrania `imgw-meteo`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WarningsSnapshot {
+    pub fetched_at: chrono::DateTime<chrono::Utc>,
+    pub warnings: Vec<MapWarning>,
+}
+
+/// Pamięć ostrzeżeń źródła bez typów z crate'a źródeł; ustawia ją binarka.
+/// `None` = źródło jeszcze nic nie pobrało.
+pub type WarningsMap = Arc<dyn Fn() -> Option<WarningsSnapshot> + Send + Sync>;
+
+/// Wynik podglądu biuletynu bez typów z crate'a źródeł: tekst (albo powód,
+/// dla którego nic by nie poszło) i `(id części, opis wyniku)`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BulletinPreviewView {
+    pub text: Option<String>,
+    pub parts: Vec<(String, String)>,
+    pub skipped_reason: Option<String>,
+}
+
+pub type BulletinPreviewFuture =
+    Pin<Box<dyn Future<Output = Result<BulletinPreviewView, String>> + Send>>;
+
+/// Składa biuletyn na teraz bez zapisu do kolejki; ustawia go binarka.
+pub type BulletinPreview = Arc<dyn Fn() -> BulletinPreviewFuture + Send + Sync>;
 
 /// „Odśwież teraz” dla źródła: `true`, gdy źródło o tym id istnieje i zostało
 /// obudzone, `false` dla nieznanego id. Panel nie zna crate'a źródeł (spec §3).
@@ -85,7 +163,54 @@ impl AppState {
             modules: Arc::new(ModuleRegistry::new(aars_core::module::builtin())),
             base_config: Arc::new(Config::default()),
             source_refresh: None,
+            version: "0.0.0",
+            update: None,
+            first_admin: FirstAdmin::Console,
+            local_nets: Arc::new(Vec::new()),
+            host_names: Arc::new(Vec::new()),
+            check_hosts: false,
+            lan_only: false,
+            bulletin_preview: None,
+            bulletin_preview_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            warnings_map: None,
         }
+    }
+
+    pub fn with_version(mut self, version: &'static str) -> Self {
+        self.version = version;
+        self
+    }
+
+    pub fn with_first_admin(mut self, mode: FirstAdmin) -> Self {
+        self.first_admin = mode;
+        self
+    }
+
+    pub fn with_host_names(mut self, names: Vec<String>) -> Self {
+        self.host_names = Arc::new(names);
+        self
+    }
+
+    /// Panel odpowiada tylko pod nazwami z `host_names` i literałami IP.
+    pub fn with_host_check(mut self, on: bool) -> Self {
+        self.check_hosts = on;
+        self
+    }
+
+    /// Panel odpowiada tylko klientom z sieci lokalnej; reszta dostaje `403`.
+    pub fn with_lan_only(mut self, on: bool) -> Self {
+        self.lan_only = on;
+        self
+    }
+
+    pub fn with_local_nets(mut self, nets: Vec<LocalNet>) -> Self {
+        self.local_nets = Arc::new(nets);
+        self
+    }
+
+    pub fn with_update(mut self, update: Arc<dyn UpdateControl>) -> Self {
+        self.update = Some(update);
+        self
     }
 
     pub fn with_watchdog_clear(mut self, clear: WatchdogClear) -> Self {
@@ -118,6 +243,16 @@ impl AppState {
         self
     }
 
+    pub fn with_warnings_map(mut self, map: WarningsMap) -> Self {
+        self.warnings_map = Some(map);
+        self
+    }
+
+    pub fn with_bulletin_preview(mut self, preview: BulletinPreview) -> Self {
+        self.bulletin_preview = Some(preview);
+        self
+    }
+
     pub fn with_preview(mut self, preview: Arc<dyn PreviewRenderer>) -> Self {
         self.preview = Some(preview);
         self
@@ -142,10 +277,24 @@ impl AppState {
                     name: "Ostrzeżenia meteorologiczne IMGW",
                     ..aars_core::module::sample_source("imgw-meteo")
                 });
+                // Źródła alarmowe etapu 11a i `pogoda` z 11b: w panelu liczy się tylko ich id.
+                for id in ["rso", "swpc", "gios-smog", "emsc", "pogoda"] {
+                    all.push(aars_core::module::sample_source(id));
+                }
                 all
             })),
             base_config: Arc::new(Config::default()),
             source_refresh: None,
+            version: "0.0.0-test",
+            update: None,
+            first_admin: FirstAdmin::Console,
+            local_nets: Arc::new(Vec::new()),
+            host_names: Arc::new(Vec::new()),
+            check_hosts: false,
+            lan_only: false,
+            bulletin_preview: None,
+            bulletin_preview_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            warnings_map: None,
         }
     }
 }
@@ -194,6 +343,53 @@ pub mod testing {
 
         pub fn restarts(&self) -> usize {
             self.restarts.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Aktualizacja do testów panelu: stały stan, zadany wynik sprawdzenia
+    /// i instalacji, zapisane zlecenia `(wersja, kto)`.
+    pub struct FakeUpdate {
+        pub status: Mutex<UpdateStatus>,
+        pub available: Mutex<Result<Option<Available>, UpdateRefusal>>,
+        pub install_result: Mutex<Result<(), UpdateRefusal>>,
+        pub installs: Mutex<Vec<(String, String)>>,
+    }
+
+    impl FakeUpdate {
+        /// Działa `current`, bez poprzedniej, bez próby; brak nowszej wersji,
+        /// a instalacja się udaje.
+        pub fn new(current: &str) -> Self {
+            Self {
+                status: Mutex::new(UpdateStatus {
+                    current: current.to_owned(),
+                    previous: None,
+                    trial: None,
+                    unsupported: None,
+                    last: None,
+                }),
+                available: Mutex::new(Ok(None)),
+                install_result: Mutex::new(Ok(())),
+                installs: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl UpdateControl for FakeUpdate {
+        fn status(&self) -> UpdateStatus {
+            self.status.lock().unwrap().clone()
+        }
+        fn check(&self) -> UpdateFuture<'_, Result<Option<Available>, UpdateRefusal>> {
+            Box::pin(async move { self.available.lock().unwrap().clone() })
+        }
+        fn install(&self, version: &str, by: &str) -> UpdateFuture<'_, Result<(), UpdateRefusal>> {
+            let entry = (version.to_owned(), by.to_owned());
+            Box::pin(async move {
+                let result = self.install_result.lock().unwrap().clone();
+                if result.is_ok() {
+                    self.installs.lock().unwrap().push(entry);
+                }
+                result
+            })
         }
     }
 

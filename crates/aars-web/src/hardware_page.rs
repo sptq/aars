@@ -514,7 +514,7 @@ async fn show(state: &AppState, current: &CurrentUser, status: StatusCode, ctx: 
     page_response(
         status,
         &HardwarePage {
-            chrome: Chrome::from(current),
+            chrome: Chrome::load(state, current).await,
             origin,
             apply_error,
             pending: pending_restart(state, &stored, &station_settings),

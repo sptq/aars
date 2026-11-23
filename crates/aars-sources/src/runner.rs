@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use aars_core::error::DbError;
 use aars_core::geo::PositionRepo;
+use aars_core::module::Needs;
 use aars_core::settings::SettingsRepo;
 use aars_core::priority::Priority;
 use aars_core::queue::{EnqueueRequest, QueueRepo, QueueState};
@@ -20,7 +21,7 @@ const BACKOFF_CEILING: Duration = Duration::from_secs(1800);
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CycleReport {
-    /// `"wyłączone"` albo `"brak obszaru"`.
+    /// `"wyłączone"`, `"brak obszaru"` albo `"brak pozycji stacji"`.
     pub skipped: Option<&'static str>,
     pub fetched: bool,
     pub announced: usize,
@@ -118,7 +119,12 @@ impl SourceRunner {
 
     /// Pozycja i ustawienia modułu na ten cykl (R20). Błąd odczytu nie
     /// przerywa cyklu: źródło dostaje `None` albo puste ustawienia.
-    async fn context(&self, now: DateTime<Utc>, id: &str, area: Vec<aars_core::area::AreaEntry>) -> SourceCtx {
+    async fn context(
+        &self,
+        now: DateTime<Utc>,
+        id: &str,
+        cfg: &aars_core::source_state::SourceConfig,
+    ) -> SourceCtx {
         let pool = self.state.pool().clone();
         let position = match PositionRepo::new(pool.clone()).load().await {
             Ok(p) => p,
@@ -134,7 +140,15 @@ impl SourceRunner {
                 Default::default()
             }
         };
-        SourceCtx { now, area, position, settings }
+        SourceCtx {
+            now,
+            area: cfg.area.clone(),
+            area_text: cfg.area_text.clone(),
+            position,
+            settings,
+            tracked_keys: HashSet::new(),
+            tracked: Default::default(),
+        }
     }
 
     async fn run_cycle(&self, now: DateTime<Utc>, report: &mut CycleReport) -> Result<(), DbError> {
@@ -147,15 +161,31 @@ impl SourceRunner {
             report.skipped = Some("wyłączone");
             return Ok(());
         }
-        if cfg.area.is_empty() {
+        let needs = self.source.needs();
+        if needs == Needs::Area && cfg.area.is_empty() {
             report.skipped = Some("brak obszaru");
             return Ok(());
         }
+        // Kontekst przed porównaniem R9. Zakres nie zależy od
+        // `tracked_keys`, więc najpierw zakres, potem klucze aktywnych pozycji
+        // śledzonych przy tym zakresie (inny zakres R9 zaraz porzuci).
+        let mut ctx = self.context(now, id, &cfg).await;
+        if needs == Needs::Position && ctx.position.is_none() {
+            report.skipped = Some("brak pozycji stacji");
+            return Ok(());
+        }
+        let scope = self.source.scope(&ctx);
+        let active = self.state.active_items(id).await?;
+        ctx.tracked_keys = active.iter().filter(|a| a.area == scope).map(|a| a.item_key.clone()).collect();
+        ctx.tracked = active
+            .iter()
+            .filter(|a| a.area == scope)
+            .map(|a| (a.item_key.clone(), a.fingerprint.clone()))
+            .collect();
 
         self.settle_pending_cancellations(id, now).await?;
 
         report.fetched = true;
-        let ctx = self.context(now, id, cfg.area.clone()).await;
         let output = match self.source.fetch(&ctx).await {
             Ok(output) => output,
             Err(error) => {
@@ -167,12 +197,12 @@ impl SourceRunner {
             }
         };
 
-        // R9: pozycje śledzone przy innym obszarze znikają po cichu, a ich
-        // czekające komunikaty z kolejki też (inaczej poprawka literówki w
-        // obszarze nadałaby to samo ostrzeżenie drugi raz).
+        // R9: pozycje śledzone przy innym zakresie (A2) znikają po cichu, a
+        // ich czekające komunikaty z kolejki też (inaczej poprawka literówki
+        // w obszarze nadałaby to samo ostrzeżenie drugi raz).
         let mut kept: Vec<TrackedItem> = Vec::new();
-        for item in self.state.active_items(id).await? {
-            if item.area == cfg.area_text {
+        for item in active {
+            if item.area == scope {
                 kept.push(item);
             } else {
                 self.cancel_waiting(item.queue_item_id).await;
@@ -215,14 +245,14 @@ impl SourceRunner {
             if let Some(old) = existing {
                 consumed.insert(old.id);
                 if old.fingerprint == item.fingerprint {
-                    self.state.touch(old.id, now).await?;
+                    self.state.touch(old.id, now, item.valid_until).await?;
                     announced
                         .entry(item.fingerprint.as_str())
                         .or_insert((old.queue_item_id, old.aired, old.superseded.clone()));
                 } else {
                     let queued = self.announce(item, &item.change_text).await?;
                     let (aired, superseded) = self.supersede(old).await?;
-                    self.track(item, &cfg.area_text, Some(queued), aired, superseded.clone(), now).await?;
+                    self.track(item, &scope, Some(queued), aired, superseded.clone(), now).await?;
                     refingerprinted.insert(old.id);
                     announced.insert(item.fingerprint.as_str(), (Some(queued), aired, superseded));
                     report.changed += 1;
@@ -233,7 +263,7 @@ impl SourceRunner {
             // Nowy klucz (R4): ten sam odcisk co jakakolwiek aktywna albo
             // ogłoszona w tym cyklu pozycja to to samo ostrzeżenie.
             if let Some((queued, aired, superseded)) = announced.get(item.fingerprint.as_str()) {
-                self.track(item, &cfg.area_text, *queued, *aired, superseded.clone(), now).await?;
+                self.track(item, &scope, *queued, *aired, superseded.clone(), now).await?;
                 continue;
             }
             if let Some(old) = kept.iter().find(|a| live(a) && !refingerprinted.contains(&a.id) && a.fingerprint == item.fingerprint) {
@@ -242,7 +272,7 @@ impl SourceRunner {
                     self.state.set_state(old.id, TrackedState::Replaced).await?;
                     consumed.insert(old.id);
                 }
-                self.track(item, &cfg.area_text, old.queue_item_id, old.aired, old.superseded.clone(), now).await?;
+                self.track(item, &scope, old.queue_item_id, old.aired, old.superseded.clone(), now).await?;
                 announced.insert(item.fingerprint.as_str(), (old.queue_item_id, old.aired, old.superseded.clone()));
                 continue;
             }
@@ -254,12 +284,12 @@ impl SourceRunner {
                 let (aired, superseded) = self.supersede(old).await?;
                 self.state.set_state(old.id, TrackedState::Replaced).await?;
                 consumed.insert(old.id);
-                self.track(item, &cfg.area_text, Some(queued), aired, superseded.clone(), now).await?;
+                self.track(item, &scope, Some(queued), aired, superseded.clone(), now).await?;
                 announced.insert(item.fingerprint.as_str(), (Some(queued), aired, superseded));
                 report.changed += 1;
             } else {
                 let queued = self.announce(item, &item.text).await?;
-                self.track(item, &cfg.area_text, Some(queued), false, Vec::new(), now).await?;
+                self.track(item, &scope, Some(queued), false, Vec::new(), now).await?;
                 announced.insert(item.fingerprint.as_str(), (Some(queued), false, Vec::new()));
                 report.announced += 1;
             }
@@ -288,9 +318,12 @@ impl SourceRunner {
                 self.cancel_waiting(old.queue_item_id).await;
                 let fate = if old.aired { Fate::Aired } else { self.fate(old.queue_ids()).await? };
                 match fate {
+                    // A3: pusty tekst odwołania to brak komunikatu.
+                    Fate::Aired if old.cancel_text.is_empty() => {}
                     Fate::Aired => {
                         self.enqueue(old.cancel_text.clone(), Priority::Normal, false, old.valid_until).await?;
                     }
+                    Fate::Unresolved if old.cancel_text.is_empty() => {}
                     Fate::Unresolved => self.state.set_cancel_pending(old.id, true).await?,
                     Fate::NotAired => {}
                 }
@@ -369,7 +402,7 @@ impl SourceRunner {
         for waiting in self.state.awaiting_cancellation(id).await? {
             match self.fate(waiting.queue_ids()).await? {
                 Fate::Aired => {
-                    if waiting.valid_until.is_none_or(|until| until > now) {
+                    if !waiting.cancel_text.is_empty() && waiting.valid_until.is_none_or(|until| until > now) {
                         self.enqueue(waiting.cancel_text.clone(), Priority::Normal, false, waiting.valid_until)
                             .await?;
                     }
@@ -406,7 +439,7 @@ impl SourceRunner {
     async fn track(
         &self,
         item: &SourceItem,
-        area_text: &str,
+        scope: &str,
         queue_item_id: Option<i64>,
         aired: bool,
         superseded: Vec<i64>,
@@ -417,7 +450,7 @@ impl SourceRunner {
             item_key: item.key.clone(),
             topic: item.topic.clone(),
             fingerprint: item.fingerprint.clone(),
-            area: area_text.to_owned(),
+            area: scope.to_owned(),
             summary: item.summary.clone(),
             cancel_text: item.cancel_text.clone(),
             priority: item.priority,
@@ -440,6 +473,8 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use chrono::TimeDelta;
+
     use aars_core::db::test_pool;
     use aars_core::queue::QueueItem;
 
@@ -452,11 +487,27 @@ mod tests {
         script: Mutex<VecDeque<Result<SourceOutput, SourceError>>>,
         calls: AtomicUsize,
         last_ctx: Mutex<Option<SeenCtx>>,
+        last_keys: Mutex<Option<HashSet<String>>>,
+        last_tracked: Mutex<Option<HashMap<String, String>>>,
+        needs: Needs,
+        /// `None`: domyślny zakres (tekst obszaru).
+        scope: Mutex<Option<String>>,
     }
 
     impl FakeSource {
         fn new(script: Vec<Result<SourceOutput, SourceError>>) -> Arc<Self> {
-            Arc::new(Self { script: Mutex::new(script.into()), calls: AtomicUsize::new(0), last_ctx: Mutex::new(None) })
+            Self::needing(Needs::Area, script)
+        }
+        fn needing(needs: Needs, script: Vec<Result<SourceOutput, SourceError>>) -> Arc<Self> {
+            Arc::new(Self {
+                script: Mutex::new(script.into()),
+                calls: AtomicUsize::new(0),
+                last_ctx: Mutex::new(None),
+                last_keys: Mutex::new(None),
+                last_tracked: Mutex::new(None),
+                needs,
+                scope: Mutex::new(None),
+            })
         }
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
@@ -470,9 +521,17 @@ mod tests {
         fn default_interval(&self) -> Duration {
             Duration::from_secs(300)
         }
+        fn needs(&self) -> Needs {
+            self.needs
+        }
+        fn scope(&self, ctx: &SourceCtx) -> String {
+            self.scope.lock().unwrap().clone().unwrap_or_else(|| ctx.area_text.clone())
+        }
         fn fetch<'a>(&'a self, ctx: &'a SourceCtx) -> FetchFuture<'a> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_ctx.lock().unwrap() = Some((ctx.position.clone(), ctx.settings.clone()));
+            *self.last_keys.lock().unwrap() = Some(ctx.tracked_keys.clone());
+            *self.last_tracked.lock().unwrap() = Some(ctx.tracked.clone());
             let next = self.script.lock().ok().and_then(|mut s| s.pop_front());
             Box::pin(async move { next.unwrap_or(Err(SourceError::Http("skrypt wyczerpany".into()))) })
         }
@@ -518,12 +577,15 @@ mod tests {
     }
 
     async fn rig(script: Vec<Result<SourceOutput, SourceError>>) -> Rig {
+        rig_with(FakeSource::new(script)).await
+    }
+
+    async fn rig_with(source: Arc<FakeSource>) -> Rig {
         let pool = test_pool().await;
         let state = SourceStateRepo::new(pool.clone());
         state.save_config("imgw-meteo", "10", 300).await.unwrap();
         state.set_enabled("imgw-meteo", true).await.unwrap();
         let queue = Arc::new(QueueRepo::new(pool));
-        let source = FakeSource::new(script);
         let runner = SourceRunner::new(source.clone(), state.clone(), queue.clone());
         Rig { runner, source, queue, state }
     }
@@ -967,5 +1029,204 @@ mod tests {
         r.state.save_config("imgw-meteo", "1061 Łódź", 300).await.unwrap();
         r.runner.cycle(now()).await;
         assert_eq!(texts(&r.queue).await, vec!["nowe a f1"], "czekające ostrzeżenie nie może pójść dwa razy");
+    }
+
+    fn silent(key: &str, fingerprint: &str) -> SourceItem {
+        SourceItem { cancel_text: String::new(), ..warning(key, fingerprint) }
+    }
+
+    async fn item_state(r: &Rig, key: &str) -> String {
+        sqlx::query_scalar("SELECT state FROM source_items WHERE item_key = ?")
+            .bind(key)
+            .fetch_one(r.state.pool())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_position_source_without_a_position_is_skipped() {
+        let r = rig_with(FakeSource::needing(Needs::Position, vec![ok(vec![warning("a", "f1")])])).await;
+        let report = r.runner.cycle(now()).await;
+        assert_eq!(report.skipped, Some("brak pozycji stacji"));
+        assert!(!report.fetched);
+        assert_eq!(r.source.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_source_that_needs_nothing_runs_without_an_area() {
+        let r = rig_with(FakeSource::needing(Needs::Nothing, vec![ok(vec![warning("a", "f1")])])).await;
+        r.state.save_config("imgw-meteo", "", 300).await.unwrap();
+        let report = r.runner.cycle(now()).await;
+        assert_eq!(report.skipped, None);
+        assert!(report.fetched);
+        assert_eq!(report.announced, 1);
+        assert_eq!(texts(&r.queue).await, vec!["nowe a f1"]);
+    }
+
+    #[tokio::test]
+    async fn an_item_without_cancel_text_disappears_silently() {
+        let r = rig(vec![ok(vec![silent("a", "f1")]), ok(vec![]), ok(vec![])]).await;
+        r.runner.cycle(now()).await;
+        air(&r).await;
+        r.runner.cycle(now()).await;
+        let report = r.runner.cycle(now()).await;
+        assert_eq!(report.cancelled, 1);
+        assert!(texts(&r.queue).await.is_empty(), "pusty tekst odwołania to brak komunikatu");
+        assert_eq!(item_state(&r, "a").await, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn an_unaired_item_without_cancel_text_does_not_leave_a_pending_cancellation() {
+        let r = rig(vec![ok(vec![silent("a", "f1")]), ok(vec![]), ok(vec![]), ok(vec![])]).await;
+        r.runner.cycle(now()).await;
+        let original = r.queue.claim_next().await.unwrap().unwrap().id;
+        r.runner.cycle(now()).await;
+        let report = r.runner.cycle(now()).await;
+        assert_eq!(report.cancelled, 1);
+        assert!(r.state.awaiting_cancellation("imgw-meteo").await.unwrap().is_empty(), "cancel_pending == false");
+        r.queue.mark_done(original).await.unwrap();
+        r.runner.cycle(now()).await;
+        assert!(texts(&r.queue).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_scope_change_drops_items_silently() {
+        let r = rig(vec![ok(vec![warning("a", "f1")]), ok(vec![]), ok(vec![])]).await;
+        *r.source.scope.lock().unwrap() = Some("x|m=3.0".to_owned());
+        r.runner.cycle(now()).await;
+        air(&r).await;
+        assert_eq!(r.state.active_items("imgw-meteo").await.unwrap()[0].area, "x|m=3.0");
+        *r.source.scope.lock().unwrap() = Some("x|m=4.0".to_owned());
+        let first = r.runner.cycle(now()).await;
+        let second = r.runner.cycle(now()).await;
+        assert_eq!((first.cancelled, second.cancelled), (0, 0));
+        assert_eq!(item_state(&r, "a").await, "dropped");
+        assert!(texts(&r.queue).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn two_keys_with_distinct_fingerprints_are_two_announcements() {
+        let r = rig(vec![ok(vec![warning("a", "a|3.0"), warning("b", "b|3.0")])]).await;
+        let report = r.runner.cycle(now()).await;
+        assert_eq!(report.announced, 2);
+        assert_eq!(texts(&r.queue).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_position_source_with_a_position_runs_without_an_area() {
+        let r = rig_with(FakeSource::needing(Needs::Position, vec![ok(vec![warning("a", "f1")])])).await;
+        r.state.save_config("imgw-meteo", "", 300).await.unwrap();
+        let p = aars_core::geo::parse_position("", "", "JO91RS").unwrap();
+        PositionRepo::new(r.state.pool().clone()).save(p.as_ref()).await.unwrap();
+        let report = r.runner.cycle(now()).await;
+        assert_eq!(report.skipped, None);
+        assert!(report.fetched);
+        assert_eq!(report.announced, 1);
+    }
+
+    #[tokio::test]
+    async fn keys_tracked_under_another_scope_are_not_tracked_keys() {
+        let r = rig(vec![ok(vec![warning("k1", "f1")]), ok(vec![]), ok(vec![])]).await;
+        *r.source.scope.lock().unwrap() = Some("A".to_owned());
+        r.runner.cycle(now()).await;
+        *r.source.scope.lock().unwrap() = Some("B".to_owned());
+        r.runner.cycle(now()).await;
+        assert_eq!(r.source.last_keys.lock().unwrap().clone().unwrap(), HashSet::new());
+    }
+
+    #[tokio::test]
+    async fn tracked_keys_reach_the_source() {
+        let r = rig(vec![ok(vec![warning("k1", "f1")]), ok(vec![warning("k1", "f1")])]).await;
+        r.runner.cycle(now()).await;
+        assert_eq!(r.source.last_keys.lock().unwrap().clone().unwrap(), HashSet::new());
+        r.runner.cycle(now()).await;
+        let keys = r.source.last_keys.lock().unwrap().clone().unwrap();
+        assert_eq!(keys, HashSet::from(["k1".to_owned()]));
+    }
+
+    #[tokio::test]
+    async fn tracked_fingerprints_reach_the_source() {
+        let r = rig(vec![ok(vec![warning("k1", "f1")]), ok(vec![warning("k1", "f1")])]).await;
+        r.runner.cycle(now()).await;
+        r.runner.cycle(now()).await;
+        let tracked = r.source.last_tracked.lock().unwrap().clone().unwrap();
+        assert_eq!(tracked, HashMap::from([("k1".to_owned(), "f1".to_owned())]));
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_item_gets_its_new_valid_until() {
+        let mut first = warning("k1", "f1");
+        first.valid_until = Some(now() + TimeDelta::hours(1));
+        let mut second = warning("k1", "f1");
+        second.valid_until = Some(now() + TimeDelta::hours(3));
+        let r = rig(vec![ok(vec![first]), ok(vec![second])]).await;
+        r.runner.cycle(now()).await;
+        let report = r.runner.cycle(now()).await;
+        assert_eq!((report.announced, report.changed), (0, 0));
+        let items = r.state.active_items("imgw-meteo").await.unwrap();
+        assert_eq!(items[0].valid_until, Some(now() + TimeDelta::hours(3)));
+    }
+
+    /// Wynik prawdziwego `gios::to_output` dla stacji przy Rzeszowie (promień 5 km):
+    /// fiks (PI) albo fiks z dodanym PA dla tej samej strefy i parametru.
+    fn gios_rzeszow(pa: bool, keep_pi: bool) -> SourceOutput {
+        const STATIONS: &[u8] = include_bytes!("../tests/fixtures/gios/findAll-size500-2026-11-22.json");
+        const WARNINGS: &[u8] = include_bytes!("../tests/fixtures/gios/getWarnings-2026-11-22.json");
+        let mut v: serde_json::Value = serde_json::from_slice(WARNINGS).unwrap();
+        if pa {
+            let list = v.as_array_mut().unwrap();
+            let i = list.iter().position(|w| w["zone"]["zoneCode"] == "PL1801").unwrap();
+            let mut alarm = list[i].clone();
+            alarm["standard"]["standardTypeCode"] = "PA".into();
+            if keep_pi {
+                list.push(alarm);
+            } else {
+                list[i] = alarm;
+            }
+        }
+        let (stations, _) = crate::gios::parse::parse_stations(STATIONS).unwrap();
+        let (warnings, skipped) = crate::gios::parse::parse_warnings(&serde_json::to_vec(&v).unwrap()).unwrap();
+        let ctx = SourceCtx {
+            now: now(),
+            area: Vec::new(),
+            area_text: String::new(),
+            position: Some(aars_core::geo::StationPosition { lat: 50.04, lon: 22.00, locator: "KN00".into() }),
+            settings: [("radius_km".to_owned(), "5".to_owned())].into(),
+            tracked_keys: Default::default(),
+            tracked: Default::default(),
+        };
+        crate::gios::to_output(&warnings, skipped, &stations, &ctx)
+    }
+
+    #[tokio::test]
+    async fn a_gios_escalation_from_pi_to_pa_is_one_change_and_no_cancellation() {
+        let pi = gios_rzeszow(false, false);
+        assert_eq!(pi.items.len(), 1);
+        let r = rig(vec![
+            Ok(pi),
+            Ok(gios_rzeszow(true, true)),
+            Ok(gios_rzeszow(true, false)),
+            Ok(gios_rzeszow(true, false)),
+        ])
+        .await;
+        let first = r.runner.cycle(now()).await;
+        assert_eq!(first.announced, 1);
+        air(&r).await;
+        let mut changed = 0;
+        let mut cancelled = 0;
+        for _ in 0..3 {
+            let report = r.runner.cycle(now()).await;
+            changed += report.changed;
+            cancelled += report.cancelled;
+        }
+        assert_eq!((changed, cancelled), (1, 0));
+        let pending = texts(&r.queue).await;
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert!(pending[0].starts_with("Zmiana alertu smogowego. Alert smogowy GIOŚ."), "{}", pending[0]);
+        assert!(pending[0].contains("Przekroczony poziom alarmowy."), "{}", pending[0]);
+        assert!(!pending.iter().any(|t| t.contains("Koniec alertu")));
+        let active = r.state.active_items("imgw-meteo").await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].item_key, "PL1801|PA|PM10");
     }
 }

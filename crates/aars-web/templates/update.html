@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}AARS — aktualizacja{% endblock %}
+{% block heading %}Aktualizacja{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Wersja</h2>
+  <p>Działa: {{ current }}</p>
+  <p>Poprzednia: {{ previous }}</p>
+  {% if let Some((version, start, back)) = trial %}
+  <p>Próba wersji {{ version }}: start {{ start }} z 3. Stacja potwierdzi ją po minucie pracy; gdy nie wstanie, wróci do {{ back }}.</p>
+  <p class="error">Nie zmieniaj teraz sprzętu — nieudany start w czasie próby cofnie aktualizację.</p>
+  {% endif %}
+</div>
+
+{% if let Some((css, text)) = last %}
+<div class="card">
+  <h2>Ostatni wynik</h2>
+  <p class="{{ css }}">{{ text }}</p>
+</div>
+{% endif %}
+
+{% if let Some((css, text)) = notice %}
+<div class="card">
+  <p class="{{ css }}">{{ text }}</p>
+</div>
+{% endif %}
+
+{% if let Some(reason) = unsupported %}
+<div class="card">
+  <h2>Aktualizacja</h2>
+  <p class="error">{{ reason }}</p>
+</div>
+{% else %}
+<div class="card">
+  <h2>Aktualizacja</h2>
+  <p class="muted">Stacja pyta o nowe wydanie tylko po naciśnięciu przycisku. Wydanie musi mieć poprawny podpis i sumy kontrolne.</p>
+  {% if let Some(check) = check %}
+  {% match check %}
+  {% when CheckView::Latest with (version) %}
+  <p class="badge on">Działa najnowsza wersja ({{ version }}).</p>
+  {% when CheckView::Error with (error) %}
+  <p class="error">Nie udało się sprawdzić: {{ error }}</p>
+  {% when CheckView::Available with { version, size_mb, notes } %}
+  <h3>Dostępna wersja {{ version }} ({{ size_mb }} MB)</h3>
+  {% if !notes.is_empty() %}<div class="release-notes">{{ notes }}</div>{% endif %}
+  <form method="post" action="/settings/update/install">
+    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+    <input type="hidden" name="version" value="{{ version }}">
+    <div class="field">
+      <label class="check"><input type="checkbox" name="confirm" value="tak"> Rozumiem: stacja dokończy bieżące nadanie, zatrzyma się na około minutę i wstanie na wersji {{ version }}. Gdy nowa wersja nie wstanie, wróci do {{ current }}.</label>
+    </div>
+    <button type="submit" class="danger">Zainstaluj {{ version }}</button>
+  </form>
+  {% endmatch %}
+  {% endif %}
+  <form method="post" action="/settings/update/check" class="check-form">
+    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+    <button type="submit" class="ghost">Sprawdź aktualizacje</button>
+  </form>
+</div>
+{% endif %}
+{% endblock %}

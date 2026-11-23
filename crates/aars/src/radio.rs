@@ -23,7 +23,7 @@ const WATCHDOG_GRACE: Duration = Duration::from_secs(2);
 /// Limit strażnika: PTT trzyma `tx_tail` przed audio i do `tx_max` audio,
 /// więc strażnik musi dać obu, plus zapas. Bez `tx_tail` długi ogon radia
 /// zatruwałby stację na zwykłym komunikacie o maksymalnej długości.
-fn watchdog_limit(tx_max: Duration, tx_tail: Duration) -> Duration {
+pub(crate) fn watchdog_limit(tx_max: Duration, tx_tail: Duration) -> Duration {
     tx_max + tx_tail + WATCHDOG_GRACE
 }
 
@@ -35,6 +35,8 @@ pub struct RadioStack {
     pub sequencer: SequencerHandle,
     pub watchdog: WatchdogHandle,
     pub interlocks: Arc<InMemoryInterlocks>,
+    /// Limit strażnika TX: dłużej żadne nadanie nie trzyma PTT.
+    pub watchdog_limit: Duration,
 }
 
 /// Wczytuje parametr operacyjny z tabeli `settings` (spec §9).
@@ -87,8 +89,8 @@ pub async fn build_stack(
     };
 
     let tx_tail = Duration::from_millis(config.ptt.tx_tail_ms);
-    let watchdog =
-        Watchdog::spawn(ptt.clone(), watchdog_limit(Duration::from_secs(tx_max_s), tx_tail));
+    let limit = watchdog_limit(Duration::from_secs(tx_max_s), tx_tail);
+    let watchdog = Watchdog::spawn(ptt.clone(), limit);
     // Nowy strażnik startuje czysty; blokada z bazy musi go zatruć, inaczej
     // po restarcie test audio zagrałby na wejście radia (przegląd T7, I-3).
     if interlocks.snapshot().poisoned {
@@ -107,7 +109,7 @@ pub async fn build_stack(
         Some(watchdog.marker()),
     );
 
-    Ok(RadioStack { sequencer, watchdog, interlocks })
+    Ok(RadioStack { sequencer, watchdog, interlocks, watchdog_limit: limit })
 }
 
 /// Utrwala interwencję strażnika: interlocki od razu, `settings.poisoned`
@@ -196,8 +198,7 @@ pub async fn apply_quiet_hours(
 ) {
     match aars_core::settings::SettingsRepo::new(pool.clone()).load().await {
         Ok(settings) => {
-            let quiet = settings.quiet_hours.is_some_and(|window| window.contains(now));
-            interlocks.set_quiet(quiet, settings.quiet_min_priority);
+            interlocks.set_quiet(settings.quiet_now(now), settings.quiet_min_priority);
         }
         Err(err) => tracing::error!(%err, "odczyt okna ciszy zawiódł"),
     }

@@ -20,11 +20,34 @@ voices_dir = "/var/lib/aars/voices"
 # Adres API ostrzeżeń meteo IMGW. Włączanie źródła, obszar i interwał ustawia
 # się w panelu (/modules); źródło po instalacji jest wyłączone.
 imgw_meteo_url = "https://danepubliczne.imgw.pl/api/data/warningsmeteo"
+# Adresy pozostałych źródeł (wartości domyślne; odkomentuj, by zmienić):
+# imgw_hydro_url = "https://danepubliczne.imgw.pl/api/data/warningshydro"
+# imgw_hydro_stations_url = "https://danepubliczne.imgw.pl/api/data/hydro"
+# rso_url = "https://komunikaty.tvp.pl/komunikatyxml"
+# swpc_url = "https://services.swpc.noaa.gov/products/noaa-scales.json"
+# gios_url = "https://api.gios.gov.pl/pjp-api/v1/rest"
+# emsc_url = "https://www.seismicportal.eu/fdsnws/event/1/query"
+# open_meteo_url = "https://api.open-meteo.com/v1/forecast"
+# met_no_url = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+# swpc_f107_url = "https://services.swpc.noaa.gov/json/f107_cm_flux.json"
+# swpc_kp_url = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
+# kc2g_url = "https://prop.kc2g.com/api/stations.json"
 
 # Ustawiane w panelu (Ustawienia → Sprzęt). Wartości tutaj są tylko startowe; panel ma pierwszeństwo.
 #
 # [server]
 # bind = "0.0.0.0:8080"
+# Panel odpowiada tylko pod literałem IP, `localhost`, nazwą hosta stacji,
+# `{nazwa}.local`, `{nazwa}-{N}.local` (avahi po kolizji nazw), `{nazwa}.lan`,
+# `.home`, `.home.arpa`, `.localdomain` i nazwą z `bind` (obrona przed DNS
+# rebinding; inna nazwa dostaje 421). Inne nazwy, np. z lokalnego DNS, dopisz
+# tutaj (tylko w pliku):
+# allowed_hosts = ["stacja.dom.lan"]
+# Domyślnie cały panel odpowiada tylko klientom z sieci lokalnej (pętla,
+# prywatne IPv4, link-local, ULA, ta sama sieć /64 IPv6); inni dostają 403.
+# `true` wpuszcza każdego (tylko w pliku). Panel jest bez HTTPS i bez limitu
+# prób logowania: nie wystawiaj go do internetu, do pracy zdalnej użyj VPN.
+# allow_remote = false
 #
 # [audio]
 # device = "default"
@@ -45,3 +68,24 @@ imgw_meteo_url = "https://danepubliczne.imgw.pl/api/data/warningsmeteo"
 # [ptt.serial]
 # port = "/dev/ttyUSB0"
 # line = "dtr"            # dtr | rts
+
+# Pierwsze konto administratora. Tylko w pliku.
+#   "console" — przy pierwszym starcie konto `admin` z hasłem wypisanym na
+#               konsoli (domyślnie, instalacja „z ręki”),
+#   "wizard"  — kreator http://{stacja}:8080/setup, tylko z sieci lokalnej,
+#               dopóki nie ma admina (obraz Raspberry Pi). W tym trybie pusty
+#               plik `aars-reset-admin` obok bazy wyłącza konta admina przy
+#               starcie i otwiera kreator znowu.
+#
+# [setup]
+# first_admin = "console"
+
+# Aktualizacja z panelu (tylko w obrazie Raspberry Pi: systemd, Linux aarch64,
+# kompilacja z kluczem wydań). Tylko w pliku: kto zmienia źródło aktualizacji,
+# ten wybiera kod do uruchomienia. Wartości domyślne:
+#
+# [update]
+# releases_url = "https://github.com/sptq/aars/releases"
+# state_dir = "/var/lib/aars/update"     # katalog roboczy usługi (użytkownik aars)
+# guard_dir = "/var/lib/aars-update"     # stan strażnika startu (root)
+# install_root = "/opt/aars"             # releases/, current, previous

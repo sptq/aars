@@ -17,6 +17,55 @@ pub struct Config {
     pub tts: TtsConfig,
     pub storage: StorageConfig,
     pub sources: SourcesConfig,
+    /// Aktualizacja z wydań GitHub (etap 10). Tylko w pliku: kto zmienia
+    /// źródło aktualizacji, ten wybiera kod do uruchomienia (R5).
+    #[serde(default)]
+    pub update: UpdateConfig,
+    /// Zakładanie pierwszego konta (etap 10, R12).
+    #[serde(default)]
+    pub setup: SetupConfig,
+}
+
+/// Skąd stacja bierze wydania i gdzie trzyma stan aktualizacji (R5, R6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Adres wydań; manifest leży pod `{releases_url}/latest/download/…`.
+    pub releases_url: String,
+    /// Katalog roboczy usługi (użytkownik `aars`).
+    pub state_dir: PathBuf,
+    /// Stan strażnika startu (root).
+    pub guard_dir: PathBuf,
+    /// Katalog z `releases/`, `current` i `previous`.
+    pub install_root: PathBuf,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            releases_url: "https://github.com/sptq/aars/releases".to_owned(),
+            state_dir: PathBuf::from("/var/lib/aars/update"),
+            guard_dir: PathBuf::from("/var/lib/aars-update"),
+            install_root: PathBuf::from("/opt/aars"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SetupConfig {
+    pub first_admin: FirstAdmin,
+}
+
+/// Jak powstaje pierwsze konto administratora (R12).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FirstAdmin {
+    /// Hasło startowe wypisane na konsoli (jak przed etapem 10).
+    #[default]
+    Console,
+    /// Kreator `/setup` w panelu, z sieci lokalnej (obraz Raspberry Pi).
+    Wizard,
 }
 
 /// Adresy źródeł danych: to rozruch stacji, nie operacja (włączanie, obszar
@@ -24,28 +73,129 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourcesConfig {
+    #[serde(default = "default_imgw_meteo_url")]
     pub imgw_meteo_url: String,
+    #[serde(default = "default_imgw_hydro_url")]
+    pub imgw_hydro_url: String,
+    #[serde(default = "default_imgw_hydro_stations_url")]
+    pub imgw_hydro_stations_url: String,
+    #[serde(default = "default_rso_url")]
+    pub rso_url: String,
+    #[serde(default = "default_swpc_url")]
+    pub swpc_url: String,
+    #[serde(default = "default_gios_url")]
+    pub gios_url: String,
+    #[serde(default = "default_emsc_url")]
+    pub emsc_url: String,
+    #[serde(default = "default_open_meteo_url")]
+    pub open_meteo_url: String,
+    #[serde(default = "default_met_no_url")]
+    pub met_no_url: String,
+    #[serde(default = "default_swpc_f107_url")]
+    pub swpc_f107_url: String,
+    #[serde(default = "default_swpc_kp_url")]
+    pub swpc_kp_url: String,
+    #[serde(default = "default_kc2g_url")]
+    pub kc2g_url: String,
+}
+
+fn default_imgw_meteo_url() -> String {
+    "https://danepubliczne.imgw.pl/api/data/warningsmeteo".to_owned()
+}
+
+fn default_imgw_hydro_url() -> String {
+    "https://danepubliczne.imgw.pl/api/data/warningshydro".to_owned()
+}
+
+fn default_imgw_hydro_stations_url() -> String {
+    "https://danepubliczne.imgw.pl/api/data/hydro".to_owned()
+}
+
+fn default_rso_url() -> String {
+    "https://komunikaty.tvp.pl/komunikatyxml".to_owned()
+}
+
+fn default_swpc_url() -> String {
+    "https://services.swpc.noaa.gov/products/noaa-scales.json".to_owned()
+}
+
+fn default_gios_url() -> String {
+    "https://api.gios.gov.pl/pjp-api/v1/rest".to_owned()
+}
+
+fn default_emsc_url() -> String {
+    "https://www.seismicportal.eu/fdsnws/event/1/query".to_owned()
+}
+
+fn default_open_meteo_url() -> String {
+    "https://api.open-meteo.com/v1/forecast".to_owned()
+}
+
+fn default_met_no_url() -> String {
+    "https://api.met.no/weatherapi/locationforecast/2.0/compact".to_owned()
+}
+
+fn default_swpc_f107_url() -> String {
+    "https://services.swpc.noaa.gov/json/f107_cm_flux.json".to_owned()
+}
+
+fn default_swpc_kp_url() -> String {
+    "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json".to_owned()
+}
+
+fn default_kc2g_url() -> String {
+    "https://prop.kc2g.com/api/stations.json".to_owned()
 }
 
 impl SourcesConfig {
-    /// Adres musi być URL-em http(s); literówka ma wyjść przy starcie, nie
-    /// jako wieczna porażka odpytywania.
+    /// Każdy adres musi być URL-em http(s); literówka ma wyjść przy starcie,
+    /// nie jako wieczna porażka odpytywania.
     fn validate(&self) -> Result<(), ConfigError> {
-        let url = self.imgw_meteo_url.as_str();
-        let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
-        match rest {
-            Some(rest) if !rest.is_empty() && !rest.starts_with('/') && !url.contains(char::is_whitespace) => Ok(()),
-            _ => Err(ConfigError::Invalid(Box::new(figment::Error::from(format!(
-                "sources.imgw_meteo_url: „{url}” nie jest adresem http:// ani https://"
-            ))))),
+        let pairs = [
+            ("imgw_meteo_url", &self.imgw_meteo_url),
+            ("imgw_hydro_url", &self.imgw_hydro_url),
+            ("imgw_hydro_stations_url", &self.imgw_hydro_stations_url),
+            ("rso_url", &self.rso_url),
+            ("swpc_url", &self.swpc_url),
+            ("gios_url", &self.gios_url),
+            ("emsc_url", &self.emsc_url),
+            ("open_meteo_url", &self.open_meteo_url),
+            ("met_no_url", &self.met_no_url),
+            ("swpc_f107_url", &self.swpc_f107_url),
+            ("swpc_kp_url", &self.swpc_kp_url),
+            ("kc2g_url", &self.kc2g_url),
+        ];
+        for (key, url) in pairs {
+            let url = url.as_str();
+            let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
+            match rest {
+                Some(rest) if !rest.is_empty() && !rest.starts_with('/') && !url.contains(char::is_whitespace) => {}
+                _ => {
+                    return Err(ConfigError::Invalid(Box::new(figment::Error::from(format!(
+                        "sources.{key}: „{url}” nie jest adresem http:// ani https://"
+                    )))))
+                }
+            }
         }
+        Ok(())
     }
 }
 
 impl Default for SourcesConfig {
     fn default() -> Self {
         Self {
-            imgw_meteo_url: "https://danepubliczne.imgw.pl/api/data/warningsmeteo".to_owned(),
+            imgw_meteo_url: default_imgw_meteo_url(),
+            imgw_hydro_url: default_imgw_hydro_url(),
+            imgw_hydro_stations_url: default_imgw_hydro_stations_url(),
+            rso_url: default_rso_url(),
+            swpc_url: default_swpc_url(),
+            gios_url: default_gios_url(),
+            emsc_url: default_emsc_url(),
+            open_meteo_url: default_open_meteo_url(),
+            met_no_url: default_met_no_url(),
+            swpc_f107_url: default_swpc_f107_url(),
+            swpc_kp_url: default_swpc_kp_url(),
+            kc2g_url: default_kc2g_url(),
         }
     }
 }
@@ -54,6 +204,17 @@ impl Default for SourcesConfig {
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind: String,
+    /// Dodatkowe nazwy, pod którymi panel odpowiada (obrona przed DNS
+    /// rebinding). Zawsze przechodzą literały IP, `localhost`, nazwa hosta,
+    /// `{nazwa}.local`, `{nazwa}-{N}.local`, `{nazwa}.lan`, `.home`,
+    /// `.home.arpa`, `.localdomain` i host z `bind`. Tylko w pliku.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// `false` (domyślnie): cały panel odpowiada tylko klientom z sieci
+    /// lokalnej stacji, reszta dostaje `403`. `true`: każdemu klientowi.
+    /// Tylko w pliku.
+    #[serde(default)]
+    pub allow_remote: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -155,7 +316,11 @@ pub struct StorageConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            server: ServerConfig { bind: "0.0.0.0:8080".to_owned() },
+            server: ServerConfig {
+                bind: "0.0.0.0:8080".to_owned(),
+                allowed_hosts: Vec::new(),
+                allow_remote: false,
+            },
             audio: AudioConfig {
                 device: "default".to_owned(),
                 sample_rate: 48_000,
@@ -187,6 +352,8 @@ impl Default for Config {
                 cache_max_bytes: 512 * 1024 * 1024,
             },
             sources: SourcesConfig::default(),
+            update: UpdateConfig::default(),
+            setup: SetupConfig::default(),
         }
     }
 }
@@ -296,6 +463,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_partial_sources_block_keeps_the_other_defaults() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("aars.toml", "[sources]\nimgw_meteo_url = \"http://127.0.0.1:9/x\"\n")?;
+            let cfg = Config::load(Some(std::path::Path::new("aars.toml"))).unwrap();
+            assert_eq!(cfg.sources.imgw_meteo_url, "http://127.0.0.1:9/x");
+            assert_eq!(cfg.sources.imgw_hydro_url, "https://danepubliczne.imgw.pl/api/data/warningshydro");
+            assert_eq!(cfg.sources.imgw_hydro_stations_url, "https://danepubliczne.imgw.pl/api/data/hydro");
+            assert_eq!(cfg.sources.rso_url, "https://komunikaty.tvp.pl/komunikatyxml");
+            assert_eq!(cfg.sources.swpc_url, "https://services.swpc.noaa.gov/products/noaa-scales.json");
+            assert_eq!(cfg.sources.gios_url, "https://api.gios.gov.pl/pjp-api/v1/rest");
+            assert_eq!(cfg.sources.emsc_url, "https://www.seismicportal.eu/fdsnws/event/1/query");
+            assert_eq!(cfg.sources.open_meteo_url, "https://api.open-meteo.com/v1/forecast");
+            assert_eq!(
+                cfg.sources.met_no_url,
+                "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+            );
+            assert_eq!(cfg.sources.swpc_f107_url, "https://services.swpc.noaa.gov/json/f107_cm_flux.json");
+            assert_eq!(
+                cfg.sources.swpc_kp_url,
+                "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
+            );
+            assert_eq!(cfg.sources.kc2g_url, "https://prop.kc2g.com/api/stations.json");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn every_source_url_is_validated() {
+        for key in ["IMGW_METEO_URL", "IMGW_HYDRO_URL", "IMGW_HYDRO_STATIONS_URL", "RSO_URL", "SWPC_URL", "GIOS_URL", "EMSC_URL", "OPEN_METEO_URL", "MET_NO_URL", "SWPC_F107_URL", "SWPC_KP_URL", "KC2G_URL"] {
+            figment::Jail::expect_with(|jail| {
+                jail.set_env(format!("AARS_SOURCES__{key}"), "ftp://x");
+                let err = Config::load(None).unwrap_err().to_string();
+                assert!(err.contains(&key.to_lowercase()), "{key}: {err}");
+                Ok(())
+            });
+        }
+    }
+
     // Każdy test dotykający konfiguracji pracuje w `figment::Jail`, który
     // trzyma globalny zamek. Bez tego zmienne `AARS_*` z jednego testu
     // wyciekają do równolegle biegnącego drugiego.
@@ -304,6 +510,7 @@ mod tests {
         figment::Jail::expect_with(|_jail| {
             let cfg = Config::load(None).expect("domyślna konfiguracja musi się wczytać");
             assert_eq!(cfg.server.bind, "0.0.0.0:8080");
+            assert!(!cfg.server.allow_remote, "panel domyślnie tylko dla sieci lokalnej");
             assert_eq!(cfg.audio.sample_rate, 48_000);
             assert_eq!(cfg.ptt.backend, PttBackendKind::Vox);
             assert_eq!(cfg.ptt.channel_busy, ChannelBusyKind::None);
@@ -319,6 +526,7 @@ mod tests {
                 r#"
                 [server]
                 bind = "127.0.0.1:9000"
+                allow_remote = true
 
                 [ptt]
                 backend = "gpio"
@@ -331,12 +539,46 @@ mod tests {
 
             let cfg = Config::load(Some(std::path::Path::new("aars.toml"))).unwrap();
             assert_eq!(cfg.server.bind, "127.0.0.1:9000");
+            assert!(cfg.server.allow_remote);
             assert_eq!(cfg.ptt.backend, PttBackendKind::Gpio);
             assert_eq!(cfg.ptt.gpio.line, 17);
             assert_eq!(cfg.audio.sample_rate, 44_100, "env musi wygrywać z plikiem");
             assert_eq!(cfg.ptt.gpio.chip, "/dev/gpiochip0", "nietknięte pola zachowują domyślne");
             Ok(())
         });
+    }
+
+    #[test]
+    fn a_config_without_update_and_setup_uses_the_defaults() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("aars.toml", "[server]\nbind = \"127.0.0.1:9000\"\n")?;
+            let cfg = Config::load(Some(std::path::Path::new("aars.toml"))).unwrap();
+            assert_eq!(
+                cfg.update.releases_url,
+                "https://github.com/sptq/aars/releases"
+            );
+            assert_eq!(cfg.update.state_dir, PathBuf::from("/var/lib/aars/update"));
+            assert_eq!(cfg.update.guard_dir, PathBuf::from("/var/lib/aars-update"));
+            assert_eq!(cfg.update.install_root, PathBuf::from("/opt/aars"));
+            assert_eq!(cfg.setup.first_admin, FirstAdmin::Console);
+            Ok(())
+        });
+        // Sama sekcja bez części pól też się wczytuje (obraz ustawia tylko `wizard`).
+        let cfg: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(
+                "[setup]\nfirst_admin = \"wizard\"\n[update]\ninstall_root = \"/tmp/x\"\n",
+            ))
+            .extract()
+            .unwrap();
+        assert_eq!(cfg.setup.first_admin, FirstAdmin::Wizard);
+        assert_eq!(cfg.update.install_root, PathBuf::from("/tmp/x"));
+        assert_eq!(cfg.update.guard_dir, PathBuf::from("/var/lib/aars-update"));
+        let partial: UpdateConfig = Figment::from(Toml::string("install_root = \"/tmp/x\"\n"))
+            .extract()
+            .unwrap();
+        assert_eq!(partial.releases_url, UpdateConfig::default().releases_url);
+        let empty: SetupConfig = Figment::from(Toml::string("")).extract().unwrap();
+        assert_eq!(empty.first_admin, FirstAdmin::Console);
     }
 
     #[test]

@@ -1,14 +1,87 @@
+/* System wyglądu AARS: tokeny kolorów (jasny i ciemny motyw) + komponenty.
+   Kolory tylko jako #rrggbb. Ciemny blok występuje dwa razy (preferencja
+   systemu i ręczny przełącznik) — test ui_checks pilnuje, by były identyczne. */
 :root {
-  --bg: #11161c;
-  --panel: #19202a;
-  --line: #2a3542;
-  --text: #e6edf3;
-  --muted: #8b98a8;
-  --accent: #4da3ff;
-  --warn: #ffb224;
-  --bad: #ff5c5c;
-  --good: #3fcf8e;
+  --bg: #f3f5f8;
+  --surface: #ffffff;
+  --surface-2: #e9edf2;
+  --line: #c9d1db;
+  --text: #17202a;
+  --muted: #4a5666;
+  --accent: #0b5cc2;
+  --on-accent: #ffffff;
+  --danger: #b3261e;
+  --on-danger: #ffffff;
+  --ok: #136b3a;
+  --ok-bg: #dcf2e4;
+  --warn: #7a4b00;
+  --warn-bg: #fdecc8;
+  --error: #a4161a;
+  --error-bg: #fbe0df;
+  --disabled: #5b6573;
+  --disabled-bg: #e3e7ec;
+  --focus: #0b5cc2;
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2.5rem;
+  --radius: 8px;
+  --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #11161c;
+    --surface: #19202a;
+    --surface-2: #212b37;
+    --line: #34414f;
+    --text: #e6edf3;
+    --muted: #9aa7b6;
+    --accent: #5eaeff;
+    --on-accent: #06131f;
+    --danger: #ff6b6b;
+    --on-danger: #1b0606;
+    --ok: #5fdc9f;
+    --ok-bg: #14382a;
+    --warn: #ffc247;
+    --warn-bg: #3d2d08;
+    --error: #ff8a8a;
+    --error-bg: #421a1a;
+    --disabled: #a0acba;
+    --disabled-bg: #2a3340;
+    --focus: #7dbdff;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #11161c;
+  --surface: #19202a;
+  --surface-2: #212b37;
+  --line: #34414f;
+  --text: #e6edf3;
+  --muted: #9aa7b6;
+  --accent: #5eaeff;
+  --on-accent: #06131f;
+  --danger: #ff6b6b;
+  --on-danger: #1b0606;
+  --ok: #5fdc9f;
+  --ok-bg: #14382a;
+  --warn: #ffc247;
+  --warn-bg: #3d2d08;
+  --error: #ff8a8a;
+  --error-bg: #421a1a;
+  --disabled: #a0acba;
+  --disabled-bg: #2a3340;
+  --focus: #7dbdff;
+}
+
+:root { color-scheme: light; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { color-scheme: dark; } }
+:root[data-theme="dark"] { color-scheme: dark; }
 
 * { box-sizing: border-box; }
 
@@ -16,47 +89,203 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font: 15px/1.5 var(--font);
 }
 
 a, a:visited { color: var(--accent); }
 a:hover { color: var(--text); }
 
-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  padding: 0.75rem 1.25rem;
-  background: var(--panel);
-  border-bottom: 1px solid var(--line);
-}
-
-header h1 { font-size: 1.05rem; margin: 0; letter-spacing: 0.04em; }
-header nav { display: flex; gap: 1rem; align-items: center; }
-header nav a, header nav a:visited { color: var(--muted); text-decoration: none; }
-header nav a:hover { color: var(--text); }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 
 main { padding: 1.25rem; max-width: 72rem; margin: 0 auto; }
+footer.version { color: var(--muted); font-size: 0.8rem; text-align: center; padding: var(--space-2) 1.25rem 1.25rem; }
+
+/* Pasek stanu: przyklejony u góry na każdej szerokości, żeby wyłącznik
+   nadawania był zawsze pod ręką. Kolejność: plakietka nadawania i wyłącznik
+   pierwsze, użytkownik i Wyloguj na końcu (one zawijają się pierwsze). */
+:root { --statusbar-h: 3.75rem; --sidebar-w: 15rem; }
+.statusbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+  min-height: var(--statusbar-h);
+  padding: var(--space-2) var(--space-4);
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+.statusbar form { margin: 0; }
+.statusbar > time { font-family: var(--font-mono); }
+.statusbar .tx-switch button { min-height: 44px; }
+#statusbar > .tx-switch { order: 1; margin-left: auto; }
+#statusbar > .sb-user, #statusbar > .sb-logout { order: 2; }
+#statusbar .sb-logout button { padding: 0.2rem 0.6rem; font-size: 0.85rem; }
+.statusbar.locked { justify-content: flex-end; }
+
+/* Układ: menu boczne + treść. */
+/* Kolumna menu ma tło na samym układzie (gradient), a układ ma co najmniej
+   wysokość okna pod paskiem, więc tło sięga dołu okna także na krótkich
+   stronach; przyklejone menu w środku zostaje `sticky`. Stopka siedzi
+   w kolumnie treści, w ostatnim wierszu siatki. */
+.layout {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  grid-template-rows: 1fr auto;
+  align-items: start;
+  min-height: calc(100vh - var(--statusbar-h));
+  background: linear-gradient(to right, var(--surface) 0, var(--surface) calc(var(--sidebar-w) - 1px), var(--line) calc(var(--sidebar-w) - 1px), var(--line) var(--sidebar-w), transparent var(--sidebar-w));
+}
+.layout > footer.version { grid-column: 2; }
+.layout.locked { display: block; background: none; }
+.menu-toggle, .menu-button, .sidebar-user { display: none; }
+.sidebar {
+  grid-row: 1 / span 2;
+  position: sticky;
+  top: var(--statusbar-h);
+  max-height: calc(100vh - var(--statusbar-h));
+  overflow-y: auto;
+  padding: var(--space-4) var(--space-3);
+  background: var(--surface);
+  border-right: 1px solid var(--line);
+}
+.sidebar .brand { margin: 0 var(--space-2) var(--space-4); font-weight: 700; letter-spacing: 0.04em; }
+.sidebar h2 {
+  margin: var(--space-4) var(--space-2) var(--space-1);
+  font-size: 0.75rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.sidebar ul { list-style: none; margin: 0; padding: 0; }
+.sidebar a, .sidebar a:visited {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 40px;
+  padding: var(--space-1) var(--space-2);
+  border-radius: 6px;
+  color: var(--text);
+  text-decoration: none;
+}
+.sidebar a:hover { background: var(--surface-2); }
+.sidebar a[aria-current="page"] {
+  background: var(--surface-2);
+  color: var(--accent);
+  font-weight: 600;
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.sidebar .theme-toggle { margin: var(--space-5) var(--space-2) 0; }
+.js .sidebar .theme-toggle { display: block; }
+
+main.content { padding: 1.25rem; max-width: 72rem; width: 100%; margin: 0 auto; }
+main.content.wide, .wide { max-width: none; }
+.page-title { margin: 0 0 var(--space-4); font-size: 1.4rem; line-height: 1.25; }
+
+/* Węższy pulpit: drobniejsze pismo, żeby pasek zwykle mieścił się w jednym
+   wierszu; gdy nie, zawija użytkownika i Wyloguj, wyłącznik zostaje w pierwszym. */
+@media (min-width: 900px) and (max-width: 1199px) {
+  #statusbar { font-size: 0.875rem; gap: var(--space-2); }
+}
+
+/* Menu mobilne bez JS (D9): checkbox przed menu, etykieta „Menu” go przełącza.
+   Pasek na telefonie ma najwyżej dwa wiersze: plakietka + wyłącznik, potem
+   drobnym pismem cisza, znak i zegar; użytkownik i Wyloguj są w menu. */
+@media (max-width: 899px) {
+  #statusbar { gap: var(--space-1) var(--space-2); padding: var(--space-2) var(--space-3); }
+  #statusbar > .sb-tx { order: 0; flex: 1 1 0; min-width: 0; }
+  #statusbar > .tx-switch { order: 1; flex: none; }
+  #statusbar::after { content: ""; order: 1; flex-basis: 100%; height: 0; }
+  #statusbar > * { order: 2; font-size: 0.8rem; }
+  #statusbar > .sb-tx { font-size: 0.85rem; }
+  #statusbar > .tx-switch { font-size: inherit; }
+  #statusbar .tx-switch button { padding-inline: var(--space-3); font-size: 0.9rem; }
+  #statusbar > .sb-user, #statusbar > .sb-logout { display: none; }
+  .sidebar-user {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-3);
+    margin: var(--space-5) var(--space-2) 0;
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--line);
+  }
+  .sidebar-user form { margin: 0; }
+  .sidebar-user button { min-height: 44px; }
+  .layout { display: block; background: none; min-height: 0; }
+  .menu-toggle {
+    display: block;
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+  }
+  .menu-button {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin: 0;
+    padding: var(--space-2) var(--space-4);
+    min-height: 44px;
+    color: var(--text);
+    font-size: 1rem;
+    font-weight: 600;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+    cursor: pointer;
+  }
+  .menu-toggle:focus-visible + .menu-button { outline: 2px solid var(--focus); outline-offset: -2px; }
+  .sidebar { display: none; position: static; max-height: none; border-right: none; border-bottom: 1px solid var(--line); }
+  .menu-toggle:checked ~ .sidebar { display: block; }
+  main.content { padding: var(--space-4); }
+}
 
 .card {
-  background: var(--panel);
+  background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 1rem 1.25rem;
-  margin-bottom: 1rem;
+  border-radius: var(--radius);
+  padding: var(--space-4) 1.25rem;
+  margin-bottom: var(--space-4);
 }
 
 .card h2 {
-  margin: 0 0 0.75rem;
+  margin: 0 0 var(--space-3);
   font-size: 0.95rem;
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.08em;
 }
 
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+.tile {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--space-3) var(--space-4);
+}
+.tile h3 { margin: 0 0 var(--space-1); font-size: 0.8rem; color: var(--muted); font-weight: 600; }
+.tile p { margin: var(--space-1) 0 0; }
+.tile-value { font-size: 1.6rem; font-weight: 700; line-height: 1.2; overflow-wrap: anywhere; }
+.tile-value .badge { font-size: 0.95rem; }
+.tile-unit { font-size: 0.9rem; font-weight: 400; color: var(--muted); }
+.tile-action { margin-top: var(--space-3); }
+
+/* Szeroka tabela przewija się w swojej karcie, nie poszerza strony na telefonie. */
+.table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
 table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--line); }
+th, td { text-align: left; padding: 0.4rem var(--space-2); border-bottom: 1px solid var(--line); }
 th { color: var(--muted); font-weight: 600; font-size: 0.85rem; }
 tr:last-child td { border-bottom: none; }
 
@@ -67,35 +296,118 @@ tr:last-child td { border-bottom: none; }
   font-size: 0.78rem;
   font-weight: 600;
 }
-.badge.on { background: rgba(63, 207, 142, 0.15); color: var(--good); }
-.badge.off { background: rgba(255, 92, 92, 0.15); color: var(--bad); }
-.badge.err { background: var(--bad); color: #0b0f14; }
-.badge.warn { background: rgba(255, 178, 36, 0.15); color: var(--warn); }
+.badge.on { background: var(--ok-bg); color: var(--ok); }
+.badge.warn { background: var(--warn-bg); color: var(--warn); }
+.badge.err { background: var(--error-bg); color: var(--error); }
+.badge.off { background: var(--disabled-bg); color: var(--disabled); }
 
 label { display: block; margin-bottom: 0.3rem; color: var(--muted); font-size: 0.85rem; }
 
 input, select, textarea, button {
   font: inherit;
   color: var(--text);
-  background: #0e1319;
-  border: 1px solid var(--line);
+  background: var(--surface);
+  border: 1px solid var(--muted);
   border-radius: 6px;
   padding: 0.45rem 0.6rem;
 }
 textarea { width: 100%; min-height: 6rem; resize: vertical; }
-.row { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.9rem; }
+.row { display: flex; gap: var(--space-4); flex-wrap: wrap; margin-bottom: 0.9rem; }
 .row > div { flex: 1 1 10rem; }
+.field { margin-bottom: 0.9rem; }
+.help { display: block; margin: var(--space-1) 0 0; color: var(--muted); font-size: 0.82rem; }
 
 button {
   background: var(--accent);
   border-color: var(--accent);
-  color: #06131f;
+  color: var(--on-accent);
   font-weight: 600;
   cursor: pointer;
 }
 button:hover { filter: brightness(1.08); }
-button.ghost { background: transparent; color: var(--text); border-color: var(--line); }
-button.danger { background: var(--bad); border-color: var(--bad); color: #1b0606; }
+button.ghost { background: transparent; color: var(--text); border-color: var(--muted); }
+button.danger { background: var(--danger); border-color: var(--danger); color: var(--on-danger); }
+button:disabled, button[disabled] {
+  background: var(--disabled-bg);
+  border-color: var(--disabled-bg);
+  color: var(--disabled);
+  cursor: not-allowed;
+  filter: none;
+}
 
-.error { color: var(--bad); margin-bottom: 0.8rem; }
-.login { max-width: 22rem; margin: 6rem auto; }
+.empty {
+  padding: var(--space-5) var(--space-4);
+  text-align: center;
+  color: var(--muted);
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+}
+.alert {
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+  border: 1px solid var(--error);
+  border-left-width: 4px;
+  border-radius: 6px;
+  background: var(--error-bg);
+  color: var(--error);
+}
+.muted, .hint, .preview-note { color: var(--muted); }
+.icon {
+  width: 1.25em;
+  height: 1.25em;
+  vertical-align: -0.25em;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.theme-toggle { display: none; }
+.js .theme-toggle { display: inline-block; }
+
+.error { color: var(--error); margin-bottom: 0.8rem; }
+
+/* Logowanie i kreator: osobne strony, wyśrodkowana karta bez menu i paska. */
+.auth { min-height: 100vh; display: flex; flex-direction: column; }
+.auth-main { flex: 1; display: flex; align-items: center; justify-content: center; width: 100%; max-width: none; padding: var(--space-5) var(--space-4); }
+.auth-card { width: 100%; max-width: 26rem; margin: 0; padding: var(--space-5); }
+.auth-card .brand { margin: 0 0 var(--space-4); font-weight: 700; letter-spacing: 0.04em; color: var(--muted); }
+.auth-card h1 { margin: 0 0 var(--space-3); font-size: 1.4rem; }
+.auth-card input:not([type="checkbox"]) { width: 100%; }
+.auth-card button { min-height: 44px; }
+
+/* Strony nadawania: pole wyboru, odsłuch, akcje w komórce tabeli. */
+label.check { display: flex; gap: var(--space-2); align-items: center; margin-bottom: var(--space-4); color: var(--text); font-size: inherit; }
+label.check input { width: auto; }
+.preview { margin-bottom: var(--space-4); }
+.preview audio, .preview-audio { width: 100%; margin-top: var(--space-2); }
+.row-actions { white-space: nowrap; }
+.row-actions > * + * { margin-left: var(--space-2); }
+form.inline { display: inline; }
+
+/* Grupa Dane: źródła, moduły, mapa */
+.section-title { margin: var(--space-4) 0 var(--space-2); font-size: 0.95rem; }
+.area-text { margin: 0; font-family: var(--font-mono); white-space: pre-wrap; }
+.source-actions { margin-top: var(--space-3); white-space: normal; }
+.module-form { margin-bottom: var(--space-3); }
+fieldset.field-group { border: 0; padding: 0; margin: 0; }
+fieldset.field-group legend { padding: 0; margin-bottom: 0.3rem; color: var(--muted); font-size: 0.85rem; }
+.card h2 .badge { text-transform: none; letter-spacing: normal; }
+
+.map-canvas { height: 560px; margin-bottom: var(--space-2); border: 1px solid var(--line); border-radius: var(--radius); }
+@media (max-width: 599px) { .map-canvas { height: 60vh; } }
+.map-legend { display: flex; gap: var(--space-4); flex-wrap: wrap; margin-bottom: var(--space-2); }
+.swatch { display: inline-block; width: 1rem; height: 1rem; vertical-align: middle; }
+.swatch-1 { background: #ffd400; opacity: 0.85; }
+.swatch-2 { background: #ff8c00; opacity: 0.85; }
+.swatch-3 { background: #d7191c; opacity: 0.85; }
+.swatch-area { border: 2.5px solid #1f4fd1; box-sizing: border-box; }
+.map-attribution { font-size: 0.85rem; }
+
+/* Grupa System */
+.station-map { height: 320px; margin-bottom: var(--space-2); }
+label.check.inline-option { display: inline-flex; margin-right: var(--space-4); margin-bottom: var(--space-2); }
+.test-group { margin-bottom: var(--space-4); }
+.release-notes { white-space: pre-wrap; margin-bottom: var(--space-3); }
+.check-form { margin-top: var(--space-3); }

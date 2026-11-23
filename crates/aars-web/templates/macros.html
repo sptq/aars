@@ -1,0 +1,21 @@
+{#- Wyłącznik nadawania (D5). Formularz zawsze niesie jawne enabled=0 albo
+    enabled=1 i wysyła się tylko kliknięciem; bez hx-trigger. Przy wyłączonym
+    nadawaniu i offer_start = false nie renderuje nic. -#}
+{% macro tx_switch(csrf, tx_enabled, offer_start, back) %}
+{%- if tx_enabled || offer_start -%}
+<form method="post" action="/tx-enabled" class="tx-switch">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="enabled" value="{% if tx_enabled %}0{% else %}1{% endif %}">
+  <input type="hidden" name="back" value="{{ back }}">
+  <button type="submit"{% if tx_enabled %} class="danger"{% endif %}>
+    {% if tx_enabled %}Zatrzymaj nadawanie{% else %}Włącz nadawanie{% endif %}
+  </button>
+</form>
+{%- endif -%}
+{% endmacro %}
+
+{#- Pozycja menu bocznego: ikona ze sprite'a i tekst; bieżąca dostaje
+    aria-current="page". -#}
+{% macro nav_item(href, key, icon, label, current) %}
+<li><a href="{{ href }}"{% if key == current %} aria-current="page"{% endif %}><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg#{{ icon }}"></use></svg><span>{{ label }}</span></a></li>
+{%- endmacro %}

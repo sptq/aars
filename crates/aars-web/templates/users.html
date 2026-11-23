@@ -1,17 +1,18 @@
 {% extends "base.html" %}
 {% block title %}AARS — użytkownicy{% endblock %}
+{% block heading %}Użytkownicy{% endblock %}
 {% block content %}
 {% if let Some((name, pass)) = secret %}
 <div class="card">
   <h2>Hasło tymczasowe dla {{ name }}</h2>
-  <p class="error">Hasło widać tylko teraz. Po odświeżeniu strony zniknie, a w dzienniku go nie ma. Przekaż je użytkownikowi bezpiecznym kanałem; przy pierwszym logowaniu będzie musiał je zmienić.</p>
+  <p class="alert">Hasło widać tylko teraz. Po odświeżeniu strony zniknie, a w dzienniku go nie ma. Przekaż je użytkownikowi bezpiecznym kanałem; przy pierwszym logowaniu będzie musiał je zmienić.</p>
   <p><code id="new-password">{{ pass }}</code></p>
 </div>
 {% endif %}
 <div class="card">
   <h2>Użytkownicy</h2>
   {% if let Some(message) = error %}<p class="error">{{ message }}</p>{% endif %}
-  <table>
+  <div class="table-wrap"><table>
     <thead>
       <tr><th>Nazwa</th><th>Rola</th><th>Stan</th><th></th></tr>
     </thead>
@@ -21,7 +22,7 @@
         <td>{{ row.username }}{% if row.is_self %} (to Ty){% endif %}{% if row.must_change %} <span class="badge off">hasło tymczasowe</span>{% endif %}</td>
         <td>
           {% if row.is_self %}{{ row.role_label }}{% else %}
-          <form method="post" action="/users/{{ row.id }}/role" style="display:inline">
+          <form method="post" action="/users/{{ row.id }}/role" class="inline">
             <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
             <select name="role" aria-label="Rola">
               <option value="viewer" {% if row.role == "viewer" %}selected{% endif %}>Podgląd</option>
@@ -33,19 +34,19 @@
           {% endif %}
         </td>
         <td>{% if row.disabled %}<span class="badge off">wyłączony</span>{% else %}<span class="badge on">aktywny</span>{% endif %}</td>
-        <td style="white-space:nowrap">
+        <td class="row-actions">
           {% if !row.is_self %}
-          <form method="post" action="/users/{{ row.id }}/disabled" style="display:inline">
+          <form method="post" action="/users/{{ row.id }}/disabled" class="inline">
             <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
             <input type="hidden" name="disabled" value="{% if row.disabled %}0{% else %}1{% endif %}">
             <button type="submit" class="ghost">{% if row.disabled %}Włącz{% else %}Wyłącz{% endif %}</button>
           </form>
-          <form method="post" action="/users/{{ row.id }}/reset" style="display:inline"
+          <form method="post" action="/users/{{ row.id }}/reset" class="inline"
                 onsubmit="return confirm('Wygenerować nowe hasło tymczasowe i zakończyć sesje użytkownika?')">
             <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
             <button type="submit" class="ghost">Resetuj hasło</button>
           </form>
-          <form method="post" action="/users/{{ row.id }}/delete" style="display:inline"
+          <form method="post" action="/users/{{ row.id }}/delete" class="inline"
                 onsubmit="return confirm('Usunąć konto?')">
             <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
             <button type="submit" class="danger">Usuń</button>
@@ -55,18 +56,18 @@
       </tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
 </div>
 <div class="card">
   <h2>Nowy użytkownik</h2>
-  <p style="color:var(--muted)">Hasło zostanie wygenerowane i pokazane raz po zapisaniu.</p>
+  <p class="muted">Hasło zostanie wygenerowane i pokazane raz po zapisaniu.</p>
   <form method="post" action="/users">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-    <div style="margin-bottom:0.8rem">
+    <div class="field">
       <label for="username">Nazwa (3–32 znaki: a–z, 0–9, _ . -)</label>
       <input id="username" name="username" value="{{ new_username }}" maxlength="32" required>
     </div>
-    <div style="margin-bottom:1rem">
+    <div class="field">
       <label for="role">Rola</label>
       <select id="role" name="role">
         <option value="viewer">Podgląd</option>

@@ -59,6 +59,11 @@ pub struct StationSettings {
 }
 
 impl StationSettings {
+    /// Czy o tej porze lokalnej trwa okno ciszy.
+    pub fn quiet_now(&self, local: NaiveTime) -> bool {
+        self.quiet_hours.is_some_and(|window| window.contains(local))
+    }
+
     /// Zamienia znak na wielkie litery i sprawdza zakresy.
     pub fn validate(&mut self) -> Result<(), String> {
         self.callsign = self.callsign.trim().to_uppercase();
@@ -244,6 +249,14 @@ mod tests {
         assert!(QuietHours::parse("22:00").is_err());
         assert!(QuietHours::parse("abc").is_err());
         assert!(QuietHours::parse("10:00-10:00").is_err());
+    }
+
+    #[test]
+    fn quiet_now_follows_the_window() {
+        let s = sample();
+        assert!(s.quiet_now(t(23, 0)));
+        assert!(!s.quiet_now(t(12, 0)));
+        assert!(!StationSettings { quiet_hours: None, ..s }.quiet_now(t(23, 0)));
     }
 
     fn sample() -> StationSettings {

@@ -325,3 +325,207 @@ fn hardware_reset_clears_panel_overrides() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `systemctl stop` wysyła SIGTERM: stacja ma się zatrzymać tak jak po
+/// Ctrl-C (R10e), z kodem 0 i w ograniczonym czasie.
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_the_station_like_ctrl_c() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("aars.toml");
+    // PTT na nieistniejącym porcie pada przy budowie stosu, zanim ktokolwiek
+    // otworzy kartę: stacja idzie w tryb bez nadawania i nic nie gra.
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:0\"\n\n\
+             [storage]\ndb_path = {db:?}\ncache_dir = {cache:?}\ncache_max_bytes = 1048576\n\n\
+             [ptt]\nbackend = \"serial\"\n\n\
+             [ptt.serial]\nport = \"/dev/aars-test-nie-ma\"\nline = \"dtr\"\n\n\
+             [sources]\nimgw_meteo_url = \"http://127.0.0.1:9/x\"\n",
+            db = dir.path().join("aars.db").to_string_lossy(),
+            cache = dir.path().join("cache").to_string_lossy(),
+        ),
+    )
+    .unwrap();
+
+    let mut child = aars()
+        .arg("--config")
+        .arg(&config)
+        .arg("run")
+        .env_remove("NOTIFY_SOCKET")
+        .env_remove("AARS_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Logi idą na stdout (tracing), błędy CLI na stderr: czytamy oba.
+    let (tx, rx) = mpsc::channel::<String>();
+    let mut readers = Vec::new();
+    for stream in [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn std::io::Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ] {
+        let tx = tx.clone();
+        readers.push(std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        }));
+    }
+    drop(tx);
+
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let started = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(line) => {
+                let hit = line.contains("stacja uruchomiona");
+                seen.push(line);
+                if hit {
+                    break true;
+                }
+            }
+            Err(_) => break false,
+        }
+    };
+    if !started {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("stacja nie wstała w 10 s: {seen:#?}");
+    }
+
+    let pid = child.id().to_string();
+    let killed = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+    assert!(killed.success());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("SIGTERM nie zatrzymał stacji w 5 s");
+    };
+    for reader in readers {
+        let _ = reader.join();
+    }
+    seen.extend(rx.try_iter());
+    assert!(status.success(), "kod wyjścia {status:?}: {seen:#?}");
+    assert!(
+        seen.iter().any(|l| l.contains("zatrzymuję stację")),
+        "SIGTERM idzie tą samą drogą co Ctrl-C: {seen:#?}"
+    );
+}
+
+#[test]
+fn the_version_flag_prints_what_the_smoke_test_expects() {
+    let out = aars().arg("--version").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("aars {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn update_status_and_guard_work_without_an_installation() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        aars()
+            .env("AARS_STORAGE__DB_PATH", dir.path().join("aars.db"))
+            .env("AARS_UPDATE__INSTALL_ROOT", dir.path().join("opt"))
+            .env("AARS_UPDATE__GUARD_DIR", dir.path().join("guard"))
+            .env("AARS_UPDATE__STATE_DIR", dir.path().join("state"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let out = run(&["update", "status"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("poprzednia: brak"), "{stdout}");
+    assert!(stdout.contains("próba:      brak"), "{stdout}");
+
+    // Strażnik zawsze kończy się kodem 0 (R8), nawet bez katalogów.
+    let out = run(&["update", "guard"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("nic do zrobienia"));
+
+    // Bez pliku blokady stan usługi jest nieznany: odmowa bez --force (M-5).
+    let out = run(&["update", "rollback"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nie wiadomo, czy usługa aars działa"));
+    let out = run(&["update", "rollback", "--force"]);
+    assert!(!out.status.success(), "powrót bez poprzedniej wersji to błąd");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("brak poprzedniej wersji"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn source_preview_uses_the_module_settings_from_the_database() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let dir = std::env::temp_dir().join(format!("aars-src-set-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("src.db");
+    let _ = std::fs::remove_file(&db);
+
+    // G2 jest poniżej domyślnego progu G3; ogłoszenie pojawi się tylko,
+    // gdy podgląd weźmie próg G2 z bazy.
+    let now = chrono::Utc::now();
+    let body = serde_json::json!({"0": {
+        "DateStamp": now.format("%Y-%m-%d").to_string(),
+        "TimeStamp": now.format("%H:%M:%S").to_string(),
+        "R": {"Scale": "0"}, "S": {"Scale": "0"}, "G": {"Scale": "2"}
+    }});
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/s.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    let url = format!("{}/s.json", server.uri());
+
+    let db2 = db.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let migrate = aars().env("AARS_STORAGE__DB_PATH", &db2).arg("migrate").output().unwrap();
+        assert!(migrate.status.success());
+        let set = std::process::Command::new("sqlite3")
+            .arg(&db2)
+            .arg("INSERT OR REPLACE INTO settings (key, value) VALUES ('source:swpc:g_min', '2');")
+            .status()
+            .unwrap();
+        assert!(set.success());
+        aars()
+            .env("AARS_STORAGE__DB_PATH", &db2)
+            .env("AARS_SOURCES__SWPC_URL", &url)
+            .args(["source", "preview", "swpc"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("G2"), "stdout: {stdout}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

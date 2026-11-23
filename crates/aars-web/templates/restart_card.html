@@ -1,7 +1,7 @@
 <div class="card">
   <h2>Restart stacji</h2>
   {% if pending.is_empty() %}
-  <p style="color:var(--muted)">Nic nie czeka na restart.</p>
+  <p class="muted">Nic nie czeka na restart.</p>
   {% else %}
   <p>Czeka na restart:</p>
   <ul>
@@ -13,7 +13,7 @@
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     <button type="submit" class="danger">Restartuj stację</button>
   </form>
-  <small style="color:var(--muted)">Stacja dokończy bieżące nadanie, po czym uruchomi się ponownie.</small>
+  <small class="help">Stacja dokończy bieżące nadanie, po czym uruchomi się ponownie.</small>
   {% else %}
   <p class="error">Panel działa bez stacji (tryb testowy) — restart i testy niedostępne.</p>
   {% endif %}
