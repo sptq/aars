@@ -77,7 +77,6 @@ pub fn tx_state(tx_enabled: bool, poisoned: bool, unavailable: bool) -> TxState 
 pub struct StatusBar {
     pub tx: TxState,
     pub tx_enabled: bool,
-    pub can_start: bool,
     pub quiet: Option<bool>,
     pub callsign: String,
     pub clock: String,
@@ -93,7 +92,6 @@ pub fn status_bar(
     StatusBar {
         tx: tx_state(interlocks.tx_enabled, interlocks.poisoned, unavailable),
         tx_enabled: interlocks.tx_enabled,
-        can_start: !interlocks.tx_enabled && !interlocks.poisoned && !unavailable,
         quiet,
         callsign,
         clock: now.format("%H:%M").to_string(),
@@ -296,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_is_offered_whenever_enabled_and_start_only_when_nothing_blocks() {
+    fn the_bar_state_follows_the_interlocks() {
         for bits in 0..8u8 {
             let (tx_enabled, poisoned, unavailable) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
             let locks = InterlockState {
@@ -308,11 +306,6 @@ mod tests {
             };
             let bar = status_bar(&locks, unavailable, None, "SP7TQ".into(), t(12, 0));
             assert_eq!(bar.tx_enabled, tx_enabled, "{bits}");
-            assert_eq!(
-                bar.can_start,
-                !tx_enabled && !poisoned && !unavailable,
-                "{bits}"
-            );
             assert_eq!(
                 bar.tx,
                 tx_state(tx_enabled, poisoned, unavailable),
@@ -524,8 +517,8 @@ mod tests {
 
         state.interlocks.set_tx_enabled(false);
         let (_, html) = fragment_html(&app, &cookie, "%2Fmap").await;
-        assert!(html.contains("Włącz nadawanie"), "{html}");
-        assert!(html.contains("name=\"enabled\" value=\"1\""), "{html}");
+        assert!(!html.contains("action=\"/tx-enabled\""), "{html}");
+        assert!(!html.contains("Włącz nadawanie"), "{html}");
 
         state.interlocks.set_poisoned(true);
         let (_, html) = fragment_html(&app, &cookie, "%2Fmap").await;
@@ -628,7 +621,9 @@ mod tests {
             .unwrap();
         let (_, _, page) = send(&app, request).await;
         let bar = page.find("id=\"statusbar\"").expect("pasek stanu");
-        let end = page[bar..].find("</header>").map_or(page.len(), |e| bar + e);
+        let end = page[bar..]
+            .find("</header>")
+            .map_or(page.len(), |e| bar + e);
         assert!(page[bar..end].contains("Zatrzymaj nadawanie"), "{page}");
         assert!(!page[bar..end].contains("Włącz nadawanie"), "{page}");
     }
@@ -678,6 +673,69 @@ mod tests {
             );
             assert!(state.interlocks.snapshot().tx_enabled, "htmx={htmx}");
         }
+    }
+
+    /// Sam pasek stanu z pełnej strony (od `id="statusbar"` do `</header>`).
+    fn bar_of(page: &str) -> &str {
+        let start = page.find("id=\"statusbar\"").expect("pasek stanu");
+        let end = page[start..]
+            .find("</header>")
+            .map_or(page.len(), |e| start + e);
+        &page[start..end]
+    }
+
+    #[tokio::test]
+    async fn the_bar_never_offers_to_start_transmission() {
+        for role in [Role::Operator, Role::Admin] {
+            for poisoned in [false, true] {
+                let (app, cookie, _csrf, state) = logged_in(role).await;
+                state.interlocks.set_tx_enabled(false);
+                state.interlocks.set_poisoned(poisoned);
+                let (_, fragment) = fragment_html(&app, &cookie, "%2F").await;
+                let (_, _, page) = send(&app, page_request(&cookie)).await;
+                for (what, html) in [("fragment", fragment.as_str()), ("strona", bar_of(&page))] {
+                    let case = format!("{role:?} watchdog={poisoned} {what}");
+                    assert!(html.contains("Nadawanie:"), "{case}: {html}");
+                    assert!(!html.contains("action=\"/tx-enabled\""), "{case}: {html}");
+                    assert!(!html.contains("Włącz nadawanie"), "{case}: {html}");
+                }
+
+                state.interlocks.set_tx_enabled(true);
+                let (_, fragment) = fragment_html(&app, &cookie, "%2F").await;
+                let (_, _, page) = send(&app, page_request(&cookie)).await;
+                for (what, html) in [("fragment", fragment.as_str()), ("strona", bar_of(&page))] {
+                    let case = format!("{role:?} watchdog={poisoned} {what}");
+                    assert!(html.contains("Zatrzymaj nadawanie"), "{case}: {html}");
+                    assert!(
+                        html.contains("name=\"enabled\" value=\"0\""),
+                        "{case}: {html}"
+                    );
+                    assert!(!html.contains("Włącz nadawanie"), "{case}: {html}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_tx_badge_is_a_polite_live_region() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Operator).await;
+        let (_, fragment) = fragment_html(&app, &cookie, "%2F").await;
+        let (_, _, page) = send(&app, page_request(&cookie)).await;
+        for html in [fragment.as_str(), bar_of(&page)] {
+            assert_eq!(html.matches("aria-live").count(), 1, "{html}");
+            let at = html.find("aria-live=\"polite\"").expect("aria-live");
+            let open = html[..at].rfind('<').unwrap_or(0);
+            assert!(html[open..at].contains("class=\"badge "), "{html}");
+            assert!(!html[open..at].contains("statusbar"), "{html}");
+        }
+    }
+
+    fn page_request(cookie: &str) -> Request<Body> {
+        Request::builder()
+            .uri("/")
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap()
     }
 
     fn fragment_request(cookie: &str) -> Request<Body> {
