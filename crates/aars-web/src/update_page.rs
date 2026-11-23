@@ -104,7 +104,7 @@ fn status_of(state: &AppState) -> UpdateStatus {
 
 fn show(
     state: &AppState,
-    current: &CurrentUser,
+    chrome: Chrome,
     status: StatusCode,
     check: Option<CheckView>,
     notice: Option<(&'static str, String)>,
@@ -120,7 +120,7 @@ fn show(
         )
     });
     let template = UpdatePage {
-        chrome: Chrome::from(current),
+        chrome,
         current: s.current,
         previous: s.previous.unwrap_or_else(|| "brak".to_owned()),
         trial,
@@ -141,7 +141,7 @@ pub async fn page_view(
     current: CurrentUser,
 ) -> Result<Response, AuthRejection> {
     require_role(&current.user, Role::Admin)?;
-    Ok(show(&state, &current, StatusCode::OK, None, None))
+    Ok(show(&state, Chrome::load(&state, &current).await, StatusCode::OK, None, None))
 }
 
 pub async fn check(
@@ -167,7 +167,8 @@ pub async fn check(
         },
         Err(err) => CheckView::Error(err.to_string()),
     };
-    Ok(show(&state, &current, StatusCode::OK, Some(view), None))
+    let chrome = Chrome::load(&state, &current).await;
+    Ok(show(&state, chrome, StatusCode::OK, Some(view), None))
 }
 
 pub async fn install(
@@ -177,10 +178,11 @@ pub async fn install(
 ) -> Result<Response, AuthRejection> {
     require_role(&current.user, Role::Admin)?;
     require_csrf(&current.csrf_token, Some(&form.csrf))?;
+    let chrome = Chrome::load(&state, &current).await;
     let refuse = |status, text: &str| {
         show(
             &state,
-            &current,
+            chrome.clone(),
             status,
             None,
             Some(("error", text.to_owned())),
@@ -201,7 +203,7 @@ pub async fn install(
             tracing::warn!(user = %current.user.username, version, "aktualizacja zlecona z panelu");
             Ok(show(
                 &state,
-                &current,
+                chrome.clone(),
                 StatusCode::OK,
                 None,
                 Some((

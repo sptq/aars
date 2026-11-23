@@ -153,6 +153,9 @@ fn one() -> u32 {
 struct TxEnabledForm {
     csrf: String,
     enabled: String,
+    /// Strona, na której użyto wyłącznika (D6); sprawdzana przez `safe_back`.
+    #[serde(default)]
+    back: Option<String>,
 }
 
 async fn login_page(State(state): State<AppState>) -> Response {
@@ -273,7 +276,7 @@ async fn dashboard(
     let (tx_unavailable, last_good_note) = status::apply_notes(&state);
 
     page(&DashboardPage {
-        chrome: Chrome::from(&current),
+        chrome: Chrome::load(&state, &current).await,
         tx_unavailable,
         last_good_note,
         no_admin,
@@ -287,9 +290,12 @@ async fn dashboard(
     })
 }
 
-async fn compose_page(current: CurrentUser) -> Result<Response, AuthRejection> {
+async fn compose_page(
+    State(state): State<AppState>,
+    current: CurrentUser,
+) -> Result<Response, AuthRejection> {
     require_role(&current.user, Role::Operator)?;
-    Ok(page(&ComposePage { chrome: Chrome::from(&current) }))
+    Ok(page(&ComposePage { chrome: Chrome::load(&state, &current).await }))
 }
 
 async fn compose_submit(
@@ -373,7 +379,7 @@ async fn set_tx_enabled(
     audit(&state, current.user.id, "tx_enabled", if enabled { "włączone" } else { "wyłączone" })
         .await;
 
-    Ok(Redirect::to("/").into_response())
+    Ok(Redirect::to(status::safe_back(form.back.as_deref())).into_response())
 }
 
 /// Zdejmuje blokadę po interwencji watchdoga. Tylko admin (Ruling R4):
@@ -460,7 +466,7 @@ pub(crate) async fn queue_fragment_response(
     };
     page(&QueueFragment {
         pending,
-        chrome: Chrome::from(current),
+        chrome: Chrome::bare(current),
         full,
     })
 }
@@ -510,6 +516,7 @@ pub fn router(state: AppState) -> Router {
         .route("/watchdog/clear", post(clear_watchdog))
         .route("/queue/{id}/cancel", post(cancel_item))
         .route("/fragments/queue", get(queue_fragment))
+        .route("/fragments/status", get(status::fragment))
         .route("/queue", get(queue_page::page_view))
         .route("/logs", get(logs::page_view))
         .route("/map", get(map_page::page_view))

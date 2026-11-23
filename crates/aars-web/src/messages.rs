@@ -255,14 +255,17 @@ pub async fn list(
     };
     let now = Utc::now();
     Ok(page(&MessagesPage {
-        chrome: Chrome::from(&current),
+        chrome: Chrome::load(&state, &current).await,
         rows: messages.iter().map(|m| message_row(m, now)).collect(),
     }))
 }
 
-pub async fn new_page(current: CurrentUser) -> Result<Response, AuthRejection> {
+pub async fn new_page(
+    State(state): State<AppState>,
+    current: CurrentUser,
+) -> Result<Response, AuthRejection> {
     require_role(&current.user, Role::Operator)?;
-    Ok(page(&form_page(Chrome::from(&current), None, None)))
+    Ok(page(&form_page(Chrome::load(&state, &current).await, None, None)))
 }
 
 pub async fn create(
@@ -295,7 +298,7 @@ pub async fn edit_page(
     require_role(&current.user, Role::Operator)?;
     match repo(&state).get(id).await {
         Ok(Some(message)) => Ok(page(&form_page(
-            Chrome::from(&current),
+            Chrome::load(&state, &current).await,
             Some(id),
             Some(&message),
         ))),

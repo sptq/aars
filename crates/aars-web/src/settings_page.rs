@@ -126,7 +126,7 @@ async fn view(
     saved: bool,
 ) -> SettingsPage {
     SettingsPage {
-        chrome: Chrome::from(current),
+        chrome: Chrome::load(state, current).await,
         callsign: s.callsign.clone(),
         id_mode: if s.id_mode == aars_core::ident::IdMode::Cw {
             "cw"

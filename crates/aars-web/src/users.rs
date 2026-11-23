@@ -105,7 +105,7 @@ async fn render(
         })
         .collect();
     let body = page(&UsersPage {
-        chrome: Chrome::from(current),
+        chrome: Chrome::load(state, current).await,
         rows,
         error,
         secret,

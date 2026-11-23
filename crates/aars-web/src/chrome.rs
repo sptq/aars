@@ -3,9 +3,12 @@ use aars_core::user::Role;
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 
 use crate::auth::CurrentUser;
+use crate::state::AppState;
+use crate::status::{StatusBar, load_status, safe_back};
 
-/// Wspólna rama każdej strony panelu: kto jest zalogowany, jaki ma token CSRF
-/// i które pozycje nawigacji mu przysługują.
+/// Wspólna rama każdej strony panelu: kto jest zalogowany, jaki ma token CSRF,
+/// które pozycje nawigacji mu przysługują i co pokazuje pasek stanu.
+#[derive(Clone)]
 pub struct Chrome {
     pub username: String,
     /// Polska nazwa roli do plakietki w nagłówku.
@@ -15,10 +18,18 @@ pub struct Chrome {
     pub is_admin: bool,
     /// Wersja produktu w stopce (każda rola, R17).
     pub version: &'static str,
+    /// Ścieżka żądania.
+    pub path: String,
+    /// Dokąd wraca wyłącznik nadawania: ścieżka strony dla `GET`, inaczej `/`
+    /// (strona po `POST` nie ma pod swoim adresem `GET`, D6).
+    pub back: String,
+    /// Dane paska stanu; `None` we fragmentach, które paska nie renderują.
+    pub status: Option<StatusBar>,
 }
 
-impl From<&CurrentUser> for Chrome {
-    fn from(current: &CurrentUser) -> Self {
+impl Chrome {
+    /// Rama bez paska stanu — tylko dla fragmentów htmx.
+    pub fn bare(current: &CurrentUser) -> Chrome {
         Chrome {
             username: current.user.username.clone(),
             role: role_label(current.user.role),
@@ -26,6 +37,21 @@ impl From<&CurrentUser> for Chrome {
             can_operate: current.user.role.can(Role::Operator),
             is_admin: current.user.role.can(Role::Admin),
             version: current.version,
+            path: current.path.clone(),
+            back: if current.is_get {
+                safe_back(Some(&current.path)).to_owned()
+            } else {
+                "/".to_owned()
+            },
+            status: None,
+        }
+    }
+
+    /// Rama strony z paskiem stanu (odczyt lokalny, nigdy nie zawodzi).
+    pub async fn load(state: &AppState, current: &CurrentUser) -> Chrome {
+        Chrome {
+            status: Some(load_status(state, Local::now()).await),
+            ..Chrome::bare(current)
         }
     }
 }

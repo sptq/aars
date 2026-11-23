@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "macros.html" as m %}
 {% block title %}AARS — pulpit{% endblock %}
 {% block content %}
 <div class="card">
@@ -25,13 +26,9 @@
   </form>
   {% endif %}
   {% if chrome.can_operate %}
-  <form method="post" action="/tx-enabled" style="margin-top:0.6rem">
-    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-    <input type="hidden" name="enabled" value="{% if tx_enabled %}0{% else %}1{% endif %}">
-    <button type="submit" class="{% if tx_enabled %}danger{% endif %}">
-      {% if tx_enabled %}Zatrzymaj nadawanie{% else %}Włącz nadawanie{% endif %}
-    </button>
-  </form>
+  <div style="margin-top:0.6rem">
+  {% call m::tx_switch(chrome.csrf, tx_enabled, true, chrome.back) %}{% endcall %}
+  </div>
   {% endif %}
 </div>
 

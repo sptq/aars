@@ -30,7 +30,7 @@ pub async fn page_view(
         Err(err) => return Ok(crate::render::db_error("odczyt kolejki zawiódł", &err)),
     };
     Ok(page(&QueuePage {
-        chrome: Chrome::from(&current),
+        chrome: Chrome::load(&state, &current).await,
         pending,
         full: true,
     }))

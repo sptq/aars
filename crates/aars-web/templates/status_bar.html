@@ -1,0 +1,19 @@
+{%- import "macros.html" as m -%}
+{%- if let Some(status) = chrome.status -%}
+<header id="statusbar" class="statusbar" hx-get="/fragments/status?back={{ chrome.back|urlencode }}" hx-trigger="every 5s [!this.matches(':hover, :focus-within')]" hx-sync="this:drop" hx-swap="outerHTML">
+  <span>Nadawanie: <span class="badge {{ status.tx.css() }}">{{ status.tx.label() }}</span></span>
+  {% if let Some(quiet) = status.quiet -%}
+  {% if quiet %}<span class="badge warn">Cisza nocna: tak</span>{% else %}<span class="muted">Cisza nocna: nie</span>{% endif %}
+  {%- endif %}
+  <span>{% if status.callsign.is_empty() %}bez znaku{% else %}{{ status.callsign }}{% endif %}</span>
+  <time>{{ status.clock }}</time>
+  <span>{{ chrome.username }} · {{ chrome.role }}</span>
+  <form method="post" action="/logout">
+    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+    <button class="ghost" type="submit">Wyloguj</button>
+  </form>
+  {% if chrome.can_operate -%}
+  {% call m::tx_switch(chrome.csrf, status.tx_enabled, status.can_start, chrome.back) %}{% endcall %}
+  {%- endif %}
+</header>
+{%- endif -%}

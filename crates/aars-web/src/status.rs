@@ -8,7 +8,15 @@ use aars_core::module::{BULLETIN, ModuleRepo};
 use aars_core::settings::SettingsRepo;
 use chrono::NaiveTime;
 
+use crate::auth::{AuthRejection, CurrentUser};
+use crate::chrome::Chrome;
+use crate::render::page;
 use crate::state::AppState;
+use askama::Template;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
 
 /// Lokalna kopia `parse_times` z runnera biuletynu (`aars-web` nie zależy od
 /// `aars-sources`): ta sama składnia, pusta lista albo błąd = `None`.
@@ -175,13 +183,79 @@ pub async fn load_next_bulletin(state: &AppState, now: NaiveTime) -> Result<Next
     Ok(next_bulletin(true, times, now))
 }
 
+/// Cel powrotu po wyłączniku (D6): tylko lokalna ścieżka — od `/`, bez `//`
+/// na początku, bez `\`, znaków sterujących i `://`; inaczej pulpit. Chroni
+/// też `Redirect::to`, który panikuje na nagłówku z CR/LF.
+pub fn safe_back(back: Option<&str>) -> &str {
+    match back {
+        Some(path)
+            if path.starts_with('/')
+                && !path.starts_with("//")
+                && !path.contains('\\')
+                && !path.contains("://")
+                && !path.chars().any(char::is_control) =>
+        {
+            path
+        }
+        _ => "/",
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BackQuery {
+    pub back: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "status_bar.html")]
+pub struct StatusFragment {
+    pub chrome: Chrome,
+}
+
+/// `GET /fragments/status`: sam pasek stanu, odświeżany przez htmx (D7).
+/// Wygasła sesja przy żądaniu htmx kończy się `HX-Redirect`, żeby
+/// przeglądarka przeszła na logowanie, a pasek nie zamienił się w formularz.
+pub async fn fragment(
+    State(state): State<AppState>,
+    current: Result<CurrentUser, AuthRejection>,
+    headers: HeaderMap,
+    Query(query): Query<BackQuery>,
+) -> Response {
+    let current = match current {
+        Ok(current) => current,
+        Err(rejection) => {
+            let htmx = headers
+                .get("HX-Request")
+                .is_some_and(|v| v.as_bytes() == b"true");
+            let target = match rejection {
+                AuthRejection::Anonymous => Some("/login"),
+                AuthRejection::MustChangePassword => Some("/account/password"),
+                _ => None,
+            };
+            return match (htmx, target) {
+                (true, Some(target)) => (StatusCode::OK, [("HX-Redirect", target)]).into_response(),
+                _ => rejection.into_response(),
+            };
+        }
+    };
+    let mut chrome = Chrome::load(&state, &current).await;
+    chrome.back = safe_back(query.back.as_deref()).to_owned();
+    page(&StatusFragment { chrome })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::testing::FakeStation;
+    use crate::tests::logged_in;
     use aars_core::priority::Priority;
+    use aars_core::user::Role;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{HeaderMap, Request, StatusCode, header};
     use chrono::{Local, TimeZone};
     use std::sync::Arc;
+    use tower::ServiceExt;
 
     fn t(h: u32, m: u32) -> NaiveTime {
         NaiveTime::from_hms_opt(h, m, 0).unwrap()
@@ -336,6 +410,185 @@ mod tests {
         assert_eq!(bar.tx, TxState::Enabled);
         assert_eq!(bar.quiet, None);
         assert_eq!(bar.callsign, "");
+    }
+
+    #[test]
+    fn safe_back_accepts_only_local_paths() {
+        for ok in ["/", "/sources", "/messages/3/edit", "/settings/hardware"] {
+            assert_eq!(safe_back(Some(ok)), ok);
+        }
+        for bad in [
+            "",
+            "sources",
+            "//evil.example",
+            "/\\evil.example",
+            "https://evil.example",
+            "/x\r\nSet-Cookie: a=b",
+            "/a\tb",
+            "/redirect?to=http://evil",
+        ] {
+            assert_eq!(safe_back(Some(bad)), "/", "{bad:?}");
+        }
+        assert_eq!(safe_back(None), "/");
+    }
+
+    async fn send(app: &Router, request: Request<Body>) -> (StatusCode, HeaderMap, String) {
+        let response = app.clone().oneshot(request).await.unwrap();
+        let (status, headers) = (response.status(), response.headers().clone());
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn switch(app: &Router, cookie: &str, body: String) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/tx-enabled")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::COOKIE, cookie)
+            .body(Body::from(body))
+            .unwrap();
+        let (status, headers, _) = send(app, request).await;
+        let location = headers
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        (status, location)
+    }
+
+    async fn fragment_html(app: &Router, cookie: &str, back: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .uri(format!("/fragments/status?back={back}"))
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, html) = send(app, request).await;
+        (status, html)
+    }
+
+    #[tokio::test]
+    async fn the_kill_switch_returns_to_the_page_it_was_used_on() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+        let (status, location) = switch(
+            &app,
+            &cookie,
+            format!("csrf={csrf}&enabled=0&back=%2Fsources"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(location, "/sources");
+        assert!(!state.interlocks.snapshot().tx_enabled);
+
+        let (status, location) = switch(&app, &cookie, format!("csrf={csrf}&enabled=1")).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(location, "/");
+        assert!(state.interlocks.snapshot().tx_enabled);
+    }
+
+    #[tokio::test]
+    async fn a_foreign_back_target_redirects_to_the_dashboard() {
+        let (app, cookie, csrf, _state) = logged_in(Role::Operator).await;
+        for back in [
+            "%2F%2Fevil.example",
+            "https%3A%2F%2Fevil.example",
+            "%2F%5Cevil.example",
+            "%2Fx%0D%0ASet-Cookie%3A%20a%3Db",
+        ] {
+            let (status, location) =
+                switch(&app, &cookie, format!("csrf={csrf}&enabled=0&back={back}")).await;
+            assert_eq!(status, StatusCode::SEE_OTHER, "{back}");
+            assert_eq!(location, "/", "{back}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_status_fragment_shows_the_switch_only_to_operators() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Viewer).await;
+        let (status, html) = fragment_html(&app, &cookie, "%2Fmap").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!html.contains("<html"), "{html}");
+        assert!(html.contains("id=\"statusbar\""), "{html}");
+        assert!(html.contains("Nadawanie:"), "{html}");
+        assert!(html.contains("włączone"), "{html}");
+        assert!(!html.contains("action=\"/tx-enabled\""), "{html}");
+        assert!(html.contains("u · Podgląd"), "{html}");
+        assert!(html.contains("bez znaku"), "{html}");
+
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+        let (_, html) = fragment_html(&app, &cookie, "%2Fmap").await;
+        assert!(html.contains("Zatrzymaj nadawanie"), "{html}");
+        assert!(html.contains("name=\"enabled\" value=\"0\""), "{html}");
+        assert!(html.contains("name=\"back\" value=\"/map\""), "{html}");
+
+        state.interlocks.set_tx_enabled(false);
+        let (_, html) = fragment_html(&app, &cookie, "%2Fmap").await;
+        assert!(html.contains("Włącz nadawanie"), "{html}");
+        assert!(html.contains("name=\"enabled\" value=\"1\""), "{html}");
+
+        state.interlocks.set_poisoned(true);
+        let (_, html) = fragment_html(&app, &cookie, "%2Fmap").await;
+        assert!(!html.contains("action=\"/tx-enabled\""), "{html}");
+        assert!(!html.contains("/watchdog/clear"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn the_status_fragment_ignores_a_foreign_back() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Operator).await;
+        let (_, html) = fragment_html(&app, &cookie, "%2F%2Fevil.example").await;
+        assert!(html.contains("name=\"back\" value=\"/\""), "{html}");
+        assert!(!html.contains("evil.example"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn the_status_fragment_survives_a_broken_settings_table() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+        sqlx::query("DROP TABLE settings")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let (status, html) = fragment_html(&app, &cookie, "%2F").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Zatrzymaj nadawanie"), "{html}");
+        assert!(!html.contains("Cisza nocna"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_sends_htmx_to_the_login_page() {
+        let app = crate::router(state().await);
+        let request = Request::builder()
+            .uri("/fragments/status?back=%2F")
+            .header("HX-Request", "true")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) = send(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("HX-Redirect").unwrap(), "/login");
+        assert!(body.is_empty(), "{body}");
+
+        let request = Request::builder()
+            .uri("/fragments/status?back=%2F")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, _) = send(&app, request).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers.get(header::LOCATION).unwrap(), "/login");
+    }
+
+    #[tokio::test]
+    async fn the_dashboard_switch_carries_its_back_target() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Operator).await;
+        let request = Request::builder()
+            .uri("/")
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let (_, _, html) = send(&app, request).await;
+        let back = html
+            .find("name=\"back\" value=\"/\"")
+            .expect("pulpit musi nieść cel powrotu");
+        assert!(html[back..].contains("Zatrzymaj nadawanie"), "{html}");
     }
 
     #[tokio::test]

@@ -110,7 +110,7 @@ pub async fn page_view(
         Err(response) => return Ok(response),
     };
     Ok(page(&LogsPage {
-        chrome: Chrome::from(&current),
+        chrome: Chrome::load(&state, &current).await,
         transmissions,
         audit,
     }))

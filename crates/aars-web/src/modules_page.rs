@@ -216,7 +216,7 @@ async fn page_with(
     (
         status,
         page(&ModulesPage {
-            chrome: Chrome::from(current),
+            chrome: Chrome::load(state, current).await,
             modules,
         }),
     )
@@ -252,7 +252,7 @@ pub async fn page_view(
     require_role(&current.user, Role::Operator)?;
     match load_views(&state).await {
         Ok(modules) => Ok(page(&ModulesPage {
-            chrome: Chrome::from(&current),
+            chrome: Chrome::load(&state, &current).await,
             modules,
         })),
         Err(err) => Ok(db_error("odczyt modułów zawiódł", &err)),

@@ -113,9 +113,12 @@ struct MapPage {
     chrome: Chrome,
 }
 
-pub async fn page_view(current: CurrentUser) -> Result<Response, AuthRejection> {
+pub async fn page_view(
+    State(state): State<AppState>,
+    current: CurrentUser,
+) -> Result<Response, AuthRejection> {
     Ok(page(&MapPage {
-        chrome: Chrome::from(&current),
+        chrome: Chrome::load(&state, &current).await,
     }))
 }
 

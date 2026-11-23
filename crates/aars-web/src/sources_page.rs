@@ -134,7 +134,7 @@ pub async fn page_view(
     require_role(&current.user, Role::Operator)?;
     match load_views(&state).await {
         Ok(sources) => Ok(page(&SourcesPage {
-            chrome: Chrome::from(&current),
+            chrome: Chrome::load(&state, &current).await,
             sources,
             can_refresh: state.source_refresh.is_some(),
         })),
