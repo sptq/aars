@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}AARS — moduły{% endblock %}
+{% block heading %}Moduły stacji{% endblock %}
 {% block content %}
 <div class="card">
   <h2>Moduły stacji</h2>
@@ -32,7 +33,7 @@
   <div class="preview">
     <button type="button" class="ghost" id="preview-btn">Odsłuchaj</button>
     <span id="preview-note" class="preview-note"></span>
-    <audio id="preview-audio" class="preview-audio" controls></audio>
+    <audio id="preview-audio" controls></audio>
   </div>
   {% else %}
   <p>Nic do nadania: {% if let Some(reason) = p.skipped_reason %}{{ reason }}{% else %}brak danych{% endif %}</p>

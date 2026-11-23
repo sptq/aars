@@ -243,3 +243,62 @@ fn no_template_uses_inline_styles() {
         assert!(!text.contains("style="), "{name}: atrybut style=");
     }
 }
+
+/// Treść pierwszej reguły zaczynającej się dokładnie od `selector {`.
+fn rule<'a>(css: &'a str, selector: &str) -> &'a str {
+    let start = css
+        .find(&format!("\n{selector} {{"))
+        .unwrap_or_else(|| panic!("brak reguły {selector}"));
+    let body = &css[start..];
+    &body[..body.find('}').unwrap_or(body.len())]
+}
+
+#[test]
+fn the_sidebar_column_reaches_the_bottom_of_the_window() {
+    let css = css();
+    assert_eq!(css.matches("15rem").count(), 1, "15rem tylko w --sidebar-w");
+    assert!(
+        css.contains("--sidebar-w: 15rem;"),
+        "brak tokenu --sidebar-w"
+    );
+    let layout = rule(&css, ".layout");
+    assert!(
+        layout.contains("min-height: calc(100vh - var(--statusbar-h))"),
+        "{layout}"
+    );
+    assert!(
+        layout.contains("grid-template-columns: var(--sidebar-w) "),
+        "{layout}"
+    );
+    let gradient = layout.split("linear-gradient(").nth(1).unwrap_or_default();
+    assert_eq!(gradient.matches("var(--sidebar-w)").count(), 4, "{layout}");
+    // na telefonie menu jest nad treścią, bez kolumny i wysokości okna
+    let mobile = &css[css.find("@media (max-width: 899px)").unwrap()..];
+    assert!(
+        mobile.contains(".layout { display: block; background: none; min-height: 0; }"),
+        "{mobile}"
+    );
+}
+
+#[test]
+fn the_audio_preview_has_a_single_rule() {
+    let css = css();
+    // jedna reguła dla odtwarzacza w `.preview` i samodzielnego (lista komunikatów)
+    assert_eq!(
+        css.matches(".preview-audio").count(),
+        1,
+        "zdublowana .preview-audio"
+    );
+    assert!(
+        css.contains(".preview audio, .preview-audio {"),
+        "brak wspólnej reguły"
+    );
+    for (name, text) in templates() {
+        for (at, _) in text.match_indices("class=\"preview-audio\"") {
+            let inside_preview = text[..at]
+                .rfind("<div class=\"preview\">")
+                .is_some_and(|open| text[open..at].matches("</div>").count() == 0);
+            assert!(!inside_preview, "{name}: zbędna klasa w .preview");
+        }
+    }
+}

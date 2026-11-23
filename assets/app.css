@@ -103,7 +103,7 @@ footer.version { color: var(--muted); font-size: 0.8rem; text-align: center; pad
 /* Pasek stanu: przyklejony u góry na każdej szerokości, żeby wyłącznik
    nadawania był zawsze pod ręką. Kolejność: plakietka nadawania i wyłącznik
    pierwsze, użytkownik i Wyloguj na końcu (one zawijają się pierwsze). */
-:root { --statusbar-h: 3.75rem; }
+:root { --statusbar-h: 3.75rem; --sidebar-w: 15rem; }
 .statusbar {
   position: sticky;
   top: 0;
@@ -126,17 +126,23 @@ footer.version { color: var(--muted); font-size: 0.8rem; text-align: center; pad
 .statusbar.locked { justify-content: flex-end; }
 
 /* Układ: menu boczne + treść. */
-/* Kolumna menu ma tło na samym układzie (gradient), więc sięga do dołu
-   treści; przyklejone menu w środku zostaje `sticky`. */
+/* Kolumna menu ma tło na samym układzie (gradient), a układ ma co najmniej
+   wysokość okna pod paskiem, więc tło sięga dołu okna także na krótkich
+   stronach; przyklejone menu w środku zostaje `sticky`. Stopka siedzi
+   w kolumnie treści, w ostatnim wierszu siatki. */
 .layout {
   display: grid;
-  grid-template-columns: 15rem minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  grid-template-rows: 1fr auto;
   align-items: start;
-  background: linear-gradient(to right, var(--surface) 0, var(--surface) calc(15rem - 1px), var(--line) calc(15rem - 1px), var(--line) 15rem, transparent 15rem);
+  min-height: calc(100vh - var(--statusbar-h));
+  background: linear-gradient(to right, var(--surface) 0, var(--surface) calc(var(--sidebar-w) - 1px), var(--line) calc(var(--sidebar-w) - 1px), var(--line) var(--sidebar-w), transparent var(--sidebar-w));
 }
+.layout > footer.version { grid-column: 2; }
 .layout.locked { display: block; background: none; }
 .menu-toggle, .menu-button, .sidebar-user { display: none; }
 .sidebar {
+  grid-row: 1 / span 2;
   position: sticky;
   top: var(--statusbar-h);
   max-height: calc(100vh - var(--statusbar-h));
@@ -176,6 +182,7 @@ footer.version { color: var(--muted); font-size: 0.8rem; text-align: center; pad
 
 main.content { padding: 1.25rem; max-width: 72rem; width: 100%; margin: 0 auto; }
 main.content.wide, .wide { max-width: none; }
+.page-title { margin: 0 0 var(--space-4); font-size: 1.4rem; line-height: 1.25; }
 
 /* Węższy pulpit: drobniejsze pismo, żeby pasek zwykle mieścił się w jednym
    wierszu; gdy nie, zawija użytkownika i Wyloguj, wyłącznik zostaje w pierwszym. */
@@ -207,7 +214,7 @@ main.content.wide, .wide { max-width: none; }
   }
   .sidebar-user form { margin: 0; }
   .sidebar-user button { min-height: 44px; }
-  .layout { display: block; background: none; }
+  .layout { display: block; background: none; min-height: 0; }
   .menu-toggle {
     display: block;
     position: absolute;
@@ -374,7 +381,7 @@ button:disabled, button[disabled] {
 label.check { display: flex; gap: var(--space-2); align-items: center; margin-bottom: var(--space-4); color: var(--text); font-size: inherit; }
 label.check input { width: auto; }
 .preview { margin-bottom: var(--space-4); }
-.preview audio { width: 100%; margin-top: var(--space-2); }
+.preview audio, .preview-audio { width: 100%; margin-top: var(--space-2); }
 .row-actions { white-space: nowrap; }
 .row-actions > * + * { margin-left: var(--space-2); }
 form.inline { display: inline; }
@@ -386,7 +393,6 @@ form.inline { display: inline; }
 .module-form { margin-bottom: var(--space-3); }
 fieldset.field-group { border: 0; padding: 0; margin: 0; }
 fieldset.field-group legend { padding: 0; margin-bottom: 0.3rem; color: var(--muted); font-size: 0.85rem; }
-.preview-audio { width: 100%; margin-top: var(--space-2); }
 .card h2 .badge { text-transform: none; letter-spacing: normal; }
 
 .map-canvas { height: 560px; margin-bottom: var(--space-2); border: 1px solid var(--line); border-radius: var(--radius); }

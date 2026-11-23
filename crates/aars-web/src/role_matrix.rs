@@ -243,8 +243,9 @@ async fn every_get_route_enforces_its_minimum_role() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-#[tokio::test]
-async fn every_page_shows_the_status_bar_on_first_load() {
+/// Pierwsze wczytanie każdej strony w ramie przez każdą rolę, która ma do
+/// niej prawo: (ścieżka, poziom, status, HTML).
+async fn framed_pages() -> Vec<(String, u8, StatusCode, String)> {
     let (app, _state, cookies, id) = sessions().await;
     let edit = format!("/messages/{id}/edit");
     let pages = [
@@ -264,7 +265,7 @@ async fn every_page_shows_the_status_bar_on_first_load() {
         ("/settings/update", ADMIN),
         ("/users", ADMIN),
     ];
-    let mut failures = Vec::new();
+    let mut out = Vec::new();
     for (path, min) in pages {
         for (level, session) in &cookies {
             let Some((cookie, _)) = session else { continue };
@@ -286,14 +287,45 @@ async fn every_page_shows_the_status_bar_on_first_load() {
             let body = axum::body::to_bytes(response.into_body(), 1 << 20)
                 .await
                 .unwrap();
-            let html = String::from_utf8_lossy(&body);
-            let ok = status == StatusCode::OK
-                && html.contains("id=\"statusbar\"")
-                && html.contains("Nadawanie:")
-                && html.contains("class=\"badge ");
-            if !ok {
-                failures.push(format!("GET {path} (poziom {level}): {status}"));
-            }
+            let html = String::from_utf8_lossy(&body).into_owned();
+            out.push((path.to_owned(), *level, status, html));
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn every_page_shows_the_status_bar_on_first_load() {
+    let mut failures = Vec::new();
+    for (path, level, status, html) in framed_pages().await {
+        let ok = status == StatusCode::OK
+            && html.contains("id=\"statusbar\"")
+            && html.contains("Nadawanie:")
+            && html.contains("class=\"badge ");
+        if !ok {
+            failures.push(format!("GET {path} (poziom {level}): {status}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[tokio::test]
+async fn every_page_has_exactly_one_page_title() {
+    let mut failures = Vec::new();
+    for (path, level, status, html) in framed_pages().await {
+        let h1 = html.matches("<h1").count();
+        let in_main = html
+            .find("<main")
+            .and_then(|main| html[main..].find('>').map(|e| main + e + 1))
+            .is_some_and(|open| {
+                html[open..]
+                    .trim_start()
+                    .starts_with("<h1 class=\"page-title\">")
+            });
+        if status != StatusCode::OK || h1 != 1 || !in_main {
+            failures.push(format!(
+                "GET {path} (poziom {level}): {status}, <h1: {h1}, w <main>: {in_main}"
+            ));
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");

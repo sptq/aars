@@ -66,8 +66,8 @@
     </div>
   </aside>
 {%- endif %}
-  <main class="content {% block main_class %}{% endblock %}">{% block content %}{% endblock %}</main>
+  <main class="content {% block main_class %}{% endblock %}"><h1 class="page-title">{% block heading %}AARS{% endblock %}</h1>{% block content %}{% endblock %}</main>
+  <footer class="version">AARS {{ chrome.version }}</footer>
 </div>
-<footer class="version">AARS {{ chrome.version }}</footer>
 </body>
 </html>
