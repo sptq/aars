@@ -237,36 +237,9 @@ fn no_template_adds_an_inline_script() {
     }
 }
 
-/// Szablony bez atrybutu `style=`; lista rośnie z kolejnymi zadaniami.
-const RESTYLED: &[&str] = &[
-    "base.html",
-    "dashboard.html",
-    "compose.html",
-    "messages.html",
-    "message_form.html",
-    "queue.html",
-    "queue_fragment.html",
-    "status_bar.html",
-    "macros.html",
-    "sources.html",
-    "modules.html",
-    "map.html",
-    "settings.html",
-    "hardware.html",
-    "restart_card.html",
-    "update.html",
-    "users.html",
-    "logs.html",
-    "password.html",
-];
-
 #[test]
-fn restyled_templates_have_no_inline_styles() {
-    let all = templates();
-    for name in RESTYLED {
-        let Some((_, text)) = all.iter().find(|(n, _)| n == name) else {
-            panic!("brak szablonu {name}");
-        };
+fn no_template_uses_inline_styles() {
+    for (name, text) in templates() {
         assert!(!text.contains("style="), "{name}: atrybut style=");
     }
 }

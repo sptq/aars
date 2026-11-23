@@ -38,8 +38,7 @@
       <label for="{{ f.name }}">{{ f.label }}</label>
       <input id="{{ f.name }}" name="{{ f.name }}" type="{{ f.kind }}" value="{{ f.value }}">
       {% endif %}
-      <small class="help">{{ f.hint }}</small>
-      {% if let Some(n) = f.note %}<small class="help"> · {{ n }}</small>{% endif %}
+      <small class="help">{{ f.hint }}{% if let Some(n) = f.note %}<span> · {{ n }}</span>{% endif %}</small>
       {% if let Some(e) = f.error %}<div class="error">{{ e }}</div>{% endif %}
     </div>
     {% endfor %}

@@ -825,6 +825,27 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn the_login_page_uses_the_theme_and_names_the_station() {
+        let response = router(state().await)
+            .oneshot(Request::builder().uri("/login").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        let theme = html.find(r#"<script src="/assets/theme.js"></script>"#);
+        let css = html.find("/assets/app.css");
+        assert!(theme.is_some() && theme < css, "{html}");
+        assert!(html.contains("AARS — stacja ostrzegawcza"), "{html}");
+        assert!(html.contains("AARS 0.0.0-test"), "{html}");
+        for field in ["username", "password"] {
+            assert!(html.contains(&format!(r#"for="{field}""#)), "{field}");
+            assert!(html.contains(&format!(r#"id="{field}""#)), "{field}");
+        }
+    }
+
+    #[tokio::test]
     async fn the_footer_shows_the_version_on_login() {
         let response = router(state().await)
             .oneshot(

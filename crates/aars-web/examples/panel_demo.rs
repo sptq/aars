@@ -50,12 +50,45 @@ fn request(text: &str, not_before: chrono::Duration, repeat_count: u32) -> Enque
 /// sondy sprzętu i aktualizacji.
 async fn demo_state(pool: SqlitePool) -> AppState {
     let mut all = builtin();
-    all.push(ModuleDescriptor {
-        name: "Ostrzeżenia meteorologiczne IMGW",
-        ..sample_source("imgw-meteo")
-    });
-    for id in ["rso", "swpc", "gios-smog", "emsc", "pogoda"] {
-        all.push(sample_source(id));
+    // Prawdziwe nazwy i opisy modułów z `aars-sources` (tu tylko tekst,
+    // bez zależności od tego crate'a).
+    for (id, name, description) in [
+        (
+            "imgw-meteo",
+            "Ostrzeżenia meteorologiczne IMGW",
+            "Ostrzeżenia meteorologiczne IMGW dla obszaru stacji, ogłaszane po zmianie.",
+        ),
+        (
+            "rso",
+            "Regionalny System Ostrzegania (RSO)",
+            "Komunikaty RSO: Alert RCB, komunikaty wojewódzkie i sanepidu, próby syren, alarmy z powietrza.",
+        ),
+        (
+            "swpc",
+            "Pogoda kosmiczna NOAA",
+            "Burze geomagnetyczne (G), radiacyjne (S) i zaniki łączności KF (R) według skal NOAA SWPC.",
+        ),
+        (
+            "gios-smog",
+            "Alerty smogowe GIOŚ",
+            "Alerty o przekroczeniu poziomu informowania i alarmowego dla pyłów w pobliżu stacji według GIOŚ.",
+        ),
+        (
+            "emsc",
+            "Wstrząsy sejsmiczne (EMSC)",
+            "Wstrząsy ziemi w promieniu od stacji według Europejsko-Śródziemnomorskiego Centrum Sejsmologicznego (EMSC).",
+        ),
+        (
+            "pogoda",
+            "Pogoda (Open-Meteo)",
+            "Komunikat, gdy prognoza dla pozycji stacji przekroczy progi: porywy, mróz, opady. Biuletyn korzysta z tej samej prognozy.",
+        ),
+    ] {
+        all.push(ModuleDescriptor {
+            name,
+            description,
+            ..sample_source(id)
+        });
     }
     let registry = Arc::new(ModuleRegistry::new(all));
     ModuleRepo::new(pool.clone())

@@ -4,28 +4,30 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AARS — pierwsze konto</title>
+  <script src="/assets/theme.js"></script>
   <link rel="stylesheet" href="/assets/app.css">
 </head>
-<body>
-<main>
-  <div class="card login">
-    <h2>Pierwsze konto</h2>
+<body class="auth">
+<main class="auth-main">
+  <div class="card auth-card">
+    <p class="brand">AARS — stacja ostrzegawcza</p>
+    <h1>Pierwsze konto</h1>
     <p>Pierwsze uruchomienie stacji AARS. Załóż konto administratora. Kreator działa tylko z sieci lokalnej i znika po założeniu konta.</p>
-    {% for e in errors %}<p class="error">{{ e }}</p>{% endfor %}
+    {% for e in errors %}<p class="alert">{{ e }}</p>{% endfor %}
     <form method="post" action="/setup">
       <input type="hidden" name="csrf" value="{{ csrf }}">
-      <div style="margin-bottom:0.8rem">
+      <div class="field">
         <label for="username">Nazwa administratora</label>
         <input id="username" name="username" value="{{ username }}" autocomplete="username"
                minlength="3" maxlength="32" pattern="[a-z0-9._\-]{3,32}" autofocus required>
-        <small style="color:var(--muted)">3–32 znaki: małe litery, cyfry, . _ -</small>
+        <small class="help">3–32 znaki: małe litery, cyfry, . _ -</small>
       </div>
-      <div style="margin-bottom:0.8rem">
+      <div class="field">
         <label for="password">Hasło (co najmniej 10 znaków)</label>
         <input id="password" name="password" type="password" minlength="10"
                autocomplete="new-password" required>
       </div>
-      <div style="margin-bottom:1rem">
+      <div class="field">
         <label for="password_again">Powtórz hasło</label>
         <input id="password_again" name="password_again" type="password" minlength="10"
                autocomplete="new-password" required>

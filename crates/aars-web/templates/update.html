@@ -46,7 +46,7 @@
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     <input type="hidden" name="version" value="{{ version }}">
     <div class="field">
-      <label><input type="checkbox" name="confirm" value="tak"> Rozumiem: stacja dokończy bieżące nadanie, zatrzyma się na około minutę i wstanie na wersji {{ version }}. Gdy nowa wersja nie wstanie, wróci do {{ current }}.</label>
+      <label class="check"><input type="checkbox" name="confirm" value="tak"> Rozumiem: stacja dokończy bieżące nadanie, zatrzyma się na około minutę i wstanie na wersji {{ version }}. Gdy nowa wersja nie wstanie, wróci do {{ current }}.</label>
     </div>
     <button type="submit" class="danger">Zainstaluj {{ version }}</button>
   </form>
