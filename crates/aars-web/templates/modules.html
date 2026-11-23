@@ -3,12 +3,12 @@
 {% block content %}
 <div class="card">
   <h2>Moduły stacji</h2>
-  <p style="color:var(--muted)">Włączenie lub wyłączenie modułu działa od razu: źródło od następnego cyklu, harmonogram od następnego tiku. Wyłączenie nie kasuje kolejki — to, co już czeka, anulujesz w <a href="/queue">Kolejce</a>.{% if !chrome.is_admin %} Zmiany wprowadza administrator.{% endif %}</p>
+  <p class="muted">Włączenie lub wyłączenie modułu działa od razu: źródło od następnego cyklu, harmonogram od następnego tiku. Wyłączenie nie kasuje kolejki — to, co już czeka, anulujesz w <a href="/queue">Kolejce</a>.{% if !chrome.is_admin %} Zmiany wprowadza administrator.{% endif %}</p>
 </div>
 {% for m in modules %}
 <div class="card" id="{{ m.id }}">
   <h2>{{ m.name }} <span class="badge {{ m.css }}">{{ m.state }}</span>{% if let Some((css, text)) = m.health %} <span class="badge {{ css }}">{{ text }}</span>{% endif %}</h2>
-  <p style="color:var(--muted)">{{ m.kind }}</p>
+  <p class="muted">{{ m.kind }}</p>
   <p>{{ m.description }}</p>
   {% if let Some(message) = m.error %}<p class="error">{{ message }}</p>{% endif %}
   {% if let Some(callsign) = m.ident %}
@@ -19,20 +19,20 @@
     {% if let Some((text, href)) = m.see_also %}{% if m.is_source %} · {% endif %}<a href="{{ href }}">{{ text }}</a>{% endif %}
   </p>
   {% if m.id == "bulletin" %}
-  <form method="post" action="/modules/bulletin/preview" id="bulletin-preview-form" style="margin-bottom:0.8rem">
+  <form method="post" action="/modules/bulletin/preview" id="bulletin-preview-form" class="module-form">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     <button type="submit" class="ghost">Podgląd biuletynu</button>
-    <small style="color:var(--muted)">Składa biuletyn na teraz, bez nadawania; pyta źródła o dane.</small>
+    <small class="muted">Składa biuletyn na teraz, bez nadawania; pyta źródła o dane.</small>
   </form>
   {% if let Some(p) = m.bulletin_preview %}
-  <h3 style="margin-top:1rem">Podgląd</h3>
+  <h3 class="section-title">Podgląd</h3>
   {% if let Some(text) = p.text %}
   <p>{{ text }}</p>
   <input type="hidden" id="bulletin-text" value="{{ text }}">
-  <div style="margin-bottom:1rem">
+  <div class="preview">
     <button type="button" class="ghost" id="preview-btn">Odsłuchaj</button>
-    <span id="preview-note" style="color:var(--muted)"></span>
-    <audio id="preview-audio" controls style="width:100%;margin-top:0.5rem"></audio>
+    <span id="preview-note" class="preview-note"></span>
+    <audio id="preview-audio" class="preview-audio" controls></audio>
   </div>
   {% else %}
   <p>Nic do nadania: {% if let Some(reason) = p.skipped_reason %}{{ reason }}{% else %}brak danych{% endif %}</p>
@@ -44,18 +44,18 @@
   {% endif %}
   {% if chrome.is_admin %}
   {% if m.switchable %}
-  <form method="post" action="/modules/{{ m.id }}/enabled" style="margin-bottom:0.8rem">
+  <form method="post" action="/modules/{{ m.id }}/enabled" class="module-form">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     <input type="hidden" name="enabled" value="{% if m.enabled %}0{% else %}1{% endif %}">
     <button type="submit" class="{% if m.enabled %}danger{% endif %}">{% if m.enabled %}Wyłącz{% else %}Włącz{% endif %}</button>
   </form>
   {% endif %}
   {% if !m.fields.is_empty() %}
-  <h3 style="margin-top:1rem">Ustawienia</h3>
+  <h3 class="section-title">Ustawienia</h3>
   <form method="post" action="/modules/{{ m.id }}/settings">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     {% for f in m.fields %}
-    <div style="margin-bottom:0.8rem">
+    <div class="module-form">
       {% if f.kind == "integer" %}
       <label for="{{ m.id }}-{{ f.key }}">{{ f.label }} ({{ f.min }}–{{ f.max }})</label>
       <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="number" min="{{ f.min }}" max="{{ f.max }}" value="{{ f.value }}" required>
@@ -74,14 +74,14 @@
       <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
       <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="text" inputmode="numeric" placeholder="07:00,19:00" value="{{ f.value }}" required>
       {% else if f.kind == "list" %}
-      <fieldset style="border:0;padding:0;margin:0"><legend>{{ f.label }}</legend>
-        {% for (value, label, on) in f.checks %}<label style="display:block"><input type="checkbox" name="{{ f.key }}" value="{{ value }}" {% if *on %}checked{% endif %}> {{ label }}</label>{% endfor %}
+      <fieldset class="field-group"><legend>{{ f.label }}</legend>
+        {% for (value, label, on) in f.checks %}<label class="check"><input type="checkbox" name="{{ f.key }}" value="{{ value }}" {% if *on %}checked{% endif %}> {{ label }}</label>{% endfor %}
       </fieldset>
       {% else %}
       <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
       <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" value="{{ f.value }}" maxlength="{{ f.max_len }}">
       {% endif %}
-      {% if !f.help.is_empty() %}<small style="color:var(--muted)">{{ f.help }}</small>{% endif %}
+      {% if !f.help.is_empty() %}<small class="help">{{ f.help }}</small>{% endif %}
     </div>
     {% endfor %}
     <button type="submit">Zapisz</button>

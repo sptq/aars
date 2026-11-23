@@ -248,6 +248,9 @@ const RESTYLED: &[&str] = &[
     "queue_fragment.html",
     "status_bar.html",
     "macros.html",
+    "sources.html",
+    "modules.html",
+    "map.html",
 ];
 
 #[test]

@@ -392,6 +392,21 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn the_map_uses_the_full_content_width() {
+        let (status, _, html) = viewer_get(state().await, "/map").await;
+        assert_eq!(status, StatusCode::OK);
+        for needle in [
+            "class=\"content wide\"",
+            "id=\"warnings-map\"",
+            "data-src=\"/map/data\"",
+            "Źródłem pochodzenia danych jest IMGW-PIB; dane zostały przetworzone",
+            "Granice: PRG, GUGiK",
+        ] {
+            assert!(html.contains(needle), "brak {needle}");
+        }
+    }
+
     /// Skrypt mapy: zawieszone pobranie przerwane po 20 s, starsza odpowiedź
     /// nie nadpisuje nowszej, dane starsze niż 30 min nie barwią mapy.
     #[test]

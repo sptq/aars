@@ -10,16 +10,16 @@
 <div class="card">
   <h2>Ostrzeżenia meteorologiczne IMGW</h2>
   <p id="map-banner" class="error">Ładowanie mapy…</p>
-  <div id="warnings-map" data-tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png" data-geojson="/assets/powiaty.geojson" data-src="/map/data" style="height:560px;margin-bottom:0.5rem"></div>
+  <div id="warnings-map" class="map-canvas" data-tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png" data-geojson="/assets/powiaty.geojson" data-src="/map/data"></div>
   <p id="map-note" class="error" hidden></p>
   <noscript><p class="error">Mapa wymaga JavaScriptu — bez niego nie pokazuje ostrzeżeń.</p></noscript>
-  <div id="map-legend" style="display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:0.5rem">
-    <span><span style="display:inline-block;width:1rem;height:1rem;vertical-align:middle;background:#ffd400;opacity:0.85"></span> 1. stopień</span>
-    <span><span style="display:inline-block;width:1rem;height:1rem;vertical-align:middle;background:#ff8c00;opacity:0.85"></span> 2. stopień</span>
-    <span><span style="display:inline-block;width:1rem;height:1rem;vertical-align:middle;background:#d7191c;opacity:0.85"></span> 3. stopień</span>
-    <span><span style="display:inline-block;width:1rem;height:1rem;vertical-align:middle;border:2.5px solid #1f4fd1;box-sizing:border-box"></span> obszar stacji</span>
+  <div id="map-legend" class="map-legend">
+    <span><span class="swatch swatch-1"></span> 1. stopień</span>
+    <span><span class="swatch swatch-2"></span> 2. stopień</span>
+    <span><span class="swatch swatch-3"></span> 3. stopień</span>
+    <span><span class="swatch swatch-area"></span> obszar stacji</span>
   </div>
-  <p id="map-fetched" style="color:var(--muted)">—</p>
-  <p style="color:var(--muted);font-size:0.85rem">Źródłem pochodzenia danych jest IMGW-PIB; dane zostały przetworzone. Granice: PRG, GUGiK.</p>
+  <p id="map-fetched" class="muted">—</p>
+  <p class="muted map-attribution">Źródłem pochodzenia danych jest IMGW-PIB; dane zostały przetworzone. Granice: PRG, GUGiK.</p>
 </div>
 {% endblock %}
