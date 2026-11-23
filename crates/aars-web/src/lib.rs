@@ -14,6 +14,7 @@ pub mod settings_page;
 pub mod setup_page;
 pub mod sources_page;
 pub mod state;
+pub mod status;
 pub mod update_page;
 pub mod users;
 
@@ -269,18 +270,7 @@ async fn dashboard(
         }
     };
 
-    let (mut tx_unavailable, mut last_good_note) = (None, None);
-    if let Some(station) = &state.station {
-        let status = station.apply_status();
-        let error = status
-            .error
-            .unwrap_or_else(|| "brak działającej konfiguracji sprzętu".to_owned());
-        match status.origin {
-            aars_core::hardware::ConfigOrigin::None => tx_unavailable = Some(error),
-            aars_core::hardware::ConfigOrigin::LastGood => last_good_note = Some(error),
-            _ => {}
-        }
-    }
+    let (tx_unavailable, last_good_note) = status::apply_notes(&state);
 
     page(&DashboardPage {
         chrome: Chrome::from(&current),
