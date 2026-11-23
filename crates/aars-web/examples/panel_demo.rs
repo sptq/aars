@@ -298,8 +298,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("Zatrzymaj nadawanie"), "{body}");
         assert!(body.contains(QUEUE_TEXTS[0]), "{body}");
-        // Pulpit na tym etapie liczy ostrzeżenia; ich treść stoi na stronie źródeł.
         assert!(body.contains("aktywne ostrzeżenia: 1"), "{body}");
+        assert!(body.contains("Burze z gradem, 1. stopień"), "{body}");
     }
 
     #[tokio::test]

@@ -51,8 +51,24 @@ struct DashboardPage {
     chrome: Chrome,
     tx_enabled: bool,
     poisoned: bool,
+    /// Plakietka kafla „Nadawanie” (D4), ta sama co w pasku stanu.
+    tx: status::TxState,
     pending: Vec<QueueRow>,
     full: bool,
+    /// Liczba zadań w kafla „Kolejka”; `50+`, gdy odczyt doszedł do limitu.
+    queue_count: String,
+    /// Najwcześniejszy termin czekającego zadania.
+    queue_next: Option<String>,
+    sources_ok: usize,
+    /// Źródła z plakietką `warn` albo `err`.
+    sources_problem: usize,
+    /// Etykieta najbliższego biuletynu (D3) albo notka o błędzie odczytu.
+    next_bulletin: String,
+    /// Aktywne ostrzeżenia wszystkich źródeł: nazwa źródła i wiersz.
+    warnings: Vec<(String, sources_page::WarningRow)>,
+    recent: Vec<logs::TxRow>,
+    /// Notka zamiast tabeli ostatnich nadań, gdy odczyt dziennika zawiódł.
+    recent_error: Option<String>,
     /// Notka zamiast tabeli, gdy odczyt kolejki zawiódł.
     queue_error: Option<String>,
     sources: Vec<sources_page::SourceView>,
@@ -64,6 +80,13 @@ struct DashboardPage {
     last_good_note: Option<String>,
     /// Tryb kreatora bez włączonego admina (pasek dla zalogowanych).
     no_admin: bool,
+}
+
+impl DashboardPage {
+    /// „1 działa”, „2 działają”, „5 działa”.
+    fn sources_ok_verb(&self) -> &'static str {
+        chrome::plural(self.sources_ok as u64, "działa", "działają", "działa")
+    }
 }
 
 #[derive(Template)]
@@ -91,6 +114,8 @@ pub(crate) struct QueueRow {
     interrupting: bool,
     /// Powód wstrzymania po odmowie interlocka; surowe błędy nie trafiają do UI.
     held: Option<String>,
+    /// Surowy `not_before` — kafel kolejki szuka najwcześniejszego.
+    due: chrono::DateTime<chrono::Utc>,
 }
 
 fn queue_row(item: QueueItem, sizes: &HashMap<String, i64>) -> QueueRow {
@@ -104,6 +129,7 @@ fn queue_row(item: QueueItem, sizes: &HashMap<String, i64>) -> QueueRow {
         repeat_label,
         priority: priority_label(item.priority).to_owned(),
         not_before: both_times_now(item.not_before),
+        due: item.not_before,
         text: item.rendered_text,
         interrupting: item.interrupting,
         held: item.error.filter(|e| e.starts_with(aars_core::dispatcher::HELD_PREFIX)),
@@ -275,6 +301,33 @@ async fn dashboard(
 
     let (tx_unavailable, last_good_note) = status::apply_notes(&state);
 
+    let tx = status::tx_state(interlocks.tx_enabled, interlocks.poisoned, tx_unavailable.is_some());
+    // Kafle czytają niezależnie: błąd jednego to notka w nim, nigdy 500.
+    let queue_count = if pending.len() >= 50 { "50+".to_owned() } else { pending.len().to_string() };
+    let queue_next = pending.iter().map(|row| row.due).min().map(both_times_now);
+    let sources_ok = sources.iter().filter(|s| s.css == "on").count();
+    let sources_problem = sources.iter().filter(|s| matches!(s.css, "warn" | "err")).count();
+    let warnings = sources
+        .iter()
+        .flat_map(|s| s.warnings.iter().map(|w| (s.name.clone(), w.clone())))
+        .collect();
+    // Runner biuletynu planuje pory w czasie polskim, nie w strefie urządzenia.
+    let warsaw = chrono::Utc::now().with_timezone(&chrono_tz::Europe::Warsaw).time();
+    let next_bulletin = match status::load_next_bulletin(&state, warsaw).await {
+        Ok(next) => next.label(),
+        Err(err) => {
+            tracing::error!(%err, "odczyt ustawień biuletynu zawiódł");
+            "nie udało się odczytać".to_owned()
+        }
+    };
+    let (recent, recent_error) = match aars_core::txlog::TxLogRepo::new(state.pool.clone()).recent(5).await {
+        Ok(rows) => (rows.into_iter().map(logs::tx_row).collect(), None),
+        Err(err) => {
+            tracing::error!(%err, "odczyt dziennika nadań zawiódł");
+            (Vec::new(), Some("Nie udało się odczytać dziennika nadań.".to_owned()))
+        }
+    };
+
     page(&DashboardPage {
         chrome: Chrome::load(&state, &current).await,
         tx_unavailable,
@@ -282,8 +335,17 @@ async fn dashboard(
         no_admin,
         tx_enabled: interlocks.tx_enabled,
         poisoned: interlocks.poisoned,
+        tx,
         pending,
         full: false,
+        queue_count,
+        queue_next,
+        sources_ok,
+        sources_problem,
+        next_bulletin,
+        warnings,
+        recent,
+        recent_error,
         queue_error,
         sources,
         sources_error,
@@ -1397,7 +1459,7 @@ pub(crate) mod tests {
         for uri in ["/fragments/queue", "/fragments/queue?full=1", "/queue"] {
             let (status, html) = get_html(&app, &cookie, uri).await;
             assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}");
-            assert!(!html.contains("Kolejka pusta"), "{uri}: {html}");
+            assert!(!html.contains("Brak zadań w kolejce"), "{uri}: {html}");
         }
     }
 
@@ -1780,6 +1842,11 @@ pub(crate) mod tests {
         let (app, cookie, _, _, _) = poisoned_as(Role::Admin).await;
         let html = dashboard_html(app, &cookie).await;
         assert!(html.contains("watchdog — wymaga resetu"));
+        // Blokada watchdoga to stan awaryjny: czerwona plakietka, nie szara.
+        assert!(
+            html.contains("<span class=\"badge err\">watchdog — wymaga resetu</span>"),
+            "{html}"
+        );
         assert!(html.contains("action=\"/watchdog/clear\""), "{html}");
         assert!(html.contains("Zdejmij blokadę watchdoga"));
 
@@ -1787,6 +1854,139 @@ pub(crate) mod tests {
         let html = dashboard_html(app, &cookie).await;
         assert!(html.contains("watchdog — wymaga resetu"), "operator widzi blokadę");
         assert!(!html.contains("/watchdog/clear"), "operator nie dostaje przycisku");
+    }
+
+    /// Wnętrze kafla pulpitu o danym `id` (do zamknięcia `</section>`).
+    fn tile<'a>(html: &'a str, id: &str) -> &'a str {
+        let start = html.find(&format!("id=\"{id}\"")).unwrap_or_else(|| panic!("brak {id}: {html}"));
+        let end = html[start..].find("</section>").map_or(html.len(), |e| start + e);
+        &html[start..end]
+    }
+
+    /// Fragment strony od nagłówka `heading` do następnej karty.
+    fn card<'a>(html: &'a str, heading: &str) -> &'a str {
+        let start = html.find(&format!("<h2>{heading}</h2>")).unwrap_or_else(|| panic!("brak {heading}: {html}"));
+        let end = html[start..].find("<div class=\"card\"").map_or(html.len(), |e| start + e);
+        &html[start..end]
+    }
+
+    #[tokio::test]
+    async fn the_dashboard_shows_four_tiles() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Viewer).await;
+        let (status, html) = get_html(&app, &cookie, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        for title in ["Nadawanie", "Kolejka", "Źródła", "Najbliższy biuletyn"] {
+            assert!(html.contains(&format!("{title}</h3>")), "{title}: {html}");
+        }
+        assert!(tile(&html, "tile-bulletin").contains("wyłączony"), "{html}");
+        assert!(html.contains("Brak zadań w kolejce."), "{html}");
+
+        aars_core::module::ModuleRepo::new(state.pool.clone())
+            .set_enabled(&aars_core::module::BULLETIN, true)
+            .await
+            .unwrap();
+        let (_, html) = get_html(&app, &cookie, "/").await;
+        let bulletin = tile(&html, "tile-bulletin");
+        assert!(bulletin.contains("07:00") || bulletin.contains("19:00"), "{bulletin}");
+        assert!(!bulletin.contains("wyłączony"), "{bulletin}");
+    }
+
+    #[tokio::test]
+    async fn the_queue_tile_counts_pending_items() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+        state.queue.enqueue(enqueue(&state, "pierwsze")).await.unwrap();
+        state.queue.enqueue(enqueue(&state, "drugie")).await.unwrap();
+        let earliest = state.queue.pending(10).await.unwrap().iter().map(|i| i.not_before).min().unwrap();
+
+        let (_, html) = get_html(&app, &cookie, "/").await;
+        let queue = tile(&html, "tile-queue");
+        assert!(queue.contains(">2<"), "{queue}");
+        assert!(queue.contains(&both_times_now(earliest)), "{queue}");
+        assert!(queue.contains("href=\"/queue\""), "operator ma link: {queue}");
+
+        UserRepo::new(state.pool.clone()).create("v", "haslo", Role::Viewer).await.unwrap();
+        let (viewer, _) = login(&app, "v", "haslo").await;
+        let (_, html) = get_html(&app, &viewer, "/").await;
+        assert!(tile(&html, "tile-queue").contains(">2<"), "{html}");
+        assert!(!html.contains("href=\"/queue\""), "{html}");
+    }
+
+    #[tokio::test]
+    async fn the_sources_tile_counts_problems() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Viewer).await;
+        let repo = aars_core::source_state::SourceStateRepo::new(state.pool.clone());
+        repo.set_enabled("imgw-meteo", true).await.unwrap();
+        repo.save_config("imgw-meteo", "10 łódzkie", 300).await.unwrap();
+        repo.record_failure("imgw-meteo", chrono::Utc::now(), "boom").await.unwrap();
+
+        let (_, html) = get_html(&app, &cookie, "/").await;
+        assert!(tile(&html, "tile-sources").contains("1 z problemem"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn the_dashboard_lists_active_warnings_and_recent_transmissions() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Viewer).await;
+        let (_, html) = get_html(&app, &cookie, "/").await;
+        assert!(card(&html, "Aktywne ostrzeżenia").contains("Brak aktywnych ostrzeżeń."), "{html}");
+        assert!(card(&html, "Ostatnie nadania").contains("Brak nadań."), "{html}");
+
+        crate::sources_page::tests::tracked_warning(
+            &state,
+            "Sk1",
+            "Burze, 1. stopień",
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await;
+        let now = chrono::Utc::now();
+        aars_core::txlog::TxLogRepo::new(state.pool.clone())
+            .record(aars_core::txlog::TxLogEntry {
+                queue_item_id: None,
+                started_at: now - chrono::Duration::seconds(2),
+                ended_at: now,
+                ptt_backend: "gpio".to_owned(),
+                result: "ok",
+                note: Some("test PTT".to_owned()),
+            })
+            .await
+            .unwrap();
+
+        let (_, html) = get_html(&app, &cookie, "/").await;
+        let warnings = card(&html, "Aktywne ostrzeżenia");
+        assert!(warnings.contains("Burze, 1. stopień"), "{warnings}");
+        assert!(warnings.contains("Ostrzeżenia meteorologiczne IMGW"), "{warnings}");
+        assert!(!warnings.contains("Brak aktywnych ostrzeżeń."), "{warnings}");
+        let recent = card(&html, "Ostatnie nadania");
+        assert!(recent.contains("test PTT"), "{recent}");
+        assert!(!recent.contains("Brak nadań."), "{recent}");
+        assert!(html.contains("aktywne ostrzeżenia: 1"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn a_broken_transmission_log_does_not_hide_the_kill_switch() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+        sqlx::query("DROP TABLE tx_log").execute(&state.pool).await.unwrap();
+        let (status, html) = get_html(&app, &cookie, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Nie udało się odczytać dziennika nadań."), "{html}");
+        assert!(!html.contains("Brak nadań."), "{html}");
+        assert!(html.contains("action=\"/tx-enabled\""), "{html}");
+    }
+
+    #[tokio::test]
+    async fn dashboard_tables_scroll_instead_of_widening_the_page() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+        state.queue.enqueue(enqueue(&state, "w kolejce")).await.unwrap();
+        let (_, html) = get_html(&app, &cookie, "/").await;
+        assert_eq!(
+            html.matches("<table").count(),
+            html.matches("<div class=\"table-wrap\"><table").count(),
+            "{html}"
+        );
+        let css = String::from_utf8(
+            crate::assets::Assets::get("app.css").unwrap().data.into_owned(),
+        )
+        .unwrap();
+        assert!(css_rule(&css, ".table-wrap").contains("overflow-x: auto;"), "{css}");
     }
 
     #[tokio::test]
@@ -1808,7 +2008,7 @@ pub(crate) mod tests {
         let html = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(html.contains("action=\"/tx-enabled\""), "{html}");
         assert!(html.contains("Nie udało się odczytać kolejki"));
-        assert!(!html.contains("Kolejka pusta."), "pusta tabela kłamałaby, że nic nie czeka");
+        assert!(!html.contains("Brak zadań w kolejce."), "pusta tabela kłamałaby, że nic nie czeka");
     }
 
     const OPERATOR_LINKS: [&str; 5] = ["/compose", "/messages", "/queue", "/sources", "/modules"];

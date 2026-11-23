@@ -46,6 +46,7 @@ pub fn health(
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct WarningRow {
     pub(crate) summary: String,
     pub(crate) priority: &'static str,
@@ -233,7 +234,7 @@ pub async fn refresh(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::router;
     use crate::tests::{login, state};
     use aars_core::priority::Priority;
@@ -327,7 +328,7 @@ mod tests {
         tracked_warning(state, "Sk1", "Burze, 1. stopień", Utc::now() + chrono::Duration::hours(10)).await;
     }
 
-    async fn tracked_warning(state: &AppState, key: &str, summary: &str, valid_until: DateTime<Utc>) {
+    pub(crate) async fn tracked_warning(state: &AppState, key: &str, summary: &str, valid_until: DateTime<Utc>) {
         let at = Utc.with_ymd_and_hms(2026, 7, 23, 8, 0, 0).unwrap();
         SourceStateRepo::new(state.pool.clone())
             .upsert_active(

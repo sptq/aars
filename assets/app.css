@@ -258,6 +258,17 @@ main.content.wide, .wide { max-width: none; }
   padding: var(--space-3) var(--space-4);
 }
 .tile h3 { margin: 0 0 var(--space-1); font-size: 0.8rem; color: var(--muted); font-weight: 600; }
+.tile p { margin: var(--space-1) 0 0; }
+.tile-value { font-size: 1.6rem; font-weight: 700; line-height: 1.2; overflow-wrap: anywhere; }
+.tile-value .badge { font-size: 0.95rem; }
+.tile-unit { font-size: 0.9rem; font-weight: 400; color: var(--muted); }
+.tile-action { margin-top: var(--space-3); }
+
+/* Szeroka tabela przewija się w swojej karcie, nie poszerza strony na telefonie. */
+.table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
 
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 0.4rem var(--space-2); border-bottom: 1px solid var(--line); }
