@@ -386,4 +386,19 @@ mod tests {
             assert_eq!(location.as_deref(), Some("/login"));
         }
     }
+
+    #[tokio::test]
+    async fn a_temporary_password_hides_the_menu_and_the_status_bar() {
+        let (app, _) = setup(true).await;
+        let (_, cookie) = login(&app, "stare-haslo").await;
+        let (status, _, html) = send(&app, get("/account/password", &cookie.unwrap())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!html.contains("id=\"statusbar\""), "{html}");
+        assert!(!html.contains("href=\"/sources\""), "{html}");
+        assert!(!html.contains("href=\"/map\""), "{html}");
+        assert!(!html.contains("aria-label=\"Menu główne\""), "{html}");
+        assert!(html.contains("u · Podgląd"), "{html}");
+        assert!(html.contains("Wyloguj"), "{html}");
+        assert!(html.contains("AARS 0.0.0-test"), "{html}");
+    }
 }

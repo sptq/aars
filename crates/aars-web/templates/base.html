@@ -1,37 +1,66 @@
+{%- import "macros.html" as m -%}
 <!doctype html>
 <html lang="pl">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}AARS{% endblock %}</title>
+  <script src="/assets/theme.js"></script>
   <link rel="stylesheet" href="/assets/app.css">
   <script src="/assets/vendor/htmx.min.js" defer></script>
   {% block head %}{% endblock %}
 </head>
 <body>
-<header>
-  <h1>AARS — stacja ostrzegawcza</h1>
-  <nav>
-    <a href="/">Pulpit</a>
-    <a href="/map">Mapa</a>
-    {% if chrome.can_operate %}<a href="/compose">Nadaj</a>
-    <a href="/messages">Komunikaty</a>
-    <a href="/queue">Kolejka</a>
-    <a href="/sources">Źródła</a>
-    <a href="/modules">Moduły</a>{% endif %}
-    <a href="/logs">Dzienniki</a>
-    {% if chrome.is_admin %}<a href="/settings">Ustawienia</a>
-    <a href="/settings/hardware">Sprzęt</a>
-    <a href="/settings/update">Aktualizacja</a>
-    <a href="/users">Użytkownicy</a>{% endif %}
-    <span class="badge warn">{{ chrome.username }} · {{ chrome.role }}</span>
-    <form method="post" action="/logout" style="margin:0">
-      <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-      <button class="ghost" type="submit">Wyloguj</button>
-    </form>
-  </nav>
+{% if chrome.locked -%}
+<header class="statusbar locked">
+  <span>{{ chrome.username }} · {{ chrome.role }}</span>
+  <form method="post" action="/logout">
+    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+    <button class="ghost" type="submit">Wyloguj</button>
+  </form>
 </header>
-<main>{% block content %}{% endblock %}</main>
+<div class="layout locked">
+{%- else -%}
+{% include "status_bar.html" %}
+<div class="layout">
+  <input type="checkbox" id="menu-toggle" class="menu-toggle">
+  <label for="menu-toggle" class="menu-button"><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg#i-menu"></use></svg> Menu</label>
+  <aside class="sidebar">
+    <p class="brand">AARS — stacja ostrzegawcza</p>
+    <nav aria-label="Menu główne">
+      <h2>Nadawanie</h2>
+      <ul>
+        {%- call m::nav_item("/", "dashboard", "i-dashboard", "Pulpit", chrome.section) %}{% endcall %}
+        {%- if chrome.can_operate %}
+        {%- call m::nav_item("/compose", "compose", "i-send", "Nadaj", chrome.section) %}{% endcall %}
+        {%- call m::nav_item("/messages", "messages", "i-messages", "Komunikaty", chrome.section) %}{% endcall %}
+        {%- call m::nav_item("/queue", "queue", "i-queue", "Kolejka", chrome.section) %}{% endcall %}
+        {%- endif %}
+      </ul>
+      <h2>Dane</h2>
+      <ul>
+        {%- if chrome.can_operate %}
+        {%- call m::nav_item("/sources", "sources", "i-sources", "Źródła", chrome.section) %}{% endcall %}
+        {%- call m::nav_item("/modules", "modules", "i-modules", "Moduły", chrome.section) %}{% endcall %}
+        {%- endif %}
+        {%- call m::nav_item("/map", "map", "i-map", "Mapa", chrome.section) %}{% endcall %}
+      </ul>
+      <h2>System</h2>
+      <ul>
+        {%- if chrome.is_admin %}
+        {%- call m::nav_item("/settings", "settings", "i-settings", "Ustawienia", chrome.section) %}{% endcall %}
+        {%- call m::nav_item("/settings/hardware", "hardware", "i-hardware", "Sprzęt", chrome.section) %}{% endcall %}
+        {%- call m::nav_item("/settings/update", "update", "i-update", "Aktualizacja", chrome.section) %}{% endcall %}
+        {%- call m::nav_item("/users", "users", "i-users", "Użytkownicy", chrome.section) %}{% endcall %}
+        {%- endif %}
+        {%- call m::nav_item("/logs", "logs", "i-logs", "Dzienniki", chrome.section) %}{% endcall %}
+      </ul>
+    </nav>
+    <button type="button" class="ghost theme-toggle" data-theme-toggle>Motyw: systemowy</button>
+  </aside>
+{%- endif %}
+  <main class="content {% block main_class %}{% endblock %}">{% block content %}{% endblock %}</main>
+</div>
 <footer class="version">AARS {{ chrome.version }}</footer>
 </body>
 </html>

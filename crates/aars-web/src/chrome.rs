@@ -25,6 +25,10 @@ pub struct Chrome {
     pub back: String,
     /// Dane paska stanu; `None` we fragmentach, które paska nie renderują.
     pub status: Option<StatusBar>,
+    /// Klucz bieżącej pozycji menu (`nav_section`).
+    pub section: &'static str,
+    /// Hasło tymczasowe (D8): rama bez menu i paska stanu.
+    pub locked: bool,
 }
 
 impl Chrome {
@@ -44,6 +48,8 @@ impl Chrome {
                 "/".to_owned()
             },
             status: None,
+            section: nav_section(&current.path),
+            locked: current.user.must_change_password,
         }
     }
 
@@ -53,6 +59,38 @@ impl Chrome {
             status: Some(load_status(state, Local::now()).await),
             ..Chrome::bare(current)
         }
+    }
+}
+
+/// Pozycja menu bocznego, do której należy ścieżka (`aria-current`);
+/// ścieżka spoza menu → `""`.
+pub fn nav_section(path: &str) -> &'static str {
+    let under = |prefix: &str| {
+        path.strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    };
+    if path == "/" {
+        "dashboard"
+    } else if under("/settings/hardware") {
+        "hardware"
+    } else if under("/settings/update") {
+        "update"
+    } else if path == "/settings" || under("/settings/position") {
+        "settings"
+    } else {
+        [
+            ("/compose", "compose"),
+            ("/messages", "messages"),
+            ("/queue", "queue"),
+            ("/sources", "sources"),
+            ("/modules", "modules"),
+            ("/map", "map"),
+            ("/users", "users"),
+            ("/logs", "logs"),
+        ]
+        .into_iter()
+        .find(|(prefix, _)| under(prefix))
+        .map_or("", |(_, key)| key)
     }
 }
 
@@ -218,6 +256,35 @@ mod tests {
         assert_eq!(source_label("gios-smog"), "Alerty smogowe GIOŚ");
         assert_eq!(source_label("emsc"), "Wstrząsy sejsmiczne (EMSC)");
         assert_eq!(source_label("inne"), "inne");
+    }
+
+    #[test]
+    fn nav_section_maps_paths_to_menu_entries() {
+        assert_eq!(nav_section("/"), "dashboard");
+        assert_eq!(nav_section("/messages/3/edit"), "messages");
+        assert_eq!(nav_section("/settings"), "settings");
+        assert_eq!(nav_section("/settings/position"), "settings");
+        assert_eq!(nav_section("/settings/hardware"), "hardware");
+        assert_eq!(nav_section("/settings/update"), "update");
+        assert_eq!(nav_section("/account/password"), "");
+        for (path, key) in [
+            ("/compose", "compose"),
+            ("/messages", "messages"),
+            ("/messages/new", "messages"),
+            ("/queue", "queue"),
+            ("/sources", "sources"),
+            ("/modules", "modules"),
+            ("/map", "map"),
+            ("/settings/hardware/test-ptt", "hardware"),
+            ("/settings/update/check", "update"),
+            ("/users", "users"),
+            ("/logs", "logs"),
+            ("/messagesx", ""),
+            ("/settingsx", ""),
+            ("/fragments/status", ""),
+        ] {
+            assert_eq!(nav_section(path), key, "{path}");
+        }
     }
 
     #[test]

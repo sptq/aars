@@ -610,4 +610,81 @@ mod tests {
             NextBulletin::Tomorrow(t(7, 0))
         );
     }
+
+    #[tokio::test]
+    async fn the_bar_offers_only_stop_when_enabled_under_the_watchdog() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Operator).await;
+        state.interlocks.set_poisoned(true);
+        assert!(state.interlocks.snapshot().tx_enabled);
+        let (_, html) = fragment_html(&app, &cookie, "%2F").await;
+        assert!(html.contains("zablokowane — watchdog"), "{html}");
+        assert!(html.contains("Zatrzymaj nadawanie"), "{html}");
+        assert!(!html.contains("Włącz nadawanie"), "{html}");
+
+        let request = Request::builder()
+            .uri("/")
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let (_, _, page) = send(&app, request).await;
+        let bar = page.find("id=\"statusbar\"").expect("pasek stanu");
+        let end = page[bar..].find("</header>").map_or(page.len(), |e| bar + e);
+        assert!(page[bar..end].contains("Zatrzymaj nadawanie"), "{page}");
+        assert!(!page[bar..end].contains("Włącz nadawanie"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn a_temporary_password_gets_neither_the_status_nor_the_switch() {
+        let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+        sqlx::query("UPDATE users SET must_change_password = 1")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let request = Request::builder()
+            .uri("/fragments/status?back=%2F")
+            .header(header::COOKIE, &cookie)
+            .header("HX-Request", "true")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) = send(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("HX-Redirect").unwrap(), "/account/password");
+        assert!(body.is_empty(), "{body}");
+
+        let (status, headers, body) = send(&app, fragment_request(&cookie)).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers.get(header::LOCATION).unwrap(), "/account/password");
+        assert!(!body.contains("statusbar"), "{body}");
+
+        for htmx in [false, true] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/tx-enabled")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::COOKIE, &cookie);
+            if htmx {
+                request = request.header("HX-Request", "true");
+            }
+            let request = request
+                .body(Body::from(format!("csrf={csrf}&enabled=0&back=%2F")))
+                .unwrap();
+            let (status, headers, _) = send(&app, request).await;
+            assert_eq!(status, StatusCode::SEE_OTHER, "htmx={htmx}");
+            assert_eq!(
+                headers.get(header::LOCATION).unwrap(),
+                "/account/password",
+                "htmx={htmx}"
+            );
+            assert!(state.interlocks.snapshot().tx_enabled, "htmx={htmx}");
+        }
+    }
+
+    fn fragment_request(cookie: &str) -> Request<Body> {
+        Request::builder()
+            .uri("/fragments/status?back=%2F")
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap()
+    }
 }

@@ -244,6 +244,62 @@ async fn every_get_route_enforces_its_minimum_role() {
 }
 
 #[tokio::test]
+async fn every_page_shows_the_status_bar_on_first_load() {
+    let (app, _state, cookies, id) = sessions().await;
+    let edit = format!("/messages/{id}/edit");
+    let pages = [
+        ("/", VIEWER),
+        ("/logs", VIEWER),
+        ("/map", VIEWER),
+        ("/account/password", VIEWER),
+        ("/compose", OPERATOR),
+        ("/messages", OPERATOR),
+        ("/messages/new", OPERATOR),
+        (edit.as_str(), OPERATOR),
+        ("/queue", OPERATOR),
+        ("/sources", OPERATOR),
+        ("/modules", OPERATOR),
+        ("/settings", ADMIN),
+        ("/settings/hardware", ADMIN),
+        ("/settings/update", ADMIN),
+        ("/users", ADMIN),
+    ];
+    let mut failures = Vec::new();
+    for (path, min) in pages {
+        for (level, session) in &cookies {
+            let Some((cookie, _)) = session else { continue };
+            if *level < min {
+                continue;
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let html = String::from_utf8_lossy(&body);
+            let ok = status == StatusCode::OK
+                && html.contains("id=\"statusbar\"")
+                && html.contains("Nadawanie:")
+                && html.contains("class=\"badge ");
+            if !ok {
+                failures.push(format!("GET {path} (poziom {level}): {status}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[tokio::test]
 async fn every_post_route_refuses_a_missing_csrf_token_and_a_too_low_role() {
     let (app, _state, cookies, _id) = sessions().await;
     let mut failures = Vec::new();

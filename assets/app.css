@@ -97,25 +97,111 @@ a:hover { color: var(--text); }
 
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 
-header {
+main { padding: 1.25rem; max-width: 72rem; margin: 0 auto; }
+footer.version { color: var(--muted); font-size: 0.8rem; text-align: center; padding: var(--space-2) 1.25rem 1.25rem; }
+
+/* Pasek stanu: na szerokim ekranie jeden wiersz; na wąskim plakietka
+   nadawania i wyłącznik w pierwszym wierszu, reszta zawija się niżej. */
+.statusbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   flex-wrap: wrap;
-  gap: var(--space-4);
-  padding: var(--space-3) 1.25rem;
+  gap: var(--space-2) var(--space-4);
+  padding: var(--space-2) var(--space-4);
   background: var(--surface);
   border-bottom: 1px solid var(--line);
 }
+.statusbar form { margin: 0; }
+.statusbar > time { font-family: var(--font-mono); }
+.statusbar > time + span { margin-left: auto; }
+.statusbar .tx-switch button { min-height: 44px; }
+.statusbar.locked { justify-content: flex-end; }
 
-header h1 { font-size: 1.05rem; margin: 0; letter-spacing: 0.04em; }
-header nav { display: flex; flex-wrap: wrap; gap: var(--space-4); align-items: center; }
-header nav a, header nav a:visited { color: var(--muted); text-decoration: none; }
-header nav a:hover { color: var(--text); }
+/* Układ: menu boczne + treść. */
+.layout { display: grid; grid-template-columns: 15rem minmax(0, 1fr); align-items: start; }
+.layout.locked { display: block; }
+.menu-toggle, .menu-button { display: none; }
+.sidebar {
+  position: sticky;
+  top: 0;
+  max-height: 100vh;
+  overflow-y: auto;
+  padding: var(--space-4) var(--space-3);
+  background: var(--surface);
+  border-right: 1px solid var(--line);
+  min-height: 100vh;
+}
+.sidebar .brand { margin: 0 var(--space-2) var(--space-4); font-weight: 700; letter-spacing: 0.04em; }
+.sidebar h2 {
+  margin: var(--space-4) var(--space-2) var(--space-1);
+  font-size: 0.75rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.sidebar ul { list-style: none; margin: 0; padding: 0; }
+.sidebar a, .sidebar a:visited {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 40px;
+  padding: var(--space-1) var(--space-2);
+  border-radius: 6px;
+  color: var(--text);
+  text-decoration: none;
+}
+.sidebar a:hover { background: var(--surface-2); }
+.sidebar a[aria-current="page"] {
+  background: var(--surface-2);
+  color: var(--accent);
+  font-weight: 600;
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.sidebar .theme-toggle { margin: var(--space-5) var(--space-2) 0; }
+.js .sidebar .theme-toggle { display: block; }
 
-main { padding: 1.25rem; max-width: 72rem; margin: 0 auto; }
-main.wide, .wide { max-width: none; }
-footer.version { color: var(--muted); font-size: 0.8rem; text-align: center; padding: var(--space-2) 1.25rem 1.25rem; }
+main.content { padding: 1.25rem; max-width: 72rem; width: 100%; margin: 0 auto; }
+main.content.wide, .wide { max-width: none; }
+
+@media (min-width: 900px) {
+  .statusbar { flex-wrap: nowrap; }
+}
+
+/* Menu mobilne bez JS (D9): checkbox przed menu, etykieta „Menu” go przełącza. */
+@media (max-width: 899px) {
+  .statusbar > span:first-child { order: 0; }
+  .statusbar > .tx-switch { order: 1; margin-left: auto; }
+  .statusbar::after { content: ""; order: 1; flex-basis: 100%; height: 0; }
+  .statusbar > :not(span:first-child):not(.tx-switch) { order: 2; }
+  .statusbar > time + span { margin-left: 0; }
+  .layout { display: block; }
+  .menu-toggle {
+    display: block;
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+  }
+  .menu-button {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin: 0;
+    padding: var(--space-2) var(--space-4);
+    min-height: 44px;
+    color: var(--text);
+    font-size: 1rem;
+    font-weight: 600;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+    cursor: pointer;
+  }
+  .menu-toggle:focus-visible + .menu-button { outline: 2px solid var(--focus); outline-offset: -2px; }
+  .sidebar { display: none; position: static; max-height: none; min-height: 0; border-right: none; border-bottom: 1px solid var(--line); }
+  .menu-toggle:checked ~ .sidebar { display: block; }
+  main.content { padding: var(--space-4); }
+}
 
 .card {
   background: var(--surface);

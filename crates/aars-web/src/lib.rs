@@ -1810,4 +1810,103 @@ pub(crate) mod tests {
         assert!(html.contains("Nie udało się odczytać kolejki"));
         assert!(!html.contains("Kolejka pusta."), "pusta tabela kłamałaby, że nic nie czeka");
     }
+
+    const OPERATOR_LINKS: [&str; 5] = ["/compose", "/messages", "/queue", "/sources", "/modules"];
+    const ADMIN_LINKS: [&str; 4] = ["/settings", "/settings/hardware", "/settings/update", "/users"];
+
+    #[tokio::test]
+    async fn the_menu_shows_each_role_only_its_entries() {
+        for role in [Role::Viewer, Role::Operator, Role::Admin] {
+            let (app, cookie, _csrf, _state) = logged_in(role).await;
+            let (status, html) = get_html(&app, &cookie, "/").await;
+            assert_eq!(status, StatusCode::OK);
+            let has = |href: &str| html.contains(&format!("href=\"{href}\""));
+            for href in ["/", "/map", "/logs"] {
+                assert!(has(href), "{role:?} {href}: {html}");
+            }
+            for href in OPERATOR_LINKS {
+                assert_eq!(has(href), role.can(Role::Operator), "{role:?} {href}: {html}");
+            }
+            for href in ADMIN_LINKS {
+                assert_eq!(has(href), role.can(Role::Admin), "{role:?} {href}: {html}");
+            }
+            assert!(html.contains("aria-label=\"Menu główne\""), "{html}");
+            for group in ["<h2>Nadawanie</h2>", "<h2>Dane</h2>", "<h2>System</h2>"] {
+                assert!(html.contains(group), "{role:?} {group}: {html}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_current_page_is_marked_in_the_menu() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Operator).await;
+        let (_, html) = get_html(&app, &cookie, "/sources").await;
+        assert!(html.contains("href=\"/sources\" aria-current=\"page\""), "{html}");
+        assert_eq!(html.matches("aria-current").count(), 1, "{html}");
+
+        let (app, cookie, _csrf, _state) = logged_in(Role::Admin).await;
+        let (_, html) = get_html(&app, &cookie, "/settings/hardware").await;
+        assert!(html.contains("href=\"/settings/hardware\" aria-current=\"page\""), "{html}");
+        assert!(!html.contains("href=\"/settings\" aria-current"), "{html}");
+        assert_eq!(html.matches("aria-current").count(), 1, "{html}");
+    }
+
+    #[tokio::test]
+    async fn the_status_bar_pauses_polling_under_the_pointer_and_focus() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Operator).await;
+        let (_, html) = get_html(&app, &cookie, "/").await;
+        assert!(html.contains("hx-get=\"/fragments/status?back=/\""), "{html}");
+        assert!(
+            html.contains("hx-trigger=\"every 5s [!this.matches(':hover, :focus-within')]\""),
+            "{html}"
+        );
+        assert!(html.contains("hx-sync=\"this:drop\""), "{html}");
+        assert!(html.contains("hx-swap=\"outerHTML\""), "{html}");
+        let bar = html.find("id=\"statusbar\"").expect("pasek stanu");
+        let bar = &html[bar..html[bar..].find("</header>").map_or(html.len(), |e| bar + e)];
+        assert!(bar.contains("name=\"enabled\" value=\"0\""), "{bar}");
+    }
+
+    #[tokio::test]
+    async fn a_page_rendered_after_a_post_sends_the_switch_back_to_the_dashboard() {
+        let (app, cookie, csrf, _state) = logged_in(Role::Admin).await;
+        let response = post_form(
+            &app,
+            &cookie,
+            "/settings",
+            format!(
+                "csrf={csrf}&callsign=SP7TQ&id_mode=voice&id_interval_s=600&tx_max_duration_s=0\
+                 &misfire_grace_s=600&quiet_hours=&quiet_min_priority=emergency"
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("id=\"statusbar\""), "{html}");
+        assert!(html.contains("name=\"back\" value=\"/\""), "{html}");
+    }
+
+    #[tokio::test]
+    async fn the_theme_script_runs_before_the_stylesheet_and_the_menu_works_without_js() {
+        let (app, cookie, _csrf, _state) = logged_in(Role::Viewer).await;
+        let (_, html) = get_html(&app, &cookie, "/").await;
+        let script = html
+            .find("<script src=\"/assets/theme.js\"></script>")
+            .expect("skrypt motywu");
+        let css = html.find("/assets/app.css").expect("arkusz stylów");
+        assert!(script < css, "{html}");
+        assert!(
+            html.contains("<input type=\"checkbox\" id=\"menu-toggle\" class=\"menu-toggle\">"),
+            "{html}"
+        );
+        assert!(html.contains("<label for=\"menu-toggle\""), "{html}");
+        assert!(html.contains("data-theme-toggle"), "{html}");
+        let css = String::from_utf8(
+            crate::assets::Assets::get("app.css").unwrap().data.into_owned(),
+        )
+        .unwrap();
+        assert!(css.contains("@media (max-width: 899px)"), "{css}");
+        assert!(css.contains(".menu-toggle:checked"), "{css}");
+    }
 }
