@@ -5,9 +5,9 @@
   <h2>Komunikaty</h2>
   <p><a href="/messages/new">Nowy komunikat</a></p>
   {% if rows.is_empty() %}
-  <p style="color:var(--muted)">Brak zdefiniowanych komunikatów.</p>
+  <p class="empty">Brak zdefiniowanych komunikatów.</p>
   {% else %}
-  <table>
+  <div class="table-wrap"><table>
     <thead>
       <tr><th>Tytuł</th><th>Priorytet</th><th>Harmonogram</th><th>Następne nadanie</th><th>Stan</th><th></th></tr>
     </thead>
@@ -19,18 +19,18 @@
         <td>{{ row.schedule }}</td>
         <td>{{ row.next }}</td>
         <td>{% if row.enabled %}<span class="badge on">włączony</span>{% else %}<span class="badge off">wyłączony</span>{% endif %}</td>
-        <td style="white-space:nowrap">
+        <td class="row-actions">
           <button type="button" class="ghost" onclick="var a=document.getElementById('preview-audio');a.src='/messages/{{ row.id }}/preview.wav';a.play()">Odsłuchaj</button>
-          <form method="post" action="/messages/{{ row.id }}/send" style="display:inline">
+          <form method="post" action="/messages/{{ row.id }}/send" class="inline">
             <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
             <button type="submit">Nadaj teraz</button>
           </form>
-          <form method="post" action="/messages/{{ row.id }}/enabled" style="display:inline">
+          <form method="post" action="/messages/{{ row.id }}/enabled" class="inline">
             <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
             <input type="hidden" name="enabled" value="{% if row.enabled %}0{% else %}1{% endif %}">
             <button type="submit" class="ghost">{% if row.enabled %}Wyłącz{% else %}Włącz{% endif %}</button>
           </form>
-          <form method="post" action="/messages/{{ row.id }}/delete" style="display:inline"
+          <form method="post" action="/messages/{{ row.id }}/delete" class="inline"
                 onsubmit="return confirm('Usunąć komunikat?')">
             <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
             <button type="submit" class="danger">Usuń</button>
@@ -39,8 +39,8 @@
       </tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
   {% endif %}
-  <audio id="preview-audio" controls style="width:100%;margin-top:1rem"></audio>
+  <audio id="preview-audio" class="preview-audio" controls></audio>
 </div>
 {% endblock %}

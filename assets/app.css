@@ -301,7 +301,7 @@ textarea { width: 100%; min-height: 6rem; resize: vertical; }
 .row { display: flex; gap: var(--space-4); flex-wrap: wrap; margin-bottom: 0.9rem; }
 .row > div { flex: 1 1 10rem; }
 .field { margin-bottom: 0.9rem; }
-.field .help { margin: var(--space-1) 0 0; color: var(--muted); font-size: 0.82rem; }
+.field .help { display: block; margin: var(--space-1) 0 0; color: var(--muted); font-size: 0.82rem; }
 
 button {
   background: var(--accent);
@@ -355,3 +355,13 @@ button:disabled, button[disabled] {
 .error { color: var(--error); margin-bottom: 0.8rem; }
 .login { max-width: 22rem; margin: 6rem auto; }
 @media (max-width: 599px) { .login { margin: var(--space-5) auto; } }
+
+/* Strony nadawania: pole wyboru, odsłuch, akcje w komórce tabeli. */
+label.check { display: flex; gap: var(--space-2); align-items: center; margin-bottom: var(--space-4); color: var(--text); font-size: inherit; }
+label.check input { width: auto; }
+.preview { margin-bottom: var(--space-4); }
+.preview audio, audio.preview-audio { width: 100%; margin-top: var(--space-2); }
+.preview-note { color: var(--muted); }
+.row-actions { white-space: nowrap; }
+form.inline { display: inline; }
+.hint { color: var(--muted); }
