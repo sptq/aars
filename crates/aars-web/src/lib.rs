@@ -134,7 +134,7 @@ fn queue_row(item: QueueItem, sizes: &HashMap<String, i64>) -> QueueRow {
         priority: priority_label(item.priority).to_owned(),
         not_before: both_times_now(item.not_before),
         due: item.not_before,
-        text: item.rendered_text,
+        text: aars_audio::pause::display(&item.rendered_text),
         interrupting: item.interrupting,
         held: item.error.filter(|e| e.starts_with(aars_core::dispatcher::HELD_PREFIX)),
     }
@@ -1323,6 +1323,16 @@ pub(crate) mod tests {
         let html = get_body(app, &cookie, "/fragments/queue").await;
         assert!(html.contains("wstrzymane: nadawanie wyłączone"), "{html}");
         assert!(!html.contains("surowy błąd sterownika"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn the_queue_shows_pause_markers_compactly() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Viewer).await;
+        state.queue.enqueue(enqueue(&state, "Uwaga[[pauza:1500]]koniec")).await.unwrap();
+
+        let html = get_body(app, &cookie, "/fragments/queue").await;
+        assert!(html.contains("Uwaga⏸ 1,5 skoniec"), "{html}");
+        assert!(!html.contains("[[pauza"), "{html}");
     }
 
     #[tokio::test]
