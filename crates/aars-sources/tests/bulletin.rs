@@ -20,7 +20,7 @@ use sqlx::SqlitePool;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const EXPECTED: &str = "Biuletyn stacji SP9XYZ. 20:00. Pogoda dla okolic stacji. Teraz 2 °C, bezchmurnie. W nocy do 1 °C. Jutro śnieg, do 3 °C, opady do 2,4 mm, porywy wiatru do 45 km/h. Dane: Open-Meteo. Propagacja. Strumień słoneczny 98, umiarkowany. Indeks K 0,3, warunki spokojne. Pogoda kosmiczna bez zaburzeń. Jonosonda Warszawa: częstotliwość krytyczna 3,2 megaherca, MUF 10,6 megaherca. Łączności bliskie do pasma 160 metrów, dalekie do pasma 40 metrów. Dane: NOAA, GIRO przez KC2G. Brak obowiązujących ostrzeżeń. Koniec biuletynu.";
+const EXPECTED: &str = "Biuletyn stacji SP9XYZ. 20:00. Pogoda dla okolic stacji. Obecnie bezchmurnie, temperatura 2 °C. Wiatr 3 m/s, w porywach 5 m/s. W najbliższych godzinach pochmurno, bez opadów. W nocy do 1 °C. Jutro śnieg, od 1 do 3 °C, opady do 2,4 mm, porywy wiatru do 13 m/s. Dane: Open-Meteo. Propagacja. Strumień słoneczny 98, umiarkowany. Indeks K 0,3, warunki spokojne. Pogoda kosmiczna bez zaburzeń. Jonosonda Warszawa: częstotliwość krytyczna 3,2 megaherca, MUF 10,6 megaherca. Łączności bliskie do pasma 160 metrów, dalekie do pasma 40 metrów. Dane: NOAA, GIRO przez KC2G. Brak obowiązujących ostrzeżeń. Koniec biuletynu.";
 
 fn at(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)

@@ -374,7 +374,18 @@ pub fn normalize(input: &str) -> String {
             }
         }
 
-        if let Some((_, expanded)) = ABBREVIATIONS.iter().find(|(abbr, _)| *abbr == core) {
+        // „W nocy”, „W najbliższych godzinach”: jednoliterowy skrót strony
+        // świata przed zwykłym słowem to przyimek, nie kierunek.
+        let preposition = core.chars().count() == 1
+            && trail.is_empty()
+            && parts
+                .get(idx + 1)
+                .is_some_and(|&(next_lead, next_core, _)| {
+                    next_lead.is_empty() && next_core.chars().next().is_some_and(char::is_alphabetic)
+                });
+        if !preposition
+            && let Some((_, expanded)) = ABBREVIATIONS.iter().find(|(abbr, _)| *abbr == core)
+        {
             push_word(&mut out, lead, expanded, trail);
             idx += 1;
             continue;
@@ -795,6 +806,11 @@ mod tests {
     fn abbreviations_are_expanded() {
         assert_eq!(n("kierunek N"), "kierunek północny");
         assert_eq!(n("kierunek SW"), "kierunek południowo-zachodni");
+        assert_eq!(n("W nocy do 1 °C."), "W nocy do jednego stopnia Celsjusza.");
+        assert_eq!(n("W najbliższych godzinach"), "W najbliższych godzinach");
+        assert_eq!(n("kierunek W"), "kierunek zachodni");
+        assert_eq!(n("wiatr W 5 m/s"), "wiatr zachodni pięć metrów na sekundę");
+        assert_eq!(n("wiatr W, słaby"), "wiatr zachodni, słaby");
         assert_eq!(n("IMGW ostrzega"), "I M G W ostrzega");
     }
 
