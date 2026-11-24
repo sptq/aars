@@ -103,16 +103,25 @@ pub fn split(text: &str) -> Vec<Segment> {
 /// Usuwa wszystkie znaczniki pauzy (poprawne i błędne). Dla tekstów z
 /// zewnętrznych źródeł: pauzy może wstawiać tylko operator.
 pub fn strip_markers(text: &str) -> String {
-    if !has_marker(text) {
-        return text.to_owned();
+    // Do punktu stałego: usunięcie wewnętrznego znacznika nie może skleić
+    // nowego (`[[pau[[pauza:1]]za:9999]]`). Każdy przebieg skraca tekst,
+    // więc pętla się kończy; ostatecznie zostaje tylko tekst bez `[[pauza`.
+    let mut out = text.to_owned();
+    while has_marker(&out) {
+        let next: String = tokens(&out)
+            .into_iter()
+            .filter_map(|t| match t {
+                Token::Text(s) => Some(s),
+                Token::Pause(_) => None,
+            })
+            .collect();
+        out = if next.len() < out.len() {
+            next
+        } else {
+            out.replace(PREFIX, "")
+        };
     }
-    tokens(text)
-        .into_iter()
-        .filter_map(|t| match t {
-            Token::Text(s) => Some(s),
-            Token::Pause(_) => None,
-        })
-        .collect()
+    out
 }
 
 fn parse_ms(arg: &str) -> Option<u64> {
@@ -225,6 +234,15 @@ mod tests {
     fn strip_removes_valid_and_malformed_markers() {
         assert_eq!(strip_markers("a[[pauza:500]]b[[pauza:x]]c[[pauza:5"), "abc");
         assert_eq!(strip_markers("zwykły"), "zwykły");
+        for nested in [
+            "a[[pau[[pauza:1]]za:9999]]b",
+            "[[pa[[pauza:1]]u[[pauza:2]]za:5000]]",
+            "[[[[pauza:1]]pauza:3000]]",
+        ] {
+            let out = strip_markers(nested);
+            assert!(!has_marker(&out), "{nested} -> {out}");
+            assert!(split(&out).iter().all(|s| !matches!(s, Segment::Pause(_))), "{out}");
+        }
     }
 
     #[test]
