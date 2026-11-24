@@ -116,6 +116,16 @@ JSON w `module:bulletin:layout` (serde, nazwy pól po polsku jak w enumach, snak
 - [ ] Testy: RCB → 3 elementy co 60 s; ustawienia 5 × 120 s; zwykły komunikat RSO bez powtórek; odwołanie anuluje resztę serii.
 - [ ] Commit: `alerty: Alert RCB trzy razy co minutę, potem w biuletynie`.
 
+### Task 7b: Głos „gosia”, drugi głos „mc_speech” i tempo mowy
+
+Decyzja właściciela 2026-11-25: darkman brzmi „jak Ukrainiec”; najlepsza „gosia” (najbardziej czytelna), „mc_speech” też dobry; tempo za szybkie.
+
+**Files:** Modify `packaging/voices.lock` (gosia i mc_speech w miejsce darkman; ta sama przypięta rewizja `e9c8a39444359388adaa94255becb37a5a2b8e51`; sumy: gosia `.onnx` d322ded1f1daffeab41bbacd43d6f62ac83a4a5d4d63a297aa39f345f506b358 63221984, `.onnx.json` f0cc2f4f53d60274a79bf6ec9d8d17c02e188ae3c7cc170f6d308a97526c351b 6131; mc_speech `.onnx` a6b043358bc81e6c111a5140606a21959ce7f34969b8b7207f62869787cc3907 63201294, `.onnx.json` b8bb11228e15c505219846a88fdc129e93f57e774ed7f9bac263156d1aa3d324 4961; oba zbiory danych — sprawdzić licencję w MODEL_CARD i wpisać do THIRD-PARTY.md), `packaging/etc/aars.toml`, `aars.example.toml`, `crates/aars-core/src/config.rs` (domyślny model gosia), `packaging/image/build-image.sh` (test dymny gosia), `crates/aars/tests/packaging.rs`, `panel_demo.rs` (domyślnie gosia), ustawienia stacji (`speech_rate`), renderer i podgląd (VoiceParams.rate z ustawień), strona Sprzęt (wybór głosu z listy plików `*.onnx` w `voices_dir` z przyjaznymi nazwami „Gosia (kobiecy)”, „MC Speech (męski)”; tempo).
+- `speech_rate`: mnożnik tempa 0.70–1.20, domyślnie **0.87** (≈ 15% wolniej); trafia do `VoiceParams.rate` przy nadaniu i podglądzie (cache już rozróżnia tempo).
+- Stacja z konfiguracją wskazującą nieistniejący model darkman po aktualizacji: zostaje model z ustawień panelu, a gdy pliku brak — gosia, z ostrzeżeniem w logu i na stronie Sprzęt.
+- [ ] Testy: domyślny model, walidacja tempa, tempo w VoiceParams nadania i podglądu, lista głosów na stronie Sprzęt, packaging.
+- [ ] Commit: `głos: Gosia domyślnie, MC Speech do wyboru, wolniejsze tempo mowy`.
+
 ### Task 8: Panel bez przeładowań — mechanizm
 
 **Files:** Modify `crates/aars-web/templates/base.html` (`hx-boost="true"` na `<body>` z `hx-target="#main"`/`hx-select`, kontener powiadomień `#toasts` z `aria-live`), `assets/app.css` (powiadomienia), nowy `assets/panel.js` (≤ 60 linii: obsługa `HX-Trigger` `toast` → powiadomienie, zachowanie fokusu), `crates/aars-web/src/render.rs` (helper `htmx::is_htmx(headers)`, `toast(response, kind, text)` ustawiający `HX-Trigger`), handlery POST: moduły (`enabled`, `settings`), źródła (`enabled`, `refresh`), ustawienia stacji/pozycji/sprzętu, komunikaty (`enabled`, `send`, `delete`), kolejka (`cancel`, `cancel_group`), użytkownicy.
