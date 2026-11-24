@@ -108,6 +108,7 @@ dependencies = [
 name = "aars-web"
 version = "0.1.0"
 dependencies = [
+ "aars-audio",
  "aars-core",
  "anyhow",
  "askama",

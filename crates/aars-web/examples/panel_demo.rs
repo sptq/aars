@@ -3,6 +3,11 @@
 //! `cargo run -p aars-web --example panel_demo`, potem http://127.0.0.1:8088
 //! (port z `PANEL_DEMO_PORT`). Baza leży w katalogu tymczasowym i znika razem
 //! z procesem; nic nie dotyka karty dźwiękowej ani nadajnika.
+//!
+//! „Odsłuchaj” działa, gdy jest lokalny Piper i głos: domyślnie
+//! `target/piper/bin/piper` i `target/voices/pl_PL-darkman-medium.onnx`
+//! (inne ścieżki: `AARS_DEMO_PIPER`, `AARS_DEMO_VOICE`). Synteza składa
+//! tylko plik WAV dla przeglądarki; bez Pipera podgląd jest niedostępny.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +26,7 @@ use aars_core::source_state::{NewTracked, SourceStateRepo};
 use aars_core::txlog::{TxLogEntry, TxLogRepo};
 use aars_core::user::{Role, UserRepo};
 use aars_web::AppState;
+use aars_web::preview::{BUSY, PreviewFuture, PreviewRenderer};
 use aars_web::state::{BulletinPreviewView, MapWarning, WarningsSnapshot};
 use chrono::Utc;
 use sqlx::SqlitePool;
@@ -268,12 +274,68 @@ async fn demo_state(pool: SqlitePool) -> AppState {
         }))
 }
 
+/// Odsłuch w demo: lokalny Piper przez ten sam cache co stacja.
+struct DemoPiper {
+    cache: aars_audio::cache::AudioCache,
+    synth: Arc<aars_audio::piper::PiperSynth>,
+    permit: Arc<tokio::sync::Semaphore>,
+}
+
+impl PreviewRenderer for DemoPiper {
+    fn render_wav<'a>(&'a self, text: &'a str) -> PreviewFuture<'a> {
+        Box::pin(async move {
+            let _permit = self.permit.try_acquire().map_err(|_| BUSY.to_owned())?;
+            let cache = self.cache.clone();
+            let synth = self.synth.clone();
+            let owned = text.to_owned();
+            let handle = tokio::runtime::Handle::current();
+            let (_, pcm) = tokio::task::spawn_blocking(move || {
+                handle.block_on(cache.render(
+                    synth.as_ref(),
+                    &owned,
+                    &aars_core::synth::VoiceParams::default(),
+                ))
+            })
+            .await
+            .map_err(|e| format!("wątek syntezy: {e}"))?
+            .map_err(|e| e.to_string())?;
+            aars_audio::wav::wav_bytes_mono(&pcm).map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// Piper i głos z `target/` (albo ze zmiennych środowiska), jeśli są.
+fn demo_piper(pool: SqlitePool, cache_dir: std::path::PathBuf) -> Option<DemoPiper> {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target");
+    let bin =
+        std::env::var("AARS_DEMO_PIPER").unwrap_or_else(|_| format!("{root}/piper/bin/piper"));
+    let voice = std::env::var("AARS_DEMO_VOICE")
+        .unwrap_or_else(|_| format!("{root}/voices/pl_PL-darkman-medium.onnx"));
+    if !std::path::Path::new(&bin).is_file() || !std::path::Path::new(&voice).is_file() {
+        return None;
+    }
+    Some(DemoPiper {
+        cache: aars_audio::cache::AudioCache::new(pool, cache_dir, 64 << 20),
+        synth: Arc::new(aars_audio::piper::PiperSynth::new(bin, voice, 48_000)),
+        permit: Arc::new(tokio::sync::Semaphore::new(1)),
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let pool = aars_core::db::connect(&dir.path().join("demo.db")).await?;
     aars_core::db::migrate(&pool).await?;
-    let state = demo_state(pool).await;
+    let mut state = demo_state(pool.clone()).await;
+    match demo_piper(pool, dir.path().join("cache")) {
+        Some(piper) => {
+            state = state.with_preview(Arc::new(piper));
+            println!("Odsłuch: lokalny Piper");
+        }
+        None => println!(
+            "Odsłuch wyłączony: brak Pipera albo głosu w target/ (patrz opis na górze pliku)"
+        ),
+    }
 
     let port: u16 = std::env::var("PANEL_DEMO_PORT")
         .ok()
