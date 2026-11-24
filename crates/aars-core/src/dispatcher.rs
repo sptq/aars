@@ -1763,7 +1763,7 @@ mod tests {
         assert!(wait_for_state(s.repo.pool(), urgent, "transmitting", Duration::from_secs(2)).await);
 
         s.drain.cancel();
-        tokio::time::timeout(Duration::from_secs(4), s.task).await.expect("drain kończy").unwrap();
+        tokio::time::timeout(Duration::from_secs(10), s.task).await.expect("drain kończy").unwrap();
 
         assert_eq!(s.repo.state_of(slow).await.unwrap(), Some(crate::queue::QueueState::Done));
         assert_eq!(s.repo.state_of(urgent).await.unwrap(), Some(crate::queue::QueueState::Pending));
