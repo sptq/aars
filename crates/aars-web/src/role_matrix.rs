@@ -72,6 +72,7 @@ const POSTS: &[(&str, u8)] = &[
     ("/sources/pogoda/enabled", OPERATOR),
     ("/sources/pogoda/refresh", OPERATOR),
     ("/modules/bulletin/preview", OPERATOR),
+    ("/modules/bulletin/send", OPERATOR),
     ("/watchdog/clear", ADMIN),
     ("/settings", ADMIN),
     ("/settings/hardware", ADMIN),
@@ -449,6 +450,7 @@ async fn every_post_route_enforces_its_role_with_a_valid_csrf_token() {
         ("/sources/pogoda/refresh", OPERATOR, 503),
         // Stan testowy nie ma wywołania zwrotnego podglądu.
         ("/modules/bulletin/preview", OPERATOR, 503),
+        ("/modules/bulletin/send", OPERATOR, 503),
         ("/watchdog/clear", ADMIN, 303),
         ("/settings", ADMIN, 400),
         ("/settings/hardware", ADMIN, 400),

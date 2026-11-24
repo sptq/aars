@@ -25,6 +25,11 @@
     <button type="submit" class="ghost">Podgląd biuletynu</button>
     <small class="muted">Składa biuletyn na teraz, bez nadawania; pyta źródła o dane.</small>
   </form>
+  <form method="post" action="/modules/bulletin/send" class="module-form">
+    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+    <button type="submit">Nadaj biuletyn teraz</button>
+    <small class="muted">Składa biuletyn ze świeżych danych i dodaje go do kolejki; wyjdzie na antenę, gdy nadawanie jest włączone.</small>
+  </form>
   {% if let Some(p) = m.bulletin_preview %}
   <h3 class="section-title">Podgląd</h3>
   {% if let Some(text) = p.text %}

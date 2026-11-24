@@ -615,6 +615,7 @@ pub fn router(state: AppState) -> Router {
             "/modules/bulletin/preview",
             post(modules_page::preview_bulletin),
         )
+        .route("/modules/bulletin/send", post(modules_page::send_bulletin))
         .route("/healthz", get(healthz))
         .route("/assets/{*path}", get(assets::serve))
         .layer(axum::middleware::from_fn_with_state(state.clone(), host_check))

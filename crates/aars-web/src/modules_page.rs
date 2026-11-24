@@ -8,8 +8,10 @@ use std::collections::BTreeMap;
 use aars_core::error::DbError;
 use aars_core::geo::PositionRepo;
 use aars_core::module::{
-    BULLETIN, ModuleDescriptor, ModuleError, ModuleKind, ModuleRepo, SettingKind, Toggle,
+    BULLETIN, BULLETIN_PARTS, ModuleDescriptor, ModuleError, ModuleKind, ModuleRepo, SettingKind, Toggle,
 };
+use aars_core::priority::Priority;
+use aars_core::queue::EnqueueRequest;
 use aars_core::settings::SettingsRepo;
 use aars_core::source_state::SourceStateRepo;
 use aars_core::user::Role;
@@ -17,7 +19,7 @@ use askama::Template;
 use axum::Form;
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use chrono::Utc;
 use serde::Deserialize;
 
@@ -442,7 +444,7 @@ pub async fn preview_bulletin(
     match preview().await {
         Ok(view) => Ok(
             page_with(&state, &current, BULLETIN.id, StatusCode::OK, |card| {
-                card.bulletin_preview = Some(view)
+                card.bulletin_preview = Some(with_part_labels(view))
             })
             .await,
         ),
@@ -453,6 +455,89 @@ pub async fn preview_bulletin(
             format!("podgląd biuletynu zawiódł: {e}"),
         )
         .await),
+    }
+}
+
+/// Części biuletynu po polsku, jak w ustawieniach modułu (`pogoda` →
+/// „Pogoda dla pozycji stacji”); nieznany identyfikator zostaje bez zmian.
+fn with_part_labels(mut view: BulletinPreviewView) -> BulletinPreviewView {
+    for (part, _) in &mut view.parts {
+        if let Some((_, label)) = BULLETIN_PARTS.iter().find(|(id, _)| id == part) {
+            *part = (*label).to_owned();
+        }
+    }
+    view
+}
+
+/// Jak długo ręcznie zlecony biuletyn czeka w kolejce (jak pora z harmonogramu).
+const BULLETIN_SEND_EXPIRY: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
+
+/// `POST /modules/bulletin/send` (operator): biuletyn złożony na teraz idzie
+/// do kolejki, tak jak pora z harmonogramu (priorytet Zwykły, ważny 15 min).
+/// Gdy nie ma czego nadać, nic nie trafia do kolejki, a karta podaje powód.
+pub async fn send_bulletin(
+    State(state): State<AppState>,
+    current: CurrentUser,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, AuthRejection> {
+    require_role(&current.user, Role::Operator)?;
+    require_csrf(&current.csrf_token, Some(&form.csrf))?;
+    let Some(preview) = state.bulletin_preview.clone() else {
+        return Ok(bulletin_message(
+            &state,
+            &current,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "biuletyn nie wystartował — zobacz dziennik systemowy (journalctl -u aars)".to_owned(),
+        )
+        .await);
+    };
+    let Ok(_permit) = state.bulletin_preview_gate.clone().try_acquire_owned() else {
+        return Ok(bulletin_message(
+            &state,
+            &current,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "biuletyn jest właśnie składany, spróbuj za chwilę".to_owned(),
+        )
+        .await);
+    };
+    let view = match preview().await {
+        Ok(view) => with_part_labels(view),
+        Err(e) => {
+            return Ok(bulletin_message(
+                &state,
+                &current,
+                StatusCode::BAD_GATEWAY,
+                format!("składanie biuletynu zawiodło: {e}"),
+            )
+            .await);
+        }
+    };
+    let Some(text) = view.text.clone() else {
+        let reason = view.skipped_reason.clone().unwrap_or_else(|| "brak danych".to_owned());
+        return Ok(page_with(&state, &current, BULLETIN.id, StatusCode::OK, |card| {
+            card.error = Some(format!("Nic do nadania: {reason}"));
+            card.bulletin_preview = Some(view);
+        })
+        .await);
+    };
+    let now = Utc::now();
+    let request = EnqueueRequest {
+        message_id: None,
+        rendered_text: text,
+        priority: Priority::Normal,
+        interrupting: false,
+        not_before: Some(now),
+        expires_at: Some(now + BULLETIN_SEND_EXPIRY),
+        repeat_count: 1,
+        repeat_interval: std::time::Duration::ZERO,
+        created_by: Some(current.user.id),
+    };
+    match state.queue.enqueue(request).await {
+        Ok(_) => {
+            audit(&state, current.user.id, "bulletin_send", "biuletyn na żądanie").await;
+            Ok(Redirect::to("/queue").into_response())
+        }
+        Err(err) => Ok(db_error("dodanie biuletynu do kolejki zawiodło", &err)),
     }
 }
 
@@ -593,12 +678,14 @@ mod tests {
         ] {
             assert!(html.contains(needle), "brak {needle}: {html}");
         }
-        // Operator nie dostaje przełączników ani ustawień — tylko podgląd biuletynu.
-        assert_eq!(html.matches("action=\"/modules/").count(), 1, "{html}");
+        // Operator nie dostaje przełączników ani ustawień — tylko podgląd
+        // i nadanie biuletynu na żądanie.
+        assert_eq!(html.matches("action=\"/modules/").count(), 2, "{html}");
         assert!(
             html.contains("action=\"/modules/bulletin/preview\""),
             "{html}"
         );
+        assert!(html.contains("action=\"/modules/bulletin/send\""), "{html}");
         // Kolejność rejestru: wbudowane, potem źródło.
         let scheduler = html.find("Harmonogram").unwrap();
         let source = html.find("Ostrzeżenia meteorologiczne IMGW").unwrap();
@@ -986,8 +1073,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{html}");
         for needle in [
             "Biuletyn stacji SP9XYZ. 07:00. Koniec biuletynu.",
-            "pogoda",
-            "pominięta — brak pozycji stacji",
+            "Pogoda dla pozycji stacji: pominięta — brak pozycji stacji",
             "Odsłuchaj",
         ] {
             assert!(html.contains(needle), "brak {needle}: {html}");
@@ -1006,8 +1092,58 @@ mod tests {
         let (status, _, html) = post(&app, &cookie, &csrf, "/modules/bulletin/preview", "").await;
         assert_eq!(status, StatusCode::OK, "{html}");
         assert!(html.contains("Nic do nadania: brak danych"), "{html}");
-        assert!(html.contains("propagacja: błąd — x"), "{html}");
+        assert!(html.contains("Warunki propagacji KF: błąd — x"), "{html}");
         assert!(!html.contains("Odsłuchaj"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn an_operator_sends_the_bulletin_now() {
+        let state = state()
+            .await
+            .with_bulletin_preview(preview_of(sample_view()));
+        let (app, cookie, csrf, state) = app_as(Role::Operator, state).await;
+        let (_, html) = get(&app, &cookie, "/modules").await;
+        assert!(html.contains("action=\"/modules/bulletin/send\""), "{html}");
+        assert!(html.contains("Nadaj biuletyn teraz"), "{html}");
+
+        let (status, location, _) = post(&app, &cookie, &csrf, "/modules/bulletin/send", "").await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(location.as_deref(), Some("/queue"));
+        let pending = state.queue.pending(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let item = &pending[0];
+        assert_eq!(item.rendered_text, "Biuletyn stacji SP9XYZ. 07:00. Koniec biuletynu.");
+        assert_eq!(item.priority, aars_core::priority::Priority::Normal);
+        assert!(!item.interrupting);
+        let expires = item.expires_at.expect("ważność");
+        let left = expires - chrono::Utc::now();
+        assert!(left > chrono::TimeDelta::minutes(14) && left <= chrono::TimeDelta::minutes(15), "{left}");
+    }
+
+    #[tokio::test]
+    async fn a_bulletin_with_nothing_to_say_is_not_queued() {
+        let view = BulletinPreviewView {
+            text: None,
+            parts: vec![("pogoda".to_owned(), "pominięta — brak pozycji stacji".to_owned())],
+            skipped_reason: Some("brak danych".to_owned()),
+        };
+        let state = state().await.with_bulletin_preview(preview_of(view));
+        let (app, cookie, csrf, state) = app_as(Role::Operator, state).await;
+        let (status, _, html) = post(&app, &cookie, &csrf, "/modules/bulletin/send", "").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(html.contains("Nic do nadania: brak danych"), "{html}");
+        assert!(state.queue.pending(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sending_the_bulletin_needs_csrf() {
+        let state = state()
+            .await
+            .with_bulletin_preview(preview_of(sample_view()));
+        let (app, cookie, _, state) = app_as(Role::Operator, state).await;
+        let (status, _, _) = post(&app, &cookie, "zly", "/modules/bulletin/send", "").await;
+        assert_ne!(status, StatusCode::SEE_OTHER);
+        assert!(state.queue.pending(10).await.unwrap().is_empty());
     }
 
     #[tokio::test]

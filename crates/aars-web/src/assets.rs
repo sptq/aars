@@ -141,7 +141,8 @@ mod demo_tests {
             "with_station",
             "with_probe",
             "with_update",
-            "with_preview",
+            // `with_preview` jest dozwolone: lokalny Piper składa tylko plik
+            // WAV dla przeglądarki, bez karty dźwiękowej i bez PTT.
             "serial",
             "gpio",
             "cpal",
