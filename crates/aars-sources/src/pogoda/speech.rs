@@ -24,8 +24,16 @@ const NEXT_HOURS: usize = 6;
 const GUST_RISE_MS: f64 = 3.0;
 /// Opad poniżej tej sumy to „bez opadów”.
 const DRY_BELOW_MM: f64 = 0.1;
-/// Opad poniżej tej sumy to „słabe opady” — „zero przecinek dwa milimetra” nic słuchaczowi nie mówi.
+/// Opad poniżej tej sumy to „słabe opady” (po zaokrągleniu byłoby „do 0 mm”).
 const LIGHT_BELOW_MM: f64 = 0.5;
+/// Przy ciszy porywy od tej wartości są jednak podawane.
+const CALM_GUST_FROM_MS: f64 = 5.0;
+/// Bez warunków bieżących porywy najbliższych godzin są podawane od tej wartości.
+const GUST_NOTABLE_MS: f64 = 10.0;
+/// Noc w prognozie: od tej godziny lokalnej…
+const NIGHT_FROM_HOUR: u32 = 22;
+/// …do tej godziny następnego dnia (włącznie).
+const NIGHT_TO_HOUR: u32 = 6;
 
 /// Opady w mm: poniżej 10 z przecinkiem dziesiętnym, od 10 całkowite.
 pub fn precip_text(mm: f64) -> String {
@@ -36,12 +44,15 @@ pub fn precip_text(mm: f64) -> String {
     }
 }
 
-/// Opad, który był: „słabe opady” albo „opady do X mm”.
+/// Opad z prognozy: „słabe opady” albo „opady do X mm” z liczbą całkowitą.
+/// Ułamek po „do” normalizer czyta nieodmieniony („do pięć przecinek dziewięć
+/// milimetra”), całkowita idzie w dopełniaczu („do sześciu milimetrów”), a
+/// dziesiąte części milimetra w prognozie i tak nic słuchaczowi nie mówią.
 fn wet_clause(mm: f64) -> String {
     if mm < LIGHT_BELOW_MM {
         "słabe opady".to_owned()
     } else {
-        format!("opady do {} mm", precip_text(mm))
+        format!("opady do {} mm", round_int(mm))
     }
 }
 
@@ -74,7 +85,10 @@ fn wind_now(cur: &Now) -> Option<String> {
         return gust.map(|g| format!("Porywy wiatru do {g} m/s."));
     };
     if wind < CALM_BELOW_MS {
-        return Some("Cisza.".to_owned());
+        return Some(match cur.gust_ms.filter(|g| *g >= CALM_GUST_FROM_MS) {
+            Some(g) => format!("Wiatr słaby, w porywach {} m/s.", round_int(g)),
+            None => "Cisza.".to_owned(),
+        });
     }
     let mut s = "Wiatr".to_owned();
     if let Some(deg) = cur.wind_dir_deg {
@@ -133,6 +147,28 @@ pub fn now_text(forecast: &Forecast, _now: DateTime<Utc>) -> Option<String> {
     Some(sentences.join(" "))
 }
 
+/// Minimum temperatury godzinowej najbliższej nocy (22:00–6:00 lokalnie,
+/// od bieżącej pełnej godziny); bez godzin z tego okresu → `None`.
+fn night_min(forecast: &Forecast, now: DateTime<Utc>) -> Option<f64> {
+    let local = now.with_timezone(&Warsaw);
+    let local_now = local.naive_local();
+    // Przed 6:00 trwa noc, która zaczęła się wczoraj.
+    let evening = if local.hour() < NIGHT_TO_HOUR {
+        local.date_naive() - Duration::days(1)
+    } else {
+        local.date_naive()
+    };
+    let from = evening.and_hms_opt(NIGHT_FROM_HOUR, 0, 0)?;
+    let to = (evening + Duration::days(1)).and_hms_opt(NIGHT_TO_HOUR, 0, 0)?;
+    let current_hour = local_now.date().and_hms_opt(local_now.hour(), 0, 0)?;
+    forecast
+        .hourly
+        .iter()
+        .filter(|h| h.local >= from && h.local <= to && h.local >= current_hour)
+        .filter_map(|h| h.temp_c)
+        .reduce(f64::min)
+}
+
 /// „W najbliższych godzinach…”: najdotkliwszy opis, suma opadu i porywy,
 /// gdy wyraźnie mocniejsze niż teraz.
 fn next_hours_sentence(forecast: &Forecast, now: DateTime<Utc>) -> Option<String> {
@@ -161,9 +197,12 @@ fn next_hours_sentence(forecast: &Forecast, now: DateTime<Utc>) -> Option<String
     let gust_now = forecast
         .current
         .as_ref()
-        .and_then(|c| c.gust_ms.or(c.wind_ms))
-        .unwrap_or(0.0);
-    if let Some(g) = gust.filter(|g| *g - gust_now > GUST_RISE_MS) {
+        .and_then(|c| c.gust_ms.or(c.wind_ms));
+    let notable = |g: f64| match gust_now {
+        Some(now) => g - now > GUST_RISE_MS,
+        None => g >= GUST_NOTABLE_MS,
+    };
+    if let Some(g) = gust.filter(|g| notable(*g)) {
         clauses.push(format!("porywy wiatru do {} m/s", round_int(g)));
     }
     if clauses.is_empty() {
@@ -232,9 +271,9 @@ pub fn forecast_text(forecast: &Forecast, now: DateTime<Utc>) -> Option<String> 
     let d1 = d0 + Duration::days(1);
     let mut sentences = Vec::new();
     sentences.extend(next_hours_sentence(forecast, now));
-    let night = forecast
-        .day(d1)
-        .map(|d| format!("W nocy do {} °C.", round_int(d.t_min)));
+    let night = night_min(forecast, now)
+        .or_else(|| forecast.day(d1).map(|d| d.t_min))
+        .map(|t| format!("W nocy do {} °C.", round_int(t)));
     if local.hour() < EVENING_FROM_HOUR {
         sentences.extend(forecast.day(d0).map(|d| day_sentence("Dziś", d, false)));
         sentences.extend(night);
@@ -246,26 +285,31 @@ pub fn forecast_text(forecast: &Forecast, now: DateTime<Utc>) -> Option<String> 
 }
 
 /// Wschód i zachód słońca w czasie Warszawy: przed wschodem dzisiejsze,
-/// w dzień sam zachód, po zachodzie jutrzejsze; `None` bez danych.
+/// w dzień sam zachód, po zachodzie jutrzejsze; brak jednej z godzin nie
+/// gubi drugiej; `None` bez danych.
 pub fn sun_text(forecast: &Forecast, now: DateTime<Utc>) -> Option<String> {
     let local = now.with_timezone(&Warsaw);
     let local_now = local.naive_local();
     let today = forecast.day(local.date_naive());
     let tomorrow = forecast.day(local.date_naive() + Duration::days(1));
-    let both = |prefix: &str, day: &Day| match (day.sunrise, day.sunset) {
-        (Some(r), Some(s)) => Some(format!("{prefix}o {}, zachód o {}.", hhmm(r), hhmm(s))),
-        (Some(r), None) => Some(format!("{prefix}o {}.", hhmm(r))),
-        _ => None,
+    let sentence = |when: &str, rise: Option<NaiveDateTime>, set: Option<NaiveDateTime>| {
+        Some(match (rise, set) {
+            (Some(r), Some(s)) => format!("Wschód słońca{when} o {}, zachód o {}.", hhmm(r), hhmm(s)),
+            (Some(r), None) => format!("Wschód słońca{when} o {}.", hhmm(r)),
+            (None, Some(s)) => format!("Zachód słońca{when} o {}.", hhmm(s)),
+            (None, None) => return None,
+        })
     };
     if let Some(day) = today {
         if day.sunrise.is_some_and(|r| local_now < r) {
-            return both("Wschód słońca ", day);
+            return sentence("", day.sunrise, day.sunset.filter(|s| local_now < *s));
         }
         if let Some(s) = day.sunset.filter(|s| local_now < *s) {
-            return Some(format!("Zachód słońca o {}.", hhmm(s)));
+            return sentence("", None, Some(s));
         }
     }
-    both("Wschód słońca jutro ", tomorrow?)
+    let day = tomorrow?;
+    sentence(" jutro", day.sunrise, day.sunset)
 }
 
 /// Tekst części; `None`, gdy żadne zdanie nie powstało.

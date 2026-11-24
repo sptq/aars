@@ -552,7 +552,7 @@ mod tests {
         let now = at("2026-11-22T18:50:00Z");
         assert_eq!(
             speech::bulletin(&open_meteo_forecast(), now).unwrap(),
-            "Pogoda dla okolic stacji. Obecnie bezchmurnie, temperatura 2 °C. Wiatr 3 m/s, w porywach 5 m/s. W najbliższych godzinach pochmurno, bez opadów. W nocy do 1 °C. Jutro śnieg, od 1 do 3 °C, opady do 2,4 mm, porywy wiatru do 13 m/s. Dane: Open-Meteo."
+            "Pogoda dla okolic stacji. Obecnie bezchmurnie, temperatura 2 °C. Wiatr 3 m/s, w porywach 5 m/s. W najbliższych godzinach pochmurno, bez opadów. W nocy do 1 °C. Jutro śnieg, od 1 do 3 °C, opady do 2 mm, porywy wiatru do 13 m/s. Dane: Open-Meteo."
         );
     }
 
@@ -561,7 +561,7 @@ mod tests {
         let now = at("2026-11-22T09:00:00Z");
         assert_eq!(
             speech::bulletin(&open_meteo_forecast(), now).unwrap(),
-            "Pogoda dla okolic stacji. Obecnie bezchmurnie, temperatura 2 °C. Wiatr 3 m/s, w porywach 5 m/s. W najbliższych godzinach mżawka, słabe opady, porywy wiatru do 11 m/s. Dziś mżawka, do 6 °C, opady do 1,2 mm, porywy wiatru do 11 m/s. W nocy do 1 °C. Dane: Open-Meteo."
+            "Pogoda dla okolic stacji. Obecnie bezchmurnie, temperatura 2 °C. Wiatr 3 m/s, w porywach 5 m/s. W najbliższych godzinach mżawka, słabe opady, porywy wiatru do 11 m/s. Dziś mżawka, do 6 °C, opady do 1 mm, porywy wiatru do 11 m/s. W nocy do 1 °C. Dane: Open-Meteo."
         );
     }
 
@@ -584,7 +584,7 @@ mod tests {
         let now = at(STATION_FETCHED);
         assert_eq!(
             speech::bulletin(&f, now).unwrap(),
-            "Pogoda dla okolic stacji. Obecnie pochmurno, temperatura 1 °C, odczuwalna -3 °C. Wilgotność 93 %. Ciśnienie 1024 hPa, rośnie. Wiatr północno-zachodni 4 m/s, w porywach 9 m/s. W najbliższych godzinach mżawka, słabe opady. W nocy do -4 °C. Jutro śnieg, od -4 do 1 °C, słabe opady, wiatr zachodni do 3 m/s, w porywach do 8 m/s. Wschód słońca jutro o 7:12, zachód o 15:38. Dane: Open-Meteo."
+            "Pogoda dla okolic stacji. Obecnie pochmurno, temperatura 1 °C, odczuwalna -3 °C. Wilgotność 93 %. Ciśnienie 1024 hPa, rośnie. Wiatr północno-zachodni 4 m/s, w porywach 9 m/s. W najbliższych godzinach mżawka, słabe opady. W nocy do 0 °C. Jutro śnieg, od -4 do 1 °C, słabe opady, wiatr zachodni do 3 m/s, w porywach do 8 m/s. Wschód słońca jutro o 7:12, zachód o 15:38. Dane: Open-Meteo."
         );
         assert_eq!(
             speech::now_text(&f, now).unwrap(),
@@ -592,7 +592,7 @@ mod tests {
         );
         assert_eq!(
             speech::forecast_text(&f, now).unwrap(),
-            "W najbliższych godzinach mżawka, słabe opady. W nocy do -4 °C. Jutro śnieg, od -4 do 1 °C, słabe opady, wiatr zachodni do 3 m/s, w porywach do 8 m/s."
+            "W najbliższych godzinach mżawka, słabe opady. W nocy do 0 °C. Jutro śnieg, od -4 do 1 °C, słabe opady, wiatr zachodni do 3 m/s, w porywach do 8 m/s."
         );
         assert_eq!(
             speech::sun_text(&f, now).unwrap(),
@@ -607,7 +607,7 @@ mod tests {
         let dawn = at("2026-11-24T05:00:00Z");
         assert_eq!(
             speech::forecast_text(&f, dawn).unwrap(),
-            "W najbliższych godzinach mżawka, słabe opady. Dziś śnieg, do 1 °C, opady do 5,9 mm, wiatr zachodni do 7 m/s, w porywach do 13 m/s. W nocy do -4 °C."
+            "W najbliższych godzinach mżawka, słabe opady. Dziś śnieg, do 1 °C, opady do 6 mm, wiatr zachodni do 7 m/s, w porywach do 13 m/s. W nocy do 0 °C."
         );
         assert_eq!(
             speech::sun_text(&f, dawn).unwrap(),
@@ -622,7 +622,7 @@ mod tests {
         assert!(
             speech::forecast_text(&f, at("2026-11-24T13:00:00Z"))
                 .unwrap()
-                .contains("W nocy do -4 °C. Jutro śnieg")
+                .contains("W nocy do 0 °C. Jutro śnieg")
         );
     }
 
@@ -650,8 +650,17 @@ mod tests {
         let t = text(|v| v["hourly"]["pressure_msl"][0] = serde_json::Value::Null);
         assert!(t.contains("Ciśnienie 1024 hPa. Wiatr"), "{t}");
         // Wiatr poniżej 1 m/s to cisza, bez kierunku i porywów.
-        let t = text(|v| v["current"]["wind_speed_10m"] = 0.6.into());
+        let t = text(|v| {
+            v["current"]["wind_speed_10m"] = 0.6.into();
+            v["current"]["wind_gusts_10m"] = 4.9.into();
+        });
         assert!(t.ends_with("Ciśnienie 1024 hPa, rośnie. Cisza."), "{t}");
+        // …ale silne porywy przy ciszy nie giną.
+        let t = text(|v| {
+            v["current"]["wind_speed_10m"] = 0.6.into();
+            v["current"]["wind_gusts_10m"] = 5.6.into();
+        });
+        assert!(t.ends_with("Ciśnienie 1024 hPa, rośnie. Wiatr słaby, w porywach 6 m/s."), "{t}");
         // Porywy nie mocniejsze od wiatru nie są powtarzane.
         let t = text(|v| v["current"]["wind_gusts_10m"] = 4.2.into());
         assert!(t.ends_with("Wiatr północno-zachodni 4 m/s."), "{t}");
@@ -685,13 +694,28 @@ mod tests {
         assert!(
             speech::forecast_text(&f, now)
                 .unwrap()
-                .starts_with("W najbliższych godzinach przelotny deszcz, opady do 2,1 mm, porywy wiatru do 12 m/s. W nocy"),
+                .starts_with("W najbliższych godzinach przelotny deszcz, opady do 2 mm, porywy wiatru do 12 m/s. W nocy"),
             "{:?}",
             speech::forecast_text(&f, now)
         );
         // Porywy tylko o 3 m/s mocniejsze niż teraz (8,7 m/s) nie są podawane.
         let f = station_edited(|v| v["hourly"]["wind_gusts_10m"][8] = 11.7.into());
         assert!(!speech::forecast_text(&f, now).unwrap().contains("porywy"));
+        // Bez warunków bieżących porywy tylko od 10 m/s.
+        let f = station_edited(|v| {
+            v.as_object_mut().unwrap().remove("current");
+            v["hourly"]["wind_gusts_10m"][8] = 9.9.into();
+        });
+        assert!(!speech::forecast_text(&f, now).unwrap().contains("porywy"));
+        let f = station_edited(|v| {
+            v.as_object_mut().unwrap().remove("current");
+            v["hourly"]["wind_gusts_10m"][8] = 10.4.into();
+        });
+        assert!(
+            speech::forecast_text(&f, now).unwrap().contains("porywy wiatru do 10 m/s."),
+            "{:?}",
+            speech::forecast_text(&f, now)
+        );
         // Bez kodów i opadów: brak zdania o najbliższych godzinach.
         let f = station_edited(|v| {
             v["hourly"]["weather_code"] = serde_json::json!([]);
@@ -706,7 +730,7 @@ mod tests {
         let f = met_no::parse(MET, now).unwrap();
         assert_eq!(
             speech::bulletin(&f, now).unwrap(),
-            "Pogoda dla okolic stacji. Obecnie duże zachmurzenie, temperatura -1 °C. Wilgotność 94 %. Ciśnienie 1010 hPa. Wiatr południowo-zachodni 2 m/s. W nocy do -2 °C. Jutro śnieg, od -2 do 2 °C, opady do 4,6 mm, wiatr do 7 m/s. Dane: MET Norway."
+            "Pogoda dla okolic stacji. Obecnie duże zachmurzenie, temperatura -1 °C. Wilgotność 94 %. Ciśnienie 1010 hPa. Wiatr południowo-zachodni 2 m/s. W nocy do -2 °C. Jutro śnieg, od -2 do 2 °C, opady do 5 mm, wiatr do 7 m/s. Dane: MET Norway."
         );
     }
 
@@ -747,7 +771,19 @@ mod tests {
             "Obecnie temperatura 1 °C. Wiatr 4 m/s, w porywach 9 m/s."
         );
         assert!(speech::forecast_text(&f, now).unwrap().contains("wiatr do 3 m/s, w porywach do 8 m/s."));
+        // Brak jutrzejszego wschodu nie gubi zachodu.
+        assert_eq!(speech::sun_text(&f, now).unwrap(), "Zachód słońca jutro o 15:38.");
+        let f = station_edited(|v| {
+            v["daily"]["sunrise"][1] = serde_json::Value::Null;
+            v["daily"]["sunset"][1] = serde_json::Value::Null;
+        });
         assert_eq!(speech::sun_text(&f, now), None);
+        // Przed wschodem bez dzisiejszego zachodu: sam wschód; bez wschodu: sam zachód.
+        let dawn = at("2026-11-24T05:00:00Z");
+        let f = station_edited(|v| v["daily"]["sunset"][0] = serde_json::Value::Null);
+        assert_eq!(speech::sun_text(&f, dawn).unwrap(), "Wschód słońca o 7:10.");
+        let f = station_edited(|v| v["daily"]["sunrise"][0] = serde_json::Value::Null);
+        assert_eq!(speech::sun_text(&f, dawn).unwrap(), "Zachód słońca o 15:39.");
         let mut empty = open_meteo_forecast();
         empty.current = None;
         empty.days.clear();
@@ -764,6 +800,47 @@ mod tests {
         assert_eq!(BulletinPart::max_chars(&src), 900);
         let text = speech::bulletin(&station(), at(STATION_FETCHED)).unwrap();
         assert!(text.chars().count() < 900, "{}", text.chars().count());
+    }
+
+    #[test]
+    fn the_night_minimum_comes_from_the_coming_night_hours() {
+        let now = at(STATION_FETCHED); // 23:41 lokalnie
+        let night = |f: &Forecast, now| {
+            let text = speech::forecast_text(f, now).unwrap();
+            let start = text.find("W nocy").unwrap();
+            text[start..text[start..].find('.').unwrap() + start + 1].to_owned()
+        };
+        // Godziny 23:00–6:00: najzimniej o 6:00 (−0,0 °C), nie −3,6 °C z całej jutrzejszej doby.
+        assert_eq!(night(&station(), now), "W nocy do 0 °C.");
+        // 7:00 już nie jest nocą, 22:00 przed bieżącą godziną też się nie liczy.
+        let f = station_edited(|v| {
+            v["hourly"]["temperature_2m"][11] = (-9.0).into();
+            v["hourly"]["temperature_2m"][2] = (-9.0).into();
+        });
+        assert_eq!(night(&f, now), "W nocy do 0 °C.");
+        let f = station_edited(|v| v["hourly"]["temperature_2m"][7] = (-2.6).into());
+        assert_eq!(night(&f, now), "W nocy do -3 °C.");
+        // Rano (6:00 lokalnie) mowa o nadchodzącej nocy 24/25 listopada: 22:00–6:00.
+        let f = station_edited(|v| v["hourly"]["temperature_2m"][2] = (-7.2).into());
+        assert_eq!(night(&f, at("2026-11-24T05:00:00Z")), "W nocy do -7 °C.");
+        // Bez godzin: minimum jutrzejszej doby.
+        let f = station_edited(|v| {
+            v.as_object_mut().unwrap().remove("hourly");
+        });
+        assert_eq!(night(&f, now), "W nocy do -4 °C.");
+    }
+
+    #[test]
+    fn a_gust_rounded_in_m_s_still_trips_its_km_h_threshold() {
+        // 80 km/h przychodzi z Open-Meteo jako 22,2 m/s = 79,92 km/h.
+        let f = station_edited(|v| v["hourly"]["wind_gusts_10m"][2] = 22.2.into());
+        // 20:10 lokalnie: dziś liczy się od 20:00, 22:00 ma 22,2 m/s.
+        let out = alerts::to_output(&f, &ctx_at("2026-11-24T19:10:00Z", &[("gust_kmh", "80")]));
+        let gust = item(&out, "gust:2026-11-24");
+        assert_eq!(gust.fingerprint, "gust:80");
+        assert_eq!(gust.text, "Prognoza pogody: dziś porywy wiatru do 80 km/h. Dane: Open-Meteo.");
+        let out = alerts::to_output(&f, &ctx_at("2026-11-24T19:10:00Z", &[("gust_kmh", "81")]));
+        assert!(out.items.iter().all(|i| i.key != "gust:2026-11-24"), "{:?}", out.items);
     }
 
     #[test]
@@ -787,12 +864,14 @@ mod tests {
             "Wilgotność dziewięćdziesiąt trzy procent.",
             "Ciśnienie tysiąc dwadzieścia cztery hektopaskale, rośnie.",
             "Wiatr północno-zachodni cztery metry na sekundę, w porywach dziewięć metrów na sekundę.",
-            "W nocy do minus czterech stopni Celsjusza.",
+            "W nocy do zera stopni Celsjusza.",
             "od minus czterech do jednego stopnia Celsjusza",
             "Wschód słońca jutro o godzinie siódmej dwanaście, zachód o godzinie piętnastej trzydzieści osiem.",
         ] {
             assert!(spoken.contains(phrase), "{phrase:?} w: {spoken}");
         }
+        let spoken = aars_audio::text::normalize(&e);
+        assert!(spoken.contains("Dziś śnieg, do jednego stopnia Celsjusza, opady do sześciu milimetrów,"), "{spoken}");
         let spoken = aars_audio::text::normalize(&speech::now_text(&station_edited(|v| v["current"]["visibility"] = 780.0.into()), at(STATION_FETCHED)).unwrap());
         assert!(spoken.ends_with("Widzialność osiemset metrów."), "{spoken}");
     }

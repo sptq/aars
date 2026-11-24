@@ -8,7 +8,7 @@ use crate::source::SourceError;
 
 pub fn url(base: &str, lat: f64, lon: f64) -> String {
     format!(
-        "{base}?latitude={lat:.4}&longitude={lon:.4}&current=temperature_2m,apparent_temperature,relative_humidity_2m,pressure_msl,wind_speed_10m,wind_gusts_10m,wind_direction_10m,cloud_cover,visibility,weather_code,precipitation&hourly=temperature_2m,precipitation,wind_speed_10m,wind_gusts_10m,weather_code,pressure_msl&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max,wind_gusts_10m_max,weather_code,sunrise,sunset,wind_direction_10m_dominant&timezone=Europe%2FWarsaw&forecast_days=3&past_hours=3&wind_speed_unit=ms"
+        "{base}?latitude={lat:.4}&longitude={lon:.4}&current=temperature_2m,apparent_temperature,relative_humidity_2m,pressure_msl,wind_speed_10m,wind_gusts_10m,wind_direction_10m,cloud_cover,visibility,weather_code,precipitation&hourly=temperature_2m,precipitation,wind_speed_10m,wind_gusts_10m,weather_code,pressure_msl&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max,wind_gusts_10m_max,weather_code,sunrise,sunset,wind_direction_10m_dominant&timezone=Europe%2FWarsaw&forecast_days=3&forecast_hours=48&past_hours=3&wind_speed_unit=ms"
     )
 }
 
@@ -320,7 +320,7 @@ mod tests {
         );
         assert!(
             url("http://x/v1/forecast", 50.04, 21.99)
-                .ends_with("&timezone=Europe%2FWarsaw&forecast_days=3&past_hours=3&wind_speed_unit=ms")
+                .ends_with("&timezone=Europe%2FWarsaw&forecast_days=3&forecast_hours=48&past_hours=3&wind_speed_unit=ms")
         );
     }
 
@@ -346,6 +346,7 @@ mod tests {
             "hourly=temperature_2m,precipitation,wind_speed_10m,wind_gusts_10m,weather_code,pressure_msl&",
             ",sunrise,sunset,wind_direction_10m_dominant&",
             "&past_hours=3",
+            "&forecast_hours=48",
             "&wind_speed_unit=ms",
         ] {
             assert!(u.contains(field), "{field} w {u}");

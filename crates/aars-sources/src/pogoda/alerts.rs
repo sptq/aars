@@ -31,10 +31,11 @@ fn day_month(date: NaiveDate) -> String {
     format!("{} {month}", date.day())
 }
 
-/// m/s z prognozy → km/h progów, zaokrąglone do setnych, żeby przeliczenie
-/// tam i z powrotem (80 km/h → m/s → km/h) nie spadło pod kubełek odcisku.
+/// m/s z prognozy → km/h progów, zaokrąglone do całych km/h. Open-Meteo
+/// podaje m/s z jedną cyfrą po przecinku, więc 80 km/h przychodzi jako
+/// 22,2 m/s = 79,92 km/h — i tak ma przekroczyć próg 80 i trafić do kubełka 80.
 fn kmh(ms: f64) -> f64 {
-    (ms * 360.0).round() / 100.0
+    (ms * 3.6).round()
 }
 
 /// Skrajne wartości okresu, z którego liczymy progi (porywy w km/h, jak
