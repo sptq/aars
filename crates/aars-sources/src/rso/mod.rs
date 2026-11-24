@@ -60,6 +60,7 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     toggle: Toggle::Switchable,
     default_enabled: false,
     needs: Needs::Area,
+    auto_area: Some(aars_core::area_auto::AreaGranularity::Voivodeship),
     settings: &[
         SettingSpec {
             key: "area",
@@ -203,6 +204,10 @@ fn area_slugs(ctx: &SourceCtx) -> Vec<&'static str> {
 impl DataSource for Rso {
     fn id(&self) -> &'static str {
         "rso"
+    }
+
+    fn auto_area(&self) -> Option<aars_core::area_auto::AreaGranularity> {
+        DESCRIPTOR.auto_area
     }
 
     fn default_interval(&self) -> Duration {

@@ -43,6 +43,7 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     toggle: Toggle::Switchable,
     default_enabled: false,
     needs: Needs::Position,
+    auto_area: None,
     settings: &[
         SettingSpec {
             key: "radius_km",

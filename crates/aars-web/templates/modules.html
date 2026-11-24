@@ -66,7 +66,12 @@
       <label for="{{ m.id }}-{{ f.key }}">{{ f.label }} ({{ f.min }}–{{ f.max }})</label>
       <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="number" min="{{ f.min }}" max="{{ f.max }}" value="{{ f.value }}" required>
       {% else if f.kind == "area" %}
+      {% if let Some(note) = m.auto_area_note %}
+      <p class="auto-area">{{ note }}</p>
+      <label for="{{ m.id }}-{{ f.key }}">Nadpisz obszar (zostaw puste, żeby liczyć z pozycji)</label>
+      {% else %}
       <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
+      {% endif %}
       <textarea id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" rows="5" placeholder="1061 Łódź&#10;10">{{ f.value }}</textarea>
       {% else if f.kind == "choice" %}
       <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>

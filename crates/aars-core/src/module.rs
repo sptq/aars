@@ -81,6 +81,8 @@ pub struct ModuleDescriptor {
     pub toggle: Toggle,
     pub default_enabled: bool,
     pub needs: Needs,
+    /// Obszar liczony z pozycji stacji, gdy ręczny jest pusty (etap 13).
+    pub auto_area: Option<crate::area_auto::AreaGranularity>,
     pub settings: &'static [SettingSpec],
     /// (tekst linku, ścieżka)
     pub see_also: Option<(&'static str, &'static str)>,
@@ -207,6 +209,7 @@ pub const BULLETIN: ModuleDescriptor = ModuleDescriptor {
     toggle: Toggle::Switchable,
     default_enabled: false,
     needs: Needs::Nothing,
+    auto_area: None,
     settings: &[
         SettingSpec {
             key: "times",
@@ -244,6 +247,7 @@ pub fn builtin() -> Vec<ModuleDescriptor> {
             toggle: Toggle::Switchable,
             default_enabled: true,
             needs: Needs::Nothing,
+            auto_area: None,
             settings: &[],
             see_also: Some(("Tolerancja spóźnień", "/settings")),
         },
@@ -255,6 +259,7 @@ pub fn builtin() -> Vec<ModuleDescriptor> {
             toggle: Toggle::AlwaysOn("identyfikacja stacji jest obowiązkowa"),
             default_enabled: true,
             needs: Needs::Nothing,
+            auto_area: None,
             settings: &[],
             see_also: Some(("Znak i tryb identyfikacji", "/settings")),
         },
@@ -273,6 +278,7 @@ pub fn sample_source(id: &'static str) -> ModuleDescriptor {
         toggle: Toggle::Switchable,
         default_enabled: false,
         needs: Needs::Area,
+        auto_area: None,
         settings: &[
             SettingSpec {
                 key: "area",

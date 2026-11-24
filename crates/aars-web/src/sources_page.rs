@@ -65,6 +65,8 @@ pub(crate) struct SourceView {
     pub(crate) last_error: Option<String>,
     pub(crate) shows_area: bool,
     pub(crate) area_text: String,
+    /// Obszar liczony z pozycji (gdy źródło to umie): „Automatycznie: …”.
+    pub(crate) auto_area_note: Option<String>,
     pub(crate) interval_s: u64,
     pub(crate) warnings: Vec<WarningRow>,
 }
@@ -78,6 +80,7 @@ pub(crate) async fn load_views(state: &AppState) -> Result<Vec<SourceView>, DbEr
     let repo = SourceStateRepo::new(state.pool.clone());
     let now = Utc::now();
     let has_position = matches!(PositionRepo::new(state.pool.clone()).load().await, Ok(Some(_)));
+    let position = PositionRepo::new(state.pool.clone()).load().await.ok().flatten();
     let mut views = Vec::new();
     for status in repo.statuses().await? {
         let Some(cfg) = repo.config(&status.source_id).await? else {
@@ -87,7 +90,14 @@ pub(crate) async fn load_views(state: &AppState) -> Result<Vec<SourceView>, DbEr
             .modules
             .get(&status.source_id)
             .map_or(Needs::Area, |m| m.needs);
-        let (css, health_text) = health(&status, &cfg, needs, has_position, now);
+        let auto = state.modules.get(&status.source_id).and_then(|m| m.auto_area);
+        // Pusty ręczny obszar przy obszarze z pozycji: liczy się pozycja.
+        let health_needs = if needs == Needs::Area && auto.is_some() && cfg.area.is_empty() {
+            Needs::Position
+        } else {
+            needs
+        };
+        let (css, health_text) = health(&status, &cfg, health_needs, has_position, now);
         let warnings = repo
             .active_items(&status.source_id)
             .await?
@@ -113,6 +123,11 @@ pub(crate) async fn load_views(state: &AppState) -> Result<Vec<SourceView>, DbEr
             last_error: status.last_error.clone(),
             shows_area: needs == Needs::Area,
             area_text: cfg.area_text,
+            auto_area_note: state
+                .modules
+                .get(&status.source_id)
+                .and_then(|m| m.auto_area)
+                .map(|g| aars_core::area_auto::auto_area_note(position.as_ref(), g)),
             interval_s: cfg.interval_s,
             warnings,
         });

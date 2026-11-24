@@ -153,7 +153,7 @@ impl SourceRunner {
 
     async fn run_cycle(&self, now: DateTime<Utc>, report: &mut CycleReport) -> Result<(), DbError> {
         let id = self.source.id();
-        let Some(cfg) = self.state.config(id).await? else {
+        let Some(mut cfg) = self.state.config(id).await? else {
             report.skipped = Some("wyłączone");
             return Ok(());
         };
@@ -163,8 +163,28 @@ impl SourceRunner {
         }
         let needs = self.source.needs();
         if needs == Needs::Area && cfg.area.is_empty() {
-            report.skipped = Some("brak obszaru");
-            return Ok(());
+            // Ręczny obszar pusty: źródło, które to umie, liczy go z pozycji.
+            let Some(granularity) = self.source.auto_area() else {
+                report.skipped = Some("brak obszaru");
+                return Ok(());
+            };
+            let position = match PositionRepo::new(self.state.pool().clone()).load().await {
+                Ok(p) => p,
+                Err(error) => {
+                    tracing::warn!(source = id, %error, "nie można odczytać pozycji stacji");
+                    None
+                }
+            };
+            if position.is_none() {
+                report.skipped = Some("brak pozycji stacji");
+                return Ok(());
+            }
+            let Some(entry) = aars_core::area_auto::auto_area(position.as_ref(), granularity) else {
+                report.skipped = Some("pozycja poza obszarem Polski");
+                return Ok(());
+            };
+            cfg.area = vec![entry];
+            cfg.area_text = aars_core::area::area_text(&cfg.area);
         }
         // Kontekst przed porównaniem R9. Zakres nie zależy od
         // `tracked_keys`, więc najpierw zakres, potem klucze aktywnych pozycji

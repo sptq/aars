@@ -28,6 +28,7 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     toggle: Toggle::Switchable,
     default_enabled: false,
     needs: Needs::Area,
+    auto_area: Some(aars_core::area_auto::AreaGranularity::County),
     settings: &[
         SettingSpec {
             key: "area",
@@ -86,6 +87,10 @@ impl ImgwMeteo {
 impl DataSource for ImgwMeteo {
     fn id(&self) -> &'static str {
         ID
+    }
+
+    fn auto_area(&self) -> Option<aars_core::area_auto::AreaGranularity> {
+        DESCRIPTOR.auto_area
     }
 
     fn default_interval(&self) -> Duration {

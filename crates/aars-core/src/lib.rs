@@ -1,4 +1,5 @@
 pub mod area;
+pub mod area_auto;
 pub mod bulletin;
 pub mod config;
 pub mod db;

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use aars_core::error::DbError;
 use aars_core::geo::PositionRepo;
 use aars_core::module::{
-    BULLETIN, BULLETIN_PARTS, ModuleDescriptor, ModuleError, ModuleKind, ModuleRepo, SettingKind, Toggle,
+    BULLETIN, BULLETIN_PARTS, ModuleDescriptor, ModuleError, ModuleKind, ModuleRepo, Needs, SettingKind, Toggle,
 };
 use aars_core::priority::Priority;
 use aars_core::queue::EnqueueRequest;
@@ -64,6 +64,8 @@ pub(crate) struct ModuleView {
     pub(crate) health: Option<(&'static str, String)>,
     pub(crate) see_also: Option<(&'static str, &'static str)>,
     pub(crate) fields: Vec<FieldView>,
+    /// Źródło z obszarem liczonym z pozycji: zdanie nad polem obszaru.
+    pub(crate) auto_area_note: Option<String>,
     /// Tylko `auto-id`: bieżący znak (pusty = brak).
     pub(crate) ident: Option<String>,
     pub(crate) error: Option<String>,
@@ -159,12 +161,24 @@ async fn module_view(
                     PositionRepo::new(state.pool.clone()).load().await,
                     Ok(Some(_))
                 );
-                Some(health(&status, &cfg, m.needs, has_position, Utc::now()))
+                let needs = if m.needs == Needs::Area && m.auto_area.is_some() && cfg.area.is_empty() {
+                    Needs::Position
+                } else {
+                    m.needs
+                };
+                Some(health(&status, &cfg, needs, has_position, Utc::now()))
             }
             _ => None,
         }
     } else {
         None
+    };
+    let auto_area_note = match m.auto_area {
+        Some(granularity) => {
+            let position = PositionRepo::new(state.pool.clone()).load().await.ok().flatten();
+            Some(aars_core::area_auto::auto_area_note(position.as_ref(), granularity))
+        }
+        None => None,
     };
     let values = repo.settings(m).await?;
     let fields = m
@@ -185,6 +199,7 @@ async fn module_view(
         health,
         see_also: m.see_also,
         fields,
+        auto_area_note,
         ident: (m.kind == ModuleKind::Ident).then(|| callsign.to_owned()),
         error: None,
         bulletin_preview: None,
@@ -1005,6 +1020,7 @@ mod tests {
             toggle: Toggle::Switchable,
             default_enabled: false,
             needs: Needs::Nothing,
+            auto_area: None,
             settings: SPECS,
             see_also: None,
         }]));
@@ -1027,6 +1043,41 @@ mod tests {
         assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
         // Odznaczenie wszystkich pól listy: pole nie przychodzi, więc bez zmian.
         assert_eq!(setting(&state, "module:x-lista:cats").await.as_deref(), Some("a,c"));
+    }
+
+    async fn auto_area_state(position: Option<(&str, &str)>) -> AppState {
+        use aars_core::area_auto::AreaGranularity;
+        use aars_core::module::{ModuleDescriptor, ModuleRegistry, sample_source};
+        let mut st = state().await;
+        st.modules = Arc::new(ModuleRegistry::new(vec![ModuleDescriptor {
+            auto_area: Some(AreaGranularity::County),
+            ..sample_source("imgw-meteo")
+        }]));
+        if let Some((lat, lon)) = position {
+            let p = aars_core::geo::parse_position(lat, lon, "").unwrap();
+            aars_core::geo::PositionRepo::new(st.pool.clone()).save(p.as_ref()).await.unwrap();
+        }
+        st
+    }
+
+    #[tokio::test]
+    async fn the_area_field_shows_the_automatic_county() {
+        let st = auto_area_state(Some(("51.38", "20.28"))).await;
+        let (app, cookie, _, _) = app_as(Role::Admin, st).await;
+        let (_, html) = get(&app, &cookie, "/modules").await;
+        assert!(html.contains("Automatycznie: powiat opoczyński (1007)"), "{html}");
+        assert!(html.contains("Nadpisz obszar (zostaw puste, żeby liczyć z pozycji)"), "{html}");
+        let (_, html) = get(&app, &cookie, "/sources").await;
+        assert!(html.contains("Automatycznie: powiat opoczyński (1007)"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn the_area_field_asks_for_a_position_when_there_is_none() {
+        let st = auto_area_state(None).await;
+        let (app, cookie, _, _) = app_as(Role::Admin, st).await;
+        let (_, html) = get(&app, &cookie, "/modules").await;
+        assert!(html.contains("Brak pozycji stacji — ustaw ją w Ustawieniach"), "{html}");
+        assert!(!html.contains("brak obszaru"), "{html}");
     }
 
     #[tokio::test]

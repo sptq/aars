@@ -31,6 +31,7 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     toggle: Toggle::Switchable,
     default_enabled: false,
     needs: Needs::Nothing,
+    auto_area: None,
     settings: &[
         SettingSpec {
             key: "g_min",
