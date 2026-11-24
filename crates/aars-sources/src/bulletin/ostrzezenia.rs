@@ -27,11 +27,13 @@ impl BulletinPart for Ostrzezenia {
 const SOURCES_DOWN: &str = "Część źródeł ostrzeżeń jest niedostępna.";
 const HEADER: &str = "Obowiązujące ostrzeżenia.";
 
-/// „1 ostrzeżenie”, „2–4 ostrzeżenia” (poza 12–14), reszta „ostrzeżeń”.
+/// „jedno ostrzeżenie”, „2–4 ostrzeżenia” (poza 12–14), reszta „ostrzeżeń”.
 fn warnings_count(n: usize) -> String {
-    let form = if n == 1 {
-        "ostrzeżenie"
-    } else if matches!(n % 10, 2..=4) && !matches!(n % 100, 12..=14) {
+    // Gołe „1” normalizer czyta „jeden” — przy rodzaju nijakim słowo.
+    if n == 1 {
+        return "jedno ostrzeżenie".to_owned();
+    }
+    let form = if matches!(n % 10, 2..=4) && !matches!(n % 100, 12..=14) {
         "ostrzeżenia"
     } else {
         "ostrzeżeń"
@@ -279,7 +281,7 @@ mod tests {
     #[test]
     fn the_count_is_declined() {
         for (n, expected) in [
-            (1, "1 ostrzeżenie"),
+            (1, "jedno ostrzeżenie"),
             (2, "2 ostrzeżenia"),
             (4, "4 ostrzeżenia"),
             (5, "5 ostrzeżeń"),
@@ -326,7 +328,7 @@ mod tests {
             )
         };
         let t = text(run((0..3).map(long).collect()).await);
-        assert!(t.ends_with("Oraz jeszcze 1 ostrzeżenie."), "{t}");
+        assert!(t.ends_with("Oraz jeszcze jedno ostrzeżenie."), "{t}");
     }
 
     #[tokio::test]
@@ -349,7 +351,7 @@ mod tests {
         let t = text(run_with(vec![huge, alert("Alert RCB")], PARTLY_DOWN).await);
         assert!(t.chars().count() <= 1200, "{}", t.chars().count());
         assert!(
-            t.ends_with("Oraz jeszcze 1 ostrzeżenie. Część źródeł ostrzeżeń jest niedostępna."),
+            t.ends_with("Oraz jeszcze jedno ostrzeżenie. Część źródeł ostrzeżeń jest niedostępna."),
             "{t}"
         );
         assert!(t.starts_with("Obowiązujące ostrzeżenia. słowo"), "{t}");

@@ -85,6 +85,15 @@ impl Extremes {
     }
 }
 
+/// „opady do N mm”; przy zaokrągleniu do 0 (próg poniżej 0,5 mm) — „słabe opady”.
+fn rain_clause(mm: i64) -> String {
+    if mm < 1 {
+        "słabe opady".to_owned()
+    } else {
+        format!("opady do {mm} mm")
+    }
+}
+
 fn alerts_for(day: &Extremes, when: &str, (gust, frost, precip): (i64, i64, i64)) -> Vec<Alert> {
     let mut out = Vec::new();
     if let Some(g) = day.gust_max_kmh.filter(|g| *g >= gust as f64) {
@@ -106,12 +115,12 @@ fn alerts_for(day: &Extremes, when: &str, (gust, frost, precip): (i64, i64, i64)
         });
     }
     if let Some(mm) = day.precip_mm.filter(|mm| *mm >= precip as f64) {
-        let shown = round_int(mm);
+        let clause = rain_clause(round_int(mm));
         out.push(Alert {
             kind: "precip",
             fingerprint: format!("precip:{}", (mm / 10.0).floor() as i64 * 10),
-            text: format!("{when} opady do {shown} mm."),
-            summary: format!("opady do {shown} mm, {}", day_month(day.date)),
+            text: format!("{when} {clause}."),
+            summary: format!("{clause}, {}", day_month(day.date)),
         });
     }
     out
@@ -145,8 +154,8 @@ fn held_alert(kind: &'static str, fingerprint: &str, date: NaiveDate) -> Option<
             format!("spadek temperatury do {value} °C, {}", day_month(date)),
         ),
         "precip" => (
-            format!("{when} opady do {value} mm."),
-            format!("opady do {value} mm, {}", day_month(date)),
+            format!("{when} {}.", rain_clause(value)),
+            format!("{}, {}", rain_clause(value), day_month(date)),
         ),
         _ => return None,
     };

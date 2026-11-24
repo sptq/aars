@@ -159,13 +159,41 @@ mod tests {
         .await
         .unwrap();
 
-        migrate(&pool).await.expect("0007 na bazie w wersji 6");
+        sqlx::query(
+            "INSERT INTO source_items (source_id, item_key, topic, fingerprint, area, summary, cancel_text, priority, state, aired,
+                                       first_seen_at, last_seen_at)
+             VALUES ('swpc', 'F', 'F', 'F1', '', 'F1 — flara', '', 2, 'active', 1,
+                     '2026-11-22T18:00:00Z', '2026-11-22T18:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        let text: String = sqlx::query_scalar("SELECT text FROM source_items WHERE item_key = 'G'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(text, "G3 — silna burza");
+        migrate(&pool).await.expect("0007 na bazie w wersji 6");
+        // Pozycja wstawiona po migracji z własnym `text` zostaje przy nim.
+        sqlx::query(
+            "INSERT INTO source_items (source_id, item_key, topic, fingerprint, area, summary, text, cancel_text,
+                                       priority, state, aired, first_seen_at, last_seen_at)
+             VALUES ('swpc', 'K', 'K', 'K5', '', 'K5 — burza', 'Uwaga, burza K5.', '', 2, 'active', 1,
+                     '2026-11-22T18:00:00Z', '2026-11-22T18:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let texts: Vec<(String, String)> =
+            sqlx::query_as("SELECT item_key, text FROM source_items ORDER BY item_key")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            texts,
+            [
+                ("F".to_owned(), "F1 — flara".to_owned()),
+                ("G".to_owned(), "G3 — silna burza".to_owned()),
+                ("K".to_owned(), "Uwaga, burza K5.".to_owned()),
+            ]
+        );
     }
 
     #[tokio::test]

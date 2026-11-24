@@ -388,6 +388,18 @@ mod tests {
     }
 
     #[test]
+    fn a_tiny_rain_threshold_never_says_do_zero_mm() {
+        let f = edited(|v| {
+            v["hourly"]["precipitation"][20] = 0.3.into();
+        });
+        let out = alerts::to_output(&f, &ctx_at("2026-11-22T18:50:00Z", &[("precip_mm", "0")]));
+        if let Some(rain) = out.items.iter().find(|i| i.key.starts_with("precip")) {
+            assert!(!rain.text.contains("do 0 mm"), "{}", rain.text);
+            assert!(rain.text.contains("słabe opady"), "{}", rain.text);
+        }
+    }
+
+    #[test]
     fn rain_alerts_say_whole_millimetres_after_do() {
         // Ułamek po „do” normalizer czyta nieodmieniony, więc całkowite mm.
         let f = edited(|v| {
