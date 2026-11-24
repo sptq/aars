@@ -155,6 +155,7 @@ async fn demo_state(pool: SqlitePool) -> AppState {
                 fingerprint: "demo-1".to_owned(),
                 area: "1863".to_owned(),
                 summary: "Burze z gradem, 1. stopień".to_owned(),
+                text: "Uwaga, burze z gradem, pierwszy stopień.".to_owned(),
                 cancel_text: "Odwołano ostrzeżenie o burzach z gradem.".to_owned(),
                 priority: Priority::High,
                 valid_from: Some(now),

@@ -472,6 +472,7 @@ impl SourceRunner {
             fingerprint: item.fingerprint.clone(),
             area: scope.to_owned(),
             summary: item.summary.clone(),
+            text: item.text.clone(),
             cancel_text: item.cancel_text.clone(),
             priority: item.priority,
             valid_from: item.valid_from,
@@ -641,6 +642,9 @@ mod tests {
         assert_eq!(report.announced, 0);
         // Stare ogłoszenie jeszcze czekało, więc zostaje tylko zmiana (R7).
         assert_eq!(texts(&r.queue).await, vec!["zmiana a f2"]);
+        // Śledzona pozycja trzyma pełną treść, nie tekst zmiany.
+        let active = r.state.active_items("imgw-meteo").await.unwrap();
+        assert_eq!(active[0].text, "nowe a f2");
     }
 
     #[tokio::test]

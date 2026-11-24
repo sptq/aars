@@ -361,6 +361,7 @@ pub(crate) mod tests {
                     fingerprint: "f".into(),
                     area: "1061".into(),
                     summary: summary.into(),
+                    text: summary.into(),
                     cancel_text: "Odwołanie".into(),
                     priority: Priority::Normal,
                     valid_from: Some(at),

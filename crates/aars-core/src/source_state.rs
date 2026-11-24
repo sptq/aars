@@ -98,6 +98,8 @@ pub struct TrackedItem {
     pub fingerprint: String,
     pub area: String,
     pub summary: String,
+    /// Ostatnia pełna treść pozycji (ta, która poszła lub pójdzie na antenę).
+    pub text: String,
     pub cancel_text: String,
     pub priority: Priority,
     pub valid_from: Option<DateTime<Utc>>,
@@ -133,6 +135,8 @@ pub struct NewTracked {
     pub fingerprint: String,
     pub area: String,
     pub summary: String,
+    /// Ostatnia pełna treść pozycji (ta, która poszła lub pójdzie na antenę).
+    pub text: String,
     pub cancel_text: String,
     pub priority: Priority,
     pub valid_from: Option<DateTime<Utc>>,
@@ -171,6 +175,7 @@ fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> TrackedItem {
         fingerprint: row.get("fingerprint"),
         area: row.get("area"),
         summary: row.get("summary"),
+        text: row.get("text"),
         cancel_text: row.get("cancel_text"),
         priority: Priority::from_i64(row.get("priority")).unwrap_or(Priority::Normal),
         valid_from: opt("valid_from"),
@@ -186,7 +191,7 @@ fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> TrackedItem {
     }
 }
 
-const ITEM_COLUMNS: &str = "id, source_id, item_key, topic, fingerprint, area, summary, cancel_text, \
+const ITEM_COLUMNS: &str = "id, source_id, item_key, topic, fingerprint, area, summary, text, cancel_text, \
     priority, valid_from, valid_until, state, misses, aired, first_seen_at, last_seen_at, queue_item_id, \
     superseded_queue_ids, cancel_pending";
 
@@ -394,13 +399,13 @@ impl SourceStateRepo {
     pub async fn upsert_active(&self, item: &NewTracked, now: DateTime<Utc>) -> Result<i64, DbError> {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO source_items
-               (source_id, item_key, topic, fingerprint, area, summary, cancel_text, priority,
+               (source_id, item_key, topic, fingerprint, area, summary, text, cancel_text, priority,
                 valid_from, valid_until, state, misses, aired, first_seen_at, last_seen_at, queue_item_id,
                 superseded_queue_ids)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?)
              ON CONFLICT(source_id, item_key) DO UPDATE SET
                topic = excluded.topic, fingerprint = excluded.fingerprint, area = excluded.area,
-               summary = excluded.summary, cancel_text = excluded.cancel_text,
+               summary = excluded.summary, text = excluded.text, cancel_text = excluded.cancel_text,
                priority = excluded.priority, valid_from = excluded.valid_from,
                valid_until = excluded.valid_until, state = 'active', misses = 0, aired = excluded.aired,
                last_seen_at = ?, queue_item_id = excluded.queue_item_id,
@@ -413,6 +418,7 @@ impl SourceStateRepo {
         .bind(&item.fingerprint)
         .bind(&item.area)
         .bind(&item.summary)
+        .bind(&item.text)
         .bind(&item.cancel_text)
         .bind(item.priority as i64)
         .bind(item.valid_from.map(iso))
@@ -514,6 +520,7 @@ mod tests {
             fingerprint: "fp1".into(),
             area: "10 województwo łódzkie".into(),
             summary: "Burze, stopień 1".into(),
+            text: "Pełna treść burz.".into(),
             cancel_text: "Odwołanie".into(),
             priority: Priority::Normal,
             valid_from: Some(at("2026-07-23T08:00:00Z")),
@@ -524,6 +531,18 @@ mod tests {
             queue_item_id: None,
             superseded: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn the_full_text_is_stored_and_refreshed_on_change() {
+        let repo = SourceStateRepo::new(test_pool().await);
+        let now = at("2026-07-23T09:00:00Z");
+        repo.upsert_active(&tracked("a"), now).await.unwrap();
+        assert_eq!(repo.active_items("imgw-meteo").await.unwrap()[0].text, "Pełna treść burz.");
+        let changed = NewTracked { text: "Zmieniona treść.".into(), fingerprint: "fp2".into(), ..tracked("a") };
+        repo.upsert_active(&changed, now).await.unwrap();
+        let items = repo.active_items("imgw-meteo").await.unwrap();
+        assert_eq!((items.len(), items[0].text.as_str()), (1, "Zmieniona treść."));
     }
 
     #[tokio::test]

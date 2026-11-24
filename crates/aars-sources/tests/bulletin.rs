@@ -20,7 +20,7 @@ use sqlx::SqlitePool;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const EXPECTED: &str = "Biuletyn stacji SP9XYZ. 20:00. Pogoda dla okolic stacji. Obecnie bezchmurnie, temperatura 2 °C. Wiatr 3 m/s, w porywach 5 m/s. W najbliższych godzinach pochmurno, bez opadów. W nocy do 1 °C. Jutro śnieg, od 1 do 3 °C, opady do 2 mm, porywy wiatru do 13 m/s. Dane: Open-Meteo. Propagacja. Strumień słoneczny 98, umiarkowany. Indeks K 0,3, warunki spokojne. Pogoda kosmiczna bez zaburzeń. Jonosonda Warszawa: częstotliwość krytyczna 3,2 megaherca, MUF 10,6 megaherca. Łączności bliskie do pasma 160 metrów, dalekie do pasma 40 metrów. Dane: NOAA, GIRO przez KC2G. Brak obowiązujących ostrzeżeń. Koniec biuletynu.";
+const EXPECTED: &str = "Biuletyn stacji SP9XYZ. 20:00. Pogoda dla okolic stacji. Obecnie bezchmurnie, temperatura 2 °C. Wiatr 3 m/s, w porywach 5 m/s. W najbliższych godzinach pochmurno, bez opadów. W nocy do 1 °C. Jutro śnieg, od 1 do 3 °C, opady do 2 mm, porywy wiatru do 13 m/s. Dane: Open-Meteo. Propagacja. Strumień słoneczny 98, umiarkowany. Indeks K 0,3, warunki spokojne. Pogoda kosmiczna bez zaburzeń. Jonosonda Warszawa: częstotliwość krytyczna 3,2 megaherca, MUF 10,6 megaherca. Łączności bliskie do pasma 160 metrów, dalekie do pasma 40 metrów. Dane: NOAA, GIRO przez KC2G. Brak obowiązujących ostrzeżeń dla okolic stacji. Koniec biuletynu.";
 
 fn at(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
@@ -113,7 +113,7 @@ async fn the_bulletin_reads_the_fixtures_into_one_text() {
         c.text.as_deref(),
         Some(
             EXPECTED
-                .replace(" Brak obowiązujących ostrzeżeń.", "")
+                .replace(" Brak obowiązujących ostrzeżeń dla okolic stacji.", "")
                 .as_str()
         ),
         "{:?}",
@@ -126,7 +126,7 @@ async fn the_bulletin_reads_the_fixtures_into_one_text() {
         c.parts
     );
 
-    // Włączone, świeże źródło bez ostrzeżeń: „Brak obowiązujących ostrzeżeń.”
+    // Włączone, świeże źródło bez ostrzeżeń: „Brak obowiązujących ostrzeżeń dla okolic stacji.”
     let state = SourceStateRepo::new(pool.clone());
     state.set_enabled("swpc", true).await.unwrap();
     state
@@ -147,6 +147,7 @@ async fn the_bulletin_reads_the_fixtures_into_one_text() {
                 fingerprint: "G3".into(),
                 area: String::new(),
                 summary: "G3 — silna burza geomagnetyczna".into(),
+                text: "Uwaga, burza geomagnetyczna G3, silna.".into(),
                 cancel_text: String::new(),
                 priority: Priority::High,
                 valid_from: None,
@@ -163,10 +164,10 @@ async fn the_bulletin_reads_the_fixtures_into_one_text() {
         .unwrap();
     let text = bulletin.compose(now).await.unwrap().text.unwrap();
     assert!(
-        text.contains("Obowiązujące ostrzeżenia: G3 — silna burza geomagnetyczna."),
+        text.contains("Obowiązujące ostrzeżenia. Uwaga, burza geomagnetyczna G3, silna."),
         "{text}"
     );
-    assert!(!text.contains("Brak obowiązujących ostrzeżeń."), "{text}");
+    assert!(!text.contains("Brak obowiązujących ostrzeżeń"), "{text}");
     assert_speakable(&text);
 
     // Runner o porze 19:00 lokalnie wstawia dokładnie jeden element.
