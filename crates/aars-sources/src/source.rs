@@ -22,12 +22,12 @@ pub trait DataSource: Send + Sync {
     fn needs(&self) -> Needs {
         Needs::Area
     }
-    /// Zakres R9 (A2): pozycje śledzone przy innym zakresie znikają po cichu.
     /// Granulacja obszaru liczonego z pozycji, gdy ręczny jest pusty.
     fn auto_area(&self) -> Option<aars_core::area_auto::AreaGranularity> {
         None
     }
-        fn scope(&self, ctx: &SourceCtx) -> String {
+    /// Zakres R9 (A2): pozycje śledzone przy innym zakresie znikają po cichu.
+    fn scope(&self, ctx: &SourceCtx) -> String {
         ctx.area_text.clone()
     }
     fn fetch<'a>(&'a self, ctx: &'a SourceCtx) -> FetchFuture<'a>;

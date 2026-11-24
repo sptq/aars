@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use aars_core::error::DbError;
 use aars_core::geo::PositionRepo;
 use aars_core::module::{
-    BULLETIN, BULLETIN_PARTS, ModuleDescriptor, ModuleError, ModuleKind, ModuleRepo, Needs, SettingKind, Toggle,
+    BULLETIN, BULLETIN_PARTS, ModuleDescriptor, ModuleError, ModuleKind, ModuleRepo, SettingKind, Toggle,
 };
 use aars_core::priority::Priority;
 use aars_core::queue::EnqueueRequest;
@@ -27,7 +27,7 @@ use crate::audit;
 use crate::auth::{AuthRejection, CurrentUser, require_csrf, require_role};
 use crate::chrome::Chrome;
 use crate::render::{db_error, page};
-use crate::sources_page::health;
+use crate::sources_page::{health, health_needs};
 use crate::state::{AppState, BulletinPreviewView};
 
 /// Pole formularza ustawień wygenerowane z `SettingSpec`.
@@ -148,38 +148,25 @@ async fn module_view(
         Toggle::AlwaysOn(reason) => ("on", format!("zawsze włączony — {reason}")),
         Toggle::Planned(when) => ("warn", format!("planowany — {when}")),
     };
-    let health = if m.kind == ModuleKind::Source {
+    let mut health_badge = None;
+    let mut auto_area_note = None;
+    if m.kind == ModuleKind::Source {
+        let position = PositionRepo::new(state.pool.clone()).load().await.ok().flatten();
         let sources = SourceStateRepo::new(state.pool.clone());
         let status = sources
             .statuses()
             .await?
             .into_iter()
             .find(|s| s.source_id == m.id);
-        match (status, sources.config(m.id).await?) {
-            (Some(status), Some(cfg)) => {
-                let has_position = matches!(
-                    PositionRepo::new(state.pool.clone()).load().await,
-                    Ok(Some(_))
-                );
-                let needs = if m.needs == Needs::Area && m.auto_area.is_some() && cfg.area.is_empty() {
-                    Needs::Position
-                } else {
-                    m.needs
-                };
-                Some(health(&status, &cfg, needs, has_position, Utc::now()))
-            }
-            _ => None,
+        if let (Some(status), Some(cfg)) = (status, sources.config(m.id).await?) {
+            let needs = health_needs(m.needs, m.auto_area.is_some(), cfg.area.is_empty());
+            health_badge = Some(health(&status, &cfg, needs, position.is_some(), Utc::now()));
+            auto_area_note = m.auto_area.map(|g| {
+                aars_core::area_auto::auto_area_note(position.as_ref(), g, !cfg.area.is_empty())
+            });
         }
-    } else {
-        None
-    };
-    let auto_area_note = match m.auto_area {
-        Some(granularity) => {
-            let position = PositionRepo::new(state.pool.clone()).load().await.ok().flatten();
-            Some(aars_core::area_auto::auto_area_note(position.as_ref(), granularity))
-        }
-        None => None,
-    };
+    }
+    let health = health_badge;
     let values = repo.settings(m).await?;
     let fields = m
         .settings
@@ -1069,6 +1056,19 @@ mod tests {
         assert!(html.contains("Nadpisz obszar (zostaw puste, żeby liczyć z pozycji)"), "{html}");
         let (_, html) = get(&app, &cookie, "/sources").await;
         assert!(html.contains("Automatycznie: powiat opoczyński (1007)"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn a_manual_area_is_not_presented_as_automatic() {
+        let st = auto_area_state(Some(("51.38", "20.28"))).await;
+        SourceStateRepo::new(st.pool.clone())
+            .save_config("imgw-meteo", "1061 Łódź", 300)
+            .await
+            .unwrap();
+        let (app, cookie, _, _) = app_as(Role::Admin, st).await;
+        let (_, html) = get(&app, &cookie, "/modules").await;
+        assert!(html.contains("Obszar ręczny. Z pozycji byłby: powiat opoczyński (1007)."), "{html}");
+        assert!(!html.contains("Automatycznie:"), "{html}");
     }
 
     #[tokio::test]

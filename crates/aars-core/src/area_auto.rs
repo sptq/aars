@@ -128,6 +128,15 @@ pub fn county_at(lat: f64, lon: f64) -> Option<County> {
         .map(|s| s.county.clone())
 }
 
+/// Nazwa do odczytu: powiat grodzki („powiat Rzeszów”) to samo miasto,
+/// powiat ziemski („powiat opoczyński”) zostaje z przedrostkiem.
+fn spoken_county(name: &str) -> String {
+    match name.strip_prefix("powiat ") {
+        Some(rest) if rest.chars().next().is_some_and(char::is_uppercase) => rest.to_owned(),
+        _ => name.to_owned(),
+    }
+}
+
 /// Obszar z pozycji stacji; `None` bez pozycji albo poza Polską.
 pub fn auto_area(
     position: Option<&StationPosition>,
@@ -137,7 +146,7 @@ pub fn auto_area(
     match granularity {
         AreaGranularity::County => Some(AreaEntry {
             code: county.teryt,
-            label: county.name,
+            label: spoken_county(&county.name),
         }),
         AreaGranularity::Voivodeship => {
             let code = county.teryt.get(..2)?;
@@ -151,7 +160,21 @@ pub fn auto_area(
 }
 
 /// Zdanie dla panelu o obszarze liczonym z pozycji.
-pub fn auto_area_note(position: Option<&StationPosition>, granularity: AreaGranularity) -> String {
+/// `manual`: ręczny obszar jest wpisany, więc automatyczny tylko podpowiada.
+pub fn auto_area_note(
+    position: Option<&StationPosition>,
+    granularity: AreaGranularity,
+    manual: bool,
+) -> String {
+    if manual {
+        return match auto_area(position, granularity) {
+            Some(entry) => format!(
+                "Obszar ręczny. Z pozycji byłby: {} ({}).",
+                entry.label, entry.code
+            ),
+            None => "Obszar ręczny.".to_owned(),
+        };
+    }
     if position.is_none() {
         return "Brak pozycji stacji — ustaw ją w Ustawieniach".to_owned();
     }
@@ -232,12 +255,44 @@ mod tests {
     }
 
     #[test]
+    fn city_counties_are_read_as_the_city_name() {
+        let label = |lat, lon| {
+            auto_area(Some(&pos(lat, lon)), AreaGranularity::County)
+                .unwrap()
+                .label
+        };
+        assert_eq!(label(50.04, 21.99), "Rzeszów");
+        assert_eq!(label(52.23, 21.01), "Warszawa");
+        assert_eq!(label(51.38, 20.28), "powiat opoczyński");
+    }
+
+    #[test]
+    fn the_embedded_geojson_parses_completely() {
+        assert!(parse_shapes(POWIATY).len() > 370);
+        assert!(shapes().len() > 370);
+    }
+
+    #[test]
+    fn a_manual_area_is_not_shown_as_active() {
+        let note = auto_area_note(Some(&pos(51.38, 20.28)), AreaGranularity::County, true);
+        assert_eq!(
+            note,
+            "Obszar ręczny. Z pozycji byłby: powiat opoczyński (1007)."
+        );
+    }
+
+    #[test]
     fn notes_for_the_panel() {
         assert_eq!(
-            auto_area_note(Some(&pos(51.38, 20.28)), AreaGranularity::County),
+            auto_area_note(Some(&pos(51.38, 20.28)), AreaGranularity::County, false),
             "Automatycznie: powiat opoczyński (1007)"
         );
-        assert!(auto_area_note(None, AreaGranularity::County).starts_with("Brak pozycji stacji"));
-        assert!(auto_area_note(Some(&pos(52.52, 13.40)), AreaGranularity::County).contains("poza"));
+        assert!(
+            auto_area_note(None, AreaGranularity::County, false).starts_with("Brak pozycji stacji")
+        );
+        assert!(
+            auto_area_note(Some(&pos(52.52, 13.40)), AreaGranularity::County, false)
+                .contains("poza")
+        );
     }
 }

@@ -22,6 +22,15 @@ use crate::chrome::{Chrome, both_times_now, plural, priority_label, source_label
 use crate::render::page;
 use crate::state::AppState;
 
+/// Pusty ręczny obszar przy źródle z obszarem z pozycji: liczy się pozycja.
+pub(crate) fn health_needs(needs: Needs, auto: bool, area_empty: bool) -> Needs {
+    if needs == Needs::Area && auto && area_empty {
+        Needs::Position
+    } else {
+        needs
+    }
+}
+
 /// Plakietka zdrowia źródła: (klasa CSS, tekst). Przestarzałe wygrywa z „działa”.
 pub fn health(
     status: &SourceStatus,
@@ -79,7 +88,6 @@ fn time_or_never(at: Option<DateTime<Utc>>) -> String {
 pub(crate) async fn load_views(state: &AppState) -> Result<Vec<SourceView>, DbError> {
     let repo = SourceStateRepo::new(state.pool.clone());
     let now = Utc::now();
-    let has_position = matches!(PositionRepo::new(state.pool.clone()).load().await, Ok(Some(_)));
     let position = PositionRepo::new(state.pool.clone()).load().await.ok().flatten();
     let mut views = Vec::new();
     for status in repo.statuses().await? {
@@ -92,12 +100,13 @@ pub(crate) async fn load_views(state: &AppState) -> Result<Vec<SourceView>, DbEr
             .map_or(Needs::Area, |m| m.needs);
         let auto = state.modules.get(&status.source_id).and_then(|m| m.auto_area);
         // Pusty ręczny obszar przy obszarze z pozycji: liczy się pozycja.
-        let health_needs = if needs == Needs::Area && auto.is_some() && cfg.area.is_empty() {
-            Needs::Position
-        } else {
-            needs
-        };
-        let (css, health_text) = health(&status, &cfg, health_needs, has_position, now);
+        let (css, health_text) = health(
+            &status,
+            &cfg,
+            health_needs(needs, auto.is_some(), cfg.area.is_empty()),
+            position.is_some(),
+            now,
+        );
         let warnings = repo
             .active_items(&status.source_id)
             .await?
@@ -123,11 +132,9 @@ pub(crate) async fn load_views(state: &AppState) -> Result<Vec<SourceView>, DbEr
             last_error: status.last_error.clone(),
             shows_area: needs == Needs::Area,
             area_text: cfg.area_text,
-            auto_area_note: state
-                .modules
-                .get(&status.source_id)
-                .and_then(|m| m.auto_area)
-                .map(|g| aars_core::area_auto::auto_area_note(position.as_ref(), g)),
+            auto_area_note: auto.map(|g| {
+                aars_core::area_auto::auto_area_note(position.as_ref(), g, !cfg.area.is_empty())
+            }),
             interval_s: cfg.interval_s,
             warnings,
         });

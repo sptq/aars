@@ -72,3 +72,39 @@ async fn without_a_position_the_cycle_is_skipped() {
     assert!(!report.fetched);
     assert!(queue.pending(10).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_manual_area_wins_over_the_automatic_one() {
+    // Pozycja w Opocznie (1007), ale ręcznie Łódź (1061): ogłoszenie dla Łodzi.
+    let (_server, runner, queue, state) = station(Some(("51.38", "20.28"))).await;
+    state
+        .save_config("imgw-meteo", "1061 Łódź", 300)
+        .await
+        .unwrap();
+    let report = runner.cycle(now()).await;
+    assert_eq!(report.announced, 1, "{report:?}");
+    let pending = queue.pending(10).await.unwrap();
+    assert!(
+        pending[0].rendered_text.contains("Obszar: Łódź"),
+        "{}",
+        pending[0].rendered_text
+    );
+    assert!(
+        !pending[0].rendered_text.contains("opoczyński"),
+        "{}",
+        pending[0].rendered_text
+    );
+}
+
+#[tokio::test]
+async fn a_position_outside_poland_skips_the_cycle() {
+    let (_server, runner, queue, _state) = station(Some(("52.52", "13.40"))).await;
+    let report = runner.cycle(now()).await;
+    assert_eq!(
+        report.skipped,
+        Some("pozycja poza obszarem Polski"),
+        "{report:?}"
+    );
+    assert!(!report.fetched);
+    assert!(queue.pending(10).await.unwrap().is_empty());
+}

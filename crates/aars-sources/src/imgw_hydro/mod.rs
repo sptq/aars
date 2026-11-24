@@ -33,7 +33,7 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
         SettingSpec {
             key: "area",
             label: "Obszar",
-            help: "Kody jak w ostrzeżeniach meteo (np. 18 albo 1863 Rzeszów). Ostrzeżenia hydrologiczne IMGW dotyczą województw, więc powiat oznacza całe swoje województwo. Puste pole — źródło nic nie ogłasza.",
+            help: "Kody jak w ostrzeżeniach meteo (np. 18 albo 1863 Rzeszów). Ostrzeżenia hydrologiczne IMGW dotyczą województw, więc powiat oznacza całe swoje województwo. Puste pole to obszar liczony z pozycji stacji (województwo); wpis go nadpisuje.",
             kind: SettingKind::Area,
             default: "",
         },

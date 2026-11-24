@@ -33,7 +33,7 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
         SettingSpec {
             key: "area",
             label: "Obszar",
-            help: "Jedna linia (albo wpis po średniku) na obszar: dwucyfrowy kod województwa (np. 10) albo czterocyfrowy kod powiatu z nazwą, którą stacja ma wypowiadać (np. 1061 Łódź). Najwyżej 40 wpisów; puste pole to brak obszaru — źródło nic nie ogłasza.",
+            help: "Jedna linia (albo wpis po średniku) na obszar: dwucyfrowy kod województwa (np. 10) albo czterocyfrowy kod powiatu z nazwą, którą stacja ma wypowiadać (np. 1061 Łódź). Najwyżej 40 wpisów; puste pole to obszar liczony z pozycji stacji (powiat); wpis go nadpisuje.",
             kind: SettingKind::Area,
             default: "",
         },
