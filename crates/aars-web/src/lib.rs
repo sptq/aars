@@ -1,3 +1,7 @@
+// Handlery zwracają gotową odpowiedź axum jako `Err` (idiom axum);
+// clippy 1.100 uznaje `Response` (128 B) za zbyt duży wariant błędu.
+#![allow(clippy::result_large_err)]
+
 pub mod account;
 pub mod assets;
 pub mod auth;

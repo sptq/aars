@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 aars-core = { path = "../aars-core" }
-anyhow.workspace = true
 askama.workspace = true
 axum.workspace = true
 chrono.workspace = true
@@ -28,6 +27,7 @@ name = "panel_demo"
 test = true
 
 [dev-dependencies]
+anyhow.workspace = true
 aars-core = { path = "../aars-core", features = ["testing"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 tower.workspace = true

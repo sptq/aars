@@ -87,10 +87,14 @@ async fn a_gauge_hovering_at_the_alarm_level_is_announced_once_and_cancelled_aft
     let first = runner.cycle(t).await;
     assert_eq!(first.announced, 1, "{first:?}");
     // Ogłoszenie poszło na antenę: odwołanie będzie nadane.
+    // `pending`, nie `claim_next`: ten liczy ważność wpisu od zegara
+    // ściennego, a test działa na stałej dacie fiksu.
     let aired = queue
-        .claim_next()
+        .pending(10)
         .await
         .unwrap()
+        .into_iter()
+        .next()
         .expect("ogłoszenie w kolejce");
     assert!(
         aired

@@ -383,6 +383,8 @@ impl Config {
 }
 
 #[cfg(test)]
+// figment::Jail wymaga zamknięć zwracających duży figment::Error.
+#[allow(clippy::result_large_err)]
 mod tests {
     #[test]
     fn ptt_backends_have_human_labels() {

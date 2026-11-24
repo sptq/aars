@@ -203,7 +203,7 @@ mod tests {
         let cache = AudioCache::new(aars_core::db::test_pool().await, dir.clone(), 1 << 20);
         let p = PiperPreview::new(cache, Arc::new(FakeSynth::new(22_050)), -6.0);
         let bytes = p.render_wav("Uwaga").await.unwrap();
-        let peak = bytes[44..].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]).unsigned_abs()).max().unwrap();
+        let peak = bytes[44..].as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c).unsigned_abs()).max().unwrap();
         let want = 32_767.0 * 10f32.powf(-6.0 / 20.0);
         assert!((f32::from(peak) - want).abs() <= want * 0.01, "{peak}");
         std::fs::remove_dir_all(dir).ok();
