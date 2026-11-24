@@ -35,15 +35,6 @@ const NIGHT_FROM_HOUR: u32 = 22;
 /// …do tej godziny następnego dnia (włącznie).
 const NIGHT_TO_HOUR: u32 = 6;
 
-/// Opady w mm: poniżej 10 z przecinkiem dziesiętnym, od 10 całkowite.
-pub fn precip_text(mm: f64) -> String {
-    if mm < 10.0 {
-        decimal_comma(mm)
-    } else {
-        round_int(mm).to_string()
-    }
-}
-
 /// Opad z prognozy: „słabe opady” albo „opady do X mm” z liczbą całkowitą.
 /// Ułamek po „do” normalizer czyta nieodmieniony („do pięć przecinek dziewięć
 /// milimetra”), całkowita idzie w dopełniaczu („do sześciu milimetrów”), a

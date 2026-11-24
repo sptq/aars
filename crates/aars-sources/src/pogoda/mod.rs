@@ -385,10 +385,22 @@ mod tests {
         assert_eq!(rain.fingerprint, "precip:30");
         assert!(rain.text.contains("dziś opady do 35 mm."), "{}", rain.text);
         assert_eq!(rain.summary, "opady do 35 mm, 22 listopada");
+    }
 
-        assert_eq!(speech::precip_text(7.26), "7,3");
-        assert_eq!(speech::precip_text(35.2), "35");
-        assert_eq!(speech::precip_text(2.0), "2");
+    #[test]
+    fn rain_alerts_say_whole_millimetres_after_do() {
+        // Ułamek po „do” normalizer czyta nieodmieniony, więc całkowite mm.
+        let f = edited(|v| {
+            v["hourly"]["precipitation"][20] = 7.26.into();
+        });
+        let ctx = ctx_at("2026-11-22T18:50:00Z", &[("precip_mm", "5")]);
+        let out = alerts::to_output(&f, &ctx);
+        let rain = item(&out, "precip:2026-11-22");
+        assert_eq!(rain.fingerprint, "precip:0");
+        assert_eq!(rain.text, "Prognoza pogody: dziś opady do 7 mm. Dane: Open-Meteo.");
+        assert_eq!(rain.summary, "opady do 7 mm, 22 listopada");
+        let spoken = aars_audio::text::normalize(&rain.text);
+        assert!(spoken.contains("do siedmiu milimetrów"), "{spoken}");
     }
 
     #[test]

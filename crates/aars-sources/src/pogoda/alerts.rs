@@ -5,7 +5,6 @@
 use chrono::{DateTime, Datelike, Duration, DurationRound, NaiveDate, Utc};
 use chrono_tz::Europe::Warsaw;
 
-use super::speech::precip_text;
 use super::thresholds;
 use crate::forecast::{Day, Forecast};
 use crate::imgw_meteo::speech::MONTHS_GENITIVE;
@@ -107,7 +106,7 @@ fn alerts_for(day: &Extremes, when: &str, (gust, frost, precip): (i64, i64, i64)
         });
     }
     if let Some(mm) = day.precip_mm.filter(|mm| *mm >= precip as f64) {
-        let shown = precip_text(mm);
+        let shown = round_int(mm);
         out.push(Alert {
             kind: "precip",
             fingerprint: format!("precip:{}", (mm / 10.0).floor() as i64 * 10),
