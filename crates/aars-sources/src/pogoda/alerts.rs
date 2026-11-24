@@ -31,7 +31,14 @@ fn day_month(date: NaiveDate) -> String {
     format!("{} {month}", date.day())
 }
 
-/// Skrajne wartości okresu, z którego liczymy progi; `None` = luka.
+/// m/s z prognozy → km/h progów, zaokrąglone do setnych, żeby przeliczenie
+/// tam i z powrotem (80 km/h → m/s → km/h) nie spadło pod kubełek odcisku.
+fn kmh(ms: f64) -> f64 {
+    (ms * 360.0).round() / 100.0
+}
+
+/// Skrajne wartości okresu, z którego liczymy progi (porywy w km/h, jak
+/// progi w ustawieniach); `None` = luka.
 struct Extremes {
     date: NaiveDate,
     gust_max_kmh: Option<f64>,
@@ -43,7 +50,7 @@ impl Extremes {
     fn of_day(day: &Day) -> Self {
         Self {
             date: day.date,
-            gust_max_kmh: day.gust_max_kmh,
+            gust_max_kmh: day.gust_max_ms.map(kmh),
             t_min: Some(day.t_min),
             precip_mm: day.precip_mm,
         }
@@ -68,7 +75,7 @@ impl Extremes {
         let fold = |values: Vec<f64>, f: fn(f64, f64) -> f64| values.into_iter().reduce(f);
         Some(Self {
             date,
-            gust_max_kmh: fold(hours.iter().filter_map(|h| h.gust_kmh).collect(), f64::max),
+            gust_max_kmh: fold(hours.iter().filter_map(|h| h.gust_ms).collect(), f64::max).map(kmh),
             t_min: fold(hours.iter().filter_map(|h| h.temp_c).collect(), f64::min),
             precip_mm: fold(
                 hours.iter().filter_map(|h| h.precip_mm).collect(),

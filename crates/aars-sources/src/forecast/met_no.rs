@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use chrono_tz::Europe::Warsaw;
 use serde_json::Value;
 
@@ -21,6 +21,10 @@ struct Entry {
     time: DateTime<Utc>,
     temp: f64,
     wind_ms: Option<f64>,
+    wind_dir: Option<f64>,
+    pressure: Option<f64>,
+    humidity: Option<f64>,
+    cloud: Option<f64>,
     /// `next_1_hours` (albo `next_6_hours`): opad.
     precip: Option<f64>,
     /// Symbol z `next_1_hours` (albo `next_6_hours`).
@@ -36,7 +40,7 @@ fn entry(v: &Value) -> Option<Entry> {
     let data = v.get("data")?;
     let instant = data.get("instant")?.get("details")?;
     let temp = instant.get("air_temperature")?.as_f64()?;
-    let wind_ms = instant.get("wind_speed").and_then(Value::as_f64);
+    let num = |key: &str| instant.get(key).and_then(Value::as_f64);
     let next = block(data, "next_1_hours").or_else(|| block(data, "next_6_hours"));
     let precip = next
         .and_then(|b| b.get("details"))
@@ -50,7 +54,11 @@ fn entry(v: &Value) -> Option<Entry> {
     Some(Entry {
         time,
         temp,
-        wind_ms,
+        wind_ms: num("wind_speed"),
+        wind_dir: num("wind_from_direction"),
+        pressure: num("air_pressure_at_sea_level"),
+        humidity: num("relative_humidity"),
+        cloud: num("cloud_area_fraction"),
         precip,
         code,
     })
@@ -112,9 +120,12 @@ pub fn parse(body: &[u8], now: DateTime<Utc>) -> Result<Forecast, SourceError> {
             t_min: d.t_min,
             t_max: d.t_max,
             precip_mm: d.precip,
-            gust_max_kmh: None,
-            wind_max_kmh: d.wind_ms.map(|w| w * 3.6),
+            gust_max_ms: None,
+            wind_max_ms: d.wind_ms,
+            wind_dir_deg: None,
             code: d.code,
+            sunrise: None,
+            sunset: None,
         })
         .collect();
 
@@ -123,11 +134,26 @@ pub fn parse(body: &[u8], now: DateTime<Utc>) -> Result<Forecast, SourceError> {
         .rev()
         .find(|e| e.time <= now)
         .or_else(|| entries.first())
-        .map(|e| Now {
-            temp_c: e.temp,
-            code: e.code,
-            wind_kmh: e.wind_ms.map(|w| w * 3.6),
-            gust_kmh: None,
+        .map(|e| {
+            let three_hours_ago = entries
+                .iter()
+                .find(|p| p.time == e.time - Duration::hours(3))
+                .and_then(|p| p.pressure);
+            Now {
+                temp_c: e.temp,
+                apparent_c: None,
+                humidity_pct: e.humidity,
+                pressure_hpa: e.pressure,
+                pressure_trend_hpa_3h: e.pressure.zip(three_hours_ago).map(|(a, b)| a - b),
+                wind_ms: e.wind_ms,
+                gust_ms: None,
+                wind_dir_deg: e.wind_dir,
+                cloud_pct: e.cloud,
+                visibility_m: None,
+                // Opad z `next_1_hours` to prognoza, nie opad bieżący.
+                precip_mm: None,
+                code: e.code,
+            }
         });
 
     Ok(Forecast {
@@ -159,10 +185,26 @@ mod tests {
             (-0.7, Some(Condition::MaleZachmurzenie))
         );
         let d = f.day(date(2026, 11, 23)).unwrap();
-        assert_eq!((d.t_min, d.t_max, d.gust_max_kmh), (-1.9, 1.5, None));
+        assert_eq!((d.t_min, d.t_max, d.gust_max_ms), (-1.9, 1.5, None));
         assert!((d.precip_mm.unwrap() - 4.6).abs() < 1e-9);
-        assert!((d.wind_max_kmh.unwrap() - 25.56).abs() < 1e-6);
+        assert_eq!(d.wind_max_ms, Some(7.1));
+        assert_eq!((d.sunrise, d.sunset, d.wind_dir_deg), (None, None, None));
         assert_eq!(d.code, Some(Condition::Snieg));
+    }
+
+    #[test]
+    fn current_has_pressure_humidity_direction_and_cloud() {
+        let now = parse(MET, at("2026-11-22T19:00:00Z")).unwrap().current.unwrap();
+        assert_eq!(
+            (now.pressure_hpa, now.humidity_pct, now.wind_dir_deg, now.cloud_pct),
+            (Some(1009.7), Some(93.9), Some(242.9), Some(77.3))
+        );
+        assert_eq!((now.wind_ms, now.gust_ms, now.apparent_c), (Some(1.7), None, None));
+        // Pierwszy wpis to 18:00: nie ma z czym policzyć tendencji.
+        assert_eq!(now.pressure_trend_hpa_3h, None);
+        let later = parse(MET, at("2026-11-22T21:30:00Z")).unwrap().current.unwrap();
+        let trend = later.pressure_trend_hpa_3h.unwrap();
+        assert!((trend - (later.pressure_hpa.unwrap() - 1009.7)).abs() < 1e-9);
     }
 
     #[test]

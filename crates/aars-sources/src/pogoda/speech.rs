@@ -20,11 +20,11 @@ pub fn precip_text(mm: f64) -> String {
 
 /// Człon o wietrze: porywy, a bez nich średni wiatr; brak danych → `None`.
 fn wind_clause(day: &Day) -> Option<String> {
-    if let Some(g) = day.gust_max_kmh {
-        Some(format!("porywy wiatru do {} km/h", round_int(g)))
+    if let Some(g) = day.gust_max_ms {
+        Some(format!("porywy wiatru do {} km/h", round_int(g * 3.6)))
     } else {
-        day.wind_max_kmh
-            .map(|w| format!("wiatr do {} km/h", round_int(w)))
+        day.wind_max_ms
+            .map(|w| format!("wiatr do {} km/h", round_int(w * 3.6)))
     }
 }
 

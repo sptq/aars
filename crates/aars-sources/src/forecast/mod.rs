@@ -52,6 +52,11 @@ impl Condition {
         }
     }
 
+    /// Opad (mżawka, deszcz, śnieg, burza), nie samo zachmurzenie czy mgła.
+    pub fn is_precipitation(self) -> bool {
+        self >= Condition::Mzawka
+    }
+
     /// Kod WMO (Open-Meteo); nieznany kod → `None`.
     pub fn from_wmo(code: i64) -> Option<Condition> {
         Some(match code {
@@ -92,33 +97,53 @@ impl Condition {
     }
 }
 
+/// Warunki bieżące. Prędkości wiatru w m/s, kierunek skąd wieje w stopniach,
+/// ciśnienie zredukowane do poziomu morza; każde pole poza temperaturą może być luką.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Now {
     pub temp_c: f64,
+    pub apparent_c: Option<f64>,
+    pub humidity_pct: Option<f64>,
+    pub pressure_hpa: Option<f64>,
+    /// Ciśnienie teraz minus 3 h temu (z prognozy godzinowej).
+    pub pressure_trend_hpa_3h: Option<f64>,
+    pub wind_ms: Option<f64>,
+    pub gust_ms: Option<f64>,
+    pub wind_dir_deg: Option<f64>,
+    pub cloud_pct: Option<f64>,
+    pub visibility_m: Option<f64>,
+    pub precip_mm: Option<f64>,
     pub code: Option<Condition>,
-    pub wind_kmh: Option<f64>,
-    pub gust_kmh: Option<f64>,
 }
 
+/// Jeden dzień prognozy (data lokalna); wiatr w m/s.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Day {
     pub date: NaiveDate,
     pub t_min: f64,
     pub t_max: f64,
     pub precip_mm: Option<f64>,
-    pub gust_max_kmh: Option<f64>,
-    pub wind_max_kmh: Option<f64>,
+    pub gust_max_ms: Option<f64>,
+    pub wind_max_ms: Option<f64>,
+    /// Dominujący kierunek wiatru (skąd wieje), stopnie.
+    pub wind_dir_deg: Option<f64>,
     pub code: Option<Condition>,
+    /// Wschód i zachód słońca w czasie lokalnym stacji.
+    pub sunrise: Option<NaiveDateTime>,
+    pub sunset: Option<NaiveDateTime>,
 }
 
 /// Jedna godzina prognozy (tylko Open-Meteo); `local` to czas lokalny
-/// stacji, jak w odpowiedzi, a każda wartość może być luką.
+/// stacji, jak w odpowiedzi, a każda wartość może być luką. Wiatr w m/s.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hour {
     pub local: NaiveDateTime,
     pub temp_c: Option<f64>,
     pub precip_mm: Option<f64>,
-    pub gust_kmh: Option<f64>,
+    pub wind_ms: Option<f64>,
+    pub gust_ms: Option<f64>,
+    pub pressure_hpa: Option<f64>,
+    pub code: Option<Condition>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
