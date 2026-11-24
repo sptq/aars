@@ -24,7 +24,7 @@
 ## Review Focus
 
 1. Cykl co 10 min przy restarcie stacji i zmianie czasu (DST) nie nadaje podwójnie ani nie gubi cyklu → idempotencja przez `bulletin_fires`.
-2. Powtórka RCB co 1 min przy niedziałającym nadawaniu (wyłączone/watchdog) nie zapycha kolejki → najwyżej jeden oczekujący element na pozycję.
+2. Seria RCB (3× co minutę) przy wyłączonym nadawaniu nie zalega po odwołaniu alertu → reszta serii anulowana.
 3. Pozycja na granicy powiatów / poza Polską / brak pozycji → poprawny powiat albo czytelne „brak”.
 4. Prognoza z brakującymi polami (MET Norway fallback, luki w godzinach) → zdania bez luk, nigdy „None”/„NaN”.
 5. Panel: zapis z błędem walidacji przez htmx pokazuje błąd przy polu bez utraty wpisanych wartości.
@@ -60,7 +60,7 @@
 
 **Files:** Modify `crates/aars-sources/src/pogoda/speech.rs`, `crates/aars-sources/src/speech.rs` (wspólne: kierunek wiatru, opis zachmurzenia, tendencja), `pogoda/mod.rs` (`max_chars` → 900).
 
-**Interfaces — Produces:** `speech::wind_direction(deg: f64) -> &'static str` (8 kierunków: „północny”, „północno-wschodni”, „wschodni”, „południowo-wschodni”, „południowy”, „południowo-zachodni”, „zachodni”, „północno-zachodni”; sektor 45° wyśrodkowany); `pogoda::speech::bulletin(forecast, now) -> Option<String>`.
+**Interfaces — Produces:** `speech::wind_direction(deg: f64) -> &'static str` (8 kierunków: „północny”, „północno-wschodni”, „wschodni”, „południowo-wschodni”, „południowy”, „południowo-zachodni”, „zachodni”, „północno-zachodni”; sektor 45° wyśrodkowany); `pogoda::speech::now_text(forecast, now) -> Option<String>` („Obecnie… Wilgotność… Ciśnienie… Wiatr… Widzialność…”), `forecast_text(forecast, now) -> Option<String>` („W najbliższych godzinach… Dziś/W nocy/Jutro…”), `sun_text(forecast, now) -> Option<String>` („Wschód słońca…, zachód…”); `bulletin(forecast, now)` = „Pogoda dla okolic stacji. ” + trzy powyższe + atrybucja (zostaje do czasu Task 6, który rozdziela części).
 
 Treść (przykład, każdy człon tylko gdy dane są):
 „Pogoda dla okolic stacji. Obecnie pochmurno, temperatura 8 °C, odczuwalna 5 °C. Wilgotność 82 %. Ciśnienie 1020 hPa, rośnie. Wiatr południowo-zachodni 4 m/s, w porywach 9 m/s. Widzialność 3 km. W najbliższych godzinach przelotny deszcz, do 2 mm. Dziś do 10 °C. W nocy do 2 °C. Jutro małe zachmurzenie, od 3 do 11 °C, bez opadów, wiatr zachodni do 6 m/s. Wschód słońca 7:15, zachód 15:48. Dane: Open-Meteo.”
@@ -79,29 +79,44 @@ Treść (przykład, każdy człon tylko gdy dane są):
 - [ ] Testy: migracja na istniejącej bazie (pozycje bez `text` → summary), pełna treść w biuletynie, kolejność, odmiana licznika, obcinanie.
 - [ ] Commit: `biuletyn: obowiązujące ostrzeżenia pełną treścią`.
 
-### Task 5: Komunikat cykliczny
+### Task 5: Pauzy w syntezie
 
-**Files:** Modify `aars-core/src/module.rs` (ustawienia biuletynu), `aars-sources/src/bulletin/{runner.rs,mod.rs}`, `aars-core/src/bulletin.rs` jeśli potrzeba, `crates/aars-web/src/status.rs` (najbliższy biuletyn dla trybu cyklicznego).
+**Files:** Modify `crates/aars-audio/src/cache.rs` (albo nowy `crates/aars-audio/src/pause.rs` + użycie w `AudioCache::render`).
 
-**Interfaces — Produces:**
-- Ustawienia `module:bulletin:*`: `mode` (`Choice`: `cykl` „Co określony czas” / `pory` „O stałych porach”, domyślnie `cykl`), `interval_min` (`Integer 5..=60`, domyślnie `10`), `times` bez zmian (używane w trybie `pory`).
-- `runner::cycle_fires(interval_min: u32, now) -> Vec<DateTime<Utc>>`: chwile wyrównane do wielokrotności `interval_min` od północy czasu Warszawy (dla 10: :00, :10, …), z ostatnich 24 h, już minione, rosnąco — dalej ta sama ścieżka co `due_fires` (late/superseded/claim/quiet/compose/enqueue).
-- `EXPIRY` elementu = `min(interval, 15 min)` w trybie cyklicznym.
-- Kolejność części w `BULLETIN_PARTS`: `ostrzezenia`, `pogoda`, `wody`, `propagacja` (+ nowa `slonce` nie — słońce jest w pogodzie). Domyślne części: wszystkie. Wstęp domyślny: „Tu automatyczna stacja informacyjna {znak}. {dzień tygodnia} {data słownie}, godzina {H:MM}.” Zakończenie: „Tu {znak}. Koniec komunikatu.” (bez znaku: bez członu „Tu …”).
-- Przy przekroczeniu długości wypadają części w kolejności: `propagacja`, `wody`, `pogoda`; `ostrzezenia` nie wypada nigdy (obcina się sama do `max_chars`).
+**Interfaces — Produces:** znacznik pauzy w tekście kolejki: `[[pauza:MS]]` (MS całkowite 0–10000; większe obcinane do 10000, błędne — znacznik usuwany i ostrzeżenie w logu). `aars_audio::pause::split(text) -> Vec<Segment>`; `enum Segment { Text(String), Pause(Duration) }`. `AudioCache::render` dla tekstu ze znacznikami: syntezuje każdy odcinek tekstu osobno (każdy przez cache), wstawia ciszę `Pcm::silence(sample_rate, d)`, skleja i zapisuje całość w cache pod kluczem pełnego tekstu. Tekst bez znaczników — ścieżka bez zmian. Znacznik nigdy nie trafia do syntezatora ani do normalizera.
+- [ ] Testy (FakeSynth): dwa odcinki + pauza 500 ms → długość = suma + 500 ms ±1 próbka; sama pauza; pauza na początku/końcu; `[[pauza:99999]]` → 10 s; `[[pauza:x]]` usunięty; brak znaczników → identyczny wynik jak dziś.
+- [ ] Commit: `synteza: pauzy w tekście komunikatu ([[pauza:MS]])`.
+
+### Task 6: Układ biuletynu z klocków i tryb cykliczny
+
+**Files:** Create `crates/aars-core/src/bulletin_layout.rs`; Modify `aars-core/src/module.rs` (ustawienia biuletynu), `aars-sources/src/bulletin/{mod.rs,runner.rs}`, `aars-sources/src/pogoda/{mod.rs,speech.rs}` (podział na trzy części), `crates/aars-web/src/status.rs` (najbliższy biuletyn w trybie cyklicznym).
+
+**Interfaces — Produces (aars-core, bo panel też tego używa):**
+```rust
+pub enum BlockKind { Wstep, Ostrzezenia, PogodaTeraz, Prognoza, Slonce, Wody, Propagacja, Tekst, Zakonczenie }
+pub enum When { Zawsze, CoNCykli { n: u32 /*2..=24*/ }, WGodzinach { od: NaiveTime, do_: NaiveTime /*przez północ dozwolone*/ } }
+pub struct Block { pub kind: BlockKind, pub enabled: bool, pub pause_before_ms: u32, pub pause_after_ms: u32 /*0..=10000*/, pub when: When, pub text: String /*Wstep/Zakonczenie: szablon; Tekst: treść; inne: puste*/ , pub say_when_empty: bool /*Ostrzezenia: „Brak obowiązujących ostrzeżeń…”*/ }
+pub struct Layout { pub blocks: Vec<Block> /*1..=24*/ }
+impl Layout { pub fn default_layout() -> Layout; pub fn parse(json: &str) -> Result<Layout, String>; pub fn to_json(&self) -> String; pub fn validate(&self) -> Result<(), String> }
+```
+JSON w `module:bulletin:layout` (serde, nazwy pól po polsku jak w enumach, snake_case). Brak ustawienia → `default_layout()`: Wstep („Tu automatyczna stacja informacyjna {znak}. {dzien}, {data}, godzina {godzina}.”, pauza po 700), Ostrzezenia (say_when_empty, pauza po 700), PogodaTeraz, Prognoza (pauza po 500), Slonce, Wody, Propagacja (CoNCykli 3), Zakonczenie („Tu {znak}. Koniec komunikatu.”). Zmienne szablonu: `{znak}`, `{dzien}` (dzień tygodnia), `{data}` („24 listopada”), `{godzina}` (`H:MM`); nieznana zmienna → błąd walidacji przy zapisie.
+- Ustawienia biuletynu: `mode` (`Choice`: `cykl` „Co określony czas” / `pory` „O stałych porach”, domyślnie `cykl`), `interval_min` (`Integer 5..=60`, domyślnie 10), `times` (tryb `pory`), `layout` (JSON, edytowany edytorem z Task 9; walidacja `Layout::parse`). Stare `parts` i `intro` przenoszone do układu przy pierwszym odczycie (części nieobecne → bloki wyłączone; `intro` → tekst bloku Wstep), potem ignorowane.
+- `pogoda` dzieli się na części `pogoda_teraz`, `prognoza`, `slonce` (funkcje z Task 3: `now_text`, `forecast_text`, `sun_text`; jeden odczyt prognozy na złożenie).
+- Kompozytor: idzie po blokach układu; blok wyłączony albo `when` nie pasuje do numeru cyklu (`cycle_index = minuty od północy / interval`) lub godziny → pomijany; blok danych bez treści → pomijany; między blokami `[[pauza:MS]]` z `pause_before_ms`/`pause_after_ms` (sąsiednie pauzy sumują się, max 10 s). Limit długości: wypadają bloki od końca, z wyjątkiem Ostrzezenia, Wstep i Zakonczenie. `Composed.parts` raportuje każdy blok (polska nazwa, wynik).
+- Runner: `cycle_fires(interval_min, now)` — chwile wyrównane do wielokrotności `interval_min` od północy czasu Warszawy, z ostatnich 24 h, minione, rosnąco; dalej ta sama ścieżka co `due_fires`. `EXPIRY` = `min(interval, 15 min)` w trybie cyklicznym.
 - Pasek stanu/kafel „Najbliższy biuletyn” liczy najbliższą chwilę cyklu.
-- [ ] Testy: `cycle_fires` (10 min, 15 min, DST 2026-10-25), restart w środku cyklu nie nadaje drugi raz, cisza nocna, długość, kolejność wypadania, kafel panelu.
-- [ ] Commit: `biuletyn: tryb cykliczny co 10 minut, nowy wstęp i zakończenie`.
+- [ ] Testy: domyślny układ, parse/validate (złe pauzy, puste bloki, zła zmienna, > 24 bloki), migracja `parts`/`intro`, `When` (co 3. cykl, godziny przez północ), pauzy w tekście, wypadanie przy limicie, `cycle_fires` (10, 15 min, DST 2026-10-25), restart w cyklu bez dubla, cisza nocna, kafel panelu.
+- [ ] Commit: `biuletyn: układ z klocków, tryb cykliczny co 10 minut`.
 
-### Task 6: Powtórki alertów (RCB co minutę)
+### Task 7: Alert RCB trzy razy co minutę
 
-**Files:** Modify `aars-sources/src/source.rs` (`SourceItem.repeat_every: Option<Duration>`), `aars-sources/src/runner.rs`, `aars-sources/src/rso/mod.rs` (+ ustawienie `rcb_repeat_min` Integer 1..=10, domyślnie 1), wszystkie miejsca tworzące `SourceItem` (`repeat_every: None`).
+**Files:** Modify `aars-sources/src/source.rs` (`SourceItem.repeat: Option<(u32, Duration)>`), `aars-sources/src/runner.rs` (przy pierwszym ogłoszeniu używa `repeat` jako `repeat_count`/`repeat_interval` kolejki; zmiana i odwołanie — bez powtórek), `aars-sources/src/rso/mod.rs` (ustawienia `rcb_repeats` Integer 1..=10 domyślnie 3, `rcb_interval_s` Integer 30..=600 domyślnie 60), wszystkie miejsca tworzące `SourceItem` (`repeat: None`).
+- Alert RCB i atak z powietrza: `repeat = Some((rcb_repeats, rcb_interval_s))`. Potem pozycja jest żywym alertem, więc wraca w każdym cyklu biuletynu (blok Ostrzezenia).
+- Odwołanie pozycji anuluje niewysłane powtórki serii (grupa kolejki — sprawdzić, czy istniejące anulowanie serii to robi; jeśli nie, dodać).
+- [ ] Testy: RCB → 3 elementy co 60 s; ustawienia 5 × 120 s; zwykły komunikat RSO bez powtórek; odwołanie anuluje resztę serii.
+- [ ] Commit: `alerty: Alert RCB trzy razy co minutę, potem w biuletynie`.
 
-**Interfaces — Produces:** runner w każdym cyklu (i niezależnie od interwału źródła — osobny tik co 15 s w `run`) dla aktywnych pozycji z `repeat_every`: jeśli ostatni element kolejki pozycji zakończył się (`done`, `expired`, `failed`, `cancelled`) i od jego końca minęło ≥ `repeat_every`, wstawia nowy element z tym samym `text`, priorytetem i `interrupting=false` (powtórka nie przerywa), `expires_at = now + repeat_every*2`; nigdy dwa oczekujące naraz. `repeat_every` nie jest zapisywane w bazie — przy restarcie odtwarza się z kolejnego `fetch`. RSO: Alert RCB i atak z powietrza → `Some(rcb_repeat_min)`; reszta `None`.
-- [ ] Testy: powtórka po nadaniu, brak powtórki gdy poprzedni czeka (nadawanie wyłączone), koniec powtórek po odwołaniu/wygaśnięciu, tik 15 s nie odpytuje sieci.
-- [ ] Commit: `alerty: Alert RCB i atak z powietrza powtarzane co minutę, dopóki obowiązują`.
-
-### Task 7: Panel bez przeładowań — mechanizm
+### Task 8: Panel bez przeładowań — mechanizm
 
 **Files:** Modify `crates/aars-web/templates/base.html` (`hx-boost="true"` na `<body>` z `hx-target="#main"`/`hx-select`, kontener powiadomień `#toasts` z `aria-live`), `assets/app.css` (powiadomienia), nowy `assets/panel.js` (≤ 60 linii: obsługa `HX-Trigger` `toast` → powiadomienie, zachowanie fokusu), `crates/aars-web/src/render.rs` (helper `htmx::is_htmx(headers)`, `toast(response, kind, text)` ustawiający `HX-Trigger`), handlery POST: moduły (`enabled`, `settings`), źródła (`enabled`, `refresh`), ustawienia stacji/pozycji/sprzętu, komunikaty (`enabled`, `send`, `delete`), kolejka (`cancel`, `cancel_group`), użytkownicy.
 
@@ -109,17 +124,22 @@ Treść (przykład, każdy człon tylko gdy dane są):
 - [ ] Testy (dla każdego przerobionego handlera): z `HX-Request` → 200 + fragment bez `<html>` + `HX-Trigger` z toastem; bez → jak dziś (istniejące testy zostają). Macierz ról zielona. `ui_checks`: brak skryptów inline, etykiety.
 - [ ] Commit: `panel: zapis bez przeładowania strony, powiadomienia, nawigacja hx-boost`.
 
-### Task 8: Strona Moduły od nowa
+### Task 9: Strona Moduły od nowa i wizualny edytor biuletynu
 
-**Files:** Modify `crates/aars-web/templates/modules.html`, `crates/aars-web/src/modules_page.rs`, `assets/app.css`.
+**Files:** Modify `crates/aars-web/templates/modules.html`, `crates/aars-web/src/modules_page.rs`; Create `crates/aars-web/src/bulletin_editor.rs`, `crates/aars-web/templates/bulletin_editor.html`, `assets/bulletin-editor.js`; Modify `assets/app.css`, `lib.rs` (trasy), `role_matrix.rs`, menu (`base.html`: „Biuletyn” w grupie Nadawanie).
 
-- Układ: po lewej lista modułów (nazwa, plakietka stanu, przełącznik), po prawej szczegóły wybranego (`/modules?m=<id>`, htmx wymienia tylko panel szczegółów); na wąskim ekranie lista nad szczegółami.
-- Szczegóły: opis, stan źródła (ostatnie pobranie, błąd), obszar automatyczny (Task 1), ustawienia z opisami, przy biuletynie: tryb, interwał, części (z opisem co mówi każda), przyciski „Podgląd biuletynu”, „Odsłuchaj”, „Nadaj biuletyn teraz”.
-- [ ] Testy: lista i szczegóły dla trzech ról, `?m=` nieznany → pierwszy moduł, htmx zwraca sam panel szczegółów.
+- Moduły: po lewej lista modułów (nazwa, plakietka stanu, przełącznik), po prawej szczegóły wybranego (`/modules?m=<id>`, htmx wymienia tylko panel szczegółów); na wąskim ekranie lista nad szczegółami. Szczegóły: opis, stan źródła, obszar automatyczny (Task 1), ustawienia z opisami.
+- **Edytor biuletynu** `GET /bulletin` (operator ogląda i słucha, admin edytuje), `POST /bulletin/layout` (admin, CSRF, pole `layout` = JSON, walidacja `Layout::parse`):
+  - tryb (cykl/pory), interwał, pory;
+  - lista klocków jak karty: uchwyt do przeciągania (HTML5 drag and drop) **i** przyciski „W górę/W dół” (klawiatura, bez myszy), przełącznik włączony, nazwa i opis po polsku, „pauza przed/po” w sekundach (krok 0,1 s), „kiedy” (zawsze / co N-ty cykl / w godzinach od–do), pole tekstu dla Wstęp/Zakończenie/Tekst (z listą zmiennych), „Usuń” dla bloków Tekst, „Dodaj własny tekst”;
+  - oś czasu: pasek pokazujący kolejność klocków i pauzy proporcjonalnie (szacowany czas: 10 znaków ≈ 1 s), suma vs limit nadawania;
+  - „Podgląd” (składa tekst z bieżącego, niezapisanego układu przez `POST /bulletin/preview` z polem `layout`), „Odsłuchaj” (WAV z pauzami), „Zapisz”, „Przywróć domyślny”, „Nadaj teraz”.
+  - JS tylko w `assets/bulletin-editor.js` (bez inline), stan w ukrytym polu `layout` (JSON); bez JS edytor pokazuje układ tylko do odczytu i formularz z polem JSON.
+- [ ] Testy: role (podgląd — brak dostępu, operator — bez „Zapisz”, admin — pełny), zapis poprawnego i błędnego układu (błąd przy klocku), podgląd niezapisanego układu nie zmienia bazy, ui_checks.
 - [ ] Zrzuty z `panel_demo` (1400 i 390 px) obejrzane przez kontrolera.
-- [ ] Commit: `panel: strona Moduły — lista i szczegóły, obszar automatyczny`.
+- [ ] Commit: `panel: strona Moduły i wizualny edytor biuletynu`.
 
-### Task 9: Demo, poradnik, strona
+### Task 10: Demo, poradnik, strona
 
 - `panel_demo`: dane źródeł zgodne z prawdziwymi opisami (nie `sample_source` z „Obszarem” dla wszystkich), tryb cykliczny biuletynu.
 - Poradnik sp7tq-web: rozdziały Biuletyn, Pozycja i obszar, Źródła (RCB co minutę), Panel; nowe zrzuty.

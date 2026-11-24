@@ -38,9 +38,13 @@ i mają w nawiasie koszt pomyłki.
 3. Ostrzeżenia **wracają w każdym cyklu, dopóki obowiązują** — więc słychać je
    najwyżej co 10 minut. Pierwsze ogłoszenie nowego ostrzeżenia zostaje natychmiastowe
    (jak dziś), cykl tylko je powtarza.
-4. **Alert RCB i atak z powietrza** (RSO, priorytet Alarmowy) powtarzane **co 1 minutę**,
-   dopóki obowiązują (ustawienie 1–10 min w RSO). Powtórka nie dubluje się z kolejką:
-   następna dopiero, gdy poprzednia poszła na antenę albo wygasła.
+4. **Alert RCB i atak z powietrza** (RSO, priorytet Alarmowy): **3 razy co minutę**
+   (ustawienia: liczba 1–10, odstęp 30–600 s), potem jako obowiązujące ostrzeżenie
+   w każdym cyklu biuletynu (zmiana właściciela 2026-11-24).
+4a. **Wizualny edytor biuletynu z klocków** (prośba właściciela): kolejność klocków
+   (przeciąganie), pauza przed i po każdym, kiedy klocek jest nadawany (zawsze, co N-ty
+   cykl, w godzinach), własne teksty, podgląd i odsłuch niezapisanego układu.
+   Pauzy realizuje synteza (znacznik `[[pauza:MS]]` w tekście).
 5. Długość komunikatu mieści się w limicie czasu nadawania (`tx_max_duration_s`);
    gdy za długi, wypadają części od końca listy priorytetów (najpierw propagacja,
    słońce, powietrze, wody; ostrzeżenia nigdy).
