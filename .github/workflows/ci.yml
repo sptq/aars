@@ -30,8 +30,15 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Testy dyspozytora mierzą prawdziwy czas; na przeciążonym runnerze
+      # macOS równoległe testy rozjeżdżają się o sekundy, więc tam po jednym.
       - name: Testy
-        run: cargo test --workspace --locked
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            cargo test --workspace --locked -- --test-threads=1
+          else
+            cargo test --workspace --locked
+          fi
 
       # Skrypty obrazu i strażnika dochodzą w późniejszych zadaniach etapu 10.
       - name: Shellcheck
