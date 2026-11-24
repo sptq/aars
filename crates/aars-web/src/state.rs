@@ -131,6 +131,14 @@ pub struct BulletinPreviewView {
     pub skipped_reason: Option<String>,
 }
 
+impl BulletinPreviewView {
+    /// Treść do pokazania w panelu (znaczniki pauz czytelnie); do odsłuchu
+    /// idzie surowy `text`.
+    pub fn display_text(&self) -> Option<String> {
+        self.text.as_deref().map(aars_core::pause::display)
+    }
+}
+
 pub type BulletinPreviewFuture =
     Pin<Box<dyn Future<Output = Result<BulletinPreviewView, String>> + Send>>;
 

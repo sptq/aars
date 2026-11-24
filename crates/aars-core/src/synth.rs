@@ -71,6 +71,10 @@ impl Default for VoiceParams {
 pub trait Synthesizer: Send + Sync {
     fn synthesize(&self, text: &str, voice: &VoiceParams) -> Result<Pcm, SynthError>;
 
+    /// Częstotliwość próbkowania audio, które zwraca `synthesize`; potrzebna
+    /// do wstawienia ciszy bez syntezowania czegokolwiek.
+    fn sample_rate(&self) -> u32;
+
     /// Tożsamość syntezatora (model, częstotliwość) wchodzi do klucza cache,
     /// żeby zmiana głosu albo częstotliwości nie oddała starego audio (R19).
     fn identity(&self) -> String {
@@ -104,6 +108,10 @@ impl FakeSynth {
 }
 
 impl Synthesizer for FakeSynth {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
     fn identity(&self) -> String {
         self.identity.clone()
     }

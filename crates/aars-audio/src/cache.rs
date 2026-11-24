@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
+use aars_core::pause;
 use aars_core::synth::{Pcm, SynthError, Synthesizer, VoiceParams};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
-use crate::pause;
 use crate::wav::{read_wav_mono, write_wav_mono};
 
 /// Cache audio adresowany treścią: ten sam tekst i te same parametry głosu
@@ -61,13 +61,7 @@ impl AudioCache {
             let part = match segment {
                 pause::Segment::Text(t) => self.render_plain(synth, t, voice).await?.1,
                 pause::Segment::Pause(d) => {
-                    // Częstotliwość znamy dopiero z syntezatora; pusty tekst
-                    // daje pusty Pcm w jego częstotliwości.
-                    let rate = match &total {
-                        Some(p) => p.sample_rate,
-                        None => synth.synthesize("", voice)?.sample_rate,
-                    };
-                    Pcm::silence(rate, *d)
+                    Pcm::silence(synth.sample_rate(), *d)
                 }
             };
             match &mut total {
@@ -77,7 +71,7 @@ impl AudioCache {
         }
         let pcm = match total {
             Some(p) => p,
-            None => synth.synthesize("", voice)?,
+            None => Pcm { samples: Vec::new(), sample_rate: synth.sample_rate() },
         };
         let path = self.store(&key, &pcm).await?;
         Ok((path, pcm))

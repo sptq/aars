@@ -33,7 +33,7 @@
   {% if let Some(p) = m.bulletin_preview %}
   <h3 class="section-title">Podgląd</h3>
   {% if let Some(text) = p.text %}
-  <p>{{ text }}</p>
+  <p>{% if let Some(shown) = p.display_text() %}{{ shown }}{% endif %}</p>
   <input type="hidden" id="bulletin-text" value="{{ text }}">
   <div class="preview">
     <button type="button" class="ghost" id="preview-btn">Odsłuchaj</button>

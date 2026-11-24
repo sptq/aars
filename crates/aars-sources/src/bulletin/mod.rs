@@ -320,10 +320,12 @@ fn outcome(
         Err(_) => PartOutcome::Failed(format!("przekroczony czas {} s", timeout.as_secs())),
         Ok(Err(e)) => PartOutcome::Failed(e.to_string()),
         Ok(Ok(PartText::Empty(why))) => PartOutcome::Empty(why.to_owned()),
-        Ok(Ok(PartText::Text(text))) if text.trim().is_empty() => {
+        // Pauzy wstawia tylko składanie biuletynu, nie dane z sieci.
+        Ok(Ok(PartText::Text(text))) if aars_core::pause::strip_markers(&text).trim().is_empty() => {
             PartOutcome::Empty("pusta treść".to_owned())
         }
         Ok(Ok(PartText::Text(text))) => {
+            let text = aars_core::pause::strip_markers(&text);
             PartOutcome::Included(truncate_sentence(text.trim(), max_chars).0)
         }
     }
@@ -377,6 +379,18 @@ mod tests {
             c.text.as_deref(),
             Some("Biuletyn stacji SP9XYZ. 07:00. A b. C. Koniec biuletynu.")
         );
+    }
+
+    #[test]
+    fn a_part_with_a_pause_marker_is_included_without_it() {
+        let got = outcome(
+            Ok(Ok(PartText::Text("Wiatr[[pauza:9000]] słaby.".into()))),
+            1000,
+            Duration::from_secs(1),
+        );
+        assert_eq!(got, Included("Wiatr słaby.".into()));
+        let c = assemble("B.", "07:00", vec![("a", got)], 1500);
+        assert!(!c.text.unwrap().contains("pauza"));
     }
 
     fn long(n: usize) -> String {

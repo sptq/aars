@@ -59,7 +59,7 @@ pub(crate) fn tx_row(row: TxLogRow) -> TxRow {
         at: both_times_now(row.started_at),
         result: result_label(&row.result).to_owned(),
         seconds: format!("{:.1}", row.duration_ms as f64 / 1000.0),
-        text: aars_audio::pause::display(&text.unwrap_or_default()),
+        text: aars_core::pause::display(&text.unwrap_or_default()),
         without_item,
     }
 }

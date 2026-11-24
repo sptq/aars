@@ -133,6 +133,10 @@ mod tests {
 
     struct EmptySynth;
     impl Synthesizer for EmptySynth {
+        fn sample_rate(&self) -> u32 {
+            22_050
+        }
+
         fn synthesize(&self, _: &str, _: &VoiceParams) -> Result<Pcm, SynthError> {
             Ok(Pcm {
                 samples: Vec::new(),

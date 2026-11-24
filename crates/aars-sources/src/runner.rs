@@ -207,7 +207,16 @@ impl SourceRunner {
 
         report.fetched = true;
         let output = match self.source.fetch(&ctx).await {
-            Ok(output) => output,
+            Ok(mut output) => {
+                // Pauzy może wstawiać tylko operator: tekst z sieci nie niesie
+                // znaczników (inaczej zewnętrzny feed trzymałby PTT na ciszy).
+                for item in &mut output.items {
+                    item.text = aars_core::pause::strip_markers(&item.text);
+                    item.change_text = aars_core::pause::strip_markers(&item.change_text);
+                    item.cancel_text = aars_core::pause::strip_markers(&item.cancel_text);
+                }
+                output
+            }
             Err(error) => {
                 let message = error.to_string();
                 tracing::warn!(source = id, error = %message, "odpytanie źródła nie powiodło się");
@@ -615,6 +624,19 @@ mod tests {
         let mut items: Vec<QueueItem> = queue.pending(100).await.unwrap();
         items.sort_by_key(|i| i.id);
         items.into_iter().map(|i| i.rendered_text).collect()
+    }
+
+    #[tokio::test]
+    async fn pause_markers_in_source_text_never_reach_the_queue_or_storage() {
+        let mut item = warning("a", "f1");
+        item.text = "Burza[[pauza:9000]] nad miastem".into();
+        item.cancel_text = "[[pauza:5]]koniec".into();
+        let r = rig(vec![ok(vec![item])]).await;
+        r.runner.cycle(now()).await;
+        assert_eq!(texts(&r.queue).await, vec!["Burza nad miastem"]);
+        let stored = r.state.active_items("imgw-meteo").await.unwrap();
+        assert_eq!(stored[0].text, "Burza nad miastem");
+        assert_eq!(stored[0].cancel_text, "koniec");
     }
 
     #[tokio::test]
