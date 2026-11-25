@@ -52,6 +52,44 @@ pub async fn test_pool() -> SqlitePool {
 mod tests {
     use super::*;
 
+    /// 0009 przyspiesza tylko niezmienione tempo domyślne 0,87; tempo wybrane
+    /// przez operatora zostaje.
+    #[tokio::test]
+    async fn the_faster_speech_rate_migration_keeps_an_operator_choice() {
+        use sqlx::migrate::Migrator;
+        for (before, after) in [("0.87", "0.93"), ("0.80", "0.80"), ("1.00", "1.00")] {
+            let options = SqliteConnectOptions::new().in_memory(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await
+                .unwrap();
+            let upto_8 = Migrator {
+                migrations: MIGRATOR
+                    .migrations
+                    .iter()
+                    .filter(|m| m.version <= 8)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into(),
+                ..Migrator::DEFAULT
+            };
+            upto_8.run(&pool).await.unwrap();
+            sqlx::query("UPDATE settings SET value = ? WHERE key = 'speech_rate'")
+                .bind(before)
+                .execute(&pool)
+                .await
+                .unwrap();
+            migrate(&pool).await.unwrap();
+            let got: String =
+                sqlx::query_scalar("SELECT value FROM settings WHERE key = 'speech_rate'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(got, after, "{before}");
+        }
+    }
+
     #[tokio::test]
     async fn migrations_create_every_table_from_the_spec() {
         let pool = test_pool().await;

@@ -296,11 +296,11 @@ mod tests {
             22_050,
             -3.0,
             SettingsRepo::new(pool.clone()),
-            0.87,
+            0.93,
         );
         let preview = PiperPreview::new(cache, synth.clone(), -3.0, SettingsRepo::new(pool.clone()));
 
-        // Domyślne 0,87 z migracji; identyfikacja głosowa dostała tempo ze startu.
+        // Domyślne 0,93 z migracji; identyfikacja głosowa dostała tempo ze startu.
         renderer.render("Pierwszy").await.unwrap();
         preview.render_wav("Drugi").await.unwrap();
         // Zmiana w panelu działa od następnego renderu, bez restartu.
@@ -309,7 +309,7 @@ mod tests {
         preview.render_wav("Czwarty").await.unwrap();
         let got = synth.0.lock().unwrap().clone();
         // identyfikacja głosowa, nadanie, podgląd, nadanie, podgląd
-        assert_eq!(got, [0.87, 0.87, 0.87, 1.10, 1.10]);
+        assert_eq!(got, [0.93, 0.93, 0.93, 1.10, 1.10]);
         std::fs::remove_dir_all(dir).ok();
     }
 }

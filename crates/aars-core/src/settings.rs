@@ -49,8 +49,9 @@ impl QuietHours {
 
 /// Najwolniejsze i najszybsze dozwolone tempo mowy (mnożnik tempa głosu).
 pub const SPEECH_RATE_RANGE: std::ops::RangeInclusive<f32> = 0.70..=1.20;
-/// Domyślnie ok. 15% wolniej niż tempo modelu: właściciel uznał je za za szybkie.
-pub const DEFAULT_SPEECH_RATE: f32 = 0.87;
+/// Domyślnie ok. 7% wolniej niż tempo modelu: czytelniej przez radio, a 0,87
+/// właściciel uznał za za wolne.
+pub const DEFAULT_SPEECH_RATE: f32 = 0.93;
 
 /// Tempo zapisane jako tekst („0.87”, przecinek też przejdzie); `None`, gdy
 /// to nie liczba albo wypada poza zakresem.

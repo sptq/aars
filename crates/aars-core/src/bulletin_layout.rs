@@ -805,9 +805,11 @@ mod tests {
         assert_eq!(length_limit(600, 1.20), MAX_BULLETIN_CHARS);
         assert_eq!(length_limit(10, 1.0), 0);
         assert_eq!(length_limit(5, 1.0), 0);
-        // Tempo nieczytelne → domyślne.
-        assert_eq!(Budget::new(180, f32::NAN), b);
-        assert_eq!(Budget::new(180, 0.0), b);
+        // Tempo nieczytelne → domyślne (0,93: 1422 znaki).
+        let default = Budget::new(180, 0.93);
+        assert_eq!(default.chars, 1422);
+        assert_eq!(Budget::new(180, f32::NAN), default);
+        assert_eq!(Budget::new(180, 0.0), default);
         // Pauza: sekunda kosztuje tyle znaków, ile w niej da się powiedzieć
         // (przy tempie 1,5 — 13,5 znaku/s).
         let one = Budget::new(160, 1.5);
@@ -817,7 +819,7 @@ mod tests {
         assert!((one.seconds(27) - 2.0).abs() < 1e-9);
         // Najdłuższy biuletyn mieści się w limicie: znaki × 1,5 przy tempie
         // mowy 13,5 × rate znaków/s plus rezerwa nie przekracza limitu.
-        for rate in [0.70_f32, 0.87, 1.0, 1.20] {
+        for rate in [0.70_f32, 0.87, 0.93, 1.0, 1.20] {
             for tx in [30_u64, 60, 120, 180, 300, 600] {
                 let b = Budget::new(tx, rate);
                 let spoken_s = b.chars as f64 * NORMALIZER_EXPANSION

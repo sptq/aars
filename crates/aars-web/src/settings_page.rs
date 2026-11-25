@@ -518,7 +518,7 @@ mod tests {
         let (app, cookie, csrf, state) = logged_in(Role::Admin).await;
         let (_, html) = get(&app, "/settings", &cookie).await;
         assert!(html.contains("Tempo mowy"), "{html}");
-        assert!(html.contains("name=\"speech_rate_pct\"") && html.contains("value=\"87\""), "{html}");
+        assert!(html.contains("name=\"speech_rate_pct\"") && html.contains("value=\"93\""), "{html}");
 
         let status = post_settings(&app, &cookie, &csrf, &[("speech_rate_pct", "100")]).await;
         assert_eq!(status, StatusCode::OK);
@@ -563,7 +563,7 @@ mod tests {
                 "{bad}"
             );
         }
-        assert_eq!(stored(&state, "speech_rate").await, "0.87");
+        assert_eq!(stored(&state, "speech_rate").await, "0.93");
         for ok in ["70", "120"] {
             assert_eq!(
                 post_settings(&app, &cookie, &csrf, &[("speech_rate_pct", ok)]).await,
