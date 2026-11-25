@@ -1,9 +1,10 @@
 {#- Wyłącznik nadawania (D5). Formularz zawsze niesie jawne enabled=0 albo
-    enabled=1 i wysyła się tylko kliknięciem; bez hx-trigger. Przy wyłączonym
+    enabled=1 i wysyła się tylko kliknięciem; bez hx-trigger i bez hx-boost
+    (zwykły POST, który nie zależy od JS). Przy wyłączonym
     nadawaniu i offer_start = false nie renderuje nic. -#}
 {% macro tx_switch(csrf, tx_enabled, offer_start, back) %}
 {%- if tx_enabled || offer_start -%}
-<form method="post" action="/tx-enabled" class="tx-switch">
+<form method="post" action="/tx-enabled" class="tx-switch" hx-boost="false">
   <input type="hidden" name="csrf" value="{{ csrf }}">
   <input type="hidden" name="enabled" value="{% if tx_enabled %}0{% else %}1{% endif %}">
   <input type="hidden" name="back" value="{{ back }}">

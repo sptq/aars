@@ -2,7 +2,7 @@
 {% block title %}AARS — komunikaty{% endblock %}
 {% block heading %}Komunikaty{% endblock %}
 {% block content %}
-<div class="card">
+<div class="card" id="komunikaty">
   <h2>Komunikaty</h2>
   <p><a href="/messages/new">Nowy komunikat</a></p>
   {% if rows.is_empty() %}
@@ -21,18 +21,18 @@
         <td>{{ row.next }}</td>
         <td>{% if row.enabled %}<span class="badge on">włączony</span>{% else %}<span class="badge off">wyłączony</span>{% endif %}</td>
         <td class="row-actions">
-          <button type="button" class="ghost" onclick="var a=document.getElementById('preview-audio');a.src='/messages/{{ row.id }}/preview.wav';a.play()">Odsłuchaj</button>
-          <form method="post" action="/messages/{{ row.id }}/send" class="inline">
+          <button type="button" class="ghost" data-preview data-preview-src="/messages/{{ row.id }}/preview.wav">Odsłuchaj</button>
+          <form method="post" action="/messages/{{ row.id }}/send" class="inline" hx-post="/messages/{{ row.id }}/send" hx-target="closest .card" hx-select="#komunikaty" hx-swap="outerHTML">
             <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
             <button type="submit">Nadaj teraz</button>
           </form>
-          <form method="post" action="/messages/{{ row.id }}/enabled" class="inline">
+          <form method="post" action="/messages/{{ row.id }}/enabled" class="inline" hx-post="/messages/{{ row.id }}/enabled" hx-target="closest .card" hx-select="#komunikaty" hx-swap="outerHTML">
             <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
             <input type="hidden" name="enabled" value="{% if row.enabled %}0{% else %}1{% endif %}">
             <button type="submit" class="ghost">{% if row.enabled %}Wyłącz{% else %}Włącz{% endif %}</button>
           </form>
           <form method="post" action="/messages/{{ row.id }}/delete" class="inline"
-                onsubmit="return confirm('Usunąć komunikat?')">
+                hx-post="/messages/{{ row.id }}/delete" hx-confirm="Usunąć komunikat „{{ row.title }}”?" hx-target="closest .card" hx-select="#komunikaty" hx-swap="outerHTML">
             <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
             <button type="submit" class="danger">Usuń</button>
           </form>

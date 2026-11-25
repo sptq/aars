@@ -20,6 +20,9 @@ pub struct CurrentUser {
     pub path: String,
     /// Żądanie `GET`: tylko pod taką ścieżkę wolno wrócić po wyłączniku.
     pub is_get: bool,
+    /// Formularz wysłany przez htmx (`hx-post`): odpowiedzią jest karta
+    /// i powiadomienie, nie przekierowanie (etap 13, D).
+    pub htmx: bool,
 }
 
 /// Odpowiedź dla żądania bez sesji, bez uprawnień albo bez tokenu CSRF.
@@ -94,6 +97,7 @@ impl FromRequestParts<AppState> for CurrentUser {
             version: state.version,
             path: parts.uri.path().to_owned(),
             is_get: parts.method == axum::http::Method::GET,
+            htmx: crate::render::htmx::is_htmx(&parts.headers),
         })
     }
 }

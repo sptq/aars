@@ -495,16 +495,21 @@ async fn cancel_item(
     // HTMX wysyła token nagłówkiem, bo przycisk nie jest formularzem.
     require_csrf(&current.csrf_token, headers.get("x-csrf-token").and_then(|v| v.to_str().ok()))?;
 
-    match state.queue.cancel(id).await {
+    let toast = match state.queue.cancel(id).await {
         Ok(count) => {
             tracing::info!(user = %current.user.username, id, count, "anulowanie zadania z panelu");
             audit(&state, current.user.id, "queue_cancel", &format!("zadanie {id}")).await;
+            (render::htmx::Kind::Ok, "Anulowano")
         }
-        Err(err) => tracing::error!(%err, id, "anulowanie zadania zawiodło"),
-    }
+        Err(err) => {
+            tracing::error!(%err, id, "anulowanie zadania zawiodło");
+            (render::htmx::Kind::Error, "Anulowanie zawiodło — szczegóły w dzienniku stacji")
+        }
+    };
 
     // Odpowiadamy fragmentem, więc HTMX podmienia tabelę bez przeładowania.
-    Ok(queue_fragment_response(&state, &current, view.full).await)
+    let response = queue_fragment_response(&state, &current, view.full).await;
+    Ok(render::htmx::toast(response, toast.0, toast.1))
 }
 
 /// `?full=1` oznacza fragment strony `/queue` (limit 200 zamiast 50).
@@ -704,6 +709,9 @@ mod role_matrix;
 
 #[cfg(test)]
 mod ui_checks;
+
+#[cfg(test)]
+mod htmx_checks;
 
 #[cfg(test)]
 pub(crate) mod tests {

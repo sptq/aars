@@ -225,11 +225,7 @@ fn every_form_field_has_a_label() {
 
 #[test]
 fn no_template_adds_an_inline_script() {
-    let allowed = ["compose.html", "message_form.html", "modules.html"];
     for (name, text) in templates() {
-        if allowed.contains(&name.as_str()) {
-            continue;
-        }
         let inline = text.match_indices("<script").any(|(at, _)| {
             !text[at..text[at..].find('>').map_or(text.len(), |e| at + e)].contains("src=")
         });

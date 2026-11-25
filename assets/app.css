@@ -412,3 +412,24 @@ label.check.inline-option { display: inline-flex; margin-right: var(--space-4); 
 .test-group { margin-bottom: var(--space-4); }
 .release-notes { white-space: pre-wrap; margin-bottom: var(--space-3); }
 .check-form { margin-top: var(--space-3); }
+
+/* Powiadomienia po zapisie bez przeładowania (etap 13, D; assets/panel.js). */
+.toasts {
+  position: fixed; right: var(--space-4); bottom: var(--space-4); z-index: 1000;
+  display: flex; flex-direction: column; gap: var(--space-2);
+  max-width: min(26rem, calc(100vw - 2 * var(--space-4)));
+}
+.toast {
+  padding: var(--space-3) var(--space-4); border-radius: var(--radius);
+  border: 1px solid var(--line); box-shadow: 0 4px 16px var(--line); cursor: pointer;
+  background: var(--ok-bg); color: var(--ok); font-weight: 600;
+}
+.toast.toast-error { background: var(--error-bg); color: var(--error); }
+/* Przycisk w trakcie żądania: zablokowany (panel.js) i z kółkiem. */
+button.is-busy::after {
+  content: ""; display: inline-block; width: 0.8em; height: 0.8em; margin-left: var(--space-2);
+  vertical-align: -0.1em; border: 2px solid currentColor; border-right-color: transparent;
+  border-radius: 50%; animation: busy-spin 0.7s linear infinite;
+}
+@keyframes busy-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { button.is-busy::after { animation: none; } }

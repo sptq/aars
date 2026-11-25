@@ -33,19 +33,19 @@
   var current = read();
   apply(current);
 
-  document.addEventListener('DOMContentLoaded', function () {
+  // Przycisk bywa podmieniany razem z <body> (hx-boost), więc słuchamy na
+  // dokumencie i odświeżamy napis po każdej podmianie.
+  function refresh() {
     var buttons = document.querySelectorAll('[data-theme-toggle]');
-    function refresh() {
-      for (var i = 0; i < buttons.length; i++) buttons[i].textContent = label(current);
-    }
+    for (var i = 0; i < buttons.length; i++) buttons[i].textContent = label(current);
+  }
+  document.addEventListener('DOMContentLoaded', refresh);
+  document.addEventListener('htmx:afterSettle', refresh);
+  document.addEventListener('click', function (e) {
+    if (!e.target.closest || !e.target.closest('[data-theme-toggle]')) return;
+    current = current === '' ? 'light' : current === 'light' ? 'dark' : '';
+    apply(current);
+    write(current);
     refresh();
-    for (var i = 0; i < buttons.length; i++) {
-      buttons[i].addEventListener('click', function () {
-        current = current === '' ? 'light' : current === 'light' ? 'dark' : '';
-        apply(current);
-        write(current);
-        refresh();
-      });
-    }
   });
 })();

@@ -26,7 +26,7 @@ use serde::Deserialize;
 use crate::audit;
 use crate::auth::{AuthRejection, CurrentUser, require_csrf, require_role};
 use crate::chrome::Chrome;
-use crate::render::{db_error, page};
+use crate::render::{db_error, htmx, page};
 use crate::sources_page::{health, health_needs};
 use crate::state::{AppState, BulletinPreviewView};
 
@@ -234,14 +234,16 @@ async fn page_with(
 }
 
 /// Strona z błędem w karcie modułu `id`; `entered` zastępuje wartości pól.
+/// Formularz htmx dostaje kartę z kodem 422 i powiadomienie `toast`.
 async fn page_with_error(
     state: &AppState,
     current: &CurrentUser,
     id: &str,
     message: String,
     entered: Option<&BTreeMap<String, String>>,
+    toast: &str,
 ) -> Response {
-    page_with(state, current, id, StatusCode::BAD_REQUEST, |view| {
+    let response = page_with(state, current, id, StatusCode::BAD_REQUEST, |view| {
         if let Some(entered) = entered {
             for field in &mut view.fields {
                 if let Some(value) = entered.get(field.key) {
@@ -251,7 +253,26 @@ async fn page_with_error(
         }
         view.error = Some(message);
     })
-    .await
+    .await;
+    if current.htmx {
+        htmx::refused(response, toast)
+    } else {
+        response
+    }
+}
+
+/// Po udanej akcji: formularz htmx dostaje świeżą stronę (htmx bierze z niej
+/// kartę) i powiadomienie, zwykły formularz przekierowanie jak dotąd.
+async fn done(
+    state: AppState,
+    current: CurrentUser,
+    location: String,
+    toast: &str,
+) -> Result<Response, AuthRejection> {
+    if current.htmx {
+        return Ok(htmx::ok(page_view(State(state), current).await?, toast));
+    }
+    Ok(see_other(location))
 }
 
 /// `GET /modules` (operator: stan; admin: także przełączniki i ustawienia).
@@ -306,7 +327,8 @@ pub async fn set_enabled(
     {
         Ok(()) => {}
         Err(err @ (ModuleError::AlwaysOn(_) | ModuleError::Planned(_))) => {
-            return Ok(page_with_error(&state, &current, m.id, err.to_string(), None).await);
+            let message = err.to_string();
+            return Ok(page_with_error(&state, &current, m.id, message.clone(), None, &message).await);
         }
         Err(ModuleError::Db(err)) => return Ok(db_error("zmiana stanu modułu zawiodła", &err)),
     }
@@ -330,7 +352,8 @@ pub async fn set_enabled(
     {
         refresh(m.id);
     }
-    Ok(see_other("/modules".to_owned()))
+    let toast = if enabled { "Włączono" } else { "Wyłączono" };
+    done(state, current, "/modules".to_owned(), toast).await
 }
 
 /// `POST /modules/{id}/settings` (admin). Brane są tylko klucze ze schematu;
@@ -374,7 +397,8 @@ pub async fn save_settings(
     let values = match m.validate(&input) {
         Ok(values) => values,
         Err(message) => {
-            return Ok(page_with_error(&state, &current, m.id, message, Some(&input)).await);
+            let toast = message.clone();
+            return Ok(page_with_error(&state, &current, m.id, message, Some(&input), &toast).await);
         }
     };
     let changed: Vec<&str> = m
@@ -384,7 +408,7 @@ pub async fn save_settings(
         .map(|spec| spec.key)
         .collect();
     if changed.is_empty() {
-        return Ok(see_other(format!("/modules#{}", m.id)));
+        return done(state, current, format!("/modules#{}", m.id), "Bez zmian").await;
     }
     if let Err(err) = repo.save_settings(&m, &values).await {
         return Ok(db_error("zapis ustawień modułu zawiódł", &err));
@@ -401,7 +425,7 @@ pub async fn save_settings(
     {
         refresh(m.id);
     }
-    Ok(see_other(format!("/modules#{}", m.id)))
+    done(state, current, format!("/modules#{}", m.id), "Zapisano").await
 }
 
 async fn bulletin_message(
@@ -410,10 +434,15 @@ async fn bulletin_message(
     status: StatusCode,
     message: String,
 ) -> Response {
-    page_with(state, current, BULLETIN.id, status, |card| {
+    let toast = if current.htmx { Some(message.clone()) } else { None };
+    let response = page_with(state, current, BULLETIN.id, status, |card| {
         card.error = Some(message);
     })
-    .await
+    .await;
+    match toast {
+        Some(text) => htmx::refused(response, &text),
+        None => response,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -450,12 +479,13 @@ pub async fn preview_bulletin(
         .await);
     };
     match preview().await {
-        Ok(view) => Ok(
-            page_with(&state, &current, BULLETIN.id, StatusCode::OK, |card| {
+        Ok(view) => {
+            let response = page_with(&state, &current, BULLETIN.id, StatusCode::OK, |card| {
                 card.bulletin_preview = Some(view)
             })
-            .await,
-        ),
+            .await;
+            Ok(if current.htmx { htmx::ok(response, "Podgląd gotowy") } else { response })
+        }
         Err(e) => Ok(bulletin_message(
             &state,
             &current,
@@ -511,11 +541,14 @@ pub async fn send_bulletin(
     };
     let Some(text) = view.text.clone() else {
         let reason = view.skipped_reason.clone().unwrap_or_else(|| "brak danych".to_owned());
-        return Ok(page_with(&state, &current, BULLETIN.id, StatusCode::OK, |card| {
-            card.error = Some(format!("Nic do nadania: {reason}"));
+        let message = format!("Nic do nadania: {reason}");
+        let toast = message.clone();
+        let response = page_with(&state, &current, BULLETIN.id, StatusCode::OK, |card| {
+            card.error = Some(message);
             card.bulletin_preview = Some(view);
         })
-        .await);
+        .await;
+        return Ok(if current.htmx { htmx::refused(response, &toast) } else { response });
     };
     let now = Utc::now();
     let request = EnqueueRequest {
@@ -532,6 +565,12 @@ pub async fn send_bulletin(
     match state.queue.enqueue(request).await {
         Ok(_) => {
             audit(&state, current.user.id, "bulletin_send", "biuletyn na żądanie").await;
+            if current.htmx {
+                return Ok(htmx::ok(
+                    page_view(State(state), current).await?,
+                    "Biuletyn dodany do kolejki",
+                ));
+            }
             Ok(Redirect::to("/queue").into_response())
         }
         Err(err) => Ok(db_error("dodanie biuletynu do kolejki zawiodło", &err)),

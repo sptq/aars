@@ -8,6 +8,7 @@ use axum::response::Response;
 
 use crate::auth::{AuthRejection, CurrentUser, require_csrf, require_role};
 use crate::chrome::Chrome;
+use crate::render::htmx::{Kind, toast};
 use crate::render::page;
 use crate::state::AppState;
 use crate::{QueueRow, audit, queue_fragment_response, queue_rows};
@@ -45,7 +46,7 @@ pub async fn cancel_group(
     require_role(&current.user, Role::Operator)?;
     require_csrf(&current.csrf_token, headers.get("x-csrf-token").and_then(|v| v.to_str().ok()))?;
 
-    match state.queue.cancel_group(&group).await {
+    let outcome = match state.queue.cancel_group(&group).await {
         Ok(count) => {
             tracing::info!(user = %current.user.username, %group, count, "anulowanie serii z panelu");
             audit(
@@ -55,9 +56,14 @@ pub async fn cancel_group(
                 &format!("seria {group}, anulowano {count}"),
             )
             .await;
+            (Kind::Ok, format!("Anulowano powtórzenia serii: {count}"))
         }
-        Err(err) => tracing::error!(%err, %group, "anulowanie serii zawiodło"),
-    }
+        Err(err) => {
+            tracing::error!(%err, %group, "anulowanie serii zawiodło");
+            (Kind::Error, "Anulowanie serii zawiodło — szczegóły w dzienniku stacji".to_owned())
+        }
+    };
 
-    Ok(queue_fragment_response(&state, &current, true).await)
+    let response = queue_fragment_response(&state, &current, true).await;
+    Ok(toast(response, outcome.0, &outcome.1))
 }

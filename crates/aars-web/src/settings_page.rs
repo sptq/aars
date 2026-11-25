@@ -13,7 +13,7 @@ use serde::Deserialize;
 use crate::audit;
 use crate::auth::{AuthRejection, CurrentUser, require_csrf, require_role};
 use crate::chrome::{Chrome, parse_priority, priority_value};
-use crate::render::page;
+use crate::render::{htmx, page};
 use crate::state::AppState;
 
 #[derive(Template)]
@@ -275,11 +275,22 @@ pub async fn submit(
     let new = match parse_form(&form, &stored) {
         Ok(new) => new,
         Err(message) => {
-            return Ok((
-                StatusCode::BAD_REQUEST,
-                page(&view(&state, &current, &stored, Some(message), false).await),
-            )
-                .into_response());
+            // Błąd dotyczy jednego pola i nazywa je, więc idzie też do powiadomienia.
+            let toast = message.clone();
+            let mut shown = view(&state, &current, &stored, Some(message), false).await;
+            // Wpisane wartości zostają w polach (do poprawienia, nie od nowa).
+            shown.callsign = form.callsign.clone();
+            shown.id_mode = form.id_mode.clone();
+            shown.id_interval_s = form.id_interval_s.clone();
+            shown.tx_max_duration_s = form.tx_max_duration_s.clone();
+            shown.misfire_grace_s = form.misfire_grace_s.clone();
+            shown.quiet_hours = form.quiet_hours.clone();
+            shown.quiet_min_priority = form.quiet_min_priority.clone();
+            if !form.speech_rate_pct.trim().is_empty() {
+                shown.speech_rate_pct = form.speech_rate_pct.clone();
+            }
+            let response = (StatusCode::BAD_REQUEST, page(&shown)).into_response();
+            return Ok(if current.htmx { htmx::refused(response, &toast) } else { response });
         }
     };
 
@@ -294,7 +305,8 @@ pub async fn submit(
         &changed_keys(&stored, &new).join(","),
     )
     .await;
-    Ok(page(&view(&state, &current, &new, None, true).await))
+    let response = page(&view(&state, &current, &new, None, true).await);
+    Ok(if current.htmx { htmx::ok(response, "Zapisano") } else { response })
 }
 
 /// `POST /settings/position` (admin, R17): współrzędne albo lokator; wszystkie
@@ -322,8 +334,9 @@ pub async fn submit_position(
             shown.position.lat = form.lat.clone();
             shown.position.lon = form.lon.clone();
             shown.position.locator = form.locator.clone();
-            shown.position.error = Some(message);
-            return Ok((StatusCode::BAD_REQUEST, page(&shown)).into_response());
+            shown.position.error = Some(message.clone());
+            let response = (StatusCode::BAD_REQUEST, page(&shown)).into_response();
+            return Ok(if current.htmx { htmx::refused(response, &message) } else { response });
         }
     };
 
@@ -339,6 +352,10 @@ pub async fn submit_position(
         None => "usunięto".to_owned(),
     };
     audit(&state, current.user.id, "position", &detail).await;
+    if current.htmx {
+        let toast = if position.is_some() { "Zapisano położenie" } else { "Usunięto położenie" };
+        return Ok(htmx::ok(page_view(State(state), current).await?, toast));
+    }
     Ok(axum::response::Redirect::to("/settings#polozenie").into_response())
 }
 

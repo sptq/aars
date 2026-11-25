@@ -179,6 +179,15 @@ pub struct CsrfOnly {
     csrf: String,
 }
 
+/// Po udanej akcji: formularz htmx dostaje świeżą stronę (htmx bierze z niej
+/// kartę źródła) i powiadomienie; zwykły formularz — przekierowanie.
+async fn done(state: AppState, current: CurrentUser, toast: &str) -> Result<Response, AuthRejection> {
+    if current.htmx {
+        return Ok(crate::render::htmx::ok(page_view(State(state), current).await?, toast));
+    }
+    Ok(Redirect::to("/sources").into_response())
+}
+
 fn unknown_source() -> Response {
     (StatusCode::NOT_FOUND, "nie ma takiego źródła").into_response()
 }
@@ -224,7 +233,7 @@ pub async fn set_enabled(
     if enabled && let Some(refresh) = &state.source_refresh {
         refresh(&id);
     }
-    Ok(Redirect::to("/sources").into_response())
+    done(state, current, if enabled { "Włączono" } else { "Wyłączono" }).await
 }
 
 pub async fn refresh(
@@ -252,7 +261,7 @@ pub async fn refresh(
         return Ok(unknown_source());
     }
     audit(&state, current.user.id, "source_refresh", &id).await;
-    Ok(Redirect::to("/sources").into_response())
+    done(state, current, "Odświeżanie zlecone").await
 }
 
 #[cfg(test)]

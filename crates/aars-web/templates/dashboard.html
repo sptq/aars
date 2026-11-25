@@ -123,7 +123,7 @@
   {% if let Some(note) = queue_error %}
   <p class="error">{{ note }}</p>
   {% else %}
-  <div id="queue" hx-get="/fragments/queue" hx-trigger="every 3s" hx-swap="innerHTML">
+  <div id="queue" hx-get="/fragments/queue" hx-trigger="every 3s [!this.querySelector('button:hover, button:focus, .htmx-request')]" hx-sync="this:drop" hx-swap="innerHTML">
     {% include "queue_fragment.html" %}
   </div>
   {% endif %}

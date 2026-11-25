@@ -15,7 +15,7 @@ use serde::Deserialize;
 use crate::audit;
 use crate::auth::{AuthRejection, CurrentUser, require_csrf, require_role};
 use crate::chrome::{Chrome, role_label};
-use crate::render::page;
+use crate::render::{htmx, page};
 use crate::state::AppState;
 
 struct Row {
@@ -104,6 +104,15 @@ async fn render(
             must_change: u.must_change_password,
         })
         .collect();
+    // Akcja z formularza htmx: powiadomienie o wyniku (strona i tak pokazuje
+    // błąd albo hasło tymczasowe w swojej karcie).
+    let toast = (current.htmx && !current.is_get).then(|| match (&error, &secret) {
+        (Some(message), _) => (htmx::Kind::Error, message.clone()),
+        (None, Some(_)) => (htmx::Kind::Ok, "Hasło tymczasowe gotowe".to_owned()),
+        (None, None) if current.path.ends_with("/delete") => (htmx::Kind::Ok, "Usunięto konto".to_owned()),
+        (None, None) if current.path.ends_with("/role") => (htmx::Kind::Ok, "Zmieniono rolę".to_owned()),
+        (None, None) => (htmx::Kind::Ok, "Zapisano".to_owned()),
+    });
     let body = page(&UsersPage {
         chrome: Chrome::load(state, current).await,
         rows,
@@ -112,6 +121,12 @@ async fn render(
         new_username: new_username.to_owned(),
     });
     let mut response = (status, body).into_response();
+    if let Some((kind, text)) = toast {
+        response = match kind {
+            htmx::Kind::Error => htmx::refused(response, &text),
+            htmx::Kind::Ok => htmx::ok(response, &text),
+        };
+    }
     // Strona może zawierać hasło: nie wolno jej zapisywać w pamięci podręcznej.
     response
         .headers_mut()
