@@ -3,7 +3,7 @@
 
 use aars_core::config::{PttBackendKind, SerialPttLine};
 use aars_core::dispatcher::{StationTest, TEST_PTT_RANGE, TestOutcome};
-use aars_core::hardware::probe::{HostLists, check_against_host, host_lists};
+use aars_core::hardware::probe::{HostLists, check_against_host, friendly_voice_name, host_lists, resolve_model};
 use aars_core::hardware::{FieldError, HardwareRepo, HardwareSettings, SAMPLE_RATES};
 use aars_core::interlock::RefusalReason;
 use aars_core::settings::{SettingsRepo, StationSettings};
@@ -17,7 +17,7 @@ use serde::Deserialize;
 use crate::audit;
 use crate::auth::{AuthRejection, CurrentUser, require_csrf, require_role};
 use crate::chrome::Chrome;
-use crate::render::{db_error, page};
+use crate::render::{db_error, htmx, page};
 use crate::state::AppState;
 
 /// Odpowiedź, gdy panel działa bez stacji (restart i testy).
@@ -451,7 +451,7 @@ fn build_fields(
             &input.voice_model,
         ),
         Some(l) => {
-            let o = l.voices.iter().map(|v| (v.path.clone(), v.name.clone())).collect();
+            let o = l.voices.iter().map(|v| (v.path.clone(), friendly_voice_name(&v.name))).collect();
             choice(o, None, "", &input.voice_model)
         }
         None => choice(Vec::new(), None, "Brak listy głosów — wpisz ścieżkę modelu .onnx ręcznie.", &input.voice_model),
@@ -492,6 +492,14 @@ async fn show(state: &AppState, current: &CurrentUser, status: StatusCode, ctx: 
                 .into_iter()
                 .map(|e| format!("zapisane ustawienie nie pasuje do tego komputera: {}", e.message)),
         );
+    }
+    // Zapisany model zniknął (np. darkman po aktualizacji): stacja gra Gosią.
+    let resolved = resolve_model(&stored.voice_model, &state.base_config.tts.voices_dir);
+    if let Some(missing) = resolved.replaced {
+        warnings.push(format!(
+            "model głosu {missing} nie istnieje — stacja używa głosu Gosia ({}); wybierz głos i zapisz",
+            resolved.path
+        ));
     }
     let form_failed = !ctx.errors.is_empty();
     let input = ctx.input.unwrap_or_else(|| FormInput::from_settings(&stored));
@@ -556,7 +564,7 @@ pub async fn page_view(
     require_role(&current.user, aars_core::user::Role::Admin)?;
     let mut notice = None;
     if query.saved == "1" {
-        notice = Some("Zapisano. Zmiany wejdą w życie po restarcie stacji.".to_owned());
+        notice = Some(SAVED_NOTICE.to_owned());
     } else if query.restart == "1" {
         let mut text = "Restart zlecony. Stacja dokończy bieżące nadanie i uruchomi się ponownie \
                         — odśwież stronę za kilka sekund."
@@ -576,6 +584,8 @@ pub async fn page_view(
     Ok(show(&state, &current, StatusCode::OK, Ctx { notice, ..Ctx::default() }).await)
 }
 
+const SAVED_NOTICE: &str = "Zapisano. Zmiany wejdą w życie po restarcie stacji.";
+
 pub async fn save(
     State(state): State<AppState>,
     current: CurrentUser,
@@ -589,14 +599,12 @@ pub async fn save(
 
     let new = match parse_form(&input) {
         Ok(new) => new,
-        Err(errors) => {
-            return Ok(show(&state, &current, StatusCode::BAD_REQUEST, refuse(errors)).await);
-        }
+        Err(errors) => return Ok(refused(&state, &current, refuse(errors)).await),
     };
     if let Some(l) = lists(&state).await {
         let check = check_against_host(&new, &l);
         if !check.errors.is_empty() {
-            return Ok(show(&state, &current, StatusCode::BAD_REQUEST, refuse(check.errors)).await);
+            return Ok(refused(&state, &current, refuse(check.errors)).await);
         }
     }
 
@@ -617,7 +625,22 @@ pub async fn save(
         tracing::warn!(user = %current.user.username, "zmiana sprzętu z panelu");
         audit(&state, current.user.id, "hardware", &changes.join("; ")).await;
     }
+    if current.htmx {
+        let notice = Some(SAVED_NOTICE.to_owned());
+        let response = show(&state, &current, StatusCode::OK, Ctx { notice, ..Ctx::default() }).await;
+        return Ok(htmx::ok(response, "Zapisano"));
+    }
     Ok((StatusCode::SEE_OTHER, [(header::LOCATION, "/settings/hardware?saved=1")]).into_response())
+}
+
+/// Formularz z błędami pól: strona 400, a dla htmx karta 422 z powiadomieniem.
+async fn refused(state: &AppState, current: &CurrentUser, ctx: Ctx) -> Response {
+    let response = show(state, current, StatusCode::BAD_REQUEST, ctx).await;
+    if current.htmx {
+        htmx::refused(response, htmx::FIX_FIELDS)
+    } else {
+        response
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -876,6 +899,31 @@ mod tests {
 
     /// Formularz z wartościami domyślnymi, z nadpisaniami.
     async fn post_hw(env: &Env, over: &[(&str, &str)]) -> (StatusCode, String, Option<String>) {
+        send(env, "POST", "/settings/hardware", hw_body(env, over)).await
+    }
+
+    /// Jak `post_hw`, ale formularzem htmx: status, `HX-Trigger`, treść.
+    async fn post_hw_htmx(env: &Env, over: &[(&str, &str)]) -> (StatusCode, String, String) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/settings/hardware")
+            .header(header::COOKIE, &env.cookie)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .body(Body::from(hw_body(env, over)))
+            .unwrap();
+        let response = env.app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let trigger = response
+            .headers()
+            .get("HX-Trigger")
+            .map(|v| v.to_str().unwrap().to_owned())
+            .unwrap_or_default();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, trigger, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn hw_body(env: &Env, over: &[(&str, &str)]) -> String {
         let hw = HardwareSettings::from_config(&env.state.base_config);
         let i = FormInput::from_settings(&hw);
         let mut fields: Vec<(String, String)> = vec![
@@ -899,12 +947,29 @@ mod tests {
                 None => fields.push(((*k).to_owned(), (*v).to_owned())),
             }
         }
-        let body = fields
+        fields
             .iter()
             .map(|(k, v)| format!("{k}={}", encode(v)))
             .collect::<Vec<_>>()
-            .join("&");
-        send(env, "POST", "/settings/hardware", body).await
+            .join("&")
+    }
+
+    #[tokio::test]
+    async fn an_htmx_save_answers_with_the_cards_and_a_toast() {
+        let env = env(Role::Admin).await;
+        let (status, trigger, html) = post_hw_htmx(&env, &[("tx_tail_ms", "250")]).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(!html.contains("<html"), "{html}");
+        for card in ["id=\"sprzet\"", "id=\"stan\"", "id=\"restart\"", "Zapisano. Zmiany wejdą"] {
+            assert!(html.contains(card), "brak {card}: {html}");
+        }
+        assert!(trigger.contains("\"kind\":\"ok\""), "{trigger}");
+
+        let (status, trigger, html) = post_hw_htmx(&env, &[("tx_tail_ms", "abc")]).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{html}");
+        assert!(trigger.contains("\"kind\":\"error\""), "{trigger}");
+        assert!(html.contains("aria-invalid=\"true\""), "{html}");
+        assert!(html.contains("value=\"abc\""), "wpisana wartość zostaje");
     }
 
     async fn post_simple(env: &Env, uri: &str, extra: &str) -> (StatusCode, String) {
@@ -951,6 +1016,41 @@ mod tests {
         for needle in ["hw:1,0", "/dev/ttyUSB0", "gpiochip0", "pl_PL-test", "w pliku:"] {
             assert!(html.contains(needle), "brak {needle}: {html}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_voice_list_uses_friendly_names_for_the_bundled_voices() {
+        let env = env(Role::Admin).await;
+        for f in [
+            "pl_PL-gosia-medium.onnx",
+            "pl_PL-gosia-medium.onnx.json",
+            "pl_PL-mc_speech-medium.onnx",
+            "pl_PL-mc_speech-medium.onnx.json",
+        ] {
+            std::fs::write(env._voices.path().join(f), "x").unwrap();
+        }
+        let (_, html) = get(&env, "/settings/hardware").await;
+        assert!(html.contains("Gosia (kobiecy)"), "{html}");
+        assert!(html.contains("MC Speech (męski)"), "{html}");
+        assert!(html.contains("pl_PL-test"), "nieznany głos zostaje pod nazwą pliku");
+        assert!(!html.contains("stacja używa głosu Gosia"), "model istnieje, bez ostrzeżenia");
+    }
+
+    #[tokio::test]
+    async fn a_vanished_model_is_reported_as_replaced_by_gosia() {
+        let env = env(Role::Admin).await;
+        for f in ["pl_PL-gosia-medium.onnx", "pl_PL-gosia-medium.onnx.json"] {
+            std::fs::write(env._voices.path().join(f), "x").unwrap();
+        }
+        let darkman = env._voices.path().join("pl_PL-darkman-medium.onnx");
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('hw:tts.model', ?)")
+            .bind(darkman.to_string_lossy().as_ref())
+            .execute(&env.state.pool)
+            .await
+            .unwrap();
+        let (_, html) = get(&env, "/settings/hardware").await;
+        assert!(html.contains("pl_PL-darkman-medium.onnx nie istnieje"), "{html}");
+        assert!(html.contains("stacja używa głosu Gosia"), "{html}");
     }
 
     #[tokio::test]

@@ -279,6 +279,16 @@ pub fn normalize(input: &str) -> String {
             continue;
         }
 
+        // „godzina 7:00” (wstęp biuletynu): słowo już jest, zostaje sama pora
+        // w przypadku tego słowa — bez „godzina godzina siódma”.
+        if let Some(genitive) = previous_core.and_then(hour_word_genitive)
+            && let Some((hour, minute)) = clock_time(core)
+        {
+            push_word(&mut out, lead, &bare_time(hour, minute, genitive), trail);
+            idx += 1;
+            continue;
+        }
+
         if let Some(spoken) = spoken_time(core, hour_case(previous_core)) {
             push_word(&mut out, lead, &spoken, trail);
             idx += 1;
@@ -374,7 +384,18 @@ pub fn normalize(input: &str) -> String {
             }
         }
 
-        if let Some((_, expanded)) = ABBREVIATIONS.iter().find(|(abbr, _)| *abbr == core) {
+        // „W nocy”, „W najbliższych godzinach”: jednoliterowy skrót strony
+        // świata przed zwykłym słowem to przyimek, nie kierunek.
+        let preposition = core.chars().count() == 1
+            && trail.is_empty()
+            && parts
+                .get(idx + 1)
+                .is_some_and(|&(next_lead, next_core, _)| {
+                    next_lead.is_empty() && next_core.chars().next().is_some_and(char::is_alphabetic)
+                });
+        if !preposition
+            && let Some((_, expanded)) = ABBREVIATIONS.iter().find(|(abbr, _)| *abbr == core)
+        {
             push_word(&mut out, lead, expanded, trail);
             idx += 1;
             continue;
@@ -501,6 +522,16 @@ fn unit_form(text: &str, value: &NumberText, genitive: bool) -> &'static str {
     }
 }
 
+/// Słowo „godzina” przed porą: `Some(true)`, gdy pora idzie w dopełniaczu
+/// („godziny”, „godzinie” → „siódmej”), `Some(false)` dla mianownika.
+fn hour_word_genitive(word: &str) -> Option<bool> {
+    match word.to_lowercase().as_str() {
+        "godzina" => Some(false),
+        "godziny" | "godzinie" => Some(true),
+        _ => None,
+    }
+}
+
 /// „18:00" → „godzina osiemnasta"; „06:30" → „godzina szósta trzydzieści";
 /// po „od/do/po/około" → „godziny …", po „o" → „godzinie …". „24:00" jest
 /// poprawne (koniec doby), „24:30" już nie.
@@ -578,6 +609,9 @@ mod tests {
         assert_eq!(n("w godz. 7:00 – 15:00"), "w godzinach siódma – piętnasta");
         assert_eq!(n("w godz. 8:00 - 16:00."), "w godzinach ósma - szesnasta.");
         assert_eq!(n("18:00"), "godzina osiemnasta");
+        assert_eq!(n("Wtorek, 24 listopada, godzina 7:05."), "Wtorek, dwudziestego czwartego listopada, godzina siódma zero pięć.");
+        assert_eq!(n("Godzina 19:00."), "Godzina dziewiętnasta.");
+        assert_eq!(n("od godziny 8:30"), "od godziny ósmej trzydzieści");
         // „godz.” bez godziny za nim zostaje jak jest.
         assert_eq!(
             n("czas oczekiwania 22 godz. Kolejka"),
@@ -795,6 +829,11 @@ mod tests {
     fn abbreviations_are_expanded() {
         assert_eq!(n("kierunek N"), "kierunek północny");
         assert_eq!(n("kierunek SW"), "kierunek południowo-zachodni");
+        assert_eq!(n("W nocy do 1 °C."), "W nocy do jednego stopnia Celsjusza.");
+        assert_eq!(n("W najbliższych godzinach"), "W najbliższych godzinach");
+        assert_eq!(n("kierunek W"), "kierunek zachodni");
+        assert_eq!(n("wiatr W 5 m/s"), "wiatr zachodni pięć metrów na sekundę");
+        assert_eq!(n("wiatr W, słaby"), "wiatr zachodni, słaby");
         assert_eq!(n("IMGW ostrzega"), "I M G W ostrzega");
     }
 

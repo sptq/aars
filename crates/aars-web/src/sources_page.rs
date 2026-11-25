@@ -22,6 +22,15 @@ use crate::chrome::{Chrome, both_times_now, plural, priority_label, source_label
 use crate::render::page;
 use crate::state::AppState;
 
+/// Pusty ręczny obszar przy źródle z obszarem z pozycji: liczy się pozycja.
+pub(crate) fn health_needs(needs: Needs, auto: bool, area_empty: bool) -> Needs {
+    if needs == Needs::Area && auto && area_empty {
+        Needs::Position
+    } else {
+        needs
+    }
+}
+
 /// Plakietka zdrowia źródła: (klasa CSS, tekst). Przestarzałe wygrywa z „działa”.
 pub fn health(
     status: &SourceStatus,
@@ -65,6 +74,8 @@ pub(crate) struct SourceView {
     pub(crate) last_error: Option<String>,
     pub(crate) shows_area: bool,
     pub(crate) area_text: String,
+    /// Obszar liczony z pozycji (gdy źródło to umie): „Automatycznie: …”.
+    pub(crate) auto_area_note: Option<String>,
     pub(crate) interval_s: u64,
     pub(crate) warnings: Vec<WarningRow>,
 }
@@ -77,7 +88,7 @@ fn time_or_never(at: Option<DateTime<Utc>>) -> String {
 pub(crate) async fn load_views(state: &AppState) -> Result<Vec<SourceView>, DbError> {
     let repo = SourceStateRepo::new(state.pool.clone());
     let now = Utc::now();
-    let has_position = matches!(PositionRepo::new(state.pool.clone()).load().await, Ok(Some(_)));
+    let position = PositionRepo::new(state.pool.clone()).load().await.ok().flatten();
     let mut views = Vec::new();
     for status in repo.statuses().await? {
         let Some(cfg) = repo.config(&status.source_id).await? else {
@@ -87,7 +98,15 @@ pub(crate) async fn load_views(state: &AppState) -> Result<Vec<SourceView>, DbEr
             .modules
             .get(&status.source_id)
             .map_or(Needs::Area, |m| m.needs);
-        let (css, health_text) = health(&status, &cfg, needs, has_position, now);
+        let auto = state.modules.get(&status.source_id).and_then(|m| m.auto_area);
+        // Pusty ręczny obszar przy obszarze z pozycji: liczy się pozycja.
+        let (css, health_text) = health(
+            &status,
+            &cfg,
+            health_needs(needs, auto.is_some(), cfg.area.is_empty()),
+            position.is_some(),
+            now,
+        );
         let warnings = repo
             .active_items(&status.source_id)
             .await?
@@ -113,6 +132,9 @@ pub(crate) async fn load_views(state: &AppState) -> Result<Vec<SourceView>, DbEr
             last_error: status.last_error.clone(),
             shows_area: needs == Needs::Area,
             area_text: cfg.area_text,
+            auto_area_note: auto.map(|g| {
+                aars_core::area_auto::auto_area_note(position.as_ref(), g, !cfg.area.is_empty())
+            }),
             interval_s: cfg.interval_s,
             warnings,
         });
@@ -155,6 +177,15 @@ pub struct EnabledForm {
 pub struct CsrfOnly {
     #[serde(default)]
     csrf: String,
+}
+
+/// Po udanej akcji: formularz htmx dostaje świeżą stronę (htmx bierze z niej
+/// kartę źródła) i powiadomienie; zwykły formularz — przekierowanie.
+async fn done(state: AppState, current: CurrentUser, toast: &str) -> Result<Response, AuthRejection> {
+    if current.htmx {
+        return Ok(crate::render::htmx::ok(page_view(State(state), current).await?, toast));
+    }
+    Ok(Redirect::to("/sources").into_response())
 }
 
 fn unknown_source() -> Response {
@@ -202,7 +233,7 @@ pub async fn set_enabled(
     if enabled && let Some(refresh) = &state.source_refresh {
         refresh(&id);
     }
-    Ok(Redirect::to("/sources").into_response())
+    done(state, current, if enabled { "Włączono" } else { "Wyłączono" }).await
 }
 
 pub async fn refresh(
@@ -230,7 +261,7 @@ pub async fn refresh(
         return Ok(unknown_source());
     }
     audit(&state, current.user.id, "source_refresh", &id).await;
-    Ok(Redirect::to("/sources").into_response())
+    done(state, current, "Odświeżanie zlecone").await
 }
 
 #[cfg(test)]
@@ -339,6 +370,7 @@ pub(crate) mod tests {
                     fingerprint: "f".into(),
                     area: "1061".into(),
                     summary: summary.into(),
+                    text: summary.into(),
                     cancel_text: "Odwołanie".into(),
                     priority: Priority::Normal,
                     valid_from: Some(at),
@@ -454,7 +486,7 @@ pub(crate) mod tests {
         let (_, html) = get(&app, &cookie, "/sources").await;
         assert!(html.contains("1061 Łódź"), "{html}");
         assert!(html.contains("600 s"), "{html}");
-        assert!(html.contains("href=\"/modules#imgw-meteo\""), "{html}");
+        assert!(html.contains("href=\"/modules?m=imgw-meteo\""), "{html}");
         assert!(html.contains("Zmień w Moduły"), "{html}");
         assert!(!html.contains("name=\"area\""), "{html}");
         assert!(!html.contains("/sources/imgw-meteo/settings"), "{html}");
@@ -501,7 +533,7 @@ pub(crate) mod tests {
         let swpc = html.split("Pogoda kosmiczna NOAA").nth(1).unwrap();
         let swpc = swpc.split("Aktywne ostrzeżenia").next().unwrap();
         assert!(swpc.contains("Ustawienia źródła zmienia administrator"), "{swpc}");
-        assert!(swpc.contains("href=\"/modules#swpc\""), "{swpc}");
+        assert!(swpc.contains("href=\"/modules?m=swpc\""), "{swpc}");
         assert!(!swpc.contains("Obszar i interwał"), "{swpc}");
         let imgw = html.split("Ostrzeżenia meteorologiczne IMGW").nth(1).unwrap();
         let imgw = imgw.split("Aktywne ostrzeżenia").next().unwrap();

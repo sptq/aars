@@ -1,5 +1,6 @@
-//! Biuletyn z prawdziwych fiksów: pogoda (Open-Meteo), propagacja (NOAA,
-//! KC2G) i ostrzeżenia złożone w jeden tekst; runner wstawia go do kolejki.
+//! Biuletyn z prawdziwych fiksów: pogoda (Open-Meteo), stany wód (IMGW),
+//! propagacja (NOAA, KC2G) i ostrzeżenia złożone domyślnym układem w jeden
+//! tekst z pauzami; runner wstawia go do kolejki.
 //! Tylko wiremock na 127.0.0.1; bez dyspozytora, PTT i audio, więc nic nie
 //! może kluczować nadajnika.
 
@@ -20,7 +21,7 @@ use sqlx::SqlitePool;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const EXPECTED: &str = "Biuletyn stacji SP9XYZ. 20:00. Pogoda dla okolic stacji. Teraz 2 °C, bezchmurnie. W nocy do 1 °C. Jutro śnieg, do 3 °C, opady do 2,4 mm, porywy wiatru do 45 km/h. Dane: Open-Meteo. Propagacja. Strumień słoneczny 98, umiarkowany. Indeks K 0,3, warunki spokojne. Pogoda kosmiczna bez zaburzeń. Jonosonda Warszawa: częstotliwość krytyczna 3,2 megaherca, MUF 10,6 megaherca. Łączności bliskie do pasma 160 metrów, dalekie do pasma 40 metrów. Dane: NOAA, GIRO przez KC2G. Brak obowiązujących ostrzeżeń. Koniec biuletynu.";
+const EXPECTED: &str = "Tu automatyczna stacja informacyjna SP9XYZ. Niedziela, 22 listopada, godzina 20:00. [[pauza:700]] Brak obowiązujących ostrzeżeń dla okolic stacji. [[pauza:700]] Pogoda dla okolic stacji według danych Open-Meteo. Obecnie bezchmurnie, temperatura 2 °C. Wiatr 3 m/s, w porywach 5 m/s. W najbliższych godzinach pochmurno, bez opadów. W nocy do 1 °C. Jutro śnieg, od 1 do 3 °C, opady do 2 mm, porywy wiatru do 13 m/s. [[pauza:500]] Stany wód. Rzeszów, Wisłok: 72 cm. Żarnowa, Wisłok: 164 cm. Godowa, Stobnica: 609 cm. Źródło: IMGW-PIB. Propagacja. Strumień słoneczny 98, umiarkowany. Indeks K 0,3, warunki spokojne. Pogoda kosmiczna bez zaburzeń. Jonosonda Warszawa: częstotliwość krytyczna 3,2 megaherca, MUF 10,6 megaherca. Łączności bliskie do pasma 160 metrów, dalekie do pasma 40 metrów. Dane: NOAA, GIRO przez KC2G. Tu SP9XYZ. Koniec komunikatu.";
 
 fn at(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
@@ -44,6 +45,7 @@ async fn server() -> MockServer {
         ("/kp", "propagacja/kp-2026-11-22.json"),
         ("/scales", "swpc/noaa-scales-2026-11-22.json"),
         ("/stations", "propagacja/kc2g-stations-2026-11-22.json"),
+        ("/hydro", "imgw/hydro-2026-11-22.json"),
     ] {
         Mock::given(method("GET"))
             .and(path(route))
@@ -65,6 +67,7 @@ fn config(server: &MockServer) -> Config {
     cfg.sources.swpc_kp_url = u("/kp");
     cfg.sources.swpc_url = u("/scales");
     cfg.sources.kc2g_url = u("/stations");
+    cfg.sources.imgw_hydro_stations_url = u("/hydro");
     cfg
 }
 
@@ -91,8 +94,18 @@ async fn station() -> SqlitePool {
 /// Warunki z `speech::assert_speakable` (tam tylko dla testów jednostkowych).
 fn assert_speakable(text: &str) {
     const RAW: &[&str] = &["NOAA", "MUF", "KC2G", "SWPC"];
-    let spoken = aars_audio::text::normalize(text);
+    // Synteza najpierw dzieli tekst na mowę i pauzy, potem normalizuje mowę.
+    let spoken: Vec<String> = aars_core::pause::split(text)
+        .into_iter()
+        .filter_map(|seg| match seg {
+            aars_core::pause::Segment::Text(t) => Some(aars_audio::text::normalize(&t)),
+            aars_core::pause::Segment::Pause(_) => None,
+        })
+        .collect();
+    let spoken = spoken.join(" ");
     assert!(!spoken.contains("godzinie godzina"), "{spoken}");
+    assert!(!spoken.contains("godzina godzina"), "{spoken}");
+    assert!(!spoken.contains("pauza"), "{spoken}");
     assert!(!spoken.contains(",;"), "{spoken}");
     for word in spoken.split_whitespace() {
         let core = word.trim_matches(|c: char| !c.is_alphanumeric());
@@ -106,6 +119,7 @@ async fn the_bulletin_reads_the_fixtures_into_one_text() {
     let pool = station().await;
     let bulletin = build(&config(&server), pool.clone()).unwrap().bulletin;
 
+    // 20:00 czasu polskiego: cykl 120, więc także propagacja (co 3. cykl).
     let now = at("2026-11-22T19:00:00Z");
     // Bez włączonego źródła ostrzeżeń część milczy — nie mówi „brak ostrzeżeń”.
     let c = bulletin.compose(now).await.unwrap();
@@ -113,20 +127,20 @@ async fn the_bulletin_reads_the_fixtures_into_one_text() {
         c.text.as_deref(),
         Some(
             EXPECTED
-                .replace(" Brak obowiązujących ostrzeżeń.", "")
+                .replace(" Brak obowiązujących ostrzeżeń dla okolic stacji. [[pauza:700]]", "")
                 .as_str()
         ),
         "{:?}",
         c.parts
     );
     assert!(
-        c.parts.iter().any(|(id, o)| *id == "ostrzezenia"
+        c.parts.iter().any(|(id, o)| *id == "Obowiązujące ostrzeżenia"
             && o.describe().contains("brak włączonych źródeł ostrzeżeń")),
         "{:?}",
         c.parts
     );
 
-    // Włączone, świeże źródło bez ostrzeżeń: „Brak obowiązujących ostrzeżeń.”
+    // Włączone, świeże źródło bez ostrzeżeń: „Brak obowiązujących ostrzeżeń dla okolic stacji.”
     let state = SourceStateRepo::new(pool.clone());
     state.set_enabled("swpc", true).await.unwrap();
     state
@@ -147,6 +161,7 @@ async fn the_bulletin_reads_the_fixtures_into_one_text() {
                 fingerprint: "G3".into(),
                 area: String::new(),
                 summary: "G3 — silna burza geomagnetyczna".into(),
+                text: "Uwaga, burza geomagnetyczna G3, silna.".into(),
                 cancel_text: String::new(),
                 priority: Priority::High,
                 valid_from: None,
@@ -161,15 +176,86 @@ async fn the_bulletin_reads_the_fixtures_into_one_text() {
         )
         .await
         .unwrap();
+    state
+        .upsert_active(
+            &NewTracked {
+                source_id: "swpc".into(),
+                item_key: "R".into(),
+                topic: "R".into(),
+                fingerprint: "R2".into(),
+                area: String::new(),
+                summary: "R2 — umiarkowane zaniki łączności radiowej".into(),
+                text: "Umiarkowane zaniki łączności na falach krótkich po stronie dziennej Ziemi.".into(),
+                cancel_text: String::new(),
+                priority: Priority::Normal,
+                valid_from: None,
+                valid_until: None,
+                aired: true,
+                first_seen_at: now - chrono::Duration::minutes(20),
+                last_seen_at: now - chrono::Duration::minutes(5),
+                queue_item_id: None,
+                superseded: Vec::new(),
+            },
+            now - chrono::Duration::minutes(5),
+        )
+        .await
+        .unwrap();
     let text = bulletin.compose(now).await.unwrap().text.unwrap();
     assert!(
-        text.contains("Obowiązujące ostrzeżenia: G3 — silna burza geomagnetyczna."),
+        text.contains("Obowiązujące ostrzeżenia. Uwaga, burza geomagnetyczna G3, silna. Umiarkowane zaniki"),
         "{text}"
     );
-    assert!(!text.contains("Brak obowiązujących ostrzeżeń."), "{text}");
+    assert!(!text.contains("Brak obowiązujących ostrzeżeń"), "{text}");
     assert_speakable(&text);
 
-    // Runner o porze 19:00 lokalnie wstawia dokładnie jeden element.
+    // Krótki limit nadawania: wstęp, ostrzeżenia i zakończenie muszą się
+    // zmieścić razem, a ostrzeżenia ucinają się na granicy zdania z ogonem.
+    let kv = SettingsRepo::new(pool.clone());
+    for (tx, expected) in [
+        // Tempo domyślne 0,87: (42 − 10) × 7,83 = 250 znaków, (33 − 10) × 7,83 = 180.
+        ("42", "Obowiązujące ostrzeżenia. Uwaga, burza geomagnetyczna G3, silna. Oraz jeszcze jedno ostrzeżenie."),
+        ("33", "Obowiązujące ostrzeżenia: 2."),
+    ] {
+        kv.kv_put("tx_max_duration_s", tx).await.unwrap();
+        let budget = aars_sources::bulletin::Budget::new(
+            tx.parse().unwrap(),
+            aars_core::settings::DEFAULT_SPEECH_RATE,
+        );
+        let limit = budget.chars;
+        let short = bulletin.compose(now).await.unwrap().text.unwrap();
+        let spoken = aars_core::pause::strip_markers(&short);
+        let pauses: u64 = aars_core::pause::split(&short)
+            .iter()
+            .map(|s| match s {
+                aars_core::pause::Segment::Pause(d) => d.as_millis() as u64,
+                aars_core::pause::Segment::Text(_) => 0,
+            })
+            .sum();
+        let cost = spoken.chars().count() + budget.pause_chars(pauses);
+        assert!(cost <= limit, "{cost} > {limit}: {short}");
+        assert!(short.contains(&format!("[[pauza:700]] {expected} [[pauza:700]] Tu SP9XYZ. Koniec komunikatu.")), "{short}");
+        assert!(!short.contains("Pogoda dla okolic"), "{short}");
+        assert_speakable(&short);
+    }
+    kv.kv_put("tx_max_duration_s", "180").await.unwrap();
+
+    // Atrybucja pogody jest w pierwszym dołączonym klocku pogodowym, także
+    // gdy pogoda bieżąca jest wyłączona.
+    kv.kv_put(
+        "module:bulletin:layout",
+        r#"{"bloki":[{"rodzaj":"pogoda_teraz","wlaczony":false},{"rodzaj":"wody"},{"rodzaj":"prognoza"},{"rodzaj":"slonce"}]}"#,
+    )
+    .await
+    .unwrap();
+    let text = bulletin.compose(now).await.unwrap().text.unwrap();
+    assert!(
+        text.starts_with("Stany wód. ") && text.contains(" Źródło: IMGW-PIB. Pogoda dla okolic stacji według danych Open-Meteo. W najbliższych godzinach"),
+        "{text}"
+    );
+    assert_eq!(text.matches("według danych").count(), 1, "{text}");
+    kv.kv_put("module:bulletin:layout", "").await.unwrap();
+
+    // Runner w cyklu 19:00 lokalnie wstawia dokładnie jeden element.
     let queue = Arc::new(QueueRepo::new(pool.clone()));
     let runner = BulletinRunner::new(bulletin.clone(), queue.clone());
     let tick = runner.tick(local("2026-11-22 19:00:05")).await.unwrap();
@@ -180,7 +266,7 @@ async fn the_bulletin_reads_the_fixtures_into_one_text() {
     assert!(
         items[0]
             .rendered_text
-            .starts_with("Biuletyn stacji SP9XYZ. 19:00. "),
+            .starts_with("Tu automatyczna stacja informacyjna SP9XYZ. Niedziela, 22 listopada, godzina 19:00. [[pauza:700]] Obowiązujące ostrzeżenia. "),
         "{}",
         items[0].rendered_text
     );

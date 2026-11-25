@@ -22,6 +22,10 @@ pub trait DataSource: Send + Sync {
     fn needs(&self) -> Needs {
         Needs::Area
     }
+    /// Granulacja obszaru liczonego z pozycji, gdy ręczny jest pusty.
+    fn auto_area(&self) -> Option<aars_core::area_auto::AreaGranularity> {
+        None
+    }
     /// Zakres R9 (A2): pozycje śledzone przy innym zakresie znikają po cichu.
     fn scope(&self, ctx: &SourceCtx) -> String {
         ctx.area_text.clone()
@@ -66,11 +70,15 @@ pub struct SourceItem {
     pub summary: String,
     pub priority: Priority,
     pub interrupting: bool,
+    /// Seria pierwszego ogłoszenia: (liczba nadań, odstęp). Zmiana i
+    /// odwołanie nigdy się nie powtarzają. Tylko pierwsze nadanie serii
+    /// może przerywać audycję.
+    pub repeat: Option<(u32, Duration)>,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_until: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum SourceError {
     #[error("błąd połączenia: {0}")]
     Http(String),

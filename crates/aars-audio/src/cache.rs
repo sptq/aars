@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use aars_core::pause;
 use aars_core::synth::{Pcm, SynthError, Synthesizer, VoiceParams};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
@@ -38,17 +39,63 @@ impl AudioCache {
     }
 
     /// Zwraca ścieżkę i PCM dla tekstu, syntezując tylko wtedy, gdy trzeba.
+    /// Znaczniki `[[pauza:MS]]` są wycinane przed syntezą: odcinki mowy idą
+    /// do syntezatora osobno (każdy przez cache), między nimi wchodzi cisza.
     pub async fn render(
         &self,
         synth: &dyn Synthesizer,
         text: &str,
         voice: &VoiceParams,
     ) -> Result<(PathBuf, Pcm), SynthError> {
+        if !pause::has_marker(text) {
+            return self.render_plain(synth, text, voice).await;
+        }
         let key = Self::cache_key(text, voice, &synth.identity());
+        if let Some(hit) = self.lookup(&key).await? {
+            return Ok(hit);
+        }
 
+        let segments = pause::split(text);
+        let mut total: Option<Pcm> = None;
+        for segment in &segments {
+            let part = match segment {
+                pause::Segment::Text(t) => self.render_plain(synth, t, voice).await?.1,
+                pause::Segment::Pause(d) => {
+                    Pcm::silence(synth.sample_rate(), *d)
+                }
+            };
+            match &mut total {
+                Some(acc) => acc.append(&part)?,
+                None => total = Some(part),
+            }
+        }
+        let pcm = match total {
+            Some(p) => p,
+            None => Pcm { samples: Vec::new(), sample_rate: synth.sample_rate() },
+        };
+        let path = self.store(&key, &pcm).await?;
+        Ok((path, pcm))
+    }
+
+    async fn render_plain(
+        &self,
+        synth: &dyn Synthesizer,
+        text: &str,
+        voice: &VoiceParams,
+    ) -> Result<(PathBuf, Pcm), SynthError> {
+        let key = Self::cache_key(text, voice, &synth.identity());
+        if let Some(hit) = self.lookup(&key).await? {
+            return Ok(hit);
+        }
+        let pcm = synth.synthesize(text, voice)?;
+        let path = self.store(&key, &pcm).await?;
+        Ok((path, pcm))
+    }
+
+    async fn lookup(&self, key: &str) -> Result<Option<(PathBuf, Pcm)>, SynthError> {
         let existing: Option<String> =
             sqlx::query_scalar("SELECT path FROM audio_cache WHERE hash = ?")
-                .bind(&key)
+                .bind(key)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| SynthError::Engine(format!("odczyt cache: {e}")))?;
@@ -62,37 +109,38 @@ impl AudioCache {
                 sqlx::query(
                     "UPDATE audio_cache SET last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE hash = ?",
                 )
-                .bind(&key)
+                .bind(key)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| SynthError::Engine(format!("aktualizacja cache: {e}")))?;
-                return Ok((path, pcm));
+                return Ok(Some((path, pcm)));
             }
             // Wpis bez czytelnego pliku: ktoś wyczyścił katalog pod nami.
             tracing::warn!(%key, path = %path.display(), "wpis cache bez pliku, ponowna synteza");
             sqlx::query("DELETE FROM audio_cache WHERE hash = ?")
-                .bind(&key)
+                .bind(key)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| SynthError::Engine(format!("czyszczenie wpisu cache: {e}")))?;
         }
+        Ok(None)
+    }
 
-        let pcm = synth.synthesize(text, voice)?;
+    async fn store(&self, key: &str, pcm: &Pcm) -> Result<PathBuf, SynthError> {
         std::fs::create_dir_all(&self.dir)?;
         let path = self.dir.join(format!("{key}.wav"));
-        write_wav_mono(&path, &pcm)?;
+        write_wav_mono(&path, pcm)?;
 
         let bytes = std::fs::metadata(&path)?.len() as i64;
         sqlx::query("INSERT INTO audio_cache (hash, path, bytes, duration_ms) VALUES (?, ?, ?, ?)")
-            .bind(&key)
+            .bind(key)
             .bind(path.to_string_lossy().as_ref())
             .bind(bytes)
             .bind(pcm.duration().as_millis() as i64)
             .execute(&self.pool)
             .await
             .map_err(|e| SynthError::Engine(format!("zapis wpisu cache: {e}")))?;
-
-        Ok((path, pcm))
+        Ok(path)
     }
 
     /// Usuwa najdawniej używane wpisy, aż suma rozmiarów zmieści się w limicie.
@@ -294,5 +342,72 @@ mod tests {
         cache.prune().await.unwrap();
 
         assert!(path.exists(), "ostatni wpis zostaje, choć przekracza limit");
+    }
+
+    #[tokio::test]
+    async fn pauses_are_inserted_between_separately_synthesized_segments() {
+        let pool = aars_core::db::test_pool().await;
+        let dir = tmp_dir("pause");
+        let cache = AudioCache::new(pool, dir.0.clone(), 10 * 1024 * 1024);
+        let synth = FakeSynth::new(48_000);
+        let voice = VoiceParams::default();
+
+        let (_, pcm) = cache.render(&synth, "ab[[pauza:500]]cde", &voice).await.unwrap();
+        assert_eq!(synth.requests(), vec!["ab", "cde"]);
+        // 5 znaków po 50 ms + 500 ms.
+        assert!((pcm.samples.len() as i64 - 48_000 * 750 / 1000).abs() <= 1);
+
+        let (_, again) = cache.render(&synth, "ab[[pauza:500]]cde", &voice).await.unwrap();
+        assert_eq!(again, pcm);
+        assert_eq!(synth.requests().len(), 2, "całość z cache");
+    }
+
+    #[tokio::test]
+    async fn pause_only_leading_trailing_and_clamped() {
+        let pool = aars_core::db::test_pool().await;
+        let dir = tmp_dir("pause2");
+        let cache = AudioCache::new(pool, dir.0.clone(), 10 * 1024 * 1024);
+        let synth = FakeSynth::new(48_000);
+        let voice = VoiceParams::default();
+
+        let (_, only) = cache.render(&synth, "[[pauza:300]]", &voice).await.unwrap();
+        assert_eq!(only.samples.len(), 14_400);
+        assert!(only.samples.iter().all(|s| *s == 0));
+
+        let (_, lead) = cache.render(&synth, "[[pauza:100]]ab", &voice).await.unwrap();
+        assert_eq!(lead.samples.len(), 4_800 + 4_800);
+        assert!(lead.samples[..4_800].iter().all(|s| *s == 0));
+
+        let (_, trail) = cache.render(&synth, "ab[[pauza:100]]", &voice).await.unwrap();
+        assert_eq!(trail.samples.len(), 9_600);
+        assert!(trail.samples[4_800..].iter().all(|s| *s == 0));
+
+        let (_, big) = cache.render(&synth, "[[pauza:99999]]", &voice).await.unwrap();
+        assert_eq!(big.samples.len(), 480_000);
+    }
+
+    #[tokio::test]
+    async fn bad_marker_is_removed_and_never_reaches_the_synth() {
+        let pool = aars_core::db::test_pool().await;
+        let dir = tmp_dir("pause3");
+        let cache = AudioCache::new(pool, dir.0.clone(), 10 * 1024 * 1024);
+        let synth = FakeSynth::new(48_000);
+
+        let (_, pcm) =
+            cache.render(&synth, "ab[[pauza:x]]cd", &VoiceParams::default()).await.unwrap();
+        assert_eq!(synth.requests(), vec!["abcd"]);
+        assert_eq!(pcm.samples.len(), 4 * 2_400);
+    }
+
+    #[tokio::test]
+    async fn text_without_markers_is_unchanged() {
+        let pool = aars_core::db::test_pool().await;
+        let dir = tmp_dir("pause4");
+        let cache = AudioCache::new(pool, dir.0.clone(), 10 * 1024 * 1024);
+        let synth = FakeSynth::new(48_000);
+
+        let (_, pcm) = cache.render(&synth, "zwykły tekst", &VoiceParams::default()).await.unwrap();
+        assert_eq!(synth.requests(), vec!["zwykły tekst"]);
+        assert_eq!(pcm.samples.len(), 12 * 2_400);
     }
 }

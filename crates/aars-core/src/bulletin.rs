@@ -65,6 +65,35 @@ impl BulletinFireRepo {
         Ok(())
     }
 
+    /// Pory już zajęte od `from` (włącznie) — runner nie próbuje ich drugi
+    /// raz przy każdym tiku.
+    pub async fn claimed_since(&self, from: DateTime<Utc>) -> Result<Vec<DateTime<Utc>>, DbError> {
+        let rows: Vec<String> = sqlx::query_scalar("SELECT fire_at FROM bulletin_fires WHERE fire_at >= ? ORDER BY fire_at")
+            .bind(iso(from))
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| match chrono::NaiveDateTime::parse_from_str(r, "%Y-%m-%dT%H:%M:%SZ") {
+                Ok(n) => Some(n.and_utc()),
+                Err(e) => {
+                    // Nieszkodliwe (claim i tak pilnuje INSERT OR IGNORE), ale widoczne.
+                    tracing::debug!(wiersz = %r, błąd = %e, "nieczytelna pora w bulletin_fires");
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// Usuwa wpisy starsze niż `before` (tryb cykliczny to 144 wpisy na dobę).
+    pub async fn prune_before(&self, before: DateTime<Utc>) -> Result<u64, DbError> {
+        let r = sqlx::query("DELETE FROM bulletin_fires WHERE fire_at < ?")
+            .bind(iso(before))
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
     pub async fn get(&self, fire_at: DateTime<Utc>) -> Result<Option<BulletinFire>, DbError> {
         let row = sqlx::query(
             "SELECT skipped_reason, queue_item_id FROM bulletin_fires WHERE fire_at = ?",
@@ -120,5 +149,13 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        let later = t + chrono::Duration::minutes(10);
+        assert!(repo.claim(later, Some("x")).await.unwrap());
+        assert_eq!(repo.claimed_since(t).await.unwrap(), [t, later]);
+        assert_eq!(repo.claimed_since(later).await.unwrap(), [later]);
+        assert_eq!(repo.prune_before(later).await.unwrap(), 1);
+        assert!(repo.get(t).await.unwrap().is_none());
+        assert!(repo.get(later).await.unwrap().is_some());
     }
 }

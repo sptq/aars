@@ -225,11 +225,7 @@ fn every_form_field_has_a_label() {
 
 #[test]
 fn no_template_adds_an_inline_script() {
-    let allowed = ["compose.html", "message_form.html", "modules.html"];
     for (name, text) in templates() {
-        if allowed.contains(&name.as_str()) {
-            continue;
-        }
         let inline = text.match_indices("<script").any(|(at, _)| {
             !text[at..text[at..].find('>').map_or(text.len(), |e| at + e)].contains("src=")
         });
@@ -299,6 +295,22 @@ fn the_audio_preview_has_a_single_rule() {
                 .rfind("<div class=\"preview\">")
                 .is_some_and(|open| text[open..at].matches("</div>").count() == 0);
             assert!(!inside_preview, "{name}: zbędna klasa w .preview");
+        }
+    }
+}
+
+#[test]
+fn every_asset_address_in_the_templates_carries_the_stamp() {
+    // Bez odcisku przeglądarka trzymałaby stary plik do godziny po aktualizacji.
+    for (name, text) in templates() {
+        for (at, _) in text.match_indices("/assets/") {
+            let rest = &text[at..];
+            let end = rest.find(['"', '\'']).unwrap_or(rest.len());
+            let url = &rest[..end];
+            assert!(
+                url.contains("?v={{ crate::assets::stamp() }}"),
+                "{name}: adres bez odcisku: {url}"
+            );
         }
     }
 }

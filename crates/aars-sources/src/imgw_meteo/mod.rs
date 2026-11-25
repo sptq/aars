@@ -28,11 +28,12 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     toggle: Toggle::Switchable,
     default_enabled: false,
     needs: Needs::Area,
+    auto_area: Some(aars_core::area_auto::AreaGranularity::County),
     settings: &[
         SettingSpec {
             key: "area",
             label: "Obszar",
-            help: "Jedna linia (albo wpis po średniku) na obszar: dwucyfrowy kod województwa (np. 10) albo czterocyfrowy kod powiatu z nazwą, którą stacja ma wypowiadać (np. 1061 Łódź). Najwyżej 40 wpisów; puste pole to brak obszaru — źródło nic nie ogłasza.",
+            help: "Jedna linia (albo wpis po średniku) na obszar: dwucyfrowy kod województwa (np. 10) albo czterocyfrowy kod powiatu z nazwą, którą stacja ma wypowiadać (np. 1061 Łódź). Najwyżej 40 wpisów; puste pole to obszar liczony z pozycji stacji (powiat); wpis go nadpisuje.",
             kind: SettingKind::Area,
             default: "",
         },
@@ -86,6 +87,10 @@ impl ImgwMeteo {
 impl DataSource for ImgwMeteo {
     fn id(&self) -> &'static str {
         ID
+    }
+
+    fn auto_area(&self) -> Option<aars_core::area_auto::AreaGranularity> {
+        DESCRIPTOR.auto_area
     }
 
     fn default_interval(&self) -> Duration {
@@ -152,6 +157,7 @@ pub fn to_output(parsed: ParsedWarnings, ctx: &SourceCtx) -> SourceOutput {
             },
             priority,
             interrupting,
+            repeat: None,
             valid_from: Some(valid_from),
             valid_until: Some(valid_until),
         });

@@ -184,7 +184,9 @@ impl QueueRepo {
             .bind(request.message_id)
             .bind(&request.rendered_text)
             .bind(request.priority as i64)
-            .bind(i64::from(request.interrupting))
+            // Przerywać może tylko pierwsze nadanie serii; powtórki czekają
+            // na swoją kolej, żeby nie ucinać audycji co odstęp.
+            .bind(i64::from(request.interrupting && index == 0))
             .bind(iso(not_before))
             .bind(request.expires_at.map(iso))
             .bind(group.as_deref())
@@ -394,6 +396,31 @@ impl QueueRepo {
     /// elementów anulowanych albo oznaczonych.
     pub async fn cancel(&self, id: i64) -> Result<u64, DbError> {
         self.cancel_where(CancelTarget::Id(id)).await
+    }
+
+    /// Stany wszystkich elementów serii, do której należy `id` (sam `id`,
+    /// gdy nie jest w serii). Pusta lista, gdy elementu nie ma.
+    pub async fn series_states(&self, id: i64) -> Result<Vec<QueueState>, DbError> {
+        let states: Vec<String> = sqlx::query_scalar(
+            "SELECT state FROM queue_items
+              WHERE id = ?1
+                 OR (repeat_group IS NOT NULL
+                     AND repeat_group = (SELECT repeat_group FROM queue_items WHERE id = ?1))",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(states.iter().filter_map(|s| QueueState::parse(s)).collect())
+    }
+
+    /// Grupa powtórzeń elementu (`None` dla pojedynczego albo nieistniejącego).
+    pub async fn group_of(&self, id: i64) -> Result<Option<String>, DbError> {
+        let group: Option<Option<String>> =
+            sqlx::query_scalar("SELECT repeat_group FROM queue_items WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(group.flatten())
     }
 
     /// Anuluje pozostałe wystąpienia powtórzenia (także wzięte, jak `cancel`).
@@ -647,6 +674,19 @@ mod tests {
         silent.repeat_interval = Duration::from_secs(u64::MAX / 4);
         assert!(repo.enqueue(silent).await.is_err());
         assert!(repo.pending(10).await.unwrap().is_empty(), "nic nie trafia do kolejki");
+    }
+
+    #[tokio::test]
+    async fn only_the_first_occurrence_of_a_series_interrupts() {
+        let repo = QueueRepo::new(test_pool().await);
+        let mut series = req("alert", Priority::Emergency);
+        series.interrupting = true;
+        series.repeat_count = 3;
+        series.repeat_interval = Duration::from_secs(60);
+        repo.enqueue(series).await.unwrap();
+        let mut pending = repo.pending(10).await.unwrap();
+        pending.sort_by_key(|i| i.repeat_index);
+        assert_eq!(pending.iter().map(|i| i.interrupting).collect::<Vec<_>>(), vec![true, false, false]);
     }
 
     #[tokio::test]

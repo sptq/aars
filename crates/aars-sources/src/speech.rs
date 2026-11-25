@@ -224,6 +224,46 @@ pub fn compass8(from: (f64, f64), to: (f64, f64)) -> &'static str {
     COMPASS8.get(sector).copied().unwrap_or(COMPASS8[0])
 }
 
+const WIND_FROM: [&str; 8] = [
+    "północny",
+    "północno-wschodni",
+    "wschodni",
+    "południowo-wschodni",
+    "południowy",
+    "południowo-zachodni",
+    "zachodni",
+    "północno-zachodni",
+];
+
+/// Kierunek wiatru (skąd wieje, stopnie) słownie, osiem sektorów po 45°
+/// wyśrodkowanych na stronach świata: północny to 337,5°..22,5°.
+pub fn wind_direction(deg: f64) -> &'static str {
+    let sector = ((deg.rem_euclid(360.0) + 22.5) / 45.0).floor() as usize % 8;
+    WIND_FROM.get(sector).copied().unwrap_or(WIND_FROM[0])
+}
+
+/// Zachmurzenie w procentach słownie (progi w przybliżeniu oktanowe).
+pub fn cloud_words(pct: f64) -> &'static str {
+    match pct {
+        p if p < 10.0 => "bezchmurnie",
+        p if p < 40.0 => "małe zachmurzenie",
+        p if p < 70.0 => "umiarkowane zachmurzenie",
+        p if p < 90.0 => "duże zachmurzenie",
+        _ => "pochmurno",
+    }
+}
+
+/// Tendencja ciśnienia ze zmiany w hPa: poniżej 1 hPa „bez zmian”.
+pub fn pressure_tendency(delta_hpa: f64) -> &'static str {
+    if delta_hpa.abs() < 1.0 {
+        "bez zmian"
+    } else if delta_hpa > 0.0 {
+        "rośnie"
+    } else {
+        "spada"
+    }
+}
+
 /// Wspólne sprawdzenie testów źródeł: tekst po normalizacji z `aars-audio`
 /// nie zawiera znanych potknięć syntezy.
 #[cfg(test)]
@@ -352,6 +392,45 @@ mod tests {
         // Łódź (centrum) – Warszawa.
         let km = haversine_km((51.7592, 19.4560), (52.2297, 21.0122));
         assert!((118.0..=122.0).contains(&km), "{km}");
+    }
+
+    #[test]
+    fn wind_direction_has_eight_centred_sectors() {
+        let names: Vec<_> = (0..8).map(|i| wind_direction(f64::from(i) * 45.0)).collect();
+        assert_eq!(
+            names,
+            [
+                "północny",
+                "północno-wschodni",
+                "wschodni",
+                "południowo-wschodni",
+                "południowy",
+                "południowo-zachodni",
+                "zachodni",
+                "północno-zachodni"
+            ]
+        );
+        assert_eq!(wind_direction(22.4), "północny");
+        assert_eq!(wind_direction(22.5), "północno-wschodni");
+        assert_eq!(wind_direction(337.4), "północno-zachodni");
+        assert_eq!(wind_direction(337.5), "północny");
+        assert_eq!(wind_direction(359.0), "północny");
+        assert_eq!(wind_direction(360.0), "północny");
+        assert_eq!(wind_direction(-10.0), "północny");
+        assert_eq!(wind_direction(296.0), "północno-zachodni");
+    }
+
+    #[test]
+    fn cloud_cover_and_pressure_tendency_in_words() {
+        assert_eq!(cloud_words(0.0), "bezchmurnie");
+        assert_eq!(cloud_words(25.0), "małe zachmurzenie");
+        assert_eq!(cloud_words(50.0), "umiarkowane zachmurzenie");
+        assert_eq!(cloud_words(80.0), "duże zachmurzenie");
+        assert_eq!(cloud_words(100.0), "pochmurno");
+        assert_eq!(pressure_tendency(0.9), "bez zmian");
+        assert_eq!(pressure_tendency(-0.9), "bez zmian");
+        assert_eq!(pressure_tendency(1.0), "rośnie");
+        assert_eq!(pressure_tendency(-1.3), "spada");
     }
 
     #[test]

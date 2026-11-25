@@ -43,6 +43,7 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     toggle: Toggle::Switchable,
     default_enabled: false,
     needs: Needs::Position,
+    auto_area: None,
     settings: &[
         SettingSpec {
             key: "radius_km",
@@ -188,6 +189,7 @@ pub fn to_output(gauges: &[Gauge], ctx: &SourceCtx) -> SourceOutput {
                 Exceedance::Alarm => Priority::High,
             },
             interrupting: false,
+            repeat: None,
             valid_from: Some(measured),
             valid_until: Some(measured + VALID_FOR),
         });
@@ -852,6 +854,7 @@ mod tests {
                 sources: map(sources),
                 active_alerts: Vec::new(),
                 alert_sources: Default::default(),
+                warnings_max_chars: None,
             }
         }
 

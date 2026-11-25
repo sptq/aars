@@ -8,7 +8,7 @@
   <span>{% if status.callsign.is_empty() %}bez znaku{% else %}{{ status.callsign }}{% endif %}</span>
   <time>{{ status.clock }}</time>
   <span class="sb-user">{{ chrome.username }} · {{ chrome.role }}</span>
-  <form method="post" action="/logout" class="sb-logout">
+  <form method="post" action="/logout" class="sb-logout" hx-boost="false">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     <button class="ghost" type="submit">Wyloguj</button>
   </form>

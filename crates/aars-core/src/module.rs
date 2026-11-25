@@ -61,6 +61,8 @@ pub enum SettingKind {
     List(&'static [(&'static str, &'static str)]),
     /// Pory doby `HH:MM` po przecinku; kanonicznie posortowane, bez duplikatów.
     TimeList { max: usize },
+    /// Układ biuletynu z klocków (JSON, `bulletin_layout::Layout`); pusty = domyślny.
+    BulletinLayout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -81,6 +83,8 @@ pub struct ModuleDescriptor {
     pub toggle: Toggle,
     pub default_enabled: bool,
     pub needs: Needs,
+    /// Obszar liczony z pozycji stacji, gdy ręczny jest pusty (etap 13).
+    pub auto_area: Option<crate::area_auto::AreaGranularity>,
     pub settings: &'static [SettingSpec],
     /// (tekst linku, ścieżka)
     pub see_also: Option<(&'static str, &'static str)>,
@@ -98,81 +102,101 @@ impl ModuleDescriptor {
     /// Sprawdza i sprowadza do postaci kanonicznej wszystkie ustawienia
     /// z opisu; obce klucze wejścia są pomijane.
     pub fn validate(&self, input: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>, String> {
+        self.validate_fields(input).map_err(|(_, message)| message)
+    }
+
+    /// Jak `validate`, ale błąd niesie też klucz pola, którego dotyczy
+    /// (panel zaznacza to pole w formularzu).
+    pub fn validate_fields(
+        &self,
+        input: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>, (&'static str, String)> {
         let mut out = BTreeMap::new();
         for spec in self.settings {
-            let raw = input
-                .get(spec.key)
-                .ok_or_else(|| format!("{}: brak wartości", spec.label))?;
-            let value = match spec.kind {
-                SettingKind::Text { max_len } => {
-                    let v = raw.trim();
-                    if v.chars().count() > max_len {
-                        return Err(format!("{}: najwyżej {max_len} znaków", spec.label));
-                    }
-                    v.to_owned()
-                }
-                SettingKind::Integer { min, max } => match raw.trim().parse::<i64>() {
-                    Ok(n) if (min..=max).contains(&n) => n.to_string(),
-                    _ => return Err(format!("{}: {min}–{max}", spec.label)),
-                },
-                SettingKind::Area => area_text(&parse_area(raw)?),
-                SettingKind::Choice(options) => {
-                    let v = raw.trim();
-                    if !options.iter().any(|(value, _)| *value == v) {
-                        return Err(format!("{}: nieznana wartość", spec.label));
-                    }
-                    v.to_owned()
-                }
-                SettingKind::Decimal { min, max } => {
-                    let range = || format!("{}–{}", comma(min), comma(max));
-                    match raw.trim().replace(',', ".").parse::<f64>() {
-                        Ok(n) if n.is_finite() && n >= min && n <= max => format!("{n:.1}"),
-                        _ => return Err(format!("{}: {}", spec.label, range())),
-                    }
-                }
-                SettingKind::List(options) => {
-                    let wanted: Vec<&str> =
-                        raw.split(',').map(str::trim).filter(|v| !v.is_empty()).collect();
-                    if wanted.is_empty() {
-                        return Err(format!("{}: wybierz co najmniej jedną", spec.label));
-                    }
-                    if wanted.iter().any(|w| !options.iter().any(|(v, _)| v == w)) {
-                        return Err(format!("{}: nieznana wartość", spec.label));
-                    }
-                    options
-                        .iter()
-                        .filter(|(v, _)| wanted.contains(v))
-                        .map(|(v, _)| *v)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                }
-                SettingKind::TimeList { max } => {
-                    let mut times = Vec::new();
-                    for part in raw.split(',').map(str::trim).filter(|v| !v.is_empty()) {
-                        let time = parse_clock(part).ok_or_else(|| {
-                            format!("{}: pora „{part}” ma mieć postać HH:MM", spec.label)
-                        })?;
-                        times.push(time);
-                    }
-                    times.sort_unstable();
-                    times.dedup();
-                    if times.is_empty() {
-                        return Err(format!("{}: podaj co najmniej jedną porę", spec.label));
-                    }
-                    if times.len() > max {
-                        return Err(format!("{}: najwyżej {max} pór", spec.label));
-                    }
-                    times
-                        .iter()
-                        .map(|t| t.format("%H:%M").to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                }
-            };
+            let value = canonical(spec, input.get(spec.key)).map_err(|message| (spec.key, message))?;
             out.insert(spec.key.to_owned(), value);
         }
         Ok(out)
     }
+}
+
+/// Wartość jednego ustawienia w postaci kanonicznej albo komunikat błędu.
+fn canonical(spec: &SettingSpec, raw: Option<&String>) -> Result<String, String> {
+    let raw = raw.ok_or_else(|| format!("{}: brak wartości", spec.label))?;
+    let value = match spec.kind {
+        SettingKind::Text { max_len } => {
+            let v = raw.trim();
+            if v.chars().count() > max_len {
+                return Err(format!("{}: najwyżej {max_len} znaków", spec.label));
+            }
+            v.to_owned()
+        }
+        SettingKind::Integer { min, max } => match raw.trim().parse::<i64>() {
+            Ok(n) if (min..=max).contains(&n) => n.to_string(),
+            _ => return Err(format!("{}: {min}–{max}", spec.label)),
+        },
+        SettingKind::Area => area_text(&parse_area(raw)?),
+        SettingKind::Choice(options) => {
+            let v = raw.trim();
+            if !options.iter().any(|(value, _)| *value == v) {
+                return Err(format!("{}: nieznana wartość", spec.label));
+            }
+            v.to_owned()
+        }
+        SettingKind::Decimal { min, max } => {
+            let range = || format!("{}–{}", comma(min), comma(max));
+            match raw.trim().replace(',', ".").parse::<f64>() {
+                Ok(n) if n.is_finite() && n >= min && n <= max => format!("{n:.1}"),
+                _ => return Err(format!("{}: {}", spec.label, range())),
+            }
+        }
+        SettingKind::List(options) => {
+            let wanted: Vec<&str> =
+                raw.split(',').map(str::trim).filter(|v| !v.is_empty()).collect();
+            if wanted.is_empty() {
+                return Err(format!("{}: wybierz co najmniej jedną", spec.label));
+            }
+            if wanted.iter().any(|w| !options.iter().any(|(v, _)| v == w)) {
+                return Err(format!("{}: nieznana wartość", spec.label));
+            }
+            options
+                .iter()
+                .filter(|(v, _)| wanted.contains(v))
+                .map(|(v, _)| *v)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        SettingKind::TimeList { max } => {
+            let mut times = Vec::new();
+            for part in raw.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                let time = parse_clock(part).ok_or_else(|| {
+                    format!("{}: pora „{part}” ma mieć postać HH:MM", spec.label)
+                })?;
+                times.push(time);
+            }
+            times.sort_unstable();
+            times.dedup();
+            if times.is_empty() {
+                return Err(format!("{}: podaj co najmniej jedną porę", spec.label));
+            }
+            if times.len() > max {
+                return Err(format!("{}: najwyżej {max} pór", spec.label));
+            }
+            times
+                .iter()
+                .map(|t| t.format("%H:%M").to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        SettingKind::BulletinLayout => {
+            if raw.trim().is_empty() {
+                String::new()
+            } else {
+                crate::bulletin_layout::Layout::parse(raw)?.stored()
+            }
+        }
+    };
+    Ok(value)
 }
 
 /// `HH:MM` albo `H:MM`; nic więcej.
@@ -191,42 +215,51 @@ fn comma(n: f64) -> String {
     format!("{n:.1}").replace('.', ",")
 }
 
-/// Części biuletynu (wartość, etykieta); kolejność w biuletynie jest stała.
-pub const BULLETIN_PARTS: &[(&str, &str)] = &[
-    ("pogoda", "Pogoda dla pozycji stacji"),
-    ("wody", "Stany wód w okolicy"),
-    ("propagacja", "Warunki propagacji KF"),
-    ("ostrzezenia", "Obowiązujące ostrzeżenia"),
+/// Tryby nadawania biuletynu (wartość, etykieta).
+pub const BULLETIN_MODES: &[(&str, &str)] = &[
+    (crate::bulletin_layout::MODE_CYCLE, "Co określony czas"),
+    (crate::bulletin_layout::MODE_TIMES, "O stałych porach"),
 ];
 
 pub const BULLETIN: ModuleDescriptor = ModuleDescriptor {
     id: "bulletin",
     name: "Biuletyn",
-    description: "Nadaje o stałych porach biuletyn: pogoda, propagacja, obowiązujące ostrzeżenia.",
+    description: "Pełny komunikat informacyjny sklejany z klocków (ostrzeżenia, pogoda, prognoza, wody, propagacja) — cyklicznie albo o stałych porach.",
     kind: ModuleKind::Bulletin,
     toggle: Toggle::Switchable,
     default_enabled: false,
     needs: Needs::Nothing,
+    auto_area: None,
     settings: &[
+        SettingSpec {
+            key: "mode",
+            label: "Kiedy nadawać",
+            help: "Co określony czas: wyrównane do pełnych minut od północy (np. …:00, :10, :20). O stałych porach: według listy pór.",
+            kind: SettingKind::Choice(BULLETIN_MODES),
+            default: "cykl",
+        },
+        SettingSpec {
+            key: "interval_min",
+            label: "Co ile minut",
+            help: "Tylko w trybie „co określony czas”.",
+            kind: SettingKind::Integer {
+                min: crate::bulletin_layout::MIN_INTERVAL_MIN as i64,
+                max: crate::bulletin_layout::MAX_INTERVAL_MIN as i64,
+            },
+            default: "10",
+        },
         SettingSpec {
             key: "times",
             label: "Pory nadania",
-            help: "Czas lokalny, HH:MM po przecinku. Pora w oknie ciszy nocnej jest pomijana, gdy cisza zatrzymuje komunikaty zwykłe.",
+            help: "Tylko w trybie „o stałych porach”. Czas lokalny, HH:MM po przecinku. Pora w oknie ciszy nocnej jest pomijana, gdy cisza zatrzymuje komunikaty zwykłe.",
             kind: SettingKind::TimeList { max: 8 },
             default: "07:00,19:00",
         },
         SettingSpec {
-            key: "parts",
-            label: "Części",
-            help: "Kolejność w biuletynie jest stała.",
-            kind: SettingKind::List(BULLETIN_PARTS),
-            default: "pogoda,propagacja,ostrzezenia",
-        },
-        SettingSpec {
-            key: "intro",
-            label: "Wstęp",
-            help: "Puste: „Biuletyn stacji {znak}.”",
-            kind: SettingKind::Text { max_len: 200 },
+            key: "layout",
+            label: "Układ biuletynu",
+            help: "Klocki w kolejności nadawania (JSON). Puste: układ domyślny. Zmienne w tekstach: {znak}, {dzien}, {data}, {godzina}.",
+            kind: SettingKind::BulletinLayout,
             default: "",
         },
     ],
@@ -244,6 +277,7 @@ pub fn builtin() -> Vec<ModuleDescriptor> {
             toggle: Toggle::Switchable,
             default_enabled: true,
             needs: Needs::Nothing,
+            auto_area: None,
             settings: &[],
             see_also: Some(("Tolerancja spóźnień", "/settings")),
         },
@@ -255,6 +289,7 @@ pub fn builtin() -> Vec<ModuleDescriptor> {
             toggle: Toggle::AlwaysOn("identyfikacja stacji jest obowiązkowa"),
             default_enabled: true,
             needs: Needs::Nothing,
+            auto_area: None,
             settings: &[],
             see_also: Some(("Znak i tryb identyfikacji", "/settings")),
         },
@@ -273,6 +308,7 @@ pub fn sample_source(id: &'static str) -> ModuleDescriptor {
         toggle: Toggle::Switchable,
         default_enabled: false,
         needs: Needs::Area,
+        auto_area: None,
         settings: &[
             SettingSpec {
                 key: "area",
@@ -374,6 +410,9 @@ impl ModuleRepo {
             }
         }
         tx.commit().await?;
+        if registry.iter().any(|m| m.kind == ModuleKind::Bulletin) {
+            crate::bulletin_layout::migrate_legacy(&self.pool).await?;
+        }
         Ok(())
     }
 
@@ -615,21 +654,45 @@ mod tests {
     }
 
     #[test]
-    fn the_bulletin_is_switchable_with_three_settings() {
+    fn the_bulletin_is_switchable_with_four_settings() {
         let m = by_id("bulletin");
         assert_eq!(m.toggle, Toggle::Switchable);
         assert!(!m.default_enabled);
-        assert_eq!(m.settings.len(), 3);
+        let keys: Vec<_> = m.settings.iter().map(|s| s.key).collect();
+        assert_eq!(keys, ["mode", "interval_min", "times", "layout"]);
         let defaults: BTreeMap<String, String> =
             m.settings.iter().map(|s| (s.key.to_owned(), s.default.to_owned())).collect();
+        assert_eq!(defaults["mode"], "cykl");
+        assert_eq!(defaults["interval_min"], "10");
         assert_eq!(m.validate(&defaults).unwrap(), defaults);
         let mut input = defaults.clone();
-        input.insert("parts".into(), "ostrzezenia,pogoda".into());
-        assert_eq!(m.validate(&input).unwrap()["parts"], "pogoda,ostrzezenia");
-        input.insert("parts".into(), "ostrzezenia,wody,pogoda".into());
-        assert_eq!(m.validate(&input).unwrap()["parts"], "pogoda,wody,ostrzezenia");
-        assert_eq!(BULLETIN_PARTS[1], ("wody", "Stany wód w okolicy"));
-        assert_eq!(m.settings[1].default, "pogoda,propagacja,ostrzezenia");
+        input.insert("interval_min".into(), "4".into());
+        assert_eq!(m.validate(&input).unwrap_err(), "Co ile minut: 5–60");
+        assert_eq!(m.validate_fields(&input).unwrap_err().0, "interval_min");
+        input.insert("interval_min".into(), "60".into());
+        input.insert("mode".into(), "pory".into());
+        input.insert("layout".into(), r#"{"bloki":[{"rodzaj":"wody"}]}"#.into());
+        let ok = m.validate(&input).unwrap();
+        // Układ równy domyślnemu zapisuje się jako pusty: późniejsze ulepszenia domyślnego dochodzą.
+        let mut same = input.clone();
+        same.insert("layout".into(), crate::bulletin_layout::Layout::default_layout().to_json());
+        assert_eq!(m.validate(&same).unwrap()["layout"], "");
+        assert_eq!(ok["layout"], crate::bulletin_layout::Layout::parse(&input["layout"]).unwrap().to_json());
+        input.insert("layout".into(), r#"{"bloki":[{"rodzaj":"wstep","tekst":"{stacja}"}]}"#.into());
+        assert!(m.validate(&input).unwrap_err().contains("nieznana zmienna"));
+    }
+
+    #[tokio::test]
+    async fn registering_the_bulletin_migrates_old_parts() {
+        let pool = test_pool().await;
+        let kv = SettingsRepo::new(pool.clone());
+        kv.kv_put("module:bulletin:parts", "ostrzezenia").await.unwrap();
+        ModuleRepo::new(pool.clone()).register(&ModuleRegistry::new(builtin())).await.unwrap();
+        let stored = kv.kv_get("module:bulletin:layout").await.unwrap().unwrap();
+        let layout = crate::bulletin_layout::Layout::parse(&stored).unwrap();
+        assert_eq!(layout, crate::bulletin_layout::Layout::from_legacy(Some("ostrzezenia"), None));
+        assert_eq!(kv.kv_get("module:bulletin:parts").await.unwrap(), None);
+        assert_eq!(kv.kv_get("module:bulletin:mode").await.unwrap().as_deref(), Some("cykl"));
     }
 
     #[test]

@@ -192,7 +192,12 @@ fn the_voice_lock_pins_a_revision_and_hashes() {
         let config = format!("{}.json", model.name);
         assert!(entries.iter().any(|e| e.name == config), "brak {config}");
     }
-    assert!(entries.iter().any(|e| e.name == "pl_PL-darkman-medium.onnx"));
+    assert!(entries.iter().any(|e| e.name == "pl_PL-gosia-medium.onnx"));
+    assert!(entries.iter().any(|e| e.name == "pl_PL-mc_speech-medium.onnx"));
+    assert!(
+        entries.iter().all(|e| !e.name.contains("darkman")),
+        "darkman brzmi „jak Ukrainiec” (decyzja właściciela 2026-11-25)"
+    );
 }
 
 #[test]

@@ -7,9 +7,12 @@
 
   function start() {
     var el = document.getElementById('station-map');
-    if (!el || !window.L) {
+    // Karta położenia po zapisie przychodzi od nowa (htmx): nowa mapa na
+    // nowym elemencie, stary znika razem z kartą.
+    if (!el || !window.L || el.dataset.ready) {
       return;
     }
+    el.dataset.ready = '1';
     var L = window.L;
     var latField = document.getElementById('lat');
     var lonField = document.getElementById('lon');
@@ -89,4 +92,5 @@
   } else {
     start();
   }
+  document.addEventListener('htmx:afterSettle', start);
 })();

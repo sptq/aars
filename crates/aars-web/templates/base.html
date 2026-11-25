@@ -1,20 +1,33 @@
 {%- import "macros.html" as m -%}
+{#- chrome.partial: odpowiedź na formularz htmx — sam blok treści, z którego
+    htmx wybiera kartę (hx-target="closest .card", panel.js). -#}
+{%- if !chrome.partial -%}
 <!doctype html>
 <html lang="pl">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}AARS{% endblock %}</title>
-  <script src="/assets/theme.js"></script>
-  <link rel="stylesheet" href="/assets/app.css">
-  <script src="/assets/vendor/htmx.min.js" defer></script>
+  <script src="/assets/theme.js?v={{ crate::assets::stamp() }}"></script>
+  <link rel="stylesheet" href="/assets/app.css?v={{ crate::assets::stamp() }}">
+  <script src="/assets/vendor/htmx.min.js?v={{ crate::assets::stamp() }}" defer></script>
+  <script src="/assets/panel.js?v={{ crate::assets::stamp() }}" defer></script>
+  <script src="/assets/preview.js?v={{ crate::assets::stamp() }}" defer></script>
+  <script src="/assets/bulletin-editor.js?v={{ crate::assets::stamp() }}" defer></script>
   {% block head %}{% endblock %}
 </head>
-<body>
+{#- hx-boost: linki i formularze bez własnego hx-* idą przez htmx i
+    podmieniają <body> (pasek, menu i treść są świeże, polling ze starej
+    strony znika razem z jej elementami). Wylogowanie i wyłącznik nadawania
+    mają hx-boost="false": zwykły POST, bez zależności od JS. data-panel
+    znaczy „to strona panelu”; strona z własnymi skryptami w <head> (mapa)
+    dodaje data-full-load i panel.js wchodzi na nią zwykłym ładowaniem. -#}
+<body hx-boost="true" data-panel{% block body_attrs %}{% endblock %}>
+<div id="toasts" class="toasts" role="status" aria-live="polite" hx-preserve="true"></div>
 {% if chrome.locked -%}
 <header class="statusbar locked">
   <span>{{ chrome.username }} · {{ chrome.role }}</span>
-  <form method="post" action="/logout">
+  <form method="post" action="/logout" hx-boost="false">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     <button class="ghost" type="submit">Wyloguj</button>
   </form>
@@ -24,7 +37,7 @@
 {% include "status_bar.html" %}
 <div class="layout">
   <input type="checkbox" id="menu-toggle" class="menu-toggle">
-  <label for="menu-toggle" class="menu-button"><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg#i-menu"></use></svg> Menu</label>
+  <label for="menu-toggle" class="menu-button"><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg?v={{ crate::assets::stamp() }}#i-menu"></use></svg> Menu</label>
   <aside class="sidebar">
     <p class="brand">AARS — stacja ostrzegawcza</p>
     <nav aria-label="Menu główne">
@@ -35,6 +48,7 @@
         {%- call m::nav_item("/compose", "compose", "i-send", "Nadaj", chrome.section) %}{% endcall %}
         {%- call m::nav_item("/messages", "messages", "i-messages", "Komunikaty", chrome.section) %}{% endcall %}
         {%- call m::nav_item("/queue", "queue", "i-queue", "Kolejka", chrome.section) %}{% endcall %}
+        {%- call m::nav_item("/bulletin", "bulletin", "i-bulletin", "Biuletyn", chrome.section) %}{% endcall %}
         {%- endif %}
       </ul>
       <h2>Dane</h2>
@@ -59,15 +73,20 @@
     <button type="button" class="ghost theme-toggle" data-theme-toggle>Motyw: systemowy</button>
     <div class="sidebar-user">
       <span>{{ chrome.username }} · {{ chrome.role }}</span>
-      <form method="post" action="/logout">
+      <form method="post" action="/logout" hx-boost="false">
         <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
         <button class="ghost" type="submit">Wyloguj</button>
       </form>
     </div>
   </aside>
 {%- endif %}
-  <main class="content {% block main_class %}{% endblock %}"><h1 class="page-title">{% block heading %}AARS{% endblock %}</h1>{% block content %}{% endblock %}</main>
+  <main id="main" class="content {% block main_class %}{% endblock %}"><h1 class="page-title">{% block heading %}AARS{% endblock %}</h1>
+{%- endif -%}
+{% block content %}{% endblock %}
+{%- if !chrome.partial -%}
+</main>
   <footer class="version">AARS {{ chrome.version }}</footer>
 </div>
 </body>
 </html>
+{%- endif -%}

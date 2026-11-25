@@ -22,9 +22,11 @@ natychmiast, a operator może wpisać i nadać własny komunikat z panelu www.
 - źródła danych: ostrzeżenia IMGW dla wybranego obszaru oraz alarmy (komunikaty
   RSO, pogoda kosmiczna NOAA, smog GIOŚ, wstrząsy EMSC) trafiają do kolejki jako
   polski komunikat (sekcja „Źródła danych”),
-- biuletyn o stałych porach lokalnych: pogoda dla pozycji stacji, propagacja
-  KF i obowiązujące ostrzeżenia, z podglądem w panelu i w CLI (sekcja
-  „Biuletyn (etap 11b)”), z częścią o stanach wód z wodowskazów IMGW,
+- biuletyn informacyjny co 10 minut (albo o stałych porach) sklejany
+  z klocków: wstęp ze znakiem i godziną, obowiązujące ostrzeżenia, pogoda
+  bieżąca, prognoza, wschód/zachód słońca, stany wód z wodowskazów IMGW,
+  propagacja KF, zakończenie; z pauzami i podglądem w panelu i w CLI (sekcja
+  „Biuletyn (etap 11b, 13)”),
 - źródła hydrologiczne IMGW (ostrzeżenia, przekroczenia stanów na
   wodowskazach) i mapa ostrzeżeń meteo w panelu (sekcje „Źródła danych”
   i „Mapa ostrzeżeń (etap 11c)”),
@@ -93,7 +95,7 @@ Wszystkie są po instalacji wyłączone; włącza się je tak samo jak `imgw-met
 | `emsc` | EMSC, wstrząsy sejsmiczne w promieniu stacji | CC BY 4.0; „Dane: EMSC” |
 | `imgw-hydro` (etap 11c) | IMGW-PIB, ostrzeżenia hydrologiczne dla województw obszaru (stopnie 1–3; susza nie jest ogłaszana); obszar jak w `imgw-meteo`, powiat oznacza całe województwo | „Źródło: IMGW-PIB.” |
 | `imgw-wodowskazy` (etap 11c) | IMGW-PIB, stany wodowskazów w promieniu stacji (domyślnie 25 km) albo z listy `id_stacji`: komunikat po przekroczeniu stanu ostrzegawczego i alarmowego z danych IMGW; pomiar starszy niż 3 h jest pomijany, stan bez nowego pomiaru wygasa po dobie | „Źródło: IMGW-PIB.” |
-| `pogoda` (etap 11b) | Open-Meteo, prognoza dla pozycji stacji: komunikat po przekroczeniu progów (porywy od 75 km/h, mróz od −15 °C, dobowa suma opadów od 30 mm — progi w `/modules`) na dziś (z godzin od bieżącej do końca doby) lub jutro | CC BY 4.0; „Dane: Open-Meteo.” |
+| `pogoda` (etap 11b) | Open-Meteo, prognoza dla pozycji stacji: komunikat po przekroczeniu progów (porywy od 75 km/h, mróz od −15 °C, dobowa suma opadów od 30 mm — progi w `/modules`; na antenie porywy w m/s, jak w biuletynie) na dziś (z godzin od bieżącej do końca doby) lub jutro | CC BY 4.0; „Dane: Open-Meteo.” |
 
 Źródłem pochodzenia danych jest IMGW-PIB; dane zostały przetworzone
 (regulamin IMGW-PIB; dotyczy też `imgw-meteo` i mapy ostrzeżeń).
@@ -104,20 +106,68 @@ aktualizacji stacje, które miały to pole odznaczone, jednorazowo i po cichu
 porzucają śledzone pozycje RSO (jak przy każdej zmianie obszaru) — bez
 fałszywych odwołań na antenie. Następny cykl zaczyna śledzenie od nowa.
 
-### Biuletyn (etap 11b)
+### Biuletyn (etap 11b, 13)
 
-Moduł `bulletin` składa w chwili nadania jeden komunikat z części i wstawia
-go do kolejki (priorytet Zwykły, bez przerywania; nadaje dyspozytor jak
-każdy inny element). Po instalacji jest wyłączony. Na `/modules`
-administrator:
+Moduł `bulletin` składa w chwili nadania jeden komunikat z klocków układu
+i wstawia go do kolejki (priorytet Zwykły, bez przerywania; nadaje
+dyspozytor jak każdy inny element). Po instalacji jest wyłączony. Na
+`/modules` administrator:
 
-1. ustawia **pory nadania** — HH:MM w **czasie lokalnym** (Europe/Warsaw, nie
-   UTC jak cron), po przecinku, najwyżej 8, domyślnie `07:00,19:00`;
-2. wybiera **części** (kolejność w biuletynie jest stała, nie kolejność
-   zaznaczenia) i opcjonalnie **wstęp** (pusty = „Biuletyn stacji {znak}.”);
+1. wybiera **kiedy nadawać**: „co określony czas” (domyślnie, co
+   `interval_min` = 10 minut, 5–60; chwile wyrównane do wielokrotności
+   interwału od północy czasu polskiego: …:00, :10, :20) albo „o stałych
+   porach” — HH:MM w **czasie lokalnym** (Europe/Warsaw, nie UTC jak cron),
+   po przecinku, najwyżej 8, domyślnie `07:00,19:00`;
+2. opcjonalnie zmienia **układ** w menu **Biuletyn** (`/bulletin`): wizualny
+   edytor klocków z osią czasu, podglądem i odsłuchem (pod spodem ten sam
+   JSON, pusty = domyślny; bez JavaScriptu edytuje się go wprost);
 3. włącza moduł.
 
-Pora, która przypadnie w oknie ciszy nocnej (a priorytet Zwykły jest
+**Po aktualizacji do etapu 13:** tryb „co określony czas” jest domyślny także
+dla stacji, które miały biuletyn o stałych porach — stacja bez zapisanego
+trybu nadaje od teraz co 10 minut, a przy starcie ostrzega o tym w logu
+(„biuletyn działa teraz w trybie cyklicznym…”). Żeby wrócić do stałych pór,
+w menu **Biuletyn** wybierz „o stałych porach” (pory zostały zachowane)
+i zapisz.
+
+Domyślny układ: wstęp („Tu automatyczna stacja informacyjna {znak}.
+{dzien}, {data}, godzina {godzina}.”, pauza 0,7 s), obowiązujące ostrzeżenia
+(także „brak ostrzeżeń”, pauza 0,7 s), pogoda bieżąca, prognoza (pauza
+0,5 s), wschód i zachód słońca, stany wód, propagacja (co 3. cykl),
+zakończenie („Tu {znak}. Koniec komunikatu.”). Każdy klocek ma przełącznik,
+pauzę przed i po (0–10 s; sąsiednie się sumują, najwyżej 10 s), warunek
+(`zawsze`, `co_n_cykli` 2–24 — numer cyklu to minuty od północy / interwał,
+w trybie pór zawsze pasuje — albo `w_godzinach` od–do, także przez
+północ); wstęp, zakończenie i własne teksty (`tekst`, wiele razy) są
+szablonami ze zmiennymi `{znak}`, `{dzien}` („wtorek”), `{data}`
+(„24 listopada”), `{godzina}` („7:05”) — nieznana zmienna jest błędem
+zapisu. Bez znaku stacji zdania z `{znak}` wypadają w całości. Ostrzeżenia
+bez „mów, gdy brak” znikają, gdy nic nie obowiązuje. Format:
+
+```json
+{"bloki": [
+  {"rodzaj": "wstep", "tekst": "Tu {znak}. Godzina {godzina}.", "pauza_po_ms": 700},
+  {"rodzaj": "ostrzezenia", "mow_gdy_brak": true},
+  {"rodzaj": "propagacja", "kiedy": {"typ": "co_n_cykli", "n": 3}},
+  {"rodzaj": "tekst", "tekst": "Dobranoc.", "kiedy": {"typ": "w_godzinach", "od": "22:00", "do": "06:00"}},
+  {"rodzaj": "zakonczenie", "tekst": "Tu {znak}. Koniec komunikatu.", "wlaczony": false}
+]}
+```
+
+Rodzaje: `wstep`, `ostrzezenia`, `pogoda_teraz`, `prognoza`, `slonce`,
+`wody`, `propagacja`, `tekst`, `zakonczenie`; pola pominięte mają wartości
+domyślne (`wlaczony` tak, pauzy 0, `kiedy` zawsze). Stare ustawienia
+`parts` i `intro` (do etapu 12) są przy pierwszym odczycie przenoszone do
+układu i usuwane: lista części niezmieniona (dawny domyślny wybór) daje
+pełny nowy układ, lista zmieniona przez operatora — klocki niewybranych
+części wyłączone; wstęp → tekst wstępu z godziną. Układ równy domyślnemu
+zapisuje się jako pusty, więc ulepszenia domyślnego dochodzą do stacji.
+
+W trybie cyklicznym element kolejki wygasa po długości cyklu (najwyżej
+15 min), więc biuletyn nie zalega do następnego; wpisy odpaleń starsze niż
+7 dni są usuwane.
+
+Pora (chwila cyklu), która przypadnie w oknie ciszy nocnej (a priorytet Zwykły jest
 poniżej progu ciszy), jest pominięta, nie przesunięta; okno kończące się
 dokładnie o porze jej nie blokuje. Po przestoju stacja nie nadrabia: pora
 spóźniona o więcej niż `misfire_grace_s` (od 60 s do 15 min) jest pomijana,
@@ -126,7 +176,7 @@ już zrobionej. Gdy żadna część nie ma treści, nic nie idzie na antenę.
 
 | Część | Treść | Dane |
 |---|---|---|
-| `pogoda` | teraz, noc, jutro (temperatura, opis, opady, porywy) dla pozycji stacji; bez pozycji część wypada | Open-Meteo (ta sama prognoza co źródło `pogoda`, świeża do 60 min), zapasowo MET Norway |
+| `pogoda_teraz`, `prognoza`, `slonce` | warunki bieżące; najbliższe godziny, noc, dziś/jutro; wschód i zachód słońca — dla pozycji stacji; pierwsza z nich w układzie zaczyna się od „Pogoda dla okolic stacji według danych Open-Meteo.”; bez pozycji wypadają | Open-Meteo (ta sama prognoza co źródło `pogoda`, świeża do 60 min, jedno pobranie na biuletyn), zapasowo MET Norway |
 | `propagacja` | strumień słoneczny (SFI), indeks K, skale NOAA, najbliższa jonosonda i ocena pasm KF | NOAA SWPC, GIRO przez KC2G |
 | `ostrzezenia` | obowiązujące ostrzeżenia ze źródeł włączonych i nieprzestarzałych, które poszły na antenę oraz czekające w kolejce (najwyżej 5, reszta — także bez opisu — jako „Pozostałych ostrzeżeń: n.”); brak = „Brak obowiązujących ostrzeżeń.”, a gdy część źródeł jest niedostępna — „Brak ostrzeżeń z dostępnych źródeł. Część źródeł ostrzeżeń jest niedostępna.”; bez żadnego włączonego źródła część wypada | `source_state` stacji |
 | `wody` (etap 11c) | do 3 najbliższych wodowskazów ze świeżym pomiarem (ustawienia źródła `imgw-wodowskazy`), z dopiskiem o stanie ostrzegawczym/alarmowym; susza hydrologiczna w 11c nie jest podawana (dopasowanie po województwie dawałoby ją prawie zawsze) | IMGW-PIB (ta sama instancja co źródło, dane świeże do 20 min) |
@@ -144,10 +194,20 @@ nie zdąży albo zawiedzie, wypada, reszta wychodzi. Progi oceny w części
 - łączności dalekie (DX, pasma 80…10 m): najwyższe pasmo o dolnej krawędzi
   poniżej MUF(3000) × 0,85.
 
-Limit długości biuletynu to `min(1500, 10 × (limit nadawania w s − 10))`
-znaków (10 s zostaje na identyfikację i ogony):
-gdy złożony tekst się nie mieści, wypadają całe części od końca (wstęp
-i „Koniec biuletynu.” zostają).
+Limit długości biuletynu to `min(1500, (limit nadawania w s − 10) × 13,5 ×
+tempo mowy ÷ 1,5)` znaków (10 s zostaje na identyfikację i ogony; 1,5 to
+wydłużenie tekstu przez normalizator — liczby i jednostki czytane słownie;
+przy 180 s i tempie 87% to 1331 znaków). Sekunda pauzy kosztuje tyle znaków,
+ile w niej da się powiedzieć; tak samo liczy oś czasu w edytorze. Gdy złożony tekst się nie mieści,
+wypadają całe klocki od końca — oprócz wstępu, ostrzeżeń i zakończenia.
+Ostrzeżenia dostają tyle miejsca, ile zostaje po wstępie i zakończeniu
+(najwyżej 1200 znaków), i skracają się całymi zdaniami („Oraz jeszcze…”),
+a gdy nie mieści się żadne zdanie — „Obowiązujące ostrzeżenia: N.”.
+Niezależnie od tego dyspozytor nie podnosi PTT dla żadnego komunikatu, którego
+nagranie (z identyfikacją i ogonem) jest dłuższe niż limit nadawania: element
+kolejki kończy się błędem „komunikat dłuższy niż limit nadawania” zamiast
+ucięcia na antenie. Wyjątek: komunikat Alarmowy (Alert RCB, atak z powietrza)
+idzie mimo to — lepiej jego początek uciętego twardym limitem niż nic.
 
 Podgląd — ta sama ścieżka co nadanie, bez zapisu i bez kolejki:
 `aars bulletin preview` drukuje tekst (albo „nic do nadania: powód”) i stan
@@ -156,7 +216,8 @@ każdej części; w panelu przycisk „Podgląd biuletynu” w karcie biuletynu
 naraz trwa najwyżej jeden.
 
 Licencje danych biuletynu (stacja jest niekomercyjna): Open-Meteo CC BY 4.0
-(„Dane: Open-Meteo.”), MET Norway CC BY 4.0 / NLOD („Dane: MET Norway.”),
+(„…według danych Open-Meteo.”), MET Norway CC BY 4.0 / NLOD („…według
+danych MET Norway.”),
 NOAA SWPC domena publiczna, jonosondy GIRO przez KC2G CC BY-NC-SA („Dane:
 NOAA, GIRO przez KC2G.”, KC2G tylko gdy jonosonda użyta). Adresy
 (`open_meteo_url`, `met_no_url`, `swpc_f107_url`, `swpc_kp_url`, `kc2g_url`)
@@ -348,6 +409,10 @@ potwierdzeniu:
    startach bez potwierdzenia albo gdy nowa wersja nie zbuduje stosu
    nadawczego, który stara budowała, strażnik wraca do poprzedniej wersji
    razem z kopią bazy.
+
+Aktualizacja zmienia program, nie głosy: katalog głosów (`/var/lib/aars/voices`)
+zostaje bez zmian, więc stacja mówi dotychczasowym głosem. Nowe głosy (np.
+Gosia, MC Speech) przychodzą z nowym obrazem karty.
 
 **Przy powrocie przepadają dane zapisane przez nową wersję w czasie próby**
 (najwyżej kilka minut: kolejka, dziennik nadań, zmiany ustawień). Wynik

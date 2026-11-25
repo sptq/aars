@@ -12,18 +12,20 @@ use std::time::Duration;
 use aars_core::config::Config;
 use aars_core::error::DbError;
 use aars_core::geo::{PositionRepo, StationPosition};
-use aars_core::module::{BULLETIN, BULLETIN_PARTS};
+use aars_core::bulletin_layout::{self, Block, BlockKind, MAX_PAUSE_MS};
+use aars_core::module::BULLETIN;
 use aars_core::settings::SettingsRepo;
 use aars_core::source_state::{AlertSourceHealth, SourceStateRepo, TrackedItem};
 use chrono::{DateTime, Utc};
+use chrono_tz::Europe::Warsaw;
 use sqlx::SqlitePool;
 
 use crate::source::SourceError;
-use crate::speech::{truncate_sentence, warsaw_hhmm};
+use crate::speech::truncate_sentence;
 use crate::{imgw_wodowskazy, pogoda, propagacja};
 
 pub use ostrzezenia::Ostrzezenia;
-pub use runner::{BulletinRunner, BulletinTick, due_fires};
+pub use runner::{BulletinRunner, BulletinTick, cycle_fires, due_fires};
 
 /// Wejście części: chwila nadania, pozycja stacji, ustawienia
 /// `module:bulletin:*` (bez prefiksu), żywe alerty i zdrowie źródeł alertów.
@@ -36,6 +38,10 @@ pub struct PartCtx {
     pub sources: BTreeMap<String, String>,
     pub active_alerts: Vec<TrackedItem>,
     pub alert_sources: AlertSourceHealth,
+    /// Miejsce dla części `ostrzezenia`, gdy limit nadawania jest krótki
+    /// (`None` — jej własny limit). Kompozytor liczy je tak, żeby wstęp,
+    /// ostrzeżenia i zakończenie zmieściły się razem.
+    pub warnings_max_chars: Option<usize>,
 }
 
 impl PartCtx {
@@ -86,94 +92,140 @@ impl PartOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Composed {
     pub text: Option<String>,
+    /// Każdy klocek układu: polska nazwa i wynik.
     pub parts: Vec<(&'static str, PartOutcome)>,
     pub skipped_reason: Option<&'static str>,
 }
-
-const OUTRO: &str = "Koniec biuletynu.";
 
 fn ends_sentence(t: &str) -> bool {
     t.ends_with(['.', '!', '?'])
 }
 
-/// Składa biuletyn z części `Included`; dopóki tekst przekracza `limit`
-/// znaków, ostatnia dołączona część wypada (`DroppedForLength`).
-pub fn assemble(
-    intro: &str,
-    hhmm: &str,
-    parts: Vec<(&'static str, PartOutcome)>,
-    limit: usize,
-) -> Composed {
-    let mut parts = parts;
+/// Klocek po złożeniu: wynik i pauzy wokół niego.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Piece {
+    pub kind: BlockKind,
+    pub outcome: PartOutcome,
+    pub pause_before_ms: u32,
+    pub pause_after_ms: u32,
+}
+
+impl Piece {
+    pub fn new(kind: BlockKind, outcome: PartOutcome) -> Self {
+        Self {
+            kind,
+            outcome,
+            pause_before_ms: 0,
+            pause_after_ms: 0,
+        }
+    }
+
+    fn from_block(block: &Block, outcome: PartOutcome) -> Self {
+        Self {
+            kind: block.kind,
+            outcome,
+            pause_before_ms: block.pause_before_ms,
+            pause_after_ms: block.pause_after_ms,
+        }
+    }
+}
+
+/// Tekst z klocków `Included`; między sąsiednimi pauza po poprzednim plus
+/// przed następnym (najwyżej 10 s) jako `[[pauza:MS]]`. Pauza przed
+/// pierwszym i po ostatnim klocku nic nie wnosi, więc jej nie ma.
+/// Zwraca tekst i sumę pauz w ms.
+fn join(pieces: &[Piece]) -> (String, u64) {
+    let mut text = String::new();
+    let mut total = 0u64;
+    let mut prev_after: Option<u32> = None;
+    for piece in pieces {
+        let PartOutcome::Included(t) = &piece.outcome else {
+            continue;
+        };
+        if let Some(after) = prev_after {
+            let pause = (after + piece.pause_before_ms).min(MAX_PAUSE_MS);
+            if pause > 0 {
+                text.push_str(&format!(" [[pauza:{pause}]] "));
+                total += u64::from(pause);
+            } else {
+                text.push(' ');
+            }
+        }
+        text.push_str(t);
+        if !ends_sentence(t) {
+            text.push('.');
+        }
+        prev_after = Some(piece.pause_after_ms);
+    }
+    (text, total)
+}
+
+/// „Koszt” tekstu w znakach budżetu: mowa plus pauzy przeliczone tempem
+/// budżetu (sekunda pauzy = tyle znaków, ile w niej da się powiedzieć).
+fn cost(text: &str, pause_ms: u64, budget: &Budget) -> usize {
+    let pause_chars = budget.pause_chars(pause_ms);
+    aars_core::pause::strip_markers(text)
+        .chars()
+        .count()
+        .saturating_add(pause_chars)
+}
+
+/// Składa biuletyn z klocków. Dopóki tekst przekracza `limit`, ostatni
+/// dołączony klocek, który może wypaść (nie wstęp, ostrzeżenia ani
+/// zakończenie), dostaje `DroppedForLength`. Gdy zostały same chronione,
+/// tekst idzie mimo limitu — ostrzeżeń nie wolno zgubić (i same skracają się
+/// do swojego limitu). Bez żadnego klocka z treścią (poza wstępem
+/// i zakończeniem) biuletynu nie ma.
+pub fn assemble(pieces: Vec<Piece>, budget: Budget) -> Composed {
+    let limit = budget.chars;
+    let mut pieces = pieces;
     let mut dropped = false;
     loop {
-        let included: Vec<String> = parts
-            .iter()
-            .filter_map(|(_, o)| match o {
-                PartOutcome::Included(t) => Some(if ends_sentence(t) {
-                    t.clone()
-                } else {
-                    format!("{t}.")
-                }),
-                _ => None,
-            })
-            .collect();
-        if included.is_empty() {
+        let has_content = pieces.iter().any(|p| {
+            matches!(p.outcome, PartOutcome::Included(_))
+                && !matches!(p.kind, BlockKind::Wstep | BlockKind::Zakonczenie)
+        });
+        if !has_content {
             let reason = if dropped {
                 "limit czasu nadawania"
             } else {
                 "brak danych"
             };
-            return Composed {
-                text: None,
-                parts,
-                skipped_reason: Some(reason),
-            };
+            return composed(pieces, None, Some(reason));
         }
-        let text = format!("{intro} {hhmm}. {} {OUTRO}", included.join(" "));
-        if text.chars().count() <= limit {
-            return Composed {
-                text: Some(text),
-                parts,
-                skipped_reason: None,
-            };
+        let (text, pauses) = join(&pieces);
+        if cost(&text, pauses, &budget) <= limit {
+            return composed(pieces, Some(text), None);
         }
-        if let Some((_, o)) = parts
+        let Some(last) = pieces
             .iter_mut()
             .rev()
-            .find(|(_, o)| matches!(o, PartOutcome::Included(_)))
-        {
-            *o = PartOutcome::DroppedForLength;
-            dropped = true;
-        }
-    }
-}
-
-/// Wstęp: ustawienie operatora (z kropką na końcu) albo „Biuletyn stacji {znak}.”.
-pub fn intro_text(intro_setting: &str, callsign: &str) -> String {
-    let intro = intro_setting.trim();
-    if intro.is_empty() {
-        let callsign = callsign.trim();
-        return if callsign.is_empty() {
-            "Biuletyn stacji.".to_owned()
-        } else {
-            format!("Biuletyn stacji {callsign}.")
+            .find(|p| matches!(p.outcome, PartOutcome::Included(_)) && !p.kind.is_protected())
+        else {
+            tracing::warn!(
+                znaków = cost(&text, pauses, &budget),
+                limit,
+                "biuletyn dłuższy niż limit mimo usunięcia klocków; idzie w całości"
+            );
+            return composed(pieces, Some(text), None);
         };
-    }
-    if ends_sentence(intro) {
-        intro.to_owned()
-    } else {
-        format!("{intro}.")
+        last.outcome = PartOutcome::DroppedForLength;
+        dropped = true;
     }
 }
 
-/// Limit długości tekstu: 10 s limitu nadawania na identyfikację i ogony,
-/// reszta po około 10 znaków na sekundę, nie więcej niż 1500.
-pub fn length_limit(tx_max_duration_s: u64) -> usize {
-    usize::try_from(tx_max_duration_s.saturating_sub(10).saturating_mul(10))
-        .unwrap_or(usize::MAX)
-        .min(1500)
+fn composed(pieces: Vec<Piece>, text: Option<String>, skipped_reason: Option<&'static str>) -> Composed {
+    Composed {
+        text,
+        parts: pieces
+            .into_iter()
+            .map(|p| (p.kind.label(), p.outcome))
+            .collect(),
+        skipped_reason,
+    }
 }
+
+pub use bulletin_layout::{Budget, length_limit};
 
 const SETTINGS_PREFIX: &str = "module:bulletin:";
 const DEFAULT_PART_TIMEOUT: Duration = Duration::from_secs(20);
@@ -195,15 +247,8 @@ pub(crate) async fn module_settings(
     Ok(out)
 }
 
-fn order_of(id: &str) -> usize {
-    BULLETIN_PARTS
-        .iter()
-        .position(|(v, _)| *v == id)
-        .unwrap_or(BULLETIN_PARTS.len())
-}
-
 /// Kompozytor: wspólna ścieżka nadania i podglądu. Wszystko, co zależy od
-/// operatora (znak, części, wstęp, limit nadawania), czyta z bazy przy
+/// operatora (znak, układ, tryb, limit nadawania), czyta z bazy przy
 /// każdym złożeniu.
 pub struct Bulletin {
     pool: SqlitePool,
@@ -211,11 +256,15 @@ pub struct Bulletin {
     part_timeout: Duration,
 }
 
+/// Co zrobić z klockiem układu w tym złożeniu.
+enum Plan {
+    Done(PartOutcome),
+    Part(Arc<dyn BulletinPart>),
+}
+
 impl Bulletin {
-    /// Kolejność części wg `BULLETIN_PARTS`, nie wg wektora.
+    /// Części wybierane po `id` z klocków układu; kolejność wektora bez znaczenia.
     pub fn new(pool: SqlitePool, parts: Vec<Arc<dyn BulletinPart>>) -> Self {
-        let mut parts = parts;
-        parts.sort_by_key(|p| order_of(p.id()));
         Self {
             pool,
             parts,
@@ -234,27 +283,41 @@ impl Bulletin {
 
     /// Składa biuletyn na chwilę `now` bez zapisu do kolejki (podgląd).
     pub async fn compose(&self, now: DateTime<Utc>) -> Result<Composed, DbError> {
-        self.compose_at(now, now).await
+        self.compose_at(now, now, None).await
     }
 
-    /// `now` — chwila danych; `spoken` — pora wypowiadana we wstępie.
+    /// Podgląd z podanym układem zamiast zapisanego (edytor w panelu,
+    /// niezapisane zmiany); baza zostaje bez zmian.
+    pub async fn compose_with(
+        &self,
+        now: DateTime<Utc>,
+        layout: Option<bulletin_layout::Layout>,
+    ) -> Result<Composed, DbError> {
+        self.compose_at(now, now, layout).await
+    }
+
+    /// `now` — chwila danych; `spoken` — pora wypowiadana we wstępie,
+    /// od niej zależy też numer cyklu i „w godzinach”.
     pub(crate) async fn compose_at(
         &self,
         now: DateTime<Utc>,
         spoken: DateTime<Utc>,
+        layout: Option<bulletin_layout::Layout>,
     ) -> Result<Composed, DbError> {
         let station = SettingsRepo::new(self.pool.clone()).load().await?;
         let settings = module_settings(&self.pool).await?;
-        let selected: Vec<String> = settings
-            .get("parts")
-            .map(|v| v.split(',').map(|p| p.trim().to_owned()).collect())
-            .unwrap_or_default();
-        let chosen = |id: &str| selected.iter().any(|p| p == id);
-        let position = PositionRepo::new(self.pool.clone()).load().await?;
-        let sources = SettingsRepo::new(self.pool.clone())
-            .kv_prefix("source:")
-            .await?;
-        let (active_alerts, alert_sources) = if chosen("ostrzezenia") {
+        let layout = match layout {
+            Some(layout) => layout,
+            None => bulletin_layout::load(&self.pool).await?,
+        };
+        let local = spoken.with_timezone(&Warsaw).naive_local();
+        let cycle = bulletin_layout::cycle_interval(&settings)
+            .map(|n| bulletin_layout::cycle_index(local.time(), n));
+
+        let wants_alerts = layout.blocks.iter().any(|b| {
+            b.kind == BlockKind::Ostrzezenia && b.enabled && b.when.matches(cycle, local.time())
+        });
+        let (active_alerts, alert_sources) = if wants_alerts {
             let repo = SourceStateRepo::new(self.pool.clone());
             (
                 repo.live_alerts(now).await?,
@@ -263,10 +326,48 @@ impl Bulletin {
         } else {
             (Vec::new(), AlertSourceHealth::default())
         };
-        let intro = intro_text(
-            settings.get("intro").map(String::as_str).unwrap_or(""),
-            &station.callsign,
-        );
+
+        let plans: Vec<Plan> = layout
+            .blocks
+            .iter()
+            .map(|block| {
+                if !block.enabled {
+                    return Plan::Done(PartOutcome::Empty("klocek wyłączony".to_owned()));
+                }
+                if !block.when.matches(cycle, local.time()) {
+                    return Plan::Done(PartOutcome::Empty(format!(
+                        "nadawany {}",
+                        block.when.describe()
+                    )));
+                }
+                let Some(id) = block.kind.part_id() else {
+                    let text = bulletin_layout::render_template(&block.text, &station.callsign, local);
+                    return Plan::Done(if text.trim().is_empty() {
+                        PartOutcome::Empty("pusty tekst (bez znaku stacji)".to_owned())
+                    } else {
+                        PartOutcome::Included(text)
+                    });
+                };
+                if block.kind == BlockKind::Ostrzezenia
+                    && !block.say_when_empty
+                    && active_alerts.is_empty()
+                {
+                    return Plan::Done(PartOutcome::Empty(
+                        "brak obowiązujących ostrzeżeń".to_owned(),
+                    ));
+                }
+                match self.parts.iter().find(|p| p.id() == id) {
+                    Some(part) => Plan::Part(Arc::clone(part)),
+                    None => Plan::Done(PartOutcome::Failed("część niedostępna".to_owned())),
+                }
+            })
+            .collect();
+
+        let budget = Budget::new(station.tx_max_duration_s, station.speech_rate);
+        let position = PositionRepo::new(self.pool.clone()).load().await?;
+        let sources = SettingsRepo::new(self.pool.clone())
+            .kv_prefix("source:")
+            .await?;
         let ctx = Arc::new(PartCtx {
             now,
             position,
@@ -274,40 +375,98 @@ impl Bulletin {
             sources,
             active_alerts,
             alert_sources,
+            warnings_max_chars: warnings_room(&layout.blocks, &plans, &budget),
         });
 
         let timeout = self.part_timeout;
-        let running: Vec<_> = self
-            .parts
-            .iter()
-            .filter(|p| chosen(p.id()))
-            .map(|part| {
-                let part = Arc::clone(part);
-                let ctx = Arc::clone(&ctx);
-                let id = part.id();
-                let handle = tokio::spawn(async move {
-                    let result = tokio::time::timeout(timeout, part.compose(&ctx)).await;
-                    outcome(result, part.max_chars(), timeout)
-                });
-                (id, handle)
+        let running: Vec<_> = plans
+            .into_iter()
+            .map(|plan| match plan {
+                Plan::Done(outcome) => Err(outcome),
+                Plan::Part(part) => {
+                    let ctx = Arc::clone(&ctx);
+                    let id = part.id();
+                    let handle = tokio::spawn(async move {
+                        let result = tokio::time::timeout(timeout, part.compose(&ctx)).await;
+                        outcome(result, part.max_chars(), timeout)
+                    });
+                    Ok((id, handle))
+                }
             })
             .collect();
-        let mut parts = Vec::with_capacity(running.len());
-        for (id, handle) in running {
-            let outcome = handle
-                .await
-                .unwrap_or_else(|e| PartOutcome::Failed(format!("część przerwana: {e}")));
-            if let PartOutcome::Failed(why) = &outcome {
-                tracing::warn!(część = id, błąd = %why, "część biuletynu wypada");
-            }
-            parts.push((id, outcome));
+        let mut pieces = Vec::with_capacity(running.len());
+        for (block, run) in layout.blocks.iter().zip(running) {
+            let outcome = match run {
+                Err(done) => done,
+                Ok((id, handle)) => {
+                    let outcome = handle
+                        .await
+                        .unwrap_or_else(|e| PartOutcome::Failed(format!("część przerwana: {e}")));
+                    if let PartOutcome::Failed(why) = &outcome {
+                        tracing::warn!(część = id, błąd = %why, "część biuletynu wypada");
+                    }
+                    outcome
+                }
+            };
+            pieces.push(Piece::from_block(block, outcome));
         }
-        Ok(assemble(
-            &intro,
-            &warsaw_hhmm(spoken),
-            parts,
-            length_limit(station.tx_max_duration_s),
-        ))
+        attribute_weather_once(&mut pieces);
+        Ok(assemble(pieces, budget))
+    }
+}
+
+/// Miejsce na ostrzeżenia, gdy chronione klocki (wstęp, ostrzeżenia,
+/// zakończenie) razem przekroczyłyby limit: limit minus wstęp, zakończenie,
+/// odstępy i pauzy wokół ostrzeżeń (liczone z zapasem, jakby między nimi nic
+/// nie zostało). `None`, gdy ostrzeżeń nie ma w tym złożeniu albo mieszczą się
+/// w swoim własnym limicie.
+fn warnings_room(blocks: &[Block], plans: &[Plan], budget: &Budget) -> Option<usize> {
+    let warn = blocks
+        .iter()
+        .zip(plans)
+        .position(|(b, p)| b.kind == BlockKind::Ostrzezenia && matches!(p, Plan::Part(_)))?;
+    let text_of = |kind: BlockKind| {
+        blocks.iter().zip(plans).find_map(|(b, p)| match p {
+            Plan::Done(PartOutcome::Included(t)) if b.kind == kind => Some((b, t)),
+            _ => None,
+        })
+    };
+    let w = &blocks[warn];
+    let mut used = 0usize;
+    let mut pause_ms = 0u64;
+    if let Some((intro, t)) = text_of(BlockKind::Wstep) {
+        // Tekst, kropka i odstęp (przy pauzie dwa).
+        used += t.chars().count() + 3;
+        pause_ms += u64::from((intro.pause_after_ms + w.pause_before_ms).min(MAX_PAUSE_MS));
+    }
+    if let Some((outro, t)) = text_of(BlockKind::Zakonczenie) {
+        used += t.chars().count() + 3;
+        pause_ms += u64::from((w.pause_after_ms + outro.pause_before_ms).min(MAX_PAUSE_MS));
+    }
+    let room = budget.chars.saturating_sub(used + budget.pause_chars(pause_ms));
+    (room < ostrzezenia::MAX_CHARS).then_some(room)
+}
+
+/// Kody klocków pogodowych: wspólna zapowiedź z atrybucją danych.
+const WEATHER: [BlockKind; 3] = [BlockKind::PogodaTeraz, BlockKind::Prognoza, BlockKind::Slonce];
+
+/// Każda część pogodowa zaczyna się od zapowiedzi „Pogoda dla okolic stacji
+/// według danych …” (atrybucja CC BY); zostaje tylko w pierwszej dołączonej,
+/// w następnych jest zdejmowana. Klocki wypadają przy limicie od końca, więc
+/// pierwsza pogodowa wypada ostatnia z pogodowych — atrybucja nie ginie.
+fn attribute_weather_once(pieces: &mut [Piece]) {
+    let mut seen = false;
+    for piece in pieces.iter_mut().filter(|p| WEATHER.contains(&p.kind)) {
+        let PartOutcome::Included(text) = &mut piece.outcome else {
+            continue;
+        };
+        if !seen {
+            seen = true;
+            continue;
+        }
+        if let Some(rest) = pogoda::speech::strip_heading(text) {
+            *text = rest.to_owned();
+        }
     }
 }
 
@@ -320,10 +479,12 @@ fn outcome(
         Err(_) => PartOutcome::Failed(format!("przekroczony czas {} s", timeout.as_secs())),
         Ok(Err(e)) => PartOutcome::Failed(e.to_string()),
         Ok(Ok(PartText::Empty(why))) => PartOutcome::Empty(why.to_owned()),
-        Ok(Ok(PartText::Text(text))) if text.trim().is_empty() => {
+        // Pauzy wstawia tylko składanie biuletynu, nie dane z sieci.
+        Ok(Ok(PartText::Text(text))) if aars_core::pause::strip_markers(&text).trim().is_empty() => {
             PartOutcome::Empty("pusta treść".to_owned())
         }
         Ok(Ok(PartText::Text(text))) => {
+            let text = aars_core::pause::strip_markers(&text);
             PartOutcome::Included(truncate_sentence(text.trim(), max_chars).0)
         }
     }
@@ -336,19 +497,20 @@ pub struct BuiltBulletin {
     pub wodowskazy: Arc<imgw_wodowskazy::ImgwWodowskazy>,
 }
 
-/// Biuletyn stacji: jedna `Pogoda` i jedna `ImgwWodowskazy` (te same
-/// instancje trafiają do runnera źródeł), `Propagacja`, `Ostrzezenia`.
+/// Biuletyn stacji: jedna `Pogoda` (trzy części z jednej prognozy) i jedna
+/// `ImgwWodowskazy` (te same instancje trafiają do runnera źródeł),
+/// `Propagacja`, `Ostrzezenia`.
 pub fn build(cfg: &Config, pool: SqlitePool) -> Result<BuiltBulletin, SourceError> {
     let pogoda = Arc::new(pogoda::Pogoda::new(&cfg.sources)?);
     let wodowskazy = Arc::new(imgw_wodowskazy::ImgwWodowskazy::new(
         &cfg.sources.imgw_hydro_stations_url,
     )?);
-    let parts: Vec<Arc<dyn BulletinPart>> = vec![
-        pogoda.clone(),
-        wodowskazy.clone(),
+    let mut parts: Vec<Arc<dyn BulletinPart>> = pogoda.parts();
+    parts.extend([
+        wodowskazy.clone() as Arc<dyn BulletinPart>,
         Arc::new(propagacja::Propagacja::new(&cfg.sources)?),
         Arc::new(Ostrzezenia),
-    ];
+    ]);
     Ok(BuiltBulletin {
         bulletin: Arc::new(Bulletin::new(pool, parts)),
         pogoda,
@@ -359,24 +521,85 @@ pub fn build(cfg: &Config, pool: SqlitePool) -> Result<BuiltBulletin, SourceErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use BlockKind::*;
+    const WARN: BlockKind = BlockKind::Ostrzezenia;
     use PartOutcome::*;
 
+    fn inc(kind: BlockKind, t: &str) -> Piece {
+        Piece::new(kind, Included(t.to_owned()))
+    }
+
+    fn paused(kind: BlockKind, t: &str, before: u32, after: u32) -> Piece {
+        Piece {
+            pause_before_ms: before,
+            pause_after_ms: after,
+            ..inc(kind, t)
+        }
+    }
+
     #[test]
-    fn parts_join_in_order_between_intro_and_end() {
+    fn blocks_join_in_layout_order_with_pauses_between() {
         let c = assemble(
-            "Biuletyn stacji SP9XYZ.",
-            "07:00",
             vec![
-                ("pogoda", Included("A b".into())),
-                ("propagacja", Empty("brak danych propagacji".into())),
-                ("ostrzezenia", Included("C.".into())),
+                paused(Wstep, "Tu SP9XYZ.", 300, 700),
+                paused(WARN, "Brak ostrzeżeń", 200, 0),
+                Piece::new(Propagacja, Empty("brak danych propagacji".into())),
+                inc(PogodaTeraz, "Ciepło."),
+                paused(Zakonczenie, "Koniec.", 0, 900),
             ],
-            1500,
+            chars(1500),
         );
+        // Pauza przed pierwszym i po ostatnim nie trafia do tekstu; sąsiednie się sumują.
         assert_eq!(
             c.text.as_deref(),
-            Some("Biuletyn stacji SP9XYZ. 07:00. A b. C. Koniec biuletynu.")
+            Some("Tu SP9XYZ. [[pauza:900]] Brak ostrzeżeń. Ciepło. Koniec.")
         );
+        let labels: Vec<_> = c.parts.iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            labels,
+            ["Wstęp", "Obowiązujące ostrzeżenia", "Warunki propagacji KF", "Pogoda bieżąca", "Zakończenie"]
+        );
+    }
+
+    #[test]
+    fn adjacent_pauses_are_capped_at_ten_seconds() {
+        let c = assemble(
+            vec![paused(Tekst, "A.", 0, 8000), paused(Wody, "B.", 7000, 0)],
+            chars(1500),
+        );
+        assert_eq!(c.text.as_deref(), Some("A. [[pauza:10000]] B."));
+        let segments = aars_core::pause::split(c.text.as_deref().unwrap());
+        assert_eq!(segments.len(), 3, "{segments:?}");
+    }
+
+    #[test]
+    fn pauses_skip_over_left_out_blocks() {
+        let c = assemble(
+            vec![
+                paused(Wstep, "A.", 0, 700),
+                Piece { pause_before_ms: 5000, ..Piece::new(Wody, Empty("x".into())) },
+                inc(Prognoza, "B."),
+            ],
+            chars(1500),
+        );
+        assert_eq!(c.text.as_deref(), Some("A. [[pauza:700]] B."));
+    }
+
+    #[test]
+    fn a_part_with_a_pause_marker_is_included_without_it() {
+        let got = outcome(
+            Ok(Ok(PartText::Text("Wiatr[[pauza:9000]] słaby.".into()))),
+            1000,
+            Duration::from_secs(1),
+        );
+        assert_eq!(got, Included("Wiatr słaby.".into()));
+        let c = assemble(vec![Piece::new(Wody, got)], chars(1500));
+        assert!(!c.text.unwrap().contains("pauza"));
+    }
+
+    /// Budżet w znakach przy 10 znakach na sekundę (pauza 100 ms = znak).
+    fn chars(n: usize) -> Budget {
+        Budget { chars: n, chars_per_s: 10.0 }
     }
 
     fn long(n: usize) -> String {
@@ -384,34 +607,59 @@ mod tests {
     }
 
     #[test]
-    fn parts_drop_from_the_end_to_fit_the_limit() {
+    fn blocks_drop_from_the_end_but_warnings_intro_and_end_stay() {
         let c = assemble(
-            "Biuletyn stacji.",
-            "07:00",
             vec![
-                ("a", Included(long(200))),
-                ("b", Included(long(200))),
-                ("c", Included(long(200))),
+                inc(Wstep, &long(50)),
+                inc(WARN, &long(150)),
+                inc(PogodaTeraz, &long(60)),
+                inc(Propagacja, &long(200)),
+                inc(Tekst, &long(100)),
+                inc(Zakonczenie, &long(20)),
             ],
-            length_limit(40),
+            chars(300),
         );
         assert!(matches!(c.parts[0].1, Included(_)));
-        assert_eq!(c.parts[1].1, DroppedForLength);
+        assert!(matches!(c.parts[1].1, Included(_)));
+        assert!(matches!(c.parts[2].1, Included(_)));
+        assert_eq!(c.parts[3].1, DroppedForLength);
+        assert_eq!(c.parts[4].1, DroppedForLength);
+        assert!(matches!(c.parts[5].1, Included(_)));
+        assert_eq!(c.parts[4].1.describe(), "pominięta — limit czasu nadawania");
+        let text = c.text.unwrap();
+        assert!(text.chars().count() <= 300, "{}", text.chars().count());
+
+        // Same chronione ponad limit: idą w całości, ostrzeżeń się nie gubi.
+        let c = assemble(
+            vec![inc(Wstep, &long(50)), inc(WARN, &long(400)), inc(Wody, &long(10))],
+            chars(300),
+        );
         assert_eq!(c.parts[2].1, DroppedForLength);
-        assert_eq!(c.parts[2].1.describe(), "pominięta — limit czasu nadawania");
-        assert!(c.text.is_some());
+        assert!(c.text.unwrap().contains(&long(400)));
     }
 
     #[test]
-    fn nothing_to_say_is_no_bulletin() {
+    fn pauses_count_towards_the_length_limit() {
+        // 2 × 99 znaków + spacja = 199; pauza 10 s to 100 znaków → 299 ≤ 300.
+        let pieces = |ms| vec![paused(WARN, &long(99), 0, ms), inc(Wody, &long(99))];
+        assert!(matches!(assemble(pieces(10_000), chars(300)).parts[1].1, Included(_)));
+        assert_eq!(assemble(pieces(10_000), chars(298)).parts[1].1, DroppedForLength);
+        assert!(matches!(assemble(pieces(0), chars(199)).parts[1].1, Included(_)));
+    }
+
+    #[test]
+    fn nothing_but_intro_and_end_is_no_bulletin() {
         let c = assemble(
-            "B.",
-            "07:00",
-            vec![("a", Empty("x".into())), ("b", Failed("y".into()))],
-            1500,
+            vec![
+                inc(Wstep, "Tu X."),
+                Piece::new(Wody, Empty("x".into())),
+                Piece::new(Propagacja, Failed("y".into())),
+                inc(Zakonczenie, "Koniec."),
+            ],
+            chars(1500),
         );
         assert_eq!((c.text, c.skipped_reason), (None, Some("brak danych")));
-        let c = assemble("B.", "07:00", vec![("a", Included(long(200)))], 50);
+        let c = assemble(vec![inc(Wstep, "A."), inc(Wody, &long(200))], chars(50));
         assert_eq!(
             (c.text, c.skipped_reason),
             (None, Some("limit czasu nadawania"))
@@ -419,23 +667,39 @@ mod tests {
     }
 
     #[test]
-    fn the_intro_defaults_to_the_callsign() {
-        assert_eq!(intro_text("", "SP9XYZ"), "Biuletyn stacji SP9XYZ.");
-        assert_eq!(intro_text("  ", ""), "Biuletyn stacji.");
+    fn the_weather_attribution_stays_on_the_first_included_weather_block() {
+        let h = "Pogoda dla okolic stacji według danych Open-Meteo.";
+        let mut pieces = vec![
+            Piece::new(PogodaTeraz, Empty("brak warunków bieżących".into())),
+            inc(Wody, "Stany wód."),
+            inc(Prognoza, &format!("{h} W nocy do 1 °C.")),
+            inc(Slonce, &format!("{h} Zachód słońca o 15:39.")),
+        ];
+        attribute_weather_once(&mut pieces);
+        let c = assemble(pieces, chars(1500));
         assert_eq!(
-            intro_text("Tu stacja klubowa", "SP9XYZ"),
-            "Tu stacja klubowa."
+            c.text.as_deref(),
+            Some("Stany wód. Pogoda dla okolic stacji według danych Open-Meteo. W nocy do 1 °C. Zachód słońca o 15:39.")
         );
     }
 
     #[test]
-    fn length_limit_follows_the_tx_limit() {
-        // 10 s na identyfikację i ogony, potem około 10 znaków na sekundę.
-        assert_eq!(length_limit(180), 1500);
-        assert_eq!(length_limit(160), 1500);
-        assert_eq!(length_limit(60), 500);
-        assert_eq!(length_limit(10), 0);
-        assert_eq!(length_limit(5), 0);
+    fn length_limit_follows_the_tx_limit_and_the_speech_rate() {
+        // 10 s na identyfikację i ogony; reszta po 13,5 × tempo ÷ 1,5 znaku/s.
+        assert_eq!(length_limit(180, 0.87), 1331);
+        assert_eq!(length_limit(180, 1.0), 1500);
+        assert_eq!(length_limit(600, 1.2), 1500);
+        assert_eq!(length_limit(10, 0.87), 0);
+    }
+
+    #[test]
+    fn pauses_cost_what_could_be_said_in_them_at_the_station_rate() {
+        // Budżet 5 znaków/s: pauza 10 s to 50 znaków.
+        let b = Budget { chars: 250, chars_per_s: 5.0 };
+        let pieces = || vec![paused(WARN, &long(99), 0, 10_000), inc(Wody, &long(99))];
+        assert!(matches!(assemble(pieces(), b).parts[1].1, Included(_)));
+        let b = Budget { chars: 248, chars_per_s: 5.0 };
+        assert_eq!(assemble(pieces(), b).parts[1].1, DroppedForLength);
     }
 
     #[test]
@@ -455,6 +719,7 @@ mod tests {
             .collect(),
             active_alerts: Vec::new(),
             alert_sources: AlertSourceHealth::default(),
+            warnings_max_chars: None,
         };
         let s = ctx.source_settings("imgw-wodowskazy");
         assert_eq!(s.len(), 2);

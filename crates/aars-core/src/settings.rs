@@ -47,7 +47,19 @@ impl QuietHours {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Najwolniejsze i najszybsze dozwolone tempo mowy (mnożnik tempa głosu).
+pub const SPEECH_RATE_RANGE: std::ops::RangeInclusive<f32> = 0.70..=1.20;
+/// Domyślnie ok. 15% wolniej niż tempo modelu: właściciel uznał je za za szybkie.
+pub const DEFAULT_SPEECH_RATE: f32 = 0.87;
+
+/// Tempo zapisane jako tekst („0.87”, przecinek też przejdzie); `None`, gdy
+/// to nie liczba albo wypada poza zakresem.
+pub fn parse_speech_rate(text: &str) -> Option<f32> {
+    let rate: f32 = text.trim().replace(',', ".").parse().ok()?;
+    SPEECH_RATE_RANGE.contains(&rate).then_some(rate)
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct StationSettings {
     pub callsign: String,
     pub id_mode: IdMode,
@@ -56,6 +68,8 @@ pub struct StationSettings {
     pub misfire_grace_s: u64,
     pub quiet_hours: Option<QuietHours>,
     pub quiet_min_priority: Priority,
+    /// Mnożnik tempa mowy (`VoiceParams.rate`), 0.70–1.20.
+    pub speech_rate: f32,
 }
 
 impl StationSettings {
@@ -66,6 +80,12 @@ impl StationSettings {
 
     /// Zamienia znak na wielkie litery i sprawdza zakresy.
     pub fn validate(&mut self) -> Result<(), String> {
+        self.validate_fields().map_err(|(_, message)| message)
+    }
+
+    /// Jak `validate`, ale błąd niesie też nazwę pola struktury, którego
+    /// dotyczy (panel zaznacza to pole w formularzu).
+    pub fn validate_fields(&mut self) -> Result<(), (&'static str, String)> {
         self.callsign = self.callsign.trim().to_uppercase();
         let len = self.callsign.chars().count();
         let chars_ok = self
@@ -73,17 +93,22 @@ impl StationSettings {
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '/');
         if !self.callsign.is_empty() && (!(3..=10).contains(&len) || !chars_ok) {
-            return Err("znak wywoławczy: 3–10 znaków A–Z, 0–9 lub /".to_owned());
+            return Err(("callsign", "znak wywoławczy: 3–10 znaków A–Z, 0–9 lub /".to_owned()));
         }
         if !(60..=3600).contains(&self.id_interval_s) {
-            return Err("odstęp identyfikacji: 60–3600 s".to_owned());
+            return Err(("id_interval_s", "odstęp identyfikacji: 60–3600 s".to_owned()));
         }
         if !(10..=600).contains(&self.tx_max_duration_s) {
-            return Err("limit czasu nadawania: 10–600 s".to_owned());
+            return Err(("tx_max_duration_s", "limit czasu nadawania: 10–600 s".to_owned()));
         }
         if self.misfire_grace_s > 86_400 {
-            return Err("tolerancja spóźnień: 0–86400 s".to_owned());
+            return Err(("misfire_grace_s", "tolerancja spóźnień: 0–86400 s".to_owned()));
         }
+        if !SPEECH_RATE_RANGE.contains(&self.speech_rate) {
+            return Err(("speech_rate", "tempo mowy: 70–120%".to_owned()));
+        }
+        // Dwa miejsca po przecinku, jak w formularzu (87%, nie 87,0000001%).
+        self.speech_rate = (self.speech_rate * 100.0).round() / 100.0;
         Ok(())
     }
 }
@@ -151,6 +176,20 @@ impl SettingsRepo {
         )
     }
 
+    /// Tempo mowy do syntezy. Czytane przy każdym renderze, więc zmiana z
+    /// panelu działa od następnego nadania i podglądu, bez restartu. Błąd
+    /// odczytu albo wartość spoza zakresu dają tempo domyślne.
+    pub async fn speech_rate(&self) -> f32 {
+        match self.kv_get("speech_rate").await {
+            Ok(Some(text)) => parse_speech_rate(&text).unwrap_or(DEFAULT_SPEECH_RATE),
+            Ok(None) => DEFAULT_SPEECH_RATE,
+            Err(err) => {
+                tracing::error!(%err, "odczyt tempa mowy zawiódł, użyto domyślnego");
+                DEFAULT_SPEECH_RATE
+            }
+        }
+    }
+
     /// Wartości, których nie da się odczytać, wracają do domyślnych — tak samo
     /// jak przy starcie stacji.
     pub async fn load(&self) -> Result<StationSettings, DbError> {
@@ -173,6 +212,8 @@ impl SettingsRepo {
                 .ok()
                 .and_then(Priority::from_i64)
                 .unwrap_or(Priority::Emergency),
+            speech_rate: parse_speech_rate(&self.get("speech_rate").await?)
+                .unwrap_or(DEFAULT_SPEECH_RATE),
         })
     }
 
@@ -201,6 +242,7 @@ impl SettingsRepo {
                 "quiet_min_priority",
                 (s.quiet_min_priority as i64).to_string(),
             ),
+            ("speech_rate", format!("{:.2}", s.speech_rate)),
         ];
         let mut tx = self.pool.begin().await?;
         for (key, value) in pairs {
@@ -268,6 +310,7 @@ mod tests {
             misfire_grace_s: 300,
             quiet_hours: Some(QuietHours::parse("22:00-06:00").unwrap()),
             quiet_min_priority: Priority::High,
+            speech_rate: 1.0,
         }
     }
 
@@ -278,6 +321,7 @@ mod tests {
         assert_eq!(defaults.tx_max_duration_s, 180);
         assert_eq!(defaults.quiet_hours, None);
         assert_eq!(defaults.id_mode, IdMode::Voice);
+        assert_eq!(defaults.speech_rate, DEFAULT_SPEECH_RATE);
 
         repo.save(&sample()).await.unwrap();
         assert_eq!(repo.load().await.unwrap(), sample());
@@ -318,6 +362,39 @@ mod tests {
     }
 
     #[test]
+    fn speech_rate_is_validated_and_rounded() {
+        for ok in [0.70, 0.87, 1.0, 1.20] {
+            let mut s = sample();
+            s.speech_rate = ok;
+            assert!(s.validate().is_ok(), "{ok}");
+        }
+        for bad in [0.69, 1.21, 0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let mut s = sample();
+            s.speech_rate = bad;
+            assert!(s.validate().is_err(), "{bad}");
+        }
+        let mut s = sample();
+        s.speech_rate = 0.870_000_1;
+        s.validate().unwrap();
+        assert_eq!(s.speech_rate, 0.87);
+        assert_eq!(parse_speech_rate("0,9"), Some(0.9));
+        assert_eq!(parse_speech_rate("2"), None);
+        assert_eq!(parse_speech_rate("abc"), None);
+    }
+
+    #[tokio::test]
+    async fn the_speech_rate_is_read_live_and_unreadable_values_fall_back() {
+        let repo = SettingsRepo::new(crate::db::test_pool().await);
+        assert_eq!(repo.speech_rate().await, DEFAULT_SPEECH_RATE);
+        repo.kv_put("speech_rate", "1.10").await.unwrap();
+        assert_eq!(repo.speech_rate().await, 1.10);
+        repo.kv_put("speech_rate", "9").await.unwrap();
+        assert_eq!(repo.speech_rate().await, DEFAULT_SPEECH_RATE);
+        repo.kv_put("speech_rate", "x").await.unwrap();
+        assert_eq!(repo.load().await.unwrap().speech_rate, DEFAULT_SPEECH_RATE);
+    }
+
+    #[test]
     fn validation_uppercases_and_checks_ranges() {
         let mut s = sample();
         s.callsign = "sp7tq/p".into();
@@ -328,7 +405,7 @@ mod tests {
         for bad in ["ab", "SP7 TQ", "TOOLONGCALLSIGN", "SP7TQ!", "SP7TQ-1"] {
             let mut s = sample();
             s.callsign = bad.into();
-            assert!(s.validate().is_err(), "{bad}");
+            assert_eq!(s.validate_fields().unwrap_err().0, "callsign", "{bad}");
         }
         let mut s = sample();
         s.callsign.clear();

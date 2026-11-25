@@ -21,12 +21,12 @@
       {% if chrome.can_operate %}
       <td><button class="ghost" hx-post="/queue/{{ item.id }}/cancel{% if full %}?full=1{% endif %}"
                   hx-headers='{"x-csrf-token": "{{ chrome.csrf }}"}'
-                  hx-target="#queue" hx-swap="innerHTML">Anuluj</button>
+                  hx-target="#queue" hx-swap="innerHTML" hx-sync="#queue:replace">Anuluj</button>
         {% if let Some(group) = item.group %}
         <button class="ghost" hx-post="/queue/group/{{ group }}/cancel{% if full %}?full=1{% endif %}"
                 hx-headers='{"x-csrf-token": "{{ chrome.csrf }}"}'
                 hx-confirm="Anulować wszystkie pozostałe powtórzenia tej serii?"
-                hx-target="#queue" hx-swap="innerHTML">Anuluj serię</button>
+                hx-target="#queue" hx-swap="innerHTML" hx-sync="#queue:replace">Anuluj serię</button>
         {% endif %}</td>
       {% endif %}
     </tr>

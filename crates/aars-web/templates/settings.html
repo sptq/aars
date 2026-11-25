@@ -1,56 +1,70 @@
 {% extends "base.html" %}
 {% block title %}AARS — ustawienia{% endblock %}
 {% block heading %}Ustawienia{% endblock %}
+{% block body_attrs %} data-full-load{% endblock %}
 {% block head %}
-  <link rel="stylesheet" href="/assets/vendor/leaflet/leaflet.css">
-  <script src="/assets/vendor/leaflet/leaflet.js" defer></script>
-  <script src="/assets/station-map.js" defer></script>
+  <link rel="stylesheet" href="/assets/vendor/leaflet/leaflet.css?v={{ crate::assets::stamp() }}">
+  <script src="/assets/vendor/leaflet/leaflet.js?v={{ crate::assets::stamp() }}" defer></script>
+  <script src="/assets/station-map.js?v={{ crate::assets::stamp() }}" defer></script>
 {% endblock %}
 {% block content %}
-<div class="card">
+<div class="card" id="stacja">
   <h2>Ustawienia stacji</h2>
   <p class="muted">Znak, tryb i odstęp identyfikacji, limit czasu nadawania oraz polityka spóźnień wchodzą w życie po restarcie stacji. Okno ciszy działa od razu (sprawdzane co 30 s).</p>
-  {% if let Some(message) = error %}<p class="error">{{ message }}</p>{% endif %}
+  {% if error_field.is_empty() %}{% if let Some(message) = error %}<p class="error">{{ message }}</p>{% endif %}{% endif %}
   {% if saved %}<p class="badge on">Zapisano.</p>{% endif %}
   {% if no_callsign %}<p class="alert">Uwaga: bez znaku wywoławczego stacja nadaje bez identyfikacji.</p>{% endif %}
-  <form method="post" action="/settings">
+  <form method="post" action="/settings" hx-post="/settings" hx-target="closest .card" hx-select="#stacja" hx-select-oob="#restart" hx-swap="outerHTML">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     <div class="field">
       <label for="callsign">Znak wywoławczy (3–10 znaków: A–Z, 0–9 lub /)</label>
-      <input id="callsign" name="callsign" value="{{ callsign }}" maxlength="10">
+      <input id="callsign" name="callsign" value="{{ callsign }}" maxlength="10"{% if error_field == "callsign" %} aria-invalid="true" aria-describedby="callsign-error"{% endif %}>
+      {% if error_field == "callsign" %}{% if let Some(message) = error %}<p class="error" id="callsign-error">{{ message }}</p>{% endif %}{% endif %}
     </div>
     <div class="field">
       <label for="id_mode">Tryb identyfikacji</label>
-      <select id="id_mode" name="id_mode">
+      <select id="id_mode" name="id_mode"{% if error_field == "id_mode" %} aria-invalid="true" aria-describedby="id_mode-error"{% endif %}>
         <option value="voice" {% if id_mode == "voice" %}selected{% endif %}>Głosem (TTS)</option>
         <option value="cw" {% if id_mode == "cw" %}selected{% endif %}>Telegrafią (CW)</option>
       </select>
+      {% if error_field == "id_mode" %}{% if let Some(message) = error %}<p class="error" id="id_mode-error">{{ message }}</p>{% endif %}{% endif %}
     </div>
     <div class="field">
       <label for="id_interval_s">Odstęp identyfikacji (s, 60–3600)</label>
-      <input id="id_interval_s" name="id_interval_s" type="number" min="60" max="3600" value="{{ id_interval_s }}" required>
+      <input id="id_interval_s" name="id_interval_s" type="number" min="60" max="3600" value="{{ id_interval_s }}" required{% if error_field == "id_interval_s" %} aria-invalid="true" aria-describedby="id_interval_s-error"{% endif %}>
+      {% if error_field == "id_interval_s" %}{% if let Some(message) = error %}<p class="error" id="id_interval_s-error">{{ message }}</p>{% endif %}{% endif %}
     </div>
     <div class="field">
       <label for="tx_max_duration_s">Limit czasu nadawania (s, 10–600)</label>
-      <input id="tx_max_duration_s" name="tx_max_duration_s" type="number" min="10" max="600" value="{{ tx_max_duration_s }}" required>
+      <input id="tx_max_duration_s" name="tx_max_duration_s" type="number" min="10" max="600" value="{{ tx_max_duration_s }}" required{% if error_field == "tx_max_duration_s" %} aria-invalid="true" aria-describedby="tx_max_duration_s-error"{% endif %}>
+      {% if error_field == "tx_max_duration_s" %}{% if let Some(message) = error %}<p class="error" id="tx_max_duration_s-error">{{ message }}</p>{% endif %}{% endif %}
     </div>
     <div class="field">
       <label for="misfire_grace_s">Tolerancja spóźnień harmonogramu (s, 0–86400)</label>
-      <input id="misfire_grace_s" name="misfire_grace_s" type="number" min="0" max="86400" value="{{ misfire_grace_s }}" required>
+      <input id="misfire_grace_s" name="misfire_grace_s" type="number" min="0" max="86400" value="{{ misfire_grace_s }}" required{% if error_field == "misfire_grace_s" %} aria-invalid="true" aria-describedby="misfire_grace_s-error"{% endif %}>
+      {% if error_field == "misfire_grace_s" %}{% if let Some(message) = error %}<p class="error" id="misfire_grace_s-error">{{ message }}</p>{% endif %}{% endif %}
+    </div>
+    <div class="field">
+      <label for="speech_rate_pct">Tempo mowy (%, 70–120)</label>
+      <input id="speech_rate_pct" name="speech_rate_pct" type="number" min="70" max="120" step="1" value="{{ speech_rate_pct }}" required{% if error_field == "speech_rate_pct" %} aria-invalid="true" aria-describedby="speech_rate_pct-error"{% endif %}>
+      <small class="help">100% = tempo głosu; mniej = wolniej, więcej = szybciej (domyślnie 87%). Działa od następnego nadania i podglądu, bez restartu.</small>
+      {% if error_field == "speech_rate_pct" %}{% if let Some(message) = error %}<p class="error" id="speech_rate_pct-error">{{ message }}</p>{% endif %}{% endif %}
     </div>
     <div class="field">
       <label for="quiet_hours">Okno ciszy, czas lokalny (HH:MM-HH:MM; puste = brak)</label>
-      <input id="quiet_hours" name="quiet_hours" value="{{ quiet_hours }}" placeholder="22:00-06:00">
+      <input id="quiet_hours" name="quiet_hours" value="{{ quiet_hours }}" placeholder="22:00-06:00"{% if error_field == "quiet_hours" %} aria-invalid="true" aria-describedby="quiet_hours-error"{% endif %}>
       {% if !quiet_hint.is_empty() %}<small class="help">{{ quiet_hint }}</small>{% endif %}
+      {% if error_field == "quiet_hours" %}{% if let Some(message) = error %}<p class="error" id="quiet_hours-error">{{ message }}</p>{% endif %}{% endif %}
     </div>
     <div class="field">
       <label for="quiet_min_priority">W ciszy nadają tylko komunikaty o priorytecie co najmniej</label>
-      <select id="quiet_min_priority" name="quiet_min_priority">
+      <select id="quiet_min_priority" name="quiet_min_priority"{% if error_field == "quiet_min_priority" %} aria-invalid="true" aria-describedby="quiet_min_priority-error"{% endif %}>
         <option value="emergency" {% if quiet_min_priority == "emergency" %}selected{% endif %}>Alarmowy</option>
         <option value="high" {% if quiet_min_priority == "high" %}selected{% endif %}>Wysoki</option>
         <option value="normal" {% if quiet_min_priority == "normal" %}selected{% endif %}>Zwykły</option>
         <option value="low" {% if quiet_min_priority == "low" %}selected{% endif %}>Niski</option>
       </select>
+      {% if error_field == "quiet_min_priority" %}{% if let Some(message) = error %}<p class="error" id="quiet_min_priority-error">{{ message }}</p>{% endif %}{% endif %}
     </div>
     <button type="submit">Zapisz</button>
   </form>
@@ -60,7 +74,7 @@
   {% if let Some(text) = position.text %}<p><span class="badge on">{{ text }}</span></p>{% else %}<p class="muted">Pozycja nie jest ustawiona.</p>{% endif %}
   {% if let Some(message) = position.error %}<p class="error">{{ message }}</p>{% endif %}
   <p class="muted">Szerokość i długość w stopniach (np. 51.75900) albo lokator QTH (4, 6 lub 8 znaków, np. JO91RS). Używają jej moduły pogodowe.</p>
-  <form method="post" action="/settings/position">
+  <form method="post" action="/settings/position" hx-post="/settings/position" hx-target="closest .card" hx-select="#polozenie" hx-swap="outerHTML">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     <div class="row">
       <div>

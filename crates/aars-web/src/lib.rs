@@ -10,6 +10,7 @@ pub mod hardware_page;
 pub mod logs;
 mod map_page;
 pub mod messages;
+pub mod bulletin_editor;
 pub mod modules_page;
 pub mod preview;
 pub mod queue_page;
@@ -134,7 +135,7 @@ fn queue_row(item: QueueItem, sizes: &HashMap<String, i64>) -> QueueRow {
         priority: priority_label(item.priority).to_owned(),
         not_before: both_times_now(item.not_before),
         due: item.not_before,
-        text: item.rendered_text,
+        text: aars_core::pause::display(&item.rendered_text),
         interrupting: item.interrupting,
         held: item.error.filter(|e| e.starts_with(aars_core::dispatcher::HELD_PREFIX)),
     }
@@ -495,16 +496,21 @@ async fn cancel_item(
     // HTMX wysyła token nagłówkiem, bo przycisk nie jest formularzem.
     require_csrf(&current.csrf_token, headers.get("x-csrf-token").and_then(|v| v.to_str().ok()))?;
 
-    match state.queue.cancel(id).await {
+    let toast = match state.queue.cancel(id).await {
         Ok(count) => {
             tracing::info!(user = %current.user.username, id, count, "anulowanie zadania z panelu");
             audit(&state, current.user.id, "queue_cancel", &format!("zadanie {id}")).await;
+            (render::htmx::Kind::Ok, "Anulowano")
         }
-        Err(err) => tracing::error!(%err, id, "anulowanie zadania zawiodło"),
-    }
+        Err(err) => {
+            tracing::error!(%err, id, "anulowanie zadania zawiodło");
+            (render::htmx::Kind::Error, "Anulowanie zawiodło — szczegóły w dzienniku stacji")
+        }
+    };
 
     // Odpowiadamy fragmentem, więc HTMX podmienia tabelę bez przeładowania.
-    Ok(queue_fragment_response(&state, &current, view.full).await)
+    let response = queue_fragment_response(&state, &current, view.full).await;
+    Ok(render::htmx::toast(response, toast.0, toast.1))
 }
 
 /// `?full=1` oznacza fragment strony `/queue` (limit 200 zamiast 50).
@@ -611,13 +617,13 @@ pub fn router(state: AppState) -> Router {
         .route("/modules", get(modules_page::page_view))
         .route("/modules/{id}/enabled", post(modules_page::set_enabled))
         .route("/modules/{id}/settings", post(modules_page::save_settings))
-        .route(
-            "/modules/bulletin/preview",
-            post(modules_page::preview_bulletin),
-        )
-        .route("/modules/bulletin/send", post(modules_page::send_bulletin))
+        .route("/bulletin", get(bulletin_editor::page_view))
+        .route("/bulletin/layout", post(bulletin_editor::save))
+        .route("/bulletin/preview", post(bulletin_editor::preview))
+        .route("/bulletin/send", post(bulletin_editor::send))
         .route("/healthz", get(healthz))
         .route("/assets/{*path}", get(assets::serve))
+        .layer(axum::middleware::from_fn(htmx_auth_redirect))
         .layer(axum::middleware::from_fn_with_state(state.clone(), host_check))
         // Zewnętrzna warstwa: adres klienta przed `Host` i przed trasami.
         .layer(axum::middleware::from_fn_with_state(state.clone(), client_check))
@@ -674,6 +680,27 @@ async fn client_check(
     }
 }
 
+/// Żądanie htmx odesłane na logowanie albo zmianę hasła (wygasła sesja,
+/// hasło tymczasowe): zamiast 303, które XHR po cichu wykonałby i wstawił
+/// stronę logowania w kartę (albo kartę usunął), `HX-Redirect` — htmx
+/// przechodzi wtedy na ten adres całą stroną.
+async fn htmx_auth_redirect(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let htmx = request
+        .headers()
+        .get("HX-Request")
+        .is_some_and(|v| v.as_bytes() == b"true");
+    let response = next.run(request).await;
+    if !htmx || !response.status().is_redirection() {
+        return response;
+    }
+    match response.headers().get(header::LOCATION) {
+        Some(to) if matches!(to.as_bytes(), b"/login" | b"/account/password") => {
+            (StatusCode::OK, [("HX-Redirect", to.clone())]).into_response()
+        }
+        _ => response,
+    }
+}
+
 /// Odpowiedź na żądanie pod obcą nazwą (`421`).
 pub const FOREIGN_HOST: &str = "Panel stacji odpowiada tylko pod nazwą albo adresem stacji. \
      Otwórz go pod adresem IP stacji (np. http://192.168.1.20:8080) albo dopisz tę nazwę \
@@ -704,6 +731,9 @@ mod role_matrix;
 
 #[cfg(test)]
 mod ui_checks;
+
+#[cfg(test)]
+mod htmx_checks;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -839,7 +869,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let html = String::from_utf8_lossy(&body);
-        let theme = html.find(r#"<script src="/assets/theme.js"></script>"#);
+        let theme = html.find(r#"<script src="/assets/theme.js?v="#);
         let css = html.find("/assets/app.css");
         assert!(theme.is_some() && theme < css, "{html}");
         assert!(html.contains("AARS — stacja ostrzegawcza"), "{html}");
@@ -1323,6 +1353,16 @@ pub(crate) mod tests {
         let html = get_body(app, &cookie, "/fragments/queue").await;
         assert!(html.contains("wstrzymane: nadawanie wyłączone"), "{html}");
         assert!(!html.contains("surowy błąd sterownika"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn the_queue_shows_pause_markers_compactly() {
+        let (app, cookie, _csrf, state) = logged_in(Role::Viewer).await;
+        state.queue.enqueue(enqueue(&state, "Uwaga[[pauza:1500]]koniec")).await.unwrap();
+
+        let html = get_body(app, &cookie, "/fragments/queue").await;
+        assert!(html.contains("Uwaga ⏸ 1,5 s koniec"), "{html}");
+        assert!(!html.contains("[[pauza"), "{html}");
     }
 
     #[tokio::test]
@@ -1913,8 +1953,21 @@ pub(crate) mod tests {
             .unwrap();
         let (_, html) = get_html(&app, &cookie, "/").await;
         let bulletin = tile(&html, "tile-bulletin");
-        assert!(bulletin.contains("07:00") || bulletin.contains("19:00"), "{bulletin}");
+        // Domyślnie cykl co 10 minut: najbliższa pełna dziesiątka minut.
+        let warsaw = chrono::Utc::now().with_timezone(&chrono_tz::Europe::Warsaw).time();
+        let soon = [warsaw, warsaw + chrono::TimeDelta::seconds(5)].map(|now| {
+            status::next_cycle(10, now).label()
+        });
+        assert!(soon.iter().any(|l| bulletin.contains(l.as_str())), "{soon:?}: {bulletin}");
         assert!(!bulletin.contains("wyłączony"), "{bulletin}");
+
+        aars_core::settings::SettingsRepo::new(state.pool.clone())
+            .kv_put("module:bulletin:mode", "pory")
+            .await
+            .unwrap();
+        let (_, html) = get_html(&app, &cookie, "/").await;
+        let bulletin = tile(&html, "tile-bulletin");
+        assert!(bulletin.contains("07:00") || bulletin.contains("19:00"), "{bulletin}");
     }
 
     #[tokio::test]
@@ -2118,7 +2171,7 @@ pub(crate) mod tests {
         let (app, cookie, _csrf, _state) = logged_in(Role::Viewer).await;
         let (_, html) = get_html(&app, &cookie, "/").await;
         let script = html
-            .find("<script src=\"/assets/theme.js\"></script>")
+            .find("<script src=\"/assets/theme.js?v=")
             .expect("skrypt motywu");
         let css = html.find("/assets/app.css").expect("arkusz stylów");
         assert!(script < css, "{html}");

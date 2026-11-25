@@ -153,7 +153,7 @@ impl SourceRunner {
 
     async fn run_cycle(&self, now: DateTime<Utc>, report: &mut CycleReport) -> Result<(), DbError> {
         let id = self.source.id();
-        let Some(cfg) = self.state.config(id).await? else {
+        let Some(mut cfg) = self.state.config(id).await? else {
             report.skipped = Some("wyłączone");
             return Ok(());
         };
@@ -163,8 +163,28 @@ impl SourceRunner {
         }
         let needs = self.source.needs();
         if needs == Needs::Area && cfg.area.is_empty() {
-            report.skipped = Some("brak obszaru");
-            return Ok(());
+            // Ręczny obszar pusty: źródło, które to umie, liczy go z pozycji.
+            let Some(granularity) = self.source.auto_area() else {
+                report.skipped = Some("brak obszaru");
+                return Ok(());
+            };
+            let position = match PositionRepo::new(self.state.pool().clone()).load().await {
+                Ok(p) => p,
+                Err(error) => {
+                    tracing::warn!(source = id, %error, "nie można odczytać pozycji stacji");
+                    None
+                }
+            };
+            if position.is_none() {
+                report.skipped = Some("brak pozycji stacji");
+                return Ok(());
+            }
+            let Some(entry) = aars_core::area_auto::auto_area(position.as_ref(), granularity) else {
+                report.skipped = Some("pozycja poza obszarem Polski");
+                return Ok(());
+            };
+            cfg.area = vec![entry];
+            cfg.area_text = aars_core::area::area_text(&cfg.area);
         }
         // Kontekst przed porównaniem R9. Zakres nie zależy od
         // `tracked_keys`, więc najpierw zakres, potem klucze aktywnych pozycji
@@ -187,7 +207,16 @@ impl SourceRunner {
 
         report.fetched = true;
         let output = match self.source.fetch(&ctx).await {
-            Ok(output) => output,
+            Ok(mut output) => {
+                // Pauzy może wstawiać tylko operator: tekst z sieci nie niesie
+                // znaczników (inaczej zewnętrzny feed trzymałby PTT na ciszy).
+                for item in &mut output.items {
+                    item.text = aars_core::pause::strip_markers(&item.text);
+                    item.change_text = aars_core::pause::strip_markers(&item.change_text);
+                    item.cancel_text = aars_core::pause::strip_markers(&item.cancel_text);
+                }
+                output
+            }
             Err(error) => {
                 let message = error.to_string();
                 tracing::warn!(source = id, error = %message, "odpytanie źródła nie powiodło się");
@@ -250,7 +279,7 @@ impl SourceRunner {
                         .entry(item.fingerprint.as_str())
                         .or_insert((old.queue_item_id, old.aired, old.superseded.clone()));
                 } else {
-                    let queued = self.announce(item, &item.change_text).await?;
+                    let queued = self.announce(item, &item.change_text, false).await?;
                     let (aired, superseded) = self.supersede(old).await?;
                     self.track(item, &scope, Some(queued), aired, superseded.clone(), now).await?;
                     refingerprinted.insert(old.id);
@@ -280,7 +309,7 @@ impl SourceRunner {
                 live(a) && !consumed.contains(&a.id) && a.topic == item.topic && !out_keys.contains(a.item_key.as_str())
             });
             if let Some(old) = replaced {
-                let queued = self.announce(item, &item.change_text).await?;
+                let queued = self.announce(item, &item.change_text, false).await?;
                 let (aired, superseded) = self.supersede(old).await?;
                 self.state.set_state(old.id, TrackedState::Replaced).await?;
                 consumed.insert(old.id);
@@ -288,7 +317,7 @@ impl SourceRunner {
                 announced.insert(item.fingerprint.as_str(), (Some(queued), aired, superseded));
                 report.changed += 1;
             } else {
-                let queued = self.announce(item, &item.text).await?;
+                let queued = self.announce(item, &item.text, true).await?;
                 self.track(item, &scope, Some(queued), false, Vec::new(), now).await?;
                 announced.insert(item.fingerprint.as_str(), (Some(queued), false, Vec::new()));
                 report.announced += 1;
@@ -321,7 +350,7 @@ impl SourceRunner {
                     // A3: pusty tekst odwołania to brak komunikatu.
                     Fate::Aired if old.cancel_text.is_empty() => {}
                     Fate::Aired => {
-                        self.enqueue(old.cancel_text.clone(), Priority::Normal, false, old.valid_until).await?;
+                        self.enqueue(old.cancel_text.clone(), Priority::Normal, false, old.valid_until, None).await?;
                     }
                     Fate::Unresolved if old.cancel_text.is_empty() => {}
                     Fate::Unresolved => self.state.set_cancel_pending(old.id, true).await?,
@@ -342,7 +371,9 @@ impl SourceRunner {
         priority: Priority,
         interrupting: bool,
         expires_at: Option<DateTime<Utc>>,
+        repeat: Option<(u32, Duration)>,
     ) -> Result<i64, DbError> {
+        let (repeat_count, repeat_interval) = repeat.unwrap_or((1, Duration::ZERO));
         let ids = self
             .queue
             .enqueue(EnqueueRequest {
@@ -352,27 +383,36 @@ impl SourceRunner {
                 interrupting,
                 not_before: None,
                 expires_at,
-                repeat_count: 1,
-                repeat_interval: Duration::ZERO,
+                repeat_count,
+                repeat_interval,
                 created_by: None,
             })
             .await?;
         ids.first().copied().ok_or_else(|| DbError::Invalid("kolejka nie zwróciła identyfikatora".to_owned()))
     }
 
-    async fn announce(&self, item: &SourceItem, text: &str) -> Result<i64, DbError> {
-        self.enqueue(text.to_owned(), item.priority, item.interrupting, item.valid_until).await
+    /// Pierwsze ogłoszenie pozycji idzie jako seria (`item.repeat`); zmiana
+    /// jest zawsze pojedyncza. Zwracamy id pierwszego elementu serii: jego
+    /// los rozstrzyga, czy pozycja „poszła na antenę” (`fate`), a anulowanie
+    /// go (`cancel_waiting`) wycofuje całą resztę serii.
+    async fn announce(&self, item: &SourceItem, text: &str, first: bool) -> Result<i64, DbError> {
+        let repeat = if first { item.repeat } else { None };
+        self.enqueue(text.to_owned(), item.priority, item.interrupting, item.valid_until, repeat).await
     }
 
-    /// Co wiadomo o nadaniu pozycji z jej elementów kolejki: `done`
-    /// któregokolwiek to nadanie; wzięty albo czekający jeszcze się waży.
+    /// Co wiadomo o nadaniu pozycji z jej elementów kolejki, z całymi seriami
+    /// (śledzony jest tylko pierwszy element serii, a pierwszy mógł odpaść
+    /// przy interlocku, gdy powtórka poszła): `done` któregokolwiek członka to
+    /// nadanie; wzięty albo czekający jeszcze się waży.
     async fn fate(&self, ids: impl Iterator<Item = i64>) -> Result<Fate, DbError> {
         let mut fate = Fate::NotAired;
         for queue_item_id in ids {
-            match self.queue.state_of(queue_item_id).await? {
-                Some(QueueState::Done) => return Ok(Fate::Aired),
-                Some(QueueState::Transmitting | QueueState::Pending) => fate = Fate::Unresolved,
-                _ => {}
+            for state in self.queue.series_states(queue_item_id).await? {
+                match state {
+                    QueueState::Done => return Ok(Fate::Aired),
+                    QueueState::Transmitting | QueueState::Pending => fate = Fate::Unresolved,
+                    _ => {}
+                }
             }
         }
         Ok(fate)
@@ -387,10 +427,13 @@ impl SourceRunner {
         let mut aired = old.aired;
         if let Some(queue_item_id) = old.queue_item_id {
             self.cancel_waiting(Some(queue_item_id)).await;
-            match self.queue.state_of(queue_item_id).await? {
-                Some(QueueState::Done) => aired = true,
-                Some(QueueState::Transmitting) => superseded.push(queue_item_id),
-                _ => {}
+            let states = self.queue.series_states(queue_item_id).await?;
+            if states.contains(&QueueState::Done) {
+                aired = true;
+            }
+            // Wzięty członek serii może jeszcze skończyć jako `done`.
+            if states.contains(&QueueState::Transmitting) {
+                superseded.push(queue_item_id);
             }
         }
         Ok((aired, superseded))
@@ -403,7 +446,7 @@ impl SourceRunner {
             match self.fate(waiting.queue_ids()).await? {
                 Fate::Aired => {
                     if !waiting.cancel_text.is_empty() && waiting.valid_until.is_none_or(|until| until > now) {
-                        self.enqueue(waiting.cancel_text.clone(), Priority::Normal, false, waiting.valid_until)
+                        self.enqueue(waiting.cancel_text.clone(), Priority::Normal, false, waiting.valid_until, None)
                             .await?;
                     }
                     self.state.set_aired(waiting.id).await?;
@@ -420,17 +463,20 @@ impl SourceRunner {
         Ok(())
     }
 
-    /// R7: anuluje element kolejki, który jeszcze czeka. `true`, gdy czekał.
-    async fn cancel_waiting(&self, queue_item_id: Option<i64>) -> bool {
+    /// R7: anuluje element kolejki, który jeszcze czeka, a dla serii cały jej
+    /// niewysłany ogon.
+    async fn cancel_waiting(&self, queue_item_id: Option<i64>) {
         let Some(queue_item_id) = queue_item_id else {
-            return false;
+            return;
         };
-        match self.queue.cancel(queue_item_id).await {
-            Ok(rows) => rows == 1,
-            Err(error) => {
-                tracing::warn!(%error, queue_item_id, "nie udało się anulować elementu kolejki");
-                false
-            }
+        // Pozycja z serii (Alert RCB): wycofujemy cały niewysłany ogon serii.
+        let result = match self.queue.group_of(queue_item_id).await {
+            Ok(Some(group)) => self.queue.cancel_group(&group).await,
+            Ok(None) => self.queue.cancel(queue_item_id).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, queue_item_id, "nie udało się anulować elementu kolejki");
         }
     }
 
@@ -452,6 +498,7 @@ impl SourceRunner {
             fingerprint: item.fingerprint.clone(),
             area: scope.to_owned(),
             summary: item.summary.clone(),
+            text: item.text.clone(),
             cancel_text: item.cancel_text.clone(),
             priority: item.priority,
             valid_from: item.valid_from,
@@ -556,6 +603,7 @@ mod tests {
             summary: format!("Burze {key}"),
             priority: Priority::Normal,
             interrupting: false,
+            repeat: None,
             valid_from: None,
             valid_until: Some(at("2099-01-01T00:00:00Z")),
         }
@@ -597,6 +645,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_markers_in_source_text_never_reach_the_queue_or_storage() {
+        let mut item = warning("a", "f1");
+        item.text = "Burza[[pauza:9000]] nad miastem".into();
+        item.cancel_text = "[[pauza:5]]koniec".into();
+        let r = rig(vec![ok(vec![item])]).await;
+        r.runner.cycle(now()).await;
+        assert_eq!(texts(&r.queue).await, vec!["Burza nad miastem"]);
+        let stored = r.state.active_items("imgw-meteo").await.unwrap();
+        assert_eq!(stored[0].text, "Burza nad miastem");
+        assert_eq!(stored[0].cancel_text, "koniec");
+    }
+
+    #[tokio::test]
     async fn a_new_item_is_queued_once_and_a_repeat_fetch_queues_nothing() {
         let mut item = warning("a", "f1");
         item.priority = Priority::High;
@@ -612,6 +673,114 @@ mod tests {
         assert_eq!(pending[0].expires_at, item.valid_until);
     }
 
+    fn series_item(key: &str, fingerprint: &str) -> SourceItem {
+        SourceItem {
+            priority: Priority::Emergency,
+            interrupting: true,
+            repeat: Some((3, Duration::from_secs(60))),
+            ..warning(key, fingerprint)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_series_item_is_queued_as_a_series_and_only_the_first_interrupts() {
+        let r = rig(vec![ok(vec![series_item("a", "f1")]), ok(vec![series_item("a", "f1")])]).await;
+        assert_eq!(r.runner.cycle(now()).await.announced, 1);
+        // Powtórny odczyt tej samej pozycji nie dokłada serii.
+        assert_eq!(r.runner.cycle(now()).await.announced, 0);
+        let mut pending = r.queue.pending(10).await.unwrap();
+        pending.sort_by_key(|i| i.repeat_index);
+        assert_eq!(pending.len(), 3);
+        assert!(pending.iter().all(|i| i.priority == Priority::Emergency));
+        assert!(pending.iter().all(|i| i.repeat_group == pending[0].repeat_group));
+        assert_eq!(
+            pending.iter().map(|i| i.interrupting).collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
+        let gap = pending[1].not_before - pending[0].not_before;
+        assert_eq!(gap, chrono::Duration::seconds(60));
+        assert_eq!(pending[2].not_before - pending[1].not_before, chrono::Duration::seconds(60));
+    }
+
+    #[tokio::test]
+    async fn an_item_without_repeat_is_queued_once() {
+        let r = rig(vec![ok(vec![warning("a", "f1")])]).await;
+        r.runner.cycle(now()).await;
+        let pending = r.queue.pending(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].repeat_group.is_none());
+    }
+
+    #[tokio::test]
+    async fn withdrawing_a_series_item_cancels_the_unaired_rest_of_the_series() {
+        let r = rig(vec![ok(vec![series_item("a", "f1")]), ok(vec![]), ok(vec![])]).await;
+        r.runner.cycle(now()).await;
+        // Pierwsze nadanie poszło na antenę, dwie powtórki jeszcze czekają.
+        let first = r.queue.claim_next().await.unwrap().unwrap();
+        r.queue.mark_done(first.id).await.unwrap();
+        assert_eq!(r.queue.pending(10).await.unwrap().len(), 2);
+        r.runner.cycle(now()).await;
+        let report = r.runner.cycle(now()).await;
+        assert_eq!(report.cancelled, 1);
+        // Zostaje tylko odwołanie; powtórki serii wycofane.
+        assert_eq!(texts(&r.queue).await, vec!["odwołanie a"]);
+    }
+
+    fn quick_series(key: &str) -> SourceItem {
+        SourceItem { repeat: Some((3, Duration::from_millis(1))), ..series_item(key, "f1") }
+    }
+
+    #[tokio::test]
+    async fn a_repeat_that_aired_after_the_first_was_dropped_still_gets_a_cancellation() {
+        let r = rig(vec![ok(vec![quick_series("a")]), ok(vec![]), ok(vec![])]).await;
+        r.runner.cycle(now()).await;
+        let mut pending = r.queue.pending(10).await.unwrap();
+        pending.sort_by_key(|i| i.repeat_index);
+        // Pierwsze nadanie odpadło (np. interlock), druga powtórka poszła.
+        r.queue.cancel(pending[0].id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second = r.queue.claim_next().await.unwrap().unwrap();
+        assert_eq!(second.id, pending[1].id);
+        r.queue.mark_done(second.id).await.unwrap();
+        r.runner.cycle(now()).await;
+        let report = r.runner.cycle(now()).await;
+        assert_eq!(report.cancelled, 1);
+        assert_eq!(texts(&r.queue).await, vec!["odwołanie a"]);
+    }
+
+    #[tokio::test]
+    async fn withdrawing_while_a_repeat_transmits_cancels_the_rest_and_announces_after_it_airs() {
+        let r = rig(vec![ok(vec![quick_series("a")]), ok(vec![]), ok(vec![]), ok(vec![])]).await;
+        r.runner.cycle(now()).await;
+        let mut pending = r.queue.pending(10).await.unwrap();
+        pending.sort_by_key(|i| i.repeat_index);
+        r.queue.cancel(pending[0].id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second = r.queue.claim_next().await.unwrap().unwrap();
+        assert_eq!(second.id, pending[1].id);
+        r.runner.cycle(now()).await;
+        r.runner.cycle(now()).await;
+        // Trwająca powtórka kończy nadanie, reszta serii wycofana, odwołania jeszcze nie ma.
+        assert!(texts(&r.queue).await.is_empty());
+        r.queue.mark_done(second.id).await.unwrap();
+        r.runner.cycle(now()).await;
+        assert_eq!(texts(&r.queue).await, vec!["odwołanie a"]);
+    }
+
+    #[tokio::test]
+    async fn a_change_to_a_series_item_cancels_the_rest_and_is_announced_once() {
+        let r = rig(vec![ok(vec![series_item("a", "f1")]), ok(vec![series_item("a", "f2")])]).await;
+        r.runner.cycle(now()).await;
+        let first = r.queue.claim_next().await.unwrap().unwrap();
+        r.queue.mark_done(first.id).await.unwrap();
+        let report = r.runner.cycle(now()).await;
+        assert_eq!(report.changed, 1);
+        let pending = r.queue.pending(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].rendered_text, "zmiana a f2");
+        assert!(pending[0].repeat_group.is_none());
+    }
+
     #[tokio::test]
     async fn a_changed_fingerprint_is_announced_with_the_change_text() {
         let r = rig(vec![ok(vec![warning("a", "f1")]), ok(vec![warning("a", "f2")])]).await;
@@ -621,6 +790,9 @@ mod tests {
         assert_eq!(report.announced, 0);
         // Stare ogłoszenie jeszcze czekało, więc zostaje tylko zmiana (R7).
         assert_eq!(texts(&r.queue).await, vec!["zmiana a f2"]);
+        // Śledzona pozycja trzyma pełną treść, nie tekst zmiany.
+        let active = r.state.active_items("imgw-meteo").await.unwrap();
+        assert_eq!(active[0].text, "nowe a f2");
     }
 
     #[tokio::test]

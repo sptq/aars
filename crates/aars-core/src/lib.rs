@@ -1,5 +1,7 @@
 pub mod area;
+pub mod area_auto;
 pub mod bulletin;
+pub mod bulletin_layout;
 pub mod config;
 pub mod db;
 pub mod dispatcher;
@@ -11,6 +13,7 @@ pub mod interlock;
 pub mod message;
 pub mod module;
 pub mod netlocal;
+pub mod pause;
 pub mod priority;
 pub mod ptt;
 pub mod queue;

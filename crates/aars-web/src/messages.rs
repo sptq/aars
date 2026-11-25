@@ -189,6 +189,20 @@ pub struct EnabledForm {
     enabled: String,
 }
 
+/// Po akcji z listy: formularz htmx dostaje świeżą listę (htmx podmienia
+/// jej kartę) i powiadomienie; zwykły formularz — przekierowanie.
+async fn done(
+    state: AppState,
+    current: CurrentUser,
+    location: &str,
+    toast: &str,
+) -> Result<Response, AuthRejection> {
+    if current.htmx {
+        return Ok(crate::render::htmx::ok(list(State(state), current).await?, toast));
+    }
+    Ok(Redirect::to(location).into_response())
+}
+
 fn repo(state: &AppState) -> MessageRepo {
     MessageRepo::new(state.pool.clone())
 }
@@ -355,7 +369,7 @@ pub async fn set_enabled(
         if enabled { "włączony" } else { "wyłączony" }
     );
     audit(&state, current.user.id, "message_enabled", &detail).await;
-    Ok(Redirect::to("/messages").into_response())
+    done(state, current, "/messages", if enabled { "Włączono" } else { "Wyłączono" }).await
 }
 
 pub async fn delete(
@@ -376,7 +390,7 @@ pub async fn delete(
         return Ok(server_error("usunięcie definicji zawiodło", &err));
     }
     audit(&state, current.user.id, "message_delete", &title).await;
-    Ok(Redirect::to("/messages").into_response())
+    done(state, current, "/messages", "Usunięto").await
 }
 
 /// Nadanie na żądanie: definicja trafia do kolejki teraz, z własnym
@@ -409,7 +423,7 @@ pub async fn send(
     match state.queue.enqueue(request).await {
         Ok(_) => {
             audit(&state, current.user.id, "message_send", &message.title).await;
-            Ok(Redirect::to("/queue").into_response())
+            done(state, current, "/queue", "Komunikat dodany do kolejki").await
         }
         Err(err) => Ok(server_error("dodanie do kolejki zawiodło", &err)),
     }

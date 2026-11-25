@@ -13,7 +13,7 @@ use serde::Deserialize;
 use crate::audit;
 use crate::auth::{AuthRejection, CurrentUser, require_csrf, require_role};
 use crate::chrome::{Chrome, parse_priority, priority_value};
-use crate::render::page;
+use crate::render::{htmx, page};
 use crate::state::AppState;
 
 #[derive(Template)]
@@ -27,10 +27,13 @@ struct SettingsPage {
     misfire_grace_s: String,
     quiet_hours: String,
     quiet_min_priority: String,
+    speech_rate_pct: String,
     quiet_hint: String,
     pending: Vec<String>,
     has_station: bool,
     error: Option<String>,
+    /// Pole formularza, którego dotyczy `error` (`""` — błąd całej karty).
+    error_field: &'static str,
     saved: bool,
     no_callsign: bool,
     position: PositionCard,
@@ -94,6 +97,9 @@ pub struct SettingsForm {
     #[serde(default)]
     quiet_hours: String,
     quiet_min_priority: String,
+    /// Tempo mowy w procentach tempa głosu; brak pola zostawia zapisane.
+    #[serde(default)]
+    speech_rate_pct: String,
 }
 
 /// `22:00–06:00 lokalnie = 21:00–05:00 UTC` dla podanego przesunięcia strefy.
@@ -139,10 +145,12 @@ async fn view(
         misfire_grace_s: s.misfire_grace_s.to_string(),
         quiet_hours: s.quiet_hours.map(|q| q.as_text()).unwrap_or_default(),
         quiet_min_priority: priority_value(s.quiet_min_priority).to_owned(),
+        speech_rate_pct: format!("{:.0}", s.speech_rate * 100.0),
         quiet_hint: quiet_hint(s.quiet_hours),
         pending: crate::hardware_page::pending_for(state, s).await,
         has_station: state.station.is_some(),
         error,
+        error_field: "",
         saved,
         no_callsign: s.callsign.is_empty(),
         position: PositionCard::from_saved(saved_position(state).await.as_ref()),
@@ -183,32 +191,51 @@ pub async fn page_view(
     }
 }
 
-fn parse_form(form: &SettingsForm) -> Result<StationSettings, String> {
-    let number = |text: &str, name: &str| {
+/// Formularz → ustawienia; błąd niesie nazwę pola formularza i komunikat.
+fn parse_form(
+    form: &SettingsForm,
+    stored: &StationSettings,
+) -> Result<StationSettings, (&'static str, String)> {
+    let number = |text: &str, key: &'static str, name: &str| {
         text.trim()
             .parse::<u64>()
-            .map_err(|_| format!("{name}: podaj liczbę całkowitą"))
+            .map_err(|_| (key, format!("{name}: podaj liczbę całkowitą")))
     };
     let id_mode = match form.id_mode.as_str() {
         "cw" => aars_core::ident::IdMode::Cw,
         "voice" => aars_core::ident::IdMode::Voice,
-        _ => return Err("tryb identyfikacji: cw albo voice".to_owned()),
+        _ => return Err(("id_mode", "tryb identyfikacji: cw albo voice".to_owned())),
     };
     let quiet_hours = match form.quiet_hours.trim() {
         "" => None,
-        text => Some(QuietHours::parse(text)?),
+        text => Some(QuietHours::parse(text).map_err(|e| ("quiet_hours", e))?),
+    };
+    let speech_rate = match form.speech_rate_pct.trim() {
+        "" => stored.speech_rate,
+        text => {
+            let pct = text.parse::<u32>().map_err(|_| {
+                ("speech_rate_pct", "tempo mowy: podaj liczbę całkowitą procent".to_owned())
+            })?;
+            pct as f32 / 100.0
+        }
     };
     let mut parsed = StationSettings {
         callsign: form.callsign.clone(),
         id_mode,
-        id_interval_s: number(&form.id_interval_s, "odstęp identyfikacji")?,
-        tx_max_duration_s: number(&form.tx_max_duration_s, "limit czasu nadawania")?,
-        misfire_grace_s: number(&form.misfire_grace_s, "tolerancja spóźnień")?,
+        id_interval_s: number(&form.id_interval_s, "id_interval_s", "odstęp identyfikacji")?,
+        tx_max_duration_s: number(&form.tx_max_duration_s, "tx_max_duration_s", "limit czasu nadawania")?,
+        misfire_grace_s: number(&form.misfire_grace_s, "misfire_grace_s", "tolerancja spóźnień")?,
         quiet_hours,
-        quiet_min_priority: parse_priority(&form.quiet_min_priority)
-            .ok_or_else(|| "nieznany priorytet progu ciszy".to_owned())?,
+        quiet_min_priority: parse_priority(&form.quiet_min_priority).ok_or_else(|| {
+            ("quiet_min_priority", "nieznany priorytet progu ciszy".to_owned())
+        })?,
+        speech_rate,
     };
-    parsed.validate()?;
+    // Pola struktury nazywają się jak pola formularza, poza tempem mowy.
+    parsed.validate_fields().map_err(|(key, message)| match key {
+        "speech_rate" => ("speech_rate_pct", message),
+        key => (key, message),
+    })?;
     Ok(parsed)
 }
 
@@ -236,6 +263,7 @@ fn changed_keys(old: &StationSettings, new: &StationSettings) -> Vec<&'static st
         old.quiet_min_priority != new.quiet_min_priority,
         "quiet_min_priority",
     );
+    note(old.speech_rate != new.speech_rate, "speech_rate");
     keys
 }
 
@@ -256,14 +284,26 @@ pub async fn submit(
         }
     };
 
-    let new = match parse_form(&form) {
+    let new = match parse_form(&form, &stored) {
         Ok(new) => new,
-        Err(message) => {
-            return Ok((
-                StatusCode::BAD_REQUEST,
-                page(&view(&state, &current, &stored, Some(message), false).await),
-            )
-                .into_response());
+        Err((field, message)) => {
+            // Błąd stoi przy polu i idzie też do powiadomienia.
+            let toast = message.clone();
+            let mut shown = view(&state, &current, &stored, Some(message), false).await;
+            shown.error_field = field;
+            // Wpisane wartości zostają w polach (do poprawienia, nie od nowa).
+            shown.callsign = form.callsign.clone();
+            shown.id_mode = form.id_mode.clone();
+            shown.id_interval_s = form.id_interval_s.clone();
+            shown.tx_max_duration_s = form.tx_max_duration_s.clone();
+            shown.misfire_grace_s = form.misfire_grace_s.clone();
+            shown.quiet_hours = form.quiet_hours.clone();
+            shown.quiet_min_priority = form.quiet_min_priority.clone();
+            if !form.speech_rate_pct.trim().is_empty() {
+                shown.speech_rate_pct = form.speech_rate_pct.clone();
+            }
+            let response = (StatusCode::BAD_REQUEST, page(&shown)).into_response();
+            return Ok(if current.htmx { htmx::refused(response, &toast) } else { response });
         }
     };
 
@@ -278,7 +318,8 @@ pub async fn submit(
         &changed_keys(&stored, &new).join(","),
     )
     .await;
-    Ok(page(&view(&state, &current, &new, None, true).await))
+    let response = page(&view(&state, &current, &new, None, true).await);
+    Ok(if current.htmx { htmx::ok(response, "Zapisano") } else { response })
 }
 
 /// `POST /settings/position` (admin, R17): współrzędne albo lokator; wszystkie
@@ -306,8 +347,9 @@ pub async fn submit_position(
             shown.position.lat = form.lat.clone();
             shown.position.lon = form.lon.clone();
             shown.position.locator = form.locator.clone();
-            shown.position.error = Some(message);
-            return Ok((StatusCode::BAD_REQUEST, page(&shown)).into_response());
+            shown.position.error = Some(message.clone());
+            let response = (StatusCode::BAD_REQUEST, page(&shown)).into_response();
+            return Ok(if current.htmx { htmx::refused(response, &message) } else { response });
         }
     };
 
@@ -323,6 +365,10 @@ pub async fn submit_position(
         None => "usunięto".to_owned(),
     };
     audit(&state, current.user.id, "position", &detail).await;
+    if current.htmx {
+        let toast = if position.is_some() { "Zapisano położenie" } else { "Usunięto położenie" };
+        return Ok(htmx::ok(page_view(State(state), current).await?, toast));
+    }
     Ok(axum::response::Redirect::to("/settings#polozenie").into_response())
 }
 
@@ -405,6 +451,7 @@ mod tests {
             ("misfire_grace_s", "600"),
             ("quiet_hours", ""),
             ("quiet_min_priority", "emergency"),
+            ("speech_rate_pct", "87"),
         ];
         for (key, value) in overrides {
             fields.iter_mut().find(|(k, _)| k == key).unwrap().1 = value;
@@ -464,6 +511,66 @@ mod tests {
             audit.contains("callsign") && audit.contains("quiet_hours"),
             "{audit}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_speech_rate_is_saved_as_a_multiplier_and_shown_as_a_percentage() {
+        let (app, cookie, csrf, state) = logged_in(Role::Admin).await;
+        let (_, html) = get(&app, "/settings", &cookie).await;
+        assert!(html.contains("Tempo mowy"), "{html}");
+        assert!(html.contains("name=\"speech_rate_pct\"") && html.contains("value=\"87\""), "{html}");
+
+        let status = post_settings(&app, &cookie, &csrf, &[("speech_rate_pct", "100")]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stored(&state, "speech_rate").await, "1.00");
+        let (_, html) = get(&app, "/settings", &cookie).await;
+        assert!(html.contains("value=\"100\""), "{html}");
+
+        // Pole pominięte (stary formularz) zostawia zapisane tempo.
+        let before = stored(&state, "speech_rate").await;
+        post_settings_without(&app, &cookie, &csrf).await;
+        assert_eq!(stored(&state, "speech_rate").await, before);
+    }
+
+    async fn post_settings_without(app: &Router, cookie: &str, csrf: &str) {
+        let body = format!(
+            "csrf={csrf}&callsign=SP7TQ&id_mode=voice&id_interval_s=600&tx_max_duration_s=180\
+             &misfire_grace_s=600&quiet_hours=&quiet_min_priority=emergency"
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/settings")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_speech_rate_outside_70_to_120_percent_is_refused() {
+        let (app, cookie, csrf, state) = logged_in(Role::Admin).await;
+        for bad in ["69", "121", "0", "abc", "-5", "87,5"] {
+            assert_eq!(
+                post_settings(&app, &cookie, &csrf, &[("speech_rate_pct", bad)]).await,
+                StatusCode::BAD_REQUEST,
+                "{bad}"
+            );
+        }
+        assert_eq!(stored(&state, "speech_rate").await, "0.87");
+        for ok in ["70", "120"] {
+            assert_eq!(
+                post_settings(&app, &cookie, &csrf, &[("speech_rate_pct", ok)]).await,
+                StatusCode::OK,
+                "{ok}"
+            );
+        }
     }
 
     #[tokio::test]

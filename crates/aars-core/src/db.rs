@@ -143,6 +143,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_0007_gives_old_tracked_items_their_summary_as_text() {
+        let options = SqliteConnectOptions::new().in_memory(true).foreign_keys(true);
+        let pool = SqlitePoolOptions::new().max_connections(1).connect_with(options).await.unwrap();
+        let mut old = sqlx::migrate::Migrator::DEFAULT;
+        old.migrations = MIGRATOR.migrations.iter().filter(|m| m.version <= 6).cloned().collect::<Vec<_>>().into();
+        old.run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO source_items (source_id, item_key, topic, fingerprint, area, summary, cancel_text, priority, state, aired,
+                                       first_seen_at, last_seen_at)
+             VALUES ('swpc', 'G', 'G', 'G3', '', 'G3 — silna burza', '', 2, 'active', 1,
+                     '2026-11-22T18:00:00Z', '2026-11-22T18:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO source_items (source_id, item_key, topic, fingerprint, area, summary, cancel_text, priority, state, aired,
+                                       first_seen_at, last_seen_at)
+             VALUES ('swpc', 'F', 'F', 'F1', '', 'F1 — flara', '', 2, 'active', 1,
+                     '2026-11-22T18:00:00Z', '2026-11-22T18:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate(&pool).await.expect("0007 na bazie w wersji 6");
+        // Pozycja wstawiona po migracji z własnym `text` zostaje przy nim.
+        sqlx::query(
+            "INSERT INTO source_items (source_id, item_key, topic, fingerprint, area, summary, text, cancel_text,
+                                       priority, state, aired, first_seen_at, last_seen_at)
+             VALUES ('swpc', 'K', 'K', 'K5', '', 'K5 — burza', 'Uwaga, burza K5.', '', 2, 'active', 1,
+                     '2026-11-22T18:00:00Z', '2026-11-22T18:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let texts: Vec<(String, String)> =
+            sqlx::query_as("SELECT item_key, text FROM source_items ORDER BY item_key")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            texts,
+            [
+                ("F".to_owned(), "F1 — flara".to_owned()),
+                ("G".to_owned(), "G3 — silna burza".to_owned()),
+                ("K".to_owned(), "Uwaga, burza K5.".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn migration_0006_applies_on_a_version_5_database() {
         let options = SqliteConnectOptions::new().in_memory(true).foreign_keys(true);
         let build = || async {

@@ -6,25 +6,25 @@
 <p class="alert">Źródła nie są uruchomione w tym procesie — „Odśwież teraz” jest wyłączone. Powód startu i ostatni błąd widać poniżej.</p>
 {% endif %}
 {% for s in sources %}
-<div class="card">
+<div class="card" id="{{ s.id }}">
   <h2>{{ s.name }} <span class="badge {{ s.css }}">{{ s.health }}</span></h2>
   <div class="table-wrap"><table>
     <tbody>
       <tr><th>Ostatnia próba</th><td>{{ s.last_run }}</td></tr>
       <tr><th>Ostatni sukces</th><td>{{ s.last_success }}</td></tr>
       {% if let Some(error) = s.last_error %}<tr><th>Ostatni błąd</th><td class="error">{{ error }}</td></tr>{% endif %}
-      {% if s.shows_area %}<tr><th>Obszar</th><td>{% if s.area_text.is_empty() %}brak{% else %}<pre class="area-text">{{ s.area_text }}</pre>{% endif %}</td></tr>{% endif %}
+      {% if s.shows_area %}<tr><th>Obszar</th><td>{% if s.area_text.is_empty() %}{% if let Some(note) = s.auto_area_note %}{{ note }}{% else %}brak{% endif %}{% else %}<pre class="area-text">{{ s.area_text }}</pre>{% endif %}</td></tr>{% endif %}
       <tr><th>Interwał</th><td>{{ s.interval_s }} s</td></tr>
     </tbody>
   </table></div>
-  {% if chrome.is_admin %}<p class="muted"><small>{% if s.shows_area %}Obszar i interwał ustawia administrator{% else %}Ustawienia źródła zmienia administrator na stronie Moduły{% endif %}: <a href="/modules#{{ s.id }}">Zmień w Moduły</a></small></p>{% endif %}
+  {% if chrome.is_admin %}<p class="muted"><small>{% if s.shows_area %}Obszar i interwał ustawia administrator{% else %}Ustawienia źródła zmienia administrator na stronie Moduły{% endif %}: <a href="/modules?m={{ s.id }}">Zmień w Moduły</a></small></p>{% endif %}
   <div class="row-actions source-actions">
-    <form method="post" action="/sources/{{ s.id }}/enabled" class="inline">
+    <form method="post" action="/sources/{{ s.id }}/enabled" class="inline" hx-post="/sources/{{ s.id }}/enabled" hx-target="closest .card" hx-select="#{{ s.id }}" hx-swap="outerHTML">
       <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
       <input type="hidden" name="enabled" value="{% if s.enabled %}0{% else %}1{% endif %}">
       <button type="submit" class="{% if s.enabled %}danger{% endif %}">{% if s.enabled %}Wyłącz{% else %}Włącz{% endif %}</button>
     </form>
-    <form method="post" action="/sources/{{ s.id }}/refresh" class="inline">
+    <form method="post" action="/sources/{{ s.id }}/refresh" class="inline" hx-post="/sources/{{ s.id }}/refresh" hx-target="closest .card" hx-select="#{{ s.id }}" hx-swap="outerHTML">
       <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
       <button type="submit" class="ghost" {% if !can_refresh %}disabled{% endif %}>Odśwież teraz</button>
     </form>

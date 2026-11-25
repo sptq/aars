@@ -14,7 +14,7 @@ use aars_core::config::{AudioConfig, Config, FirstAdmin, PttBackendKind, PttConf
 use aars_core::dispatcher::{
     Dispatcher, DispatcherConfig, DispatcherControl, StationTest, TestOutcome,
 };
-use aars_core::hardware::probe::HardwareProbe;
+use aars_core::hardware::probe::{HardwareProbe, resolve_model};
 use aars_core::hardware::{ApplyStatus, ConfigOrigin, HW_KEYS, HardwareRepo, HardwareSettings};
 use aars_core::module::{ModuleRegistry, ModuleRepo};
 use aars_core::ptt::PttBackend;
@@ -55,9 +55,19 @@ impl HardwareFactory for RealHardware {
     }
 
     fn synth(&self, config: &Config) -> Arc<dyn Synthesizer> {
+        // Po aktualizacji ustawiony model mógł zniknąć z katalogu głosów
+        // (np. darkman): wtedy Gosia, żeby stacja nie zamilkła.
+        let model = resolve_model(&config.tts.model, &config.tts.voices_dir);
+        if let Some(missing) = &model.replaced {
+            tracing::warn!(
+                brak = %missing,
+                uzyty = %model.path,
+                "model głosu nie istnieje — używam Gosi; wybierz głos na stronie Sprzęt"
+            );
+        }
         Arc::new(aars_audio::piper::PiperSynth::new(
             &config.tts.piper_bin,
-            &config.tts.model,
+            &model.path,
             config.audio.sample_rate,
         ))
     }
@@ -424,6 +434,14 @@ pub fn bulletin_preview_view(
             .map(|(id, outcome)| ((*id).to_owned(), outcome.describe()))
             .collect(),
         skipped_reason: composed.skipped_reason.map(str::to_owned),
+        part_chars: composed
+            .parts
+            .iter()
+            .map(|(_, outcome)| match outcome {
+                aars_sources::bulletin::PartOutcome::Included(text) => Some(text.chars().count()),
+                _ => None,
+            })
+            .collect(),
     }
 }
 
@@ -705,6 +723,7 @@ async fn run_station(
         cache.clone(),
         synth.clone(),
         config.audio.gain_db,
+        SettingsRepo::new(pool.clone()),
     ));
     let queue = Arc::new(QueueRepo::new(pool.clone()));
 
@@ -737,6 +756,18 @@ async fn run_station(
     }
     if let Err(err) = users.purge_expired_sessions().await {
         tracing::error!(%err, "czyszczenie wygasłych sesji zawiodło");
+    }
+
+    // Aktualizacja ze stałych pór: tryb cykliczny jest domyślny, więc
+    // stacja bez zapisanego trybu nadaje teraz co 10 minut.
+    match aars_core::bulletin_layout::times_without_mode(pool).await {
+        Ok(true) => tracing::warn!(
+            "biuletyn działa teraz w trybie cyklicznym (domyślnie co {} min), choć zapisane są stałe pory; \
+             żeby wrócić do stałych pór, w panelu Biuletyn wybierz tryb „o stałych porach” i zapisz",
+            aars_core::bulletin_layout::DEFAULT_INTERVAL_MIN
+        ),
+        Ok(false) => {}
+        Err(err) => tracing::error!(%err, "odczyt trybu biuletynu zawiódł"),
     }
 
     // Biuletyn i źródła `pogoda`, `imgw-wodowskazy` dzielą instancje (jedna
@@ -819,6 +850,8 @@ async fn run_station(
             station.id_mode,
             config.audio.sample_rate,
             config.audio.gain_db,
+            SettingsRepo::new(pool.clone()),
+            station.speech_rate,
         ));
         let mut dispatcher = Dispatcher::new(
             queue.clone(),
@@ -928,11 +961,11 @@ async fn run_station(
     }
     if let Some(built) = &bulletin {
         let bulletin = built.bulletin.clone();
-        state = state.with_bulletin_preview(Arc::new(move || {
+        state = state.with_bulletin_preview(Arc::new(move |layout| {
             let bulletin = bulletin.clone();
             Box::pin(async move {
                 bulletin
-                    .compose(chrono::Utc::now())
+                    .compose_with(chrono::Utc::now(), layout)
                     .await
                     .map(bulletin_preview_view)
                     .map_err(|e| e.to_string())
@@ -1761,7 +1794,8 @@ mod tests {
         let pool = aars_core::db::test_pool().await;
         // Strażnik: 1 s + 0 ogona + 2 s zapasu; drenaż: to plus zapas testowy.
         put(&pool, "tx_max_duration_s", "1").await;
-        enqueue_one(&pool, "komunikat na zawieszoną kartę").await;
+        // Krótki tekst: nadanie dłuższe niż limit 1 s nie podniosłoby PTT.
+        enqueue_one(&pool, "kom").await;
         let hardware = Arc::new(FakeHardware::new(&[]));
         let ptt = hardware.ptt.clone();
         *hardware.sink.lock().unwrap() = Some(Arc::new(HangsLong));
@@ -1990,6 +2024,7 @@ mod tests {
         // to za 4–5 h, więc nigdy w oknie teraz ± 15 min, w każdej strefie hosta.
         let far = (chrono::Utc::now() + chrono::TimeDelta::hours(6)).format("%H:%M");
         put(&pool, "module:bulletin:enabled", "true").await;
+        put(&pool, "module:bulletin:mode", "pory").await;
         put(&pool, "module:bulletin:times", &far.to_string()).await;
         let locator = aars_core::geo::locator_from(50.04, 21.99, 6).unwrap();
         aars_core::geo::PositionRepo::new(pool.clone())
@@ -2296,7 +2331,8 @@ mod tests {
         let pool = aars_core::db::test_pool().await;
         // Strażnik: 1 s + 0 ogona + 2 s zapasu.
         put(&pool, "tx_max_duration_s", "1").await;
-        enqueue_one(&pool, "komunikat, który zawiesi kartę").await;
+        // Krótki tekst: nadanie dłuższe niż limit 1 s nie podniosłoby PTT.
+        enqueue_one(&pool, "kom").await;
         let hardware = Arc::new(FakeHardware::new(&[]));
         let ptt = hardware.ptt.clone();
         *hardware.sink.lock().unwrap() = Some(Arc::new(HangsUntilWatchdog(ptt.clone())));

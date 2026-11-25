@@ -168,12 +168,24 @@ pub fn next_bulletin(enabled: bool, times: &str, now: NaiveTime) -> NextBulletin
     }
 }
 
+/// Najbliższa chwila cyklu po `now` (czas Warszawy) — ta sama arytmetyka
+/// co w runnerze (`aars_core::bulletin_layout`).
+pub fn next_cycle(interval_min: u32, now: NaiveTime) -> NextBulletin {
+    match aars_core::bulletin_layout::next_cycle_after(interval_min, now) {
+        Some(t) => NextBulletin::Today(t),
+        None => NextBulletin::Tomorrow(NaiveTime::MIN),
+    }
+}
+
 pub async fn load_next_bulletin(state: &AppState, now: NaiveTime) -> Result<NextBulletin, DbError> {
     let repo = ModuleRepo::new(state.pool.clone());
     if !repo.is_enabled(&BULLETIN).await? {
         return Ok(NextBulletin::Off);
     }
     let settings = repo.settings(&BULLETIN).await?;
+    if let Some(interval) = aars_core::bulletin_layout::cycle_interval(&settings) {
+        return Ok(next_cycle(interval, now));
+    }
     let times = settings
         .get("times")
         .map(String::as_str)
@@ -312,6 +324,20 @@ mod tests {
                 "{bits}"
             );
         }
+    }
+
+    #[test]
+    fn the_next_cycle_is_the_next_multiple_of_the_interval() {
+        let at = |h, m, s| NaiveTime::from_hms_opt(h, m, s).unwrap();
+        assert_eq!(next_cycle(10, at(7, 0, 0)), NextBulletin::Today(t(7, 10)));
+        assert_eq!(next_cycle(10, at(7, 9, 59)), NextBulletin::Today(t(7, 10)));
+        assert_eq!(next_cycle(15, at(7, 50, 0)), NextBulletin::Today(t(8, 0)));
+        assert_eq!(next_cycle(10, at(23, 55, 0)), NextBulletin::Tomorrow(t(0, 0)));
+        // 7 min nie dzieli doby: ostatni cykl 23:55, potem północ.
+        assert_eq!(next_cycle(7, at(23, 50, 0)), NextBulletin::Today(t(23, 55)));
+        assert_eq!(next_cycle(7, at(23, 56, 0)), NextBulletin::Tomorrow(t(0, 0)));
+        assert_eq!(NextBulletin::Today(t(7, 10)).label(), "07:10");
+        assert_eq!(NextBulletin::Tomorrow(t(0, 0)).label(), "jutro 00:00");
     }
 
     #[test]
@@ -594,6 +620,18 @@ mod tests {
             NextBulletin::Off
         );
         modules.set_enabled(&BULLETIN, true).await.unwrap();
+        // Domyślnie tryb cykliczny co 10 minut.
+        assert_eq!(
+            load_next_bulletin(&state, NaiveTime::from_hms_opt(12, 3, 20).unwrap()).await.unwrap(),
+            NextBulletin::Today(t(12, 10))
+        );
+        let kv = SettingsRepo::new(state.pool.clone());
+        kv.kv_put("module:bulletin:interval_min", "15").await.unwrap();
+        assert_eq!(
+            load_next_bulletin(&state, t(12, 50)).await.unwrap(),
+            NextBulletin::Today(t(13, 0))
+        );
+        kv.kv_put("module:bulletin:mode", "pory").await.unwrap();
         assert_eq!(
             load_next_bulletin(&state, t(12, 0)).await.unwrap(),
             next_bulletin(true, "07:00,19:00", t(12, 0))
@@ -665,12 +703,14 @@ mod tests {
                 .body(Body::from(format!("csrf={csrf}&enabled=0&back=%2F")))
                 .unwrap();
             let (status, headers, _) = send(&app, request).await;
-            assert_eq!(status, StatusCode::SEE_OTHER, "htmx={htmx}");
-            assert_eq!(
-                headers.get(header::LOCATION).unwrap(),
-                "/account/password",
-                "htmx={htmx}"
-            );
+            // htmx dostaje HX-Redirect (cała strona przechodzi na zmianę hasła).
+            let (want, target) = if htmx {
+                (StatusCode::OK, headers.get("HX-Redirect"))
+            } else {
+                (StatusCode::SEE_OTHER, headers.get(header::LOCATION))
+            };
+            assert_eq!(status, want, "htmx={htmx}");
+            assert_eq!(target.unwrap(), "/account/password", "htmx={htmx}");
             assert!(state.interlocks.snapshot().tx_enabled, "htmx={htmx}");
         }
     }

@@ -33,6 +33,7 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     toggle: Toggle::Switchable,
     default_enabled: false,
     needs: Needs::Position,
+    auto_area: None,
     settings: &[
         SettingSpec {
             key: "min_mag",
@@ -178,6 +179,7 @@ pub fn to_output(events: &[Quake], skipped: usize, ctx: &SourceCtx) -> SourceOut
                 Priority::Normal
             },
             interrupting: false,
+            repeat: None,
             valid_from: Some(q.time),
             valid_until: Some(valid_until),
         });

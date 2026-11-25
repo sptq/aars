@@ -129,13 +129,28 @@ pub struct BulletinPreviewView {
     pub text: Option<String>,
     pub parts: Vec<(String, String)>,
     pub skipped_reason: Option<String>,
+    /// Długość tekstu każdego klocka w biuletynie (w kolejności `parts`;
+    /// `None` — klocek nie wszedł). Edytor liczy z niej oś czasu.
+    pub part_chars: Vec<Option<usize>>,
+}
+
+impl BulletinPreviewView {
+    /// Treść do pokazania w panelu (znaczniki pauz czytelnie); do odsłuchu
+    /// idzie surowy `text`.
+    pub fn display_text(&self) -> Option<String> {
+        self.text.as_deref().map(aars_core::pause::display)
+    }
 }
 
 pub type BulletinPreviewFuture =
     Pin<Box<dyn Future<Output = Result<BulletinPreviewView, String>> + Send>>;
 
 /// Składa biuletyn na teraz bez zapisu do kolejki; ustawia go binarka.
-pub type BulletinPreview = Arc<dyn Fn() -> BulletinPreviewFuture + Send + Sync>;
+/// `Some(układ)` — podgląd niezapisanego układu z edytora (baza bez zmian),
+/// `None` — zapisany układ (nadanie, podgląd zapisanego).
+pub type BulletinPreview = Arc<
+    dyn Fn(Option<aars_core::bulletin_layout::Layout>) -> BulletinPreviewFuture + Send + Sync,
+>;
 
 /// „Odśwież teraz” dla źródła: `true`, gdy źródło o tym id istnieje i zostało
 /// obudzone, `false` dla nieznanego id. Panel nie zna crate'a źródeł (spec §3).
@@ -331,6 +346,7 @@ pub mod testing {
                     misfire_grace_s: 600,
                     quiet_hours: None,
                     quiet_min_priority: aars_core::priority::Priority::Emergency,
+                    speech_rate: 0.87,
                 },
                 restarts: AtomicUsize::new(0),
                 outcome: Mutex::new(TestOutcome::Done {

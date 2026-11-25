@@ -2,6 +2,9 @@
 {% block title %}AARS — użytkownicy{% endblock %}
 {% block heading %}Użytkownicy{% endblock %}
 {% block content %}
+{#- Formularze podmieniają całą zawartość strony: po utworzeniu konta albo
+    resecie hasła u góry pojawia się karta z hasłem tymczasowym. -#}
+<div id="uzytkownicy">
 {% if let Some((name, pass)) = secret %}
 <div class="card">
   <h2>Hasło tymczasowe dla {{ name }}</h2>
@@ -22,7 +25,7 @@
         <td>{{ row.username }}{% if row.is_self %} (to Ty){% endif %}{% if row.must_change %} <span class="badge off">hasło tymczasowe</span>{% endif %}</td>
         <td>
           {% if row.is_self %}{{ row.role_label }}{% else %}
-          <form method="post" action="/users/{{ row.id }}/role" class="inline">
+          <form method="post" action="/users/{{ row.id }}/role" class="inline" hx-post="/users/{{ row.id }}/role" hx-target="#uzytkownicy" hx-select="#uzytkownicy" hx-swap="outerHTML">
             <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
             <select name="role" aria-label="Rola">
               <option value="viewer" {% if row.role == "viewer" %}selected{% endif %}>Podgląd</option>
@@ -36,18 +39,18 @@
         <td>{% if row.disabled %}<span class="badge off">wyłączony</span>{% else %}<span class="badge on">aktywny</span>{% endif %}</td>
         <td class="row-actions">
           {% if !row.is_self %}
-          <form method="post" action="/users/{{ row.id }}/disabled" class="inline">
+          <form method="post" action="/users/{{ row.id }}/disabled" class="inline" hx-post="/users/{{ row.id }}/disabled" hx-target="#uzytkownicy" hx-select="#uzytkownicy" hx-swap="outerHTML">
             <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
             <input type="hidden" name="disabled" value="{% if row.disabled %}0{% else %}1{% endif %}">
             <button type="submit" class="ghost">{% if row.disabled %}Włącz{% else %}Wyłącz{% endif %}</button>
           </form>
-          <form method="post" action="/users/{{ row.id }}/reset" class="inline"
-                onsubmit="return confirm('Wygenerować nowe hasło tymczasowe i zakończyć sesje użytkownika?')">
+          <form method="post" action="/users/{{ row.id }}/reset" class="inline" hx-post="/users/{{ row.id }}/reset" hx-target="#uzytkownicy" hx-select="#uzytkownicy" hx-swap="outerHTML"
+                hx-confirm="Wygenerować nowe hasło tymczasowe dla {{ row.username }} i zakończyć jego sesje?">
             <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
             <button type="submit" class="ghost">Resetuj hasło</button>
           </form>
-          <form method="post" action="/users/{{ row.id }}/delete" class="inline"
-                onsubmit="return confirm('Usunąć konto?')">
+          <form method="post" action="/users/{{ row.id }}/delete" class="inline" hx-post="/users/{{ row.id }}/delete" hx-target="#uzytkownicy" hx-select="#uzytkownicy" hx-swap="outerHTML"
+                hx-confirm="Usunąć konto {{ row.username }}?">
             <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
             <button type="submit" class="danger">Usuń</button>
           </form>
@@ -61,7 +64,7 @@
 <div class="card">
   <h2>Nowy użytkownik</h2>
   <p class="muted">Hasło zostanie wygenerowane i pokazane raz po zapisaniu.</p>
-  <form method="post" action="/users">
+  <form method="post" action="/users" hx-post="/users" hx-target="#uzytkownicy" hx-select="#uzytkownicy" hx-swap="outerHTML">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     <div class="field">
       <label for="username">Nazwa (3–32 znaki: a–z, 0–9, _ . -)</label>
@@ -77,5 +80,6 @@
     </div>
     <button type="submit">Utwórz</button>
   </form>
+</div>
 </div>
 {% endblock %}

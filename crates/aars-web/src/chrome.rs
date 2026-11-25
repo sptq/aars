@@ -29,6 +29,9 @@ pub struct Chrome {
     pub section: &'static str,
     /// Hasło tymczasowe (D8): rama bez menu i paska stanu.
     pub locked: bool,
+    /// Żądanie htmx o fragment: `base.html` renderuje sam blok `content`,
+    /// bez `<html>`, menu i paska; htmx wybiera z niego kartę.
+    pub partial: bool,
 }
 
 impl Chrome {
@@ -50,6 +53,7 @@ impl Chrome {
             status: None,
             section: nav_section(&current.path),
             locked: current.user.must_change_password,
+            partial: current.htmx,
         }
     }
 
@@ -84,6 +88,7 @@ pub fn nav_section(path: &str) -> &'static str {
             ("/queue", "queue"),
             ("/sources", "sources"),
             ("/modules", "modules"),
+            ("/bulletin", "bulletin"),
             ("/map", "map"),
             ("/users", "users"),
             ("/logs", "logs"),
@@ -276,6 +281,7 @@ mod tests {
             ("/queue", "queue"),
             ("/sources", "sources"),
             ("/modules", "modules"),
+            ("/bulletin", "bulletin"),
             ("/map", "map"),
             ("/settings/hardware/test-ptt", "hardware"),
             ("/settings/update/check", "update"),

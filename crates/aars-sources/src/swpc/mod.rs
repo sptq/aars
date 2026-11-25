@@ -31,6 +31,7 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     toggle: Toggle::Switchable,
     default_enabled: false,
     needs: Needs::Nothing,
+    auto_area: None,
     settings: &[
         SettingSpec {
             key: "g_min",
@@ -186,6 +187,7 @@ pub fn to_output(scales: &Scales, ctx: &SourceCtx, episodes: &mut Episodes) -> S
             summary: format!("{scale}{peak} — {}", speech::label(scale, peak)),
             priority: Priority::High,
             interrupting: false,
+            repeat: None,
             valid_from: None,
             valid_until: None,
         });

@@ -2,16 +2,17 @@
 {% block title %}AARS — mapa ostrzeżeń{% endblock %}
 {% block heading %}Mapa ostrzeżeń{% endblock %}
 {% block main_class %}wide{% endblock %}
+{% block body_attrs %} data-full-load{% endblock %}
 {% block head %}
-  <link rel="stylesheet" href="/assets/vendor/leaflet/leaflet.css">
-  <script src="/assets/vendor/leaflet/leaflet.js" defer></script>
-  <script src="/assets/warnings-map.js" defer></script>
+  <link rel="stylesheet" href="/assets/vendor/leaflet/leaflet.css?v={{ crate::assets::stamp() }}">
+  <script src="/assets/vendor/leaflet/leaflet.js?v={{ crate::assets::stamp() }}" defer></script>
+  <script src="/assets/warnings-map.js?v={{ crate::assets::stamp() }}" defer></script>
 {% endblock %}
 {% block content %}
 <div class="card">
   <h2>Ostrzeżenia meteorologiczne IMGW</h2>
   <p id="map-banner" class="error">Ładowanie mapy…</p>
-  <div id="warnings-map" class="map-canvas" data-tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png" data-geojson="/assets/powiaty.geojson" data-src="/map/data"></div>
+  <div id="warnings-map" class="map-canvas" data-tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png" data-geojson="/assets/powiaty.geojson?v={{ crate::assets::stamp() }}" data-src="/map/data"></div>
   <p id="map-note" class="error" hidden></p>
   <noscript><p class="error">Mapa wymaga JavaScriptu — bez niego nie pokazuje ostrzeżeń.</p></noscript>
   <div id="map-legend" class="map-legend">

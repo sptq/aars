@@ -21,6 +21,41 @@ pub struct VoiceFile {
     pub name: String,
 }
 
+/// Model, który stacja zawsze ma w obrazie; wraca, gdy wskazany plik zniknął
+/// (np. po aktualizacji z głosu darkman).
+pub const FALLBACK_VOICE_FILE: &str = "pl_PL-gosia-medium.onnx";
+
+/// Czytelna nazwa głosu na liście wyboru; nieznane pliki zostają pod nazwą pliku.
+pub fn friendly_voice_name(stem: &str) -> String {
+    match stem {
+        "pl_PL-gosia-medium" => "Gosia (kobiecy)".to_owned(),
+        "pl_PL-mc_speech-medium" => "MC Speech (męski)".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// Model do użycia przy syntezie.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel {
+    pub path: String,
+    /// Ustawiony, a nieistniejący model, w którego miejsce wszedł zapasowy.
+    pub replaced: Option<String>,
+}
+
+/// Wskazany model, jeśli jest na dysku z `.onnx.json` obok; inaczej Gosia z
+/// `voices_dir`; gdy i jej brak, wskazany model bez zmian (synteza zgłosi błąd).
+pub fn resolve_model(model: &str, voices_dir: &Path) -> ResolvedModel {
+    let usable = |m: &str| Path::new(m).is_file() && sidecar_exists(m);
+    if usable(model) {
+        return ResolvedModel { path: model.to_owned(), replaced: None };
+    }
+    let fallback = voices_dir.join(FALLBACK_VOICE_FILE).to_string_lossy().into_owned();
+    if usable(&fallback) {
+        return ResolvedModel { path: fallback, replaced: Some(model.to_owned()) };
+    }
+    ResolvedModel { path: model.to_owned(), replaced: None }
+}
+
 pub trait HardwareProbe: Send + Sync {
     fn audio_outputs(&self) -> Result<Vec<String>, String>;
     fn serial_ports(&self) -> Result<Vec<String>, String>;
@@ -355,5 +390,36 @@ mod tests {
 
         let r = check(&settings_with("/nie/ma/v.onnx"), &probe, dir.path());
         assert_eq!(r.errors.len(), 1);
+    }
+
+    #[test]
+    fn friendly_names_for_the_bundled_voices() {
+        assert_eq!(friendly_voice_name("pl_PL-gosia-medium"), "Gosia (kobiecy)");
+        assert_eq!(friendly_voice_name("pl_PL-mc_speech-medium"), "MC Speech (męski)");
+        assert_eq!(friendly_voice_name("inny"), "inny");
+    }
+
+    #[test]
+    fn a_missing_model_falls_back_to_gosia_when_she_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let darkman = dir.path().join("pl_PL-darkman-medium.onnx").to_string_lossy().into_owned();
+
+        // Nic nie ma: model bez zmian (synteza zgłosi błąd).
+        let r = resolve_model(&darkman, dir.path());
+        assert_eq!(r, ResolvedModel { path: darkman.clone(), replaced: None });
+
+        for f in [FALLBACK_VOICE_FILE, &format!("{FALLBACK_VOICE_FILE}.json")] {
+            std::fs::write(dir.path().join(f), "x").unwrap();
+        }
+        let gosia = dir.path().join(FALLBACK_VOICE_FILE).to_string_lossy().into_owned();
+        let r = resolve_model(&darkman, dir.path());
+        assert_eq!(r, ResolvedModel { path: gosia.clone(), replaced: Some(darkman) });
+
+        // Istniejący model zostaje, choćby inny niż Gosia.
+        for f in ["mc.onnx", "mc.onnx.json"] {
+            std::fs::write(dir.path().join(f), "x").unwrap();
+        }
+        let mc = dir.path().join("mc.onnx").to_string_lossy().into_owned();
+        assert_eq!(resolve_model(&mc, dir.path()), ResolvedModel { path: mc, replaced: None });
     }
 }

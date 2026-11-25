@@ -40,6 +40,10 @@ impl PiperSynth {
 }
 
 impl Synthesizer for PiperSynth {
+    fn sample_rate(&self) -> u32 {
+        self.target_sample_rate
+    }
+
     fn identity(&self) -> String {
         format!("piper|{}|{}", self.model, self.target_sample_rate)
     }

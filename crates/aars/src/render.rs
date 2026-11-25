@@ -4,6 +4,7 @@ use aars_audio::cache::AudioCache;
 use aars_audio::resample::apply_gain_db;
 use aars_core::dispatcher::{RenderFuture, Renderer};
 use aars_core::ident::{IdMode, MorseParams, morse_pcm};
+use aars_core::settings::SettingsRepo;
 use aars_core::synth::{Pcm, Synthesizer, VoiceParams};
 use aars_web::preview::{BUSY, PreviewFuture, PreviewRenderer};
 use tokio::sync::Semaphore;
@@ -16,9 +17,13 @@ pub struct PiperRenderer {
     ident: Option<Pcm>,
     /// Poziom szczytowy w dBFS; nakładany po cache (w cache leży PCM bez niego).
     gain_db: f32,
+    /// Tempo mowy czytane przy każdym renderze: zmiana w panelu działa od
+    /// następnego nadania, bez restartu.
+    settings: SettingsRepo,
 }
 
 impl PiperRenderer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cache: AudioCache,
         synth: Arc<dyn Synthesizer>,
@@ -26,14 +31,17 @@ impl PiperRenderer {
         id_mode: IdMode,
         sample_rate: u32,
         gain_db: f32,
+        settings: SettingsRepo,
+        speech_rate: f32,
     ) -> Self {
+        let voice = VoiceParams { rate: speech_rate, ..VoiceParams::default() };
         let ident = if callsign.is_empty() {
             tracing::warn!("znak wywoławczy nieustawiony — nadania bez identyfikacji");
             None
         } else {
             match id_mode {
                 IdMode::Cw => Some(morse_pcm(callsign, &MorseParams::default(), sample_rate)),
-                IdMode::Voice => match synth.synthesize(callsign, &VoiceParams::default()) {
+                IdMode::Voice => match synth.synthesize(callsign, &voice) {
                     Ok(pcm) => Some(pcm),
                     Err(err) => {
                         tracing::error!(
@@ -52,6 +60,7 @@ impl PiperRenderer {
             synth,
             ident,
             gain_db,
+            settings,
         }
     }
 }
@@ -59,8 +68,9 @@ impl PiperRenderer {
 impl Renderer for PiperRenderer {
     fn render<'a>(&'a self, text: &'a str) -> RenderFuture<'a> {
         Box::pin(async move {
+            let voice = VoiceParams { rate: self.settings.speech_rate().await, ..VoiceParams::default() };
             self.cache
-                .render(self.synth.as_ref(), text, &VoiceParams::default())
+                .render(self.synth.as_ref(), text, &voice)
                 .await
                 .map(|(_, pcm)| apply_gain_db(&pcm, self.gain_db))
                 .map_err(|e| e.to_string())
@@ -82,11 +92,18 @@ pub struct PiperPreview {
     /// przez nią zagłodzić nadawania.
     permit: Arc<Semaphore>,
     gain_db: f32,
+    settings: SettingsRepo,
 }
 
 impl PiperPreview {
-    pub fn new(cache: AudioCache, synth: Arc<dyn Synthesizer>, gain_db: f32) -> Self {
+    pub fn new(
+        cache: AudioCache,
+        synth: Arc<dyn Synthesizer>,
+        gain_db: f32,
+        settings: SettingsRepo,
+    ) -> Self {
         Self {
+            settings,
             cache,
             synth,
             permit: Arc::new(Semaphore::new(1)),
@@ -105,9 +122,10 @@ impl PreviewRenderer for PiperPreview {
             let cache = self.cache.clone();
             let synth = self.synth.clone();
             let owned = text.to_owned();
+            let voice = VoiceParams { rate: self.settings.speech_rate().await, ..VoiceParams::default() };
             let handle = tokio::runtime::Handle::current();
             let rendered = tokio::task::spawn_blocking(move || {
-                handle.block_on(cache.render(synth.as_ref(), &owned, &VoiceParams::default()))
+                handle.block_on(cache.render(synth.as_ref(), &owned, &voice))
             })
             .await
             .map_err(|e| format!("wątek syntezy: {e}"))?
@@ -133,6 +151,10 @@ mod tests {
 
     struct EmptySynth;
     impl Synthesizer for EmptySynth {
+        fn sample_rate(&self) -> u32 {
+            22_050
+        }
+
         fn synthesize(&self, _: &str, _: &VoiceParams) -> Result<Pcm, SynthError> {
             Ok(Pcm {
                 samples: Vec::new(),
@@ -148,8 +170,9 @@ mod tests {
             rand_suffix()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let cache = AudioCache::new(aars_core::db::test_pool().await, dir.clone(), 1 << 20);
-        (PiperPreview::new(cache, synth, -3.0), dir)
+        let pool = aars_core::db::test_pool().await;
+        let cache = AudioCache::new(pool.clone(), dir.clone(), 1 << 20);
+        (PiperPreview::new(cache, synth, -3.0, SettingsRepo::new(pool)), dir)
     }
 
     /// Unikalny w procesie: na macOS dwa testy potrafią dostać te same
@@ -166,8 +189,18 @@ mod tests {
     async fn renderer(gain_db: f32, mode: IdMode) -> (PiperRenderer, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("aars-rend-{}-{}", std::process::id(), rand_suffix()));
         std::fs::create_dir_all(&dir).unwrap();
-        let cache = AudioCache::new(aars_core::db::test_pool().await, dir.clone(), 1 << 20);
-        let r = PiperRenderer::new(cache, Arc::new(FakeSynth::new(22_050)), "SP7TQ", mode, 22_050, gain_db);
+        let pool = aars_core::db::test_pool().await;
+        let cache = AudioCache::new(pool.clone(), dir.clone(), 1 << 20);
+        let r = PiperRenderer::new(
+            cache,
+            Arc::new(FakeSynth::new(22_050)),
+            "SP7TQ",
+            mode,
+            22_050,
+            gain_db,
+            SettingsRepo::new(pool),
+            0.87,
+        );
         (r, dir)
     }
 
@@ -200,8 +233,9 @@ mod tests {
     async fn the_preview_follows_gain_db() {
         let dir = std::env::temp_dir().join(format!("aars-prevg-{}-{}", std::process::id(), rand_suffix()));
         std::fs::create_dir_all(&dir).unwrap();
-        let cache = AudioCache::new(aars_core::db::test_pool().await, dir.clone(), 1 << 20);
-        let p = PiperPreview::new(cache, Arc::new(FakeSynth::new(22_050)), -6.0);
+        let pool = aars_core::db::test_pool().await;
+        let cache = AudioCache::new(pool.clone(), dir.clone(), 1 << 20);
+        let p = PiperPreview::new(cache, Arc::new(FakeSynth::new(22_050)), -6.0, SettingsRepo::new(pool));
         let bytes = p.render_wav("Uwaga").await.unwrap();
         let peak = bytes[44..].as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c).unsigned_abs()).max().unwrap();
         let want = 32_767.0 * 10f32.powf(-6.0 / 20.0);
@@ -231,6 +265,51 @@ mod tests {
         let _held = p.permit.clone().try_acquire_owned().unwrap();
         let err = p.render_wav("Uwaga").await.unwrap_err();
         assert_eq!(err, BUSY);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Zapisuje tempo każdej prośby o syntezę.
+    struct RateSynth(std::sync::Mutex<Vec<f32>>);
+    impl Synthesizer for RateSynth {
+        fn sample_rate(&self) -> u32 {
+            22_050
+        }
+        fn synthesize(&self, _: &str, voice: &VoiceParams) -> Result<Pcm, SynthError> {
+            self.0.lock().unwrap().push(voice.rate);
+            Ok(Pcm { samples: vec![1000; 100], sample_rate: 22_050 })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_station_speech_rate_reaches_transmissions_and_previews_live() {
+        let dir = std::env::temp_dir().join(format!("aars-rate-{}-{}", std::process::id(), rand_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = aars_core::db::test_pool().await;
+        let settings = SettingsRepo::new(pool.clone());
+        let cache = AudioCache::new(pool.clone(), dir.clone(), 1 << 20);
+        let synth = Arc::new(RateSynth(Default::default()));
+        let renderer = PiperRenderer::new(
+            cache.clone(),
+            synth.clone(),
+            "SP7TQ",
+            IdMode::Voice,
+            22_050,
+            -3.0,
+            SettingsRepo::new(pool.clone()),
+            0.87,
+        );
+        let preview = PiperPreview::new(cache, synth.clone(), -3.0, SettingsRepo::new(pool.clone()));
+
+        // Domyślne 0,87 z migracji; identyfikacja głosowa dostała tempo ze startu.
+        renderer.render("Pierwszy").await.unwrap();
+        preview.render_wav("Drugi").await.unwrap();
+        // Zmiana w panelu działa od następnego renderu, bez restartu.
+        settings.kv_put("speech_rate", "1.10").await.unwrap();
+        renderer.render("Trzeci").await.unwrap();
+        preview.render_wav("Czwarty").await.unwrap();
+        let got = synth.0.lock().unwrap().clone();
+        // identyfikacja głosowa, nadanie, podgląd, nadanie, podgląd
+        assert_eq!(got, [0.87, 0.87, 0.87, 1.10, 1.10]);
         std::fs::remove_dir_all(dir).ok();
     }
 }

@@ -28,11 +28,12 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     toggle: Toggle::Switchable,
     default_enabled: false,
     needs: Needs::Area,
+    auto_area: Some(aars_core::area_auto::AreaGranularity::Voivodeship),
     settings: &[
         SettingSpec {
             key: "area",
             label: "Obszar",
-            help: "Kody jak w ostrzeżeniach meteo (np. 18 albo 1863 Rzeszów). Ostrzeżenia hydrologiczne IMGW dotyczą województw, więc powiat oznacza całe swoje województwo. Puste pole — źródło nic nie ogłasza.",
+            help: "Kody jak w ostrzeżeniach meteo (np. 18 albo 1863 Rzeszów). Ostrzeżenia hydrologiczne IMGW dotyczą województw, więc powiat oznacza całe swoje województwo. Puste pole to obszar liczony z pozycji stacji (województwo); wpis go nadpisuje.",
             kind: SettingKind::Area,
             default: "",
         },
@@ -72,6 +73,10 @@ impl ImgwHydro {
 impl DataSource for ImgwHydro {
     fn id(&self) -> &'static str {
         ID
+    }
+
+    fn auto_area(&self) -> Option<aars_core::area_auto::AreaGranularity> {
+        DESCRIPTOR.auto_area
     }
 
     fn default_interval(&self) -> Duration {
@@ -149,6 +154,7 @@ pub fn to_output(parsed: &ParsedHydro, ctx: &SourceCtx) -> SourceOutput {
             summary: format!("{}, {}. stopień", w.event, w.level),
             priority,
             interrupting,
+            repeat: None,
             valid_from: Some(valid_from),
             valid_until: Some(valid_until),
         });
