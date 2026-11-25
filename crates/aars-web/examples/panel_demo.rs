@@ -208,10 +208,19 @@ async fn demo_state(pool: SqlitePool) -> AppState {
         .set_enabled(&BULLETIN, true)
         .await
         .expect("biuletyn");
-    SettingsRepo::new(pool.clone())
-        .kv_put(aars_core::bulletin_layout::LAYOUT_KEY, &demo_layout().to_json())
+    // Tryb cykliczny co 10 minut (jak po aktualizacji) i układ demo z klocków.
+    let bulletin_settings: std::collections::BTreeMap<String, String> = [
+        ("mode", aars_core::bulletin_layout::MODE_CYCLE.to_owned()),
+        ("interval_min", "10".to_owned()),
+        ("layout", demo_layout().to_json()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect();
+    ModuleRepo::new(pool.clone())
+        .save_settings(&BULLETIN, &bulletin_settings)
         .await
-        .expect("układ biuletynu");
+        .expect("ustawienia biuletynu");
     let bulletin = demo_bulletin(pool.clone());
 
     let warnings_at = now;
@@ -497,6 +506,17 @@ mod tests {
         let only = Layout::parse(r#"{"bloki":[{"rodzaj":"wody"}]}"#).unwrap();
         let view = compose(Some(only)).await.unwrap();
         assert!(view.text.unwrap().starts_with("Stany wód"));
+    }
+
+    #[tokio::test]
+    async fn the_demo_bulletin_runs_every_ten_minutes() {
+        let (state, _dir) = demo().await;
+        let (status, body) = get(state, "admin", "/bulletin").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains(r#"value="cykl" checked"#), "{body}");
+        let interval = r#"name="interval_min" type="number" min="5" max="60" value="10""#;
+        assert!(body.contains(interval), "{body}");
+        assert!(body.contains("Zapraszamy na niedzielną sieć"), "{body}");
     }
 
     #[tokio::test]
