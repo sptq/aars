@@ -154,6 +154,7 @@ pub fn to_output(parsed: &ParsedHydro, ctx: &SourceCtx) -> SourceOutput {
             summary: format!("{}, {}. stopień", w.event, w.level),
             priority,
             interrupting,
+            repeat: None,
             valid_from: Some(valid_from),
             valid_until: Some(valid_until),
         });

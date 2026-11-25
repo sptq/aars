@@ -157,6 +157,7 @@ pub fn to_output(parsed: ParsedWarnings, ctx: &SourceCtx) -> SourceOutput {
             },
             priority,
             interrupting,
+            repeat: None,
             valid_from: Some(valid_from),
             valid_until: Some(valid_until),
         });

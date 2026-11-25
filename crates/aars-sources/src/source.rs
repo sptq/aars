@@ -70,6 +70,10 @@ pub struct SourceItem {
     pub summary: String,
     pub priority: Priority,
     pub interrupting: bool,
+    /// Seria pierwszego ogłoszenia: (liczba nadań, odstęp). Zmiana i
+    /// odwołanie nigdy się nie powtarzają. Tylko pierwsze nadanie serii
+    /// może przerywać audycję.
+    pub repeat: Option<(u32, Duration)>,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_until: Option<DateTime<Utc>>,
 }

@@ -215,6 +215,7 @@ pub fn to_output(
                 Priority::Normal
             },
             interrupting: false,
+            repeat: None,
             valid_from: None,
             valid_until: None,
         }));

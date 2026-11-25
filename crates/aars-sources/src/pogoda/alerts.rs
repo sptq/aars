@@ -174,6 +174,7 @@ fn item_of(alert: Alert, date: NaiveDate) -> SourceItem {
         summary: alert.summary,
         priority: Priority::Normal,
         interrupting: false,
+        repeat: None,
         valid_from: None,
         valid_until: end_of_day(date),
     }

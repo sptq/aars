@@ -179,6 +179,7 @@ pub fn to_output(events: &[Quake], skipped: usize, ctx: &SourceCtx) -> SourceOut
                 Priority::Normal
             },
             interrupting: false,
+            repeat: None,
             valid_from: Some(q.time),
             valid_until: Some(valid_until),
         });

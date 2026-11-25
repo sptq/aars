@@ -189,6 +189,7 @@ pub fn to_output(gauges: &[Gauge], ctx: &SourceCtx) -> SourceOutput {
                 Exceedance::Alarm => Priority::High,
             },
             interrupting: false,
+            repeat: None,
             valid_from: Some(measured),
             valid_until: Some(measured + VALID_FOR),
         });

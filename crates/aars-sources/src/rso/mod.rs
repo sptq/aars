@@ -97,6 +97,20 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
             kind: SettingKind::Integer { min: 120, max: 3600 },
             default: "180",
         },
+        SettingSpec {
+            key: "rcb_repeats",
+            label: "Powtórzenia Alertu RCB",
+            help: "Ile razy nadać pierwsze ogłoszenie Alertu RCB albo ataku z powietrza (1 to bez powtórzeń). Potem alert wraca w każdym cyklu biuletynu jako aktywne ostrzeżenie. Tylko pierwsze nadanie przerywa audycję.",
+            kind: SettingKind::Integer { min: 1, max: 10 },
+            default: "3",
+        },
+        SettingSpec {
+            key: "rcb_interval_s",
+            label: "Odstęp powtórzeń (s)",
+            help: "Odstęp między kolejnymi nadaniami Alertu RCB albo ataku z powietrza.",
+            kind: SettingKind::Integer { min: 30, max: 600 },
+            default: "60",
+        },
     ],
     see_also: None,
 };
@@ -161,6 +175,19 @@ fn max_age(ctx: &SourceCtx) -> TimeDelta {
         .filter(|n| (1..=720).contains(n))
         .unwrap_or(DEFAULT_MAX_AGE_H);
     TimeDelta::hours(hours)
+}
+
+fn rcb_series(ctx: &SourceCtx) -> Option<(u32, Duration)> {
+    let read = |key: &str, min: u64, max: u64, default: u64| {
+        ctx.settings
+            .get(key)
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|n| (min..=max).contains(n))
+            .unwrap_or(default)
+    };
+    let count = read("rcb_repeats", 1, 10, 3);
+    let interval = read("rcb_interval_s", 30, 600, 60);
+    (count > 1).then(|| (u32::try_from(count).unwrap_or(3), Duration::from_secs(interval)))
 }
 
 pub struct Rso {
@@ -373,6 +400,7 @@ pub fn to_output(
                 summary: speech::summary(&n.title),
                 priority: if emergency { Priority::Emergency } else { Priority::Normal },
                 interrupting: emergency,
+                repeat: if emergency { rcb_series(ctx) } else { None },
                 valid_from: None,
                 valid_until: n.valid_until,
                 key,
@@ -458,7 +486,9 @@ mod tests {
                 ("categories", "ogolne,atak-z-powietrza"),
                 ("keywords", ""),
                 ("max_age_h", "24"),
-                ("interval_s", "180")
+                ("interval_s", "180"),
+                ("rcb_repeats", "3"),
+                ("rcb_interval_s", "60")
             ]
         );
         assert_eq!(d.settings[1].kind, SettingKind::List(CATEGORIES));
@@ -509,6 +539,38 @@ mod tests {
         assert_eq!(i.cancel_text, "Komunikat RSO „Alert RCB” nie obowiązuje.");
         assert_eq!(i.summary, "Alert RCB");
         assert_eq!(i.valid_until, Some(Utc.with_ymd_and_hms(2026, 11, 22, 22, 59, 0).unwrap()));
+    }
+
+    #[test]
+    fn an_alert_rcb_is_a_series_of_three_a_minute_apart_by_default() {
+        let out = run(vec![alert()], ogolne(), &ctx("02", &[]));
+        assert_eq!(out.items[0].repeat, Some((3, Duration::from_secs(60))));
+    }
+
+    #[test]
+    fn the_series_follows_the_settings_and_bad_values_fall_back() {
+        let set = |count: &str, secs: &str| {
+            run(vec![alert()], ogolne(), &ctx("02", &[("rcb_repeats", count), ("rcb_interval_s", secs)])).items[0]
+                .repeat
+        };
+        assert_eq!(set("5", "120"), Some((5, Duration::from_secs(120))));
+        assert_eq!(set("1", "120"), None);
+        assert_eq!(set("99", "5"), Some((3, Duration::from_secs(60))));
+    }
+
+    #[test]
+    fn the_attack_category_series_and_plain_or_test_items_have_none() {
+        let mut n = alert();
+        n.title = "Alarm przeciwlotniczy".into();
+        let out = run(vec![n], Category("atak-z-powietrza"), &ctx("02", &[]));
+        assert_eq!(out.items[0].repeat, Some((3, Duration::from_secs(60))));
+        let mut test = alert();
+        test.title = "Alert RCB – test".into();
+        assert_eq!(run(vec![test], ogolne(), &ctx("02", &[])).items[0].repeat, None);
+        let mut c = ctx("02", &[]);
+        c.tracked_keys.insert("23524661".into());
+        let plain = news(OGOLNE).into_iter().find(|n| n.id == 23_524_661).unwrap();
+        assert_eq!(run(vec![plain], ogolne(), &c).items[0].repeat, None);
     }
 
     #[test]

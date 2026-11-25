@@ -279,7 +279,7 @@ impl SourceRunner {
                         .entry(item.fingerprint.as_str())
                         .or_insert((old.queue_item_id, old.aired, old.superseded.clone()));
                 } else {
-                    let queued = self.announce(item, &item.change_text).await?;
+                    let queued = self.announce(item, &item.change_text, false).await?;
                     let (aired, superseded) = self.supersede(old).await?;
                     self.track(item, &scope, Some(queued), aired, superseded.clone(), now).await?;
                     refingerprinted.insert(old.id);
@@ -309,7 +309,7 @@ impl SourceRunner {
                 live(a) && !consumed.contains(&a.id) && a.topic == item.topic && !out_keys.contains(a.item_key.as_str())
             });
             if let Some(old) = replaced {
-                let queued = self.announce(item, &item.change_text).await?;
+                let queued = self.announce(item, &item.change_text, false).await?;
                 let (aired, superseded) = self.supersede(old).await?;
                 self.state.set_state(old.id, TrackedState::Replaced).await?;
                 consumed.insert(old.id);
@@ -317,7 +317,7 @@ impl SourceRunner {
                 announced.insert(item.fingerprint.as_str(), (Some(queued), aired, superseded));
                 report.changed += 1;
             } else {
-                let queued = self.announce(item, &item.text).await?;
+                let queued = self.announce(item, &item.text, true).await?;
                 self.track(item, &scope, Some(queued), false, Vec::new(), now).await?;
                 announced.insert(item.fingerprint.as_str(), (Some(queued), false, Vec::new()));
                 report.announced += 1;
@@ -350,7 +350,7 @@ impl SourceRunner {
                     // A3: pusty tekst odwołania to brak komunikatu.
                     Fate::Aired if old.cancel_text.is_empty() => {}
                     Fate::Aired => {
-                        self.enqueue(old.cancel_text.clone(), Priority::Normal, false, old.valid_until).await?;
+                        self.enqueue(old.cancel_text.clone(), Priority::Normal, false, old.valid_until, None).await?;
                     }
                     Fate::Unresolved if old.cancel_text.is_empty() => {}
                     Fate::Unresolved => self.state.set_cancel_pending(old.id, true).await?,
@@ -371,7 +371,9 @@ impl SourceRunner {
         priority: Priority,
         interrupting: bool,
         expires_at: Option<DateTime<Utc>>,
+        repeat: Option<(u32, Duration)>,
     ) -> Result<i64, DbError> {
+        let (repeat_count, repeat_interval) = repeat.unwrap_or((1, Duration::ZERO));
         let ids = self
             .queue
             .enqueue(EnqueueRequest {
@@ -381,16 +383,21 @@ impl SourceRunner {
                 interrupting,
                 not_before: None,
                 expires_at,
-                repeat_count: 1,
-                repeat_interval: Duration::ZERO,
+                repeat_count,
+                repeat_interval,
                 created_by: None,
             })
             .await?;
         ids.first().copied().ok_or_else(|| DbError::Invalid("kolejka nie zwróciła identyfikatora".to_owned()))
     }
 
-    async fn announce(&self, item: &SourceItem, text: &str) -> Result<i64, DbError> {
-        self.enqueue(text.to_owned(), item.priority, item.interrupting, item.valid_until).await
+    /// Pierwsze ogłoszenie pozycji idzie jako seria (`item.repeat`); zmiana
+    /// jest zawsze pojedyncza. Zwracamy id pierwszego elementu serii: jego
+    /// los rozstrzyga, czy pozycja „poszła na antenę” (`fate`), a anulowanie
+    /// go (`cancel_waiting`) wycofuje całą resztę serii.
+    async fn announce(&self, item: &SourceItem, text: &str, first: bool) -> Result<i64, DbError> {
+        let repeat = if first { item.repeat } else { None };
+        self.enqueue(text.to_owned(), item.priority, item.interrupting, item.valid_until, repeat).await
     }
 
     /// Co wiadomo o nadaniu pozycji z jej elementów kolejki: `done`
@@ -432,7 +439,7 @@ impl SourceRunner {
             match self.fate(waiting.queue_ids()).await? {
                 Fate::Aired => {
                     if !waiting.cancel_text.is_empty() && waiting.valid_until.is_none_or(|until| until > now) {
-                        self.enqueue(waiting.cancel_text.clone(), Priority::Normal, false, waiting.valid_until)
+                        self.enqueue(waiting.cancel_text.clone(), Priority::Normal, false, waiting.valid_until, None)
                             .await?;
                     }
                     self.state.set_aired(waiting.id).await?;
@@ -454,13 +461,24 @@ impl SourceRunner {
         let Some(queue_item_id) = queue_item_id else {
             return false;
         };
-        match self.queue.cancel(queue_item_id).await {
+        let waited = match self.queue.cancel(queue_item_id).await {
             Ok(rows) => rows == 1,
             Err(error) => {
                 tracing::warn!(%error, queue_item_id, "nie udało się anulować elementu kolejki");
                 false
             }
+        };
+        // Pozycja z serii (Alert RCB): wycofujemy też niewysłane powtórki.
+        match self.queue.group_of(queue_item_id).await {
+            Ok(Some(group)) => {
+                if let Err(error) = self.queue.cancel_group(&group).await {
+                    tracing::warn!(%error, queue_item_id, "nie udało się anulować serii w kolejce");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, queue_item_id, "nie udało się odczytać serii elementu"),
         }
+        waited
     }
 
     /// R16: wywoływane po `enqueue`; gdy zapis zawiedzie, następny cykl
@@ -586,6 +604,7 @@ mod tests {
             summary: format!("Burze {key}"),
             priority: Priority::Normal,
             interrupting: false,
+            repeat: None,
             valid_from: None,
             valid_until: Some(at("2099-01-01T00:00:00Z")),
         }
@@ -653,6 +672,73 @@ mod tests {
         assert_eq!(pending[0].rendered_text, "nowe a f1");
         assert_eq!(pending[0].priority, Priority::High);
         assert_eq!(pending[0].expires_at, item.valid_until);
+    }
+
+    fn series_item(key: &str, fingerprint: &str) -> SourceItem {
+        SourceItem {
+            priority: Priority::Emergency,
+            interrupting: true,
+            repeat: Some((3, Duration::from_secs(60))),
+            ..warning(key, fingerprint)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_series_item_is_queued_as_a_series_and_only_the_first_interrupts() {
+        let r = rig(vec![ok(vec![series_item("a", "f1")]), ok(vec![series_item("a", "f1")])]).await;
+        assert_eq!(r.runner.cycle(now()).await.announced, 1);
+        // Powtórny odczyt tej samej pozycji nie dokłada serii.
+        assert_eq!(r.runner.cycle(now()).await.announced, 0);
+        let mut pending = r.queue.pending(10).await.unwrap();
+        pending.sort_by_key(|i| i.repeat_index);
+        assert_eq!(pending.len(), 3);
+        assert!(pending.iter().all(|i| i.priority == Priority::Emergency));
+        assert!(pending.iter().all(|i| i.repeat_group == pending[0].repeat_group));
+        assert_eq!(
+            pending.iter().map(|i| i.interrupting).collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
+        let gap = pending[1].not_before - pending[0].not_before;
+        assert_eq!(gap, chrono::Duration::seconds(60));
+        assert_eq!(pending[2].not_before - pending[1].not_before, chrono::Duration::seconds(60));
+    }
+
+    #[tokio::test]
+    async fn an_item_without_repeat_is_queued_once() {
+        let r = rig(vec![ok(vec![warning("a", "f1")])]).await;
+        r.runner.cycle(now()).await;
+        let pending = r.queue.pending(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].repeat_group.is_none());
+    }
+
+    #[tokio::test]
+    async fn withdrawing_a_series_item_cancels_the_unaired_rest_of_the_series() {
+        let r = rig(vec![ok(vec![series_item("a", "f1")]), ok(vec![]), ok(vec![])]).await;
+        r.runner.cycle(now()).await;
+        // Pierwsze nadanie poszło na antenę, dwie powtórki jeszcze czekają.
+        let first = r.queue.claim_next().await.unwrap().unwrap();
+        r.queue.mark_done(first.id).await.unwrap();
+        assert_eq!(r.queue.pending(10).await.unwrap().len(), 2);
+        r.runner.cycle(now()).await;
+        let report = r.runner.cycle(now()).await;
+        assert_eq!(report.cancelled, 1);
+        // Zostaje tylko odwołanie; powtórki serii wycofane.
+        assert_eq!(texts(&r.queue).await, vec!["odwołanie a"]);
+    }
+
+    #[tokio::test]
+    async fn a_change_to_a_series_item_cancels_the_rest_and_is_announced_once() {
+        let r = rig(vec![ok(vec![series_item("a", "f1")]), ok(vec![series_item("a", "f2")])]).await;
+        r.runner.cycle(now()).await;
+        let first = r.queue.claim_next().await.unwrap().unwrap();
+        r.queue.mark_done(first.id).await.unwrap();
+        let report = r.runner.cycle(now()).await;
+        assert_eq!(report.changed, 1);
+        let pending = r.queue.pending(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].rendered_text, "zmiana a f2");
+        assert!(pending[0].repeat_group.is_none());
     }
 
     #[tokio::test]
