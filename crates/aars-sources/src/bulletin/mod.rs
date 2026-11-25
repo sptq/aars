@@ -685,9 +685,9 @@ mod tests {
 
     #[test]
     fn length_limit_follows_the_tx_limit_and_the_speech_rate() {
-        // 10 s na identyfikację i ogony; reszta po 10 × tempo ÷ 1,5 znaku/s.
-        assert_eq!(length_limit(180, 0.87), 986);
-        assert_eq!(length_limit(180, 1.0), 1133);
+        // 10 s na identyfikację i ogony; reszta po 13,5 × tempo ÷ 1,5 znaku/s.
+        assert_eq!(length_limit(180, 0.87), 1331);
+        assert_eq!(length_limit(180, 1.0), 1500);
         assert_eq!(length_limit(600, 1.2), 1500);
         assert_eq!(length_limit(10, 0.87), 0);
     }

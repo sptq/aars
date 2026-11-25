@@ -1470,9 +1470,9 @@ mod tests {
         // pauza 1,5 + 0,5 = 2 s.
         let ten = aars_core::bulletin_layout::Budget { chars: 1500, chars_per_s: 10.0 };
         assert_eq!(super::estimate_s(&layout, "", &ten), 19);
-        // Tempo 0,87 i normalizacja: 5,8 znaku/s → 29,5 s + 2 s.
+        // Tempo 0,87 i normalizacja: 7,83 znaku/s → 21,8 s + 2 s.
         let station = aars_core::bulletin_layout::Budget::new(180, 0.87);
-        assert_eq!(super::estimate_s(&layout, "", &station), 31);
+        assert_eq!(super::estimate_s(&layout, "", &station), 24);
         assert_eq!(super::seconds(700), "0,7 s");
     }
 }

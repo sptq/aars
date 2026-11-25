@@ -879,9 +879,9 @@ mod tests {
             None,
         )
         .await;
-        // (114 − 10) × 10 × 0,87 ÷ 1,5 = 603 znaki: wstęp, ostrzeżenia,
+        // (87 − 10) × 13,5 × 0,87 ÷ 1,5 = 602 znaki: wstęp, ostrzeżenia,
         // zakończenie i jedna część.
-        s.put("tx_max_duration_s", "114").await;
+        s.put("tx_max_duration_s", "87").await;
         let c = s.bulletin.compose(t("2026-11-23 07:00")).await.unwrap();
         let text = c.text.expect("tekst");
         assert!(text.contains(&long("c")), "{text}");

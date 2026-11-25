@@ -212,9 +212,9 @@ async fn the_bulletin_reads_the_fixtures_into_one_text() {
     // zmieścić razem, a ostrzeżenia ucinają się na granicy zdania z ogonem.
     let kv = SettingsRepo::new(pool.clone());
     for (tx, expected) in [
-        // Tempo domyślne 0,87: (53 − 10) × 5,8 = 249 znaków, (41 − 10) × 5,8 = 179.
-        ("53", "Obowiązujące ostrzeżenia. Uwaga, burza geomagnetyczna G3, silna. Oraz jeszcze jedno ostrzeżenie."),
-        ("41", "Obowiązujące ostrzeżenia: 2."),
+        // Tempo domyślne 0,87: (42 − 10) × 7,83 = 250 znaków, (33 − 10) × 7,83 = 180.
+        ("42", "Obowiązujące ostrzeżenia. Uwaga, burza geomagnetyczna G3, silna. Oraz jeszcze jedno ostrzeżenie."),
+        ("33", "Obowiązujące ostrzeżenia: 2."),
     ] {
         kv.kv_put("tx_max_duration_s", tx).await.unwrap();
         let budget = aars_sources::bulletin::Budget::new(

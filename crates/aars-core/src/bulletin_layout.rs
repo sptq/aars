@@ -642,8 +642,11 @@ pub fn resolve(raw: &str) -> Layout {
     })
 }
 
-/// Znaki mowy na sekundę przy tempie 1,0 (Piper, polski głos).
-pub const SPOKEN_CHARS_PER_S: f64 = 10.0;
+/// Znaki mowy (po normalizacji) na sekundę przy tempie 1,0. Pomiar
+/// 2026-11-25 na głosie Gosia: biuletyn 603 znaki (≈ 905 po normalizacji),
+/// tempo 0,87 → 71,6 s mowy, czyli ≈ 14,5 znaku/s przy 1,0; przyjęte 13,5
+/// z zapasem ok. 7%. Dyspozytor i tak nie kluczy komunikatu dłuższego niż limit.
+pub const SPOKEN_CHARS_PER_S: f64 = 13.5;
 /// O ile normalizator wydłuża tekst przed syntezą („1024 hPa” → „tysiąc
 /// dwadzieścia cztery hektopaskale”); pomiar na pełnym biuletynie dał 1,51.
 pub const NORMALIZER_EXPANSION: f64 = 1.5;
@@ -791,13 +794,13 @@ mod tests {
 
     #[test]
     fn the_budget_counts_normalizer_expansion_and_speech_rate() {
-        // (180 − 10) × 10 × 0,87 ÷ 1,5 = 986 znaków.
+        // (180 − 10) × 13,5 × 0,87 ÷ 1,5 = 1331 znaków.
         let b = Budget::new(180, 0.87);
-        assert_eq!(b.chars, 986);
-        assert_eq!(b.limit_s(), 170);
-        assert_eq!(length_limit(180, 1.0), 1133);
-        assert_eq!(length_limit(180, 0.70), 793);
-        assert_eq!(length_limit(60, 1.20), 400);
+        assert_eq!(b.chars, 1331);
+        assert_eq!(b.limit_s(), 169);
+        assert_eq!(length_limit(180, 1.0), MAX_BULLETIN_CHARS);
+        assert_eq!(length_limit(180, 0.70), 1070);
+        assert_eq!(length_limit(60, 1.20), 540);
         // Górna granica jak dotąd.
         assert_eq!(length_limit(600, 1.20), MAX_BULLETIN_CHARS);
         assert_eq!(length_limit(10, 1.0), 0);
@@ -805,14 +808,15 @@ mod tests {
         // Tempo nieczytelne → domyślne.
         assert_eq!(Budget::new(180, f32::NAN), b);
         assert_eq!(Budget::new(180, 0.0), b);
-        // Pauza: sekunda kosztuje tyle znaków, ile w niej da się powiedzieć.
+        // Pauza: sekunda kosztuje tyle znaków, ile w niej da się powiedzieć
+        // (przy tempie 1,5 — 13,5 znaku/s).
         let one = Budget::new(160, 1.5);
-        assert_eq!(one.pause_chars(1000), 10);
-        assert_eq!(one.pause_chars(150), 2);
+        assert_eq!(one.pause_chars(1000), 14);
+        assert_eq!(one.pause_chars(150), 3);
         assert_eq!(one.pause_chars(0), 0);
-        assert_eq!(one.seconds(25), 2.5);
+        assert!((one.seconds(27) - 2.0).abs() < 1e-9);
         // Najdłuższy biuletyn mieści się w limicie: znaki × 1,5 przy tempie
-        // mowy 10 × rate znaków/s plus rezerwa nie przekracza limitu.
+        // mowy 13,5 × rate znaków/s plus rezerwa nie przekracza limitu.
         for rate in [0.70_f32, 0.87, 1.0, 1.20] {
             for tx in [30_u64, 60, 120, 180, 300, 600] {
                 let b = Budget::new(tx, rate);

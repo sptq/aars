@@ -194,10 +194,10 @@ nie zdąży albo zawiedzie, wypada, reszta wychodzi. Progi oceny w części
 - łączności dalekie (DX, pasma 80…10 m): najwyższe pasmo o dolnej krawędzi
   poniżej MUF(3000) × 0,85.
 
-Limit długości biuletynu to `min(1500, (limit nadawania w s − 10) × 10 ×
+Limit długości biuletynu to `min(1500, (limit nadawania w s − 10) × 13,5 ×
 tempo mowy ÷ 1,5)` znaków (10 s zostaje na identyfikację i ogony; 1,5 to
 wydłużenie tekstu przez normalizator — liczby i jednostki czytane słownie;
-przy 180 s i tempie 87% to 986 znaków). Sekunda pauzy kosztuje tyle znaków,
+przy 180 s i tempie 87% to 1331 znaków). Sekunda pauzy kosztuje tyle znaków,
 ile w niej da się powiedzieć; tak samo liczy oś czasu w edytorze. Gdy złożony tekst się nie mieści,
 wypadają całe klocki od końca — oprócz wstępu, ostrzeżeń i zakończenia.
 Ostrzeżenia dostają tyle miejsca, ile zostaje po wstępie i zakończeniu
