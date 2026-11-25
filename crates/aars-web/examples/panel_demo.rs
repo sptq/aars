@@ -136,10 +136,26 @@ async fn demo_state(pool: SqlitePool) -> AppState {
         .set_enabled("rso", true)
         .await
         .expect("włączenie rso");
+    let rso_error = "serwer nie odpowiedział w wyznaczonym czasie (komunikaty.gov.pl) (demo)";
     sources
-        .record_failure("rso", now, "brak połączenia (demo)")
+        .record_failure("rso", now, rso_error)
         .await
         .expect("porażka rso");
+    // Dziennik źródeł: przykładowe zdarzenia, żeby było co oglądać.
+    let log = aars_core::source_log::SourceLogRepo::new(pool.clone());
+    let ago = |m: i64| now - chrono::Duration::minutes(m);
+    use aars_core::source_log::LogKind;
+    for (id, kind, message, at) in [
+        ("imgw-meteo", LogKind::Skipped, "brak pozycji stacji — ustaw położenie stacji w Ustawieniach", ago(180)),
+        ("imgw-meteo", LogKind::Error, "nie można połączyć się z serwerem (danepubliczne.imgw.pl): dns error — sprawdź internet i DNS na stacji", ago(95)),
+        ("imgw-meteo", LogKind::Error, "nie można połączyć się z serwerem (danepubliczne.imgw.pl): dns error — sprawdź internet i DNS na stacji", ago(90)),
+        ("rso", LogKind::Error, rso_error, ago(20)),
+        ("rso", LogKind::Error, rso_error, ago(10)),
+        ("rso", LogKind::Error, rso_error, now),
+    ] {
+        log.problem(id, kind, message, at).await.expect("dziennik źródła");
+    }
+    log.success("imgw-meteo", ago(85)).await.expect("dziennik źródła");
 
     let messages = MessageRepo::new(pool.clone());
     let new_message = |title: &str, body: &str, schedule| NewMessage {
