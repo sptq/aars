@@ -126,7 +126,7 @@ impl BlockKind {
             Self::PogodaTeraz => "Temperatura, wilgotność, ciśnienie z tendencją, wiatr i zachmurzenie z pozycji stacji.",
             Self::Prognoza => "Najbliższe godziny, potem reszta dnia albo noc i jutro.",
             Self::Slonce => "Godzina wschodu i zachodu słońca dla pozycji stacji.",
-            Self::Wody => "Stany wód na wodomierzach w okolicy stacji, gdy są ostrzegawcze lub alarmowe.",
+            Self::Wody => "Do trzech najbliższych wodowskazów ze świeżym pomiarem, z dopiskiem o stanie ostrzegawczym lub alarmowym.",
             Self::Propagacja => "Warunki propagacji na pasmach KF (indeksy słoneczne i geomagnetyczne).",
             Self::Tekst => "Twój stały tekst, np. zaproszenie na sieć albo informacja o przemienniku.",
             Self::Zakonczenie => "Pożegnanie ze znakiem stacji. Zawsze na końcu komunikatu.",
@@ -642,13 +642,65 @@ pub fn resolve(raw: &str) -> Layout {
     })
 }
 
-/// Limit długości tekstu biuletynu: 10 s limitu nadawania na identyfikację
-/// i ogony, reszta po około 10 znaków na sekundę, nie więcej niż 1500.
-/// Kompozytor i edytor w panelu liczą tak samo.
-pub fn length_limit(tx_max_duration_s: u64) -> usize {
-    usize::try_from(tx_max_duration_s.saturating_sub(10).saturating_mul(10))
-        .unwrap_or(usize::MAX)
-        .min(1500)
+/// Znaki mowy na sekundę przy tempie 1,0 (Piper, polski głos).
+pub const SPOKEN_CHARS_PER_S: f64 = 10.0;
+/// O ile normalizator wydłuża tekst przed syntezą („1024 hPa” → „tysiąc
+/// dwadzieścia cztery hektopaskale”); pomiar na pełnym biuletynie dał 1,51.
+pub const NORMALIZER_EXPANSION: f64 = 1.5;
+/// Sekundy limitu nadawania zostawione na identyfikację i ogony.
+pub const TX_RESERVE_S: u64 = 10;
+/// Górna granica długości tekstu biuletynu w znakach.
+pub const MAX_BULLETIN_CHARS: usize = 1500;
+
+/// Budżet długości biuletynu: ile znaków tekstu (przed normalizacją)
+/// zmieści się w limicie nadawania i ile znaków „kosztuje” sekunda pauzy.
+/// Liczone zachowawczo: tekst po normalizacji jest ~1,5× dłuższy, a mowa
+/// przy tempie `speech_rate` < 1 wolniejsza. Kompozytor i edytor w panelu
+/// liczą tym samym budżetem.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Budget {
+    /// Najwięcej znaków (mowa + pauzy przeliczone na znaki).
+    pub chars: usize,
+    /// Znaki tekstu na sekundę nadawania.
+    pub chars_per_s: f64,
+}
+
+impl Budget {
+    /// Budżet dla limitu nadawania i tempa mowy stacji (tempo spoza
+    /// rozsądnego zakresu → domyślne).
+    pub fn new(tx_max_duration_s: u64, speech_rate: f32) -> Self {
+        let rate = if speech_rate.is_finite() && speech_rate > 0.0 {
+            speech_rate
+        } else {
+            crate::settings::DEFAULT_SPEECH_RATE
+        };
+        let chars_per_s = SPOKEN_CHARS_PER_S * f64::from(rate) / NORMALIZER_EXPANSION;
+        let seconds = tx_max_duration_s.saturating_sub(TX_RESERVE_S) as f64;
+        // Ułamek zaokrąglony w dół; drobny błąd zmiennoprzecinkowy (np. 985,999…)
+        // nie może zabrać znaku.
+        let chars = (seconds * chars_per_s + 1e-6).floor();
+        Self { chars: (chars as usize).min(MAX_BULLETIN_CHARS), chars_per_s }
+    }
+
+    /// Ile znaków budżetu zajmuje pauza (w górę).
+    pub fn pause_chars(&self, pause_ms: u64) -> usize {
+        (pause_ms as f64 * self.chars_per_s / 1000.0 - 1e-6).ceil().max(0.0) as usize
+    }
+
+    /// Szacunkowe sekundy mowy dla `chars` znaków tekstu.
+    pub fn seconds(&self, chars: usize) -> f64 {
+        chars as f64 / self.chars_per_s
+    }
+
+    /// Ile sekund nadawania mieści budżet (w dół).
+    pub fn limit_s(&self) -> u64 {
+        (self.seconds(self.chars) + 1e-6).floor() as u64
+    }
+}
+
+/// Limit długości tekstu biuletynu w znakach (zob. [`Budget`]).
+pub fn length_limit(tx_max_duration_s: u64, speech_rate: f32) -> usize {
+    Budget::new(tx_max_duration_s, speech_rate).chars
 }
 
 /// Tryb biuletynu „co określony czas” (wartość ustawienia `mode`).
@@ -675,6 +727,17 @@ pub fn cycle_interval(settings: &std::collections::BTreeMap<String, String>) -> 
             .filter(|n| (MIN_INTERVAL_MIN..=MAX_INTERVAL_MIN).contains(n))
             .unwrap_or(DEFAULT_INTERVAL_MIN),
     )
+}
+
+/// Stacja sprzed trybu cyklicznego: ma zapisane pory (`times`), ale nie
+/// ma zapisanego trybu (`mode`) — po aktualizacji nadaje więc co
+/// [`DEFAULT_INTERVAL_MIN`] minut zamiast o swoich porach. Start stacji
+/// ostrzega o tym w logu.
+pub async fn times_without_mode(pool: &SqlitePool) -> Result<bool, DbError> {
+    let repo = SettingsRepo::new(pool.clone());
+    let times = repo.kv_get("module:bulletin:times").await?;
+    let mode = repo.kv_get("module:bulletin:mode").await?;
+    Ok(mode.is_none() && times.is_some_and(|t| !t.trim().is_empty()))
 }
 
 /// Numer cyklu: minuty od północy (czas Warszawy) / interwał.
@@ -713,6 +776,51 @@ mod tests {
             .unwrap()
             .and_hms_opt(h, min, 0)
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stored_times_without_a_mode_are_reported_after_the_upgrade() {
+        let pool = test_pool().await;
+        let repo = SettingsRepo::new(pool.clone());
+        assert!(!times_without_mode(&pool).await.unwrap(), "świeża instalacja");
+        repo.kv_put("module:bulletin:times", "07:00,19:00").await.unwrap();
+        assert!(times_without_mode(&pool).await.unwrap());
+        repo.kv_put("module:bulletin:mode", MODE_TIMES).await.unwrap();
+        assert!(!times_without_mode(&pool).await.unwrap(), "operator wybrał tryb");
+    }
+
+    #[test]
+    fn the_budget_counts_normalizer_expansion_and_speech_rate() {
+        // (180 − 10) × 10 × 0,87 ÷ 1,5 = 986 znaków.
+        let b = Budget::new(180, 0.87);
+        assert_eq!(b.chars, 986);
+        assert_eq!(b.limit_s(), 170);
+        assert_eq!(length_limit(180, 1.0), 1133);
+        assert_eq!(length_limit(180, 0.70), 793);
+        assert_eq!(length_limit(60, 1.20), 400);
+        // Górna granica jak dotąd.
+        assert_eq!(length_limit(600, 1.20), MAX_BULLETIN_CHARS);
+        assert_eq!(length_limit(10, 1.0), 0);
+        assert_eq!(length_limit(5, 1.0), 0);
+        // Tempo nieczytelne → domyślne.
+        assert_eq!(Budget::new(180, f32::NAN), b);
+        assert_eq!(Budget::new(180, 0.0), b);
+        // Pauza: sekunda kosztuje tyle znaków, ile w niej da się powiedzieć.
+        let one = Budget::new(160, 1.5);
+        assert_eq!(one.pause_chars(1000), 10);
+        assert_eq!(one.pause_chars(150), 2);
+        assert_eq!(one.pause_chars(0), 0);
+        assert_eq!(one.seconds(25), 2.5);
+        // Najdłuższy biuletyn mieści się w limicie: znaki × 1,5 przy tempie
+        // mowy 10 × rate znaków/s plus rezerwa nie przekracza limitu.
+        for rate in [0.70_f32, 0.87, 1.0, 1.20] {
+            for tx in [30_u64, 60, 120, 180, 300, 600] {
+                let b = Budget::new(tx, rate);
+                let spoken_s = b.chars as f64 * NORMALIZER_EXPANSION
+                    / (SPOKEN_CHARS_PER_S * f64::from(rate));
+                assert!(spoken_s + TX_RESERVE_S as f64 <= tx as f64 + 1e-9, "{tx} {rate}");
+            }
+        }
     }
 
     fn kinds(l: &Layout) -> Vec<BlockKind> {

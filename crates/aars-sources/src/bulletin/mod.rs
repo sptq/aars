@@ -160,9 +160,10 @@ fn join(pieces: &[Piece]) -> (String, u64) {
     (text, total)
 }
 
-/// „Koszt” tekstu w znakach: mowa plus pauzy po 10 znaków na sekundę.
-fn cost(text: &str, pause_ms: u64) -> usize {
-    let pause_chars = usize::try_from(pause_ms / 100).unwrap_or(usize::MAX);
+/// „Koszt” tekstu w znakach budżetu: mowa plus pauzy przeliczone tempem
+/// budżetu (sekunda pauzy = tyle znaków, ile w niej da się powiedzieć).
+fn cost(text: &str, pause_ms: u64, budget: &Budget) -> usize {
+    let pause_chars = budget.pause_chars(pause_ms);
     aars_core::pause::strip_markers(text)
         .chars()
         .count()
@@ -175,7 +176,8 @@ fn cost(text: &str, pause_ms: u64) -> usize {
 /// tekst idzie mimo limitu — ostrzeżeń nie wolno zgubić (i same skracają się
 /// do swojego limitu). Bez żadnego klocka z treścią (poza wstępem
 /// i zakończeniem) biuletynu nie ma.
-pub fn assemble(pieces: Vec<Piece>, limit: usize) -> Composed {
+pub fn assemble(pieces: Vec<Piece>, budget: Budget) -> Composed {
+    let limit = budget.chars;
     let mut pieces = pieces;
     let mut dropped = false;
     loop {
@@ -192,7 +194,7 @@ pub fn assemble(pieces: Vec<Piece>, limit: usize) -> Composed {
             return composed(pieces, None, Some(reason));
         }
         let (text, pauses) = join(&pieces);
-        if cost(&text, pauses) <= limit {
+        if cost(&text, pauses, &budget) <= limit {
             return composed(pieces, Some(text), None);
         }
         let Some(last) = pieces
@@ -201,7 +203,7 @@ pub fn assemble(pieces: Vec<Piece>, limit: usize) -> Composed {
             .find(|p| matches!(p.outcome, PartOutcome::Included(_)) && !p.kind.is_protected())
         else {
             tracing::warn!(
-                znaków = cost(&text, pauses),
+                znaków = cost(&text, pauses, &budget),
                 limit,
                 "biuletyn dłuższy niż limit mimo usunięcia klocków; idzie w całości"
             );
@@ -223,7 +225,7 @@ fn composed(pieces: Vec<Piece>, text: Option<String>, skipped_reason: Option<&'s
     }
 }
 
-pub use bulletin_layout::length_limit;
+pub use bulletin_layout::{Budget, length_limit};
 
 const SETTINGS_PREFIX: &str = "module:bulletin:";
 const DEFAULT_PART_TIMEOUT: Duration = Duration::from_secs(20);
@@ -361,7 +363,7 @@ impl Bulletin {
             })
             .collect();
 
-        let limit = length_limit(station.tx_max_duration_s);
+        let budget = Budget::new(station.tx_max_duration_s, station.speech_rate);
         let position = PositionRepo::new(self.pool.clone()).load().await?;
         let sources = SettingsRepo::new(self.pool.clone())
             .kv_prefix("source:")
@@ -373,7 +375,7 @@ impl Bulletin {
             sources,
             active_alerts,
             alert_sources,
-            warnings_max_chars: warnings_room(&layout.blocks, &plans, limit),
+            warnings_max_chars: warnings_room(&layout.blocks, &plans, &budget),
         });
 
         let timeout = self.part_timeout;
@@ -409,7 +411,7 @@ impl Bulletin {
             pieces.push(Piece::from_block(block, outcome));
         }
         attribute_weather_once(&mut pieces);
-        Ok(assemble(pieces, limit))
+        Ok(assemble(pieces, budget))
     }
 }
 
@@ -418,7 +420,7 @@ impl Bulletin {
 /// odstępy i pauzy wokół ostrzeżeń (liczone z zapasem, jakby między nimi nic
 /// nie zostało). `None`, gdy ostrzeżeń nie ma w tym złożeniu albo mieszczą się
 /// w swoim własnym limicie.
-fn warnings_room(blocks: &[Block], plans: &[Plan], limit: usize) -> Option<usize> {
+fn warnings_room(blocks: &[Block], plans: &[Plan], budget: &Budget) -> Option<usize> {
     let warn = blocks
         .iter()
         .zip(plans)
@@ -441,7 +443,7 @@ fn warnings_room(blocks: &[Block], plans: &[Plan], limit: usize) -> Option<usize
         used += t.chars().count() + 3;
         pause_ms += u64::from((w.pause_after_ms + outro.pause_before_ms).min(MAX_PAUSE_MS));
     }
-    let room = limit.saturating_sub(used + usize::try_from(pause_ms / 100).unwrap_or(usize::MAX));
+    let room = budget.chars.saturating_sub(used + budget.pause_chars(pause_ms));
     (room < ostrzezenia::MAX_CHARS).then_some(room)
 }
 
@@ -545,7 +547,7 @@ mod tests {
                 inc(PogodaTeraz, "Ciepło."),
                 paused(Zakonczenie, "Koniec.", 0, 900),
             ],
-            1500,
+            chars(1500),
         );
         // Pauza przed pierwszym i po ostatnim nie trafia do tekstu; sąsiednie się sumują.
         assert_eq!(
@@ -563,7 +565,7 @@ mod tests {
     fn adjacent_pauses_are_capped_at_ten_seconds() {
         let c = assemble(
             vec![paused(Tekst, "A.", 0, 8000), paused(Wody, "B.", 7000, 0)],
-            1500,
+            chars(1500),
         );
         assert_eq!(c.text.as_deref(), Some("A. [[pauza:10000]] B."));
         let segments = aars_core::pause::split(c.text.as_deref().unwrap());
@@ -578,7 +580,7 @@ mod tests {
                 Piece { pause_before_ms: 5000, ..Piece::new(Wody, Empty("x".into())) },
                 inc(Prognoza, "B."),
             ],
-            1500,
+            chars(1500),
         );
         assert_eq!(c.text.as_deref(), Some("A. [[pauza:700]] B."));
     }
@@ -591,8 +593,13 @@ mod tests {
             Duration::from_secs(1),
         );
         assert_eq!(got, Included("Wiatr słaby.".into()));
-        let c = assemble(vec![Piece::new(Wody, got)], 1500);
+        let c = assemble(vec![Piece::new(Wody, got)], chars(1500));
         assert!(!c.text.unwrap().contains("pauza"));
+    }
+
+    /// Budżet w znakach przy 10 znakach na sekundę (pauza 100 ms = znak).
+    fn chars(n: usize) -> Budget {
+        Budget { chars: n, chars_per_s: 10.0 }
     }
 
     fn long(n: usize) -> String {
@@ -610,7 +617,7 @@ mod tests {
                 inc(Tekst, &long(100)),
                 inc(Zakonczenie, &long(20)),
             ],
-            length_limit(40),
+            chars(300),
         );
         assert!(matches!(c.parts[0].1, Included(_)));
         assert!(matches!(c.parts[1].1, Included(_)));
@@ -625,7 +632,7 @@ mod tests {
         // Same chronione ponad limit: idą w całości, ostrzeżeń się nie gubi.
         let c = assemble(
             vec![inc(Wstep, &long(50)), inc(WARN, &long(400)), inc(Wody, &long(10))],
-            length_limit(40),
+            chars(300),
         );
         assert_eq!(c.parts[2].1, DroppedForLength);
         assert!(c.text.unwrap().contains(&long(400)));
@@ -635,9 +642,9 @@ mod tests {
     fn pauses_count_towards_the_length_limit() {
         // 2 × 99 znaków + spacja = 199; pauza 10 s to 100 znaków → 299 ≤ 300.
         let pieces = |ms| vec![paused(WARN, &long(99), 0, ms), inc(Wody, &long(99))];
-        assert!(matches!(assemble(pieces(10_000), 300).parts[1].1, Included(_)));
-        assert_eq!(assemble(pieces(10_000), 298).parts[1].1, DroppedForLength);
-        assert!(matches!(assemble(pieces(0), 199).parts[1].1, Included(_)));
+        assert!(matches!(assemble(pieces(10_000), chars(300)).parts[1].1, Included(_)));
+        assert_eq!(assemble(pieces(10_000), chars(298)).parts[1].1, DroppedForLength);
+        assert!(matches!(assemble(pieces(0), chars(199)).parts[1].1, Included(_)));
     }
 
     #[test]
@@ -649,10 +656,10 @@ mod tests {
                 Piece::new(Propagacja, Failed("y".into())),
                 inc(Zakonczenie, "Koniec."),
             ],
-            1500,
+            chars(1500),
         );
         assert_eq!((c.text, c.skipped_reason), (None, Some("brak danych")));
-        let c = assemble(vec![inc(Wstep, "A."), inc(Wody, &long(200))], 50);
+        let c = assemble(vec![inc(Wstep, "A."), inc(Wody, &long(200))], chars(50));
         assert_eq!(
             (c.text, c.skipped_reason),
             (None, Some("limit czasu nadawania"))
@@ -669,7 +676,7 @@ mod tests {
             inc(Slonce, &format!("{h} Zachód słońca o 15:39.")),
         ];
         attribute_weather_once(&mut pieces);
-        let c = assemble(pieces, 1500);
+        let c = assemble(pieces, chars(1500));
         assert_eq!(
             c.text.as_deref(),
             Some("Stany wód. Pogoda dla okolic stacji według danych Open-Meteo. W nocy do 1 °C. Zachód słońca o 15:39.")
@@ -677,13 +684,22 @@ mod tests {
     }
 
     #[test]
-    fn length_limit_follows_the_tx_limit() {
-        // 10 s na identyfikację i ogony, potem około 10 znaków na sekundę.
-        assert_eq!(length_limit(180), 1500);
-        assert_eq!(length_limit(160), 1500);
-        assert_eq!(length_limit(60), 500);
-        assert_eq!(length_limit(10), 0);
-        assert_eq!(length_limit(5), 0);
+    fn length_limit_follows_the_tx_limit_and_the_speech_rate() {
+        // 10 s na identyfikację i ogony; reszta po 10 × tempo ÷ 1,5 znaku/s.
+        assert_eq!(length_limit(180, 0.87), 986);
+        assert_eq!(length_limit(180, 1.0), 1133);
+        assert_eq!(length_limit(600, 1.2), 1500);
+        assert_eq!(length_limit(10, 0.87), 0);
+    }
+
+    #[test]
+    fn pauses_cost_what_could_be_said_in_them_at_the_station_rate() {
+        // Budżet 5 znaków/s: pauza 10 s to 50 znaków.
+        let b = Budget { chars: 250, chars_per_s: 5.0 };
+        let pieces = || vec![paused(WARN, &long(99), 0, 10_000), inc(Wody, &long(99))];
+        assert!(matches!(assemble(pieces(), b).parts[1].1, Included(_)));
+        let b = Budget { chars: 248, chars_per_s: 5.0 };
+        assert_eq!(assemble(pieces(), b).parts[1].1, DroppedForLength);
     }
 
     #[test]

@@ -114,6 +114,8 @@
     this.order = Object.keys(this.catalog);
     this.callsign = form.dataset.callsign || '';
     this.limitS = +form.dataset.limitS || 0;
+    // Znaki tekstu na sekundę jak w kompozytorze (tempo mowy, normalizacja).
+    this.cps = +form.dataset.charsPerS || 10;
     this.editable = form.dataset.editable === '1';
     this.field = form.querySelector('textarea[name=layout]');
     this.list = document.getElementById('bulletin-blocks');
@@ -141,8 +143,6 @@
     });
     this.blocks.forEach(function (b, i) { if (serverErrors[i] != null) b.serverError = serverErrors[i]; });
     all(form, '[data-nojs]').forEach(function (el) { el.hidden = true; });
-    var hint = document.querySelector('[data-out=preview-hint]');
-    if (hint) hint.textContent = 'Składa biuletyn na teraz z układu, który widzisz (także niezapisanego); nic nie nadaje i nic nie zapisuje.';
     this.initial = this.snapshot();
     this.serverJson = this.json();
     this.dirtyFromServer = form.dataset.dirty === '1';
@@ -356,6 +356,12 @@
       bar.querySelector('[data-act=discard]').disabled = !dirty;
       bar.querySelector('[data-act=undo]').disabled = !this.history.length;
     }
+    var phint = document.querySelector('[data-out=preview-hint]');
+    // Sam układ (bez trybu i pór) inny niż zapisany — jak etykieta serwera.
+    var layoutChanged = !!this.dirtyFromServer || (this.initial != null && json !== this.initial.slice(0, this.initial.lastIndexOf('\n')));
+    if (phint) phint.textContent = layoutChanged
+      ? 'Składa biuletyn na teraz z układu, który widzisz (niezapisanego); nic nie nadaje i nic nie zapisuje.'
+      : 'Składa biuletyn na teraz z zapisanego układu; nic nie nadaje i nic nie zapisuje.';
     var send = document.getElementById('bulletin-send-btn'), hint = document.querySelector('[data-out=send-hint]');
     if (send) {
       send.disabled = dirty;
@@ -594,7 +600,7 @@
         var p = Math.min(MAX_PAUSE_MS, (prev.after || 0) + (b.before || 0));
         if (p > 0) segs.push({ pause: true, s: p / 1000 });
       }
-      segs.push({ b: b, i: i, s: (c.n + 1) / 10, c: c, info: self.info(b) });
+      segs.push({ b: b, i: i, s: (c.n + 1) / self.cps, c: c, info: self.info(b) });
       prev = b;
     });
     var total = segs.reduce(function (t, x) { return t + x.s; }, 0);

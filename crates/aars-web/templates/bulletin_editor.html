@@ -32,10 +32,10 @@
         hx-post="/bulletin/layout" hx-target="#bulletin-form" hx-select="#bulletin-form" hx-swap="outerHTML" hx-select-oob="#bulletin-status"
         data-editable="1"{% if dirty %} data-dirty="1"{% endif %}
         data-catalog="{{ catalog_json }}" data-default="{{ default_json }}" data-callsign="{{ callsign }}"
-        data-limit-s="{{ limit_s }}" data-now="{{ now_warsaw }}" data-error-block="{% for b in blocks %}{% if b.error.is_some() %}{{ b.n }}{% endif %}{% endfor %}">
+        data-limit-s="{{ limit_s }}" data-chars-per-s="{{ chars_per_s }}" data-now="{{ now_warsaw }}" data-error-block="{% for b in blocks %}{% if b.error.is_some() %}{{ b.n }}{% endif %}{% endfor %}">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
   {% else %}
-  <div id="bulletin-form" class="bed-main" data-catalog="{{ catalog_json }}" data-callsign="{{ callsign }}" data-limit-s="{{ limit_s }}" data-now="{{ now_warsaw }}" data-layout="{{ layout_json }}">
+  <div id="bulletin-form" class="bed-main" data-catalog="{{ catalog_json }}" data-callsign="{{ callsign }}" data-limit-s="{{ limit_s }}" data-chars-per-s="{{ chars_per_s }}" data-now="{{ now_warsaw }}" data-layout="{{ layout_json }}">
   {% endif %}
 
     <section class="card bed-card" id="bulletin-schedule" aria-labelledby="bed-schedule-title">

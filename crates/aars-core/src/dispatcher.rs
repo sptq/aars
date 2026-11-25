@@ -981,6 +981,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_message_longer_than_the_tx_limit_fails_without_keying() {
+        let repo = Arc::new(QueueRepo::new(test_pool().await));
+        let ptt = Arc::new(FakePtt::new());
+        let shutdown = CancelToken::new();
+        // 1 s audio na znak, limit 30 s: 40 znaków to 40 s.
+        let dispatcher = Dispatcher::new(
+            repo.clone(),
+            Arc::new(FakeRenderer::new(48_000, 1000)),
+            spawn_sequencer(ptt.clone()),
+            DispatcherConfig { tick: Duration::from_millis(10), ptt_backend: "fake", sample_rate: 48_000 },
+        );
+        let task = tokio::spawn(dispatcher.run(shutdown.clone(), CancelToken::new()));
+        let id = repo.enqueue(req(&"a".repeat(40), Priority::Normal, false)).await.unwrap()[0];
+
+        assert!(wait_for_state(repo.pool(), id, "failed", Duration::from_secs(5)).await);
+        let error: Option<String> = sqlx::query_scalar("SELECT error FROM queue_items WHERE id = ?")
+            .bind(id)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap();
+        assert_eq!(error.as_deref(), Some(crate::sequencer::TOO_LONG_ERROR));
+        assert!(!ptt.events().contains(&PttEvent::Key), "{:?}", ptt.events());
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[tokio::test]
     async fn a_real_failure_still_counts_attempts() {
         let h = harness(2).await;
         let id = h.repo.enqueue(req("FAIL", Priority::Normal, false)).await.unwrap()[0];

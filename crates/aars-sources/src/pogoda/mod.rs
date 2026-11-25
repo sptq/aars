@@ -40,7 +40,7 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
         SettingSpec {
             key: "gust_kmh",
             label: "Porywy wiatru od (km/h)",
-            help: "Porywy od tej wartości w prognozie na dziś lub jutro są ogłaszane.",
+            help: "Porywy od tej wartości w prognozie na dziś lub jutro są ogłaszane; na antenie w m/s (75 km/h ≈ 21 m/s).",
             kind: SettingKind::Integer { min: 40, max: 150 },
             default: "75",
         },
@@ -406,24 +406,24 @@ mod tests {
         let today = item(&out, "gust:2026-11-22");
         assert_eq!(
             today.text,
-            "Prognoza pogody: dziś porywy wiatru do 40 km/h. Dane: Open-Meteo."
+            "Prognoza pogody: dziś porywy wiatru do 11 m/s. Dane: Open-Meteo."
         );
         assert_eq!(
             today.change_text,
-            "Zmiana prognozy: dziś porywy wiatru do 40 km/h. Dane: Open-Meteo."
+            "Zmiana prognozy: dziś porywy wiatru do 11 m/s. Dane: Open-Meteo."
         );
         assert_eq!(today.fingerprint, "gust:40");
         assert_eq!(today.topic, "gust:2026-11-22");
         assert_eq!(today.valid_until, Some(at("2026-11-22T23:00:00Z")));
         assert_eq!(today.valid_from, None);
-        assert_eq!(today.summary, "porywy wiatru do 40 km/h, 22 listopada");
+        assert_eq!(today.summary, "porywy wiatru do 11 m/s, 22 listopada");
         assert_eq!(today.cancel_text, "");
         assert_eq!(today.priority, aars_core::priority::Priority::Normal);
         assert!(!today.interrupting);
         let tomorrow = item(&out, "gust:2026-11-23");
         assert_eq!(
             tomorrow.text,
-            "Prognoza pogody: jutro porywy wiatru do 45 km/h. Dane: Open-Meteo."
+            "Prognoza pogody: jutro porywy wiatru do 13 m/s. Dane: Open-Meteo."
         );
         assert_eq!(tomorrow.fingerprint, "gust:40");
         assert_eq!(tomorrow.valid_until, Some(at("2026-11-23T23:00:00Z")));
@@ -530,7 +530,7 @@ mod tests {
         let out = alerts::to_output(&f, &ctx_at("2026-11-22T18:30:00Z", &[]));
         let gust = item(&out, "gust:2026-11-22");
         assert!(
-            gust.text.contains("dziś porywy wiatru do 80 km/h."),
+            gust.text.contains("dziś porywy wiatru do 22 m/s."),
             "{}",
             gust.text
         );
@@ -562,7 +562,7 @@ mod tests {
         let gust = item(&out, "gust:2026-11-22");
         assert_eq!(gust.fingerprint, "gust:80");
         assert_eq!(gust.topic, "gust:2026-11-22");
-        assert!(gust.text.contains("dziś porywy wiatru do 80 km/h."), "{}", gust.text);
+        assert!(gust.text.contains("dziś porywy wiatru do 22 m/s."), "{}", gust.text);
         assert_eq!(gust.valid_until, Some(at("2026-11-22T23:00:00Z")));
 
         let out = alerts::to_output(&f, &ctx_tracked(now, &[("frost:2026-11-22", "frost:-15")]));
@@ -952,7 +952,8 @@ mod tests {
         let out = alerts::to_output(&f, &ctx_at("2026-11-24T19:10:00Z", &[("gust_kmh", "80")]));
         let gust = item(&out, "gust:2026-11-24");
         assert_eq!(gust.fingerprint, "gust:80");
-        assert_eq!(gust.text, "Prognoza pogody: dziś porywy wiatru do 80 km/h. Dane: Open-Meteo.");
+        // Próg i odcisk w km/h, mowa w m/s jak w biuletynie.
+        assert_eq!(gust.text, "Prognoza pogody: dziś porywy wiatru do 22 m/s. Dane: Open-Meteo.");
         let out = alerts::to_output(&f, &ctx_at("2026-11-24T19:10:00Z", &[("gust_kmh", "81")]));
         assert!(out.items.iter().all(|i| i.key != "gust:2026-11-24"), "{:?}", out.items);
     }

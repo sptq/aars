@@ -212,11 +212,16 @@ async fn the_bulletin_reads_the_fixtures_into_one_text() {
     // zmieścić razem, a ostrzeżenia ucinają się na granicy zdania z ogonem.
     let kv = SettingsRepo::new(pool.clone());
     for (tx, expected) in [
-        ("35", "Obowiązujące ostrzeżenia. Uwaga, burza geomagnetyczna G3, silna. Oraz jeszcze jedno ostrzeżenie."),
-        ("28", "Obowiązujące ostrzeżenia: 2."),
+        // Tempo domyślne 0,87: (53 − 10) × 5,8 = 249 znaków, (41 − 10) × 5,8 = 179.
+        ("53", "Obowiązujące ostrzeżenia. Uwaga, burza geomagnetyczna G3, silna. Oraz jeszcze jedno ostrzeżenie."),
+        ("41", "Obowiązujące ostrzeżenia: 2."),
     ] {
         kv.kv_put("tx_max_duration_s", tx).await.unwrap();
-        let limit = aars_sources::bulletin::length_limit(tx.parse().unwrap());
+        let budget = aars_sources::bulletin::Budget::new(
+            tx.parse().unwrap(),
+            aars_core::settings::DEFAULT_SPEECH_RATE,
+        );
+        let limit = budget.chars;
         let short = bulletin.compose(now).await.unwrap().text.unwrap();
         let spoken = aars_core::pause::strip_markers(&short);
         let pauses: u64 = aars_core::pause::split(&short)
@@ -226,7 +231,7 @@ async fn the_bulletin_reads_the_fixtures_into_one_text() {
                 aars_core::pause::Segment::Text(_) => 0,
             })
             .sum();
-        let cost = spoken.chars().count() + (pauses / 100) as usize;
+        let cost = spoken.chars().count() + budget.pause_chars(pauses);
         assert!(cost <= limit, "{cost} > {limit}: {short}");
         assert!(short.contains(&format!("[[pauza:700]] {expected} [[pauza:700]] Tu SP9XYZ. Koniec komunikatu.")), "{short}");
         assert!(!short.contains("Pogoda dla okolic"), "{short}");

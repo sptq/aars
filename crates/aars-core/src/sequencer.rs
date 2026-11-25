@@ -56,6 +56,10 @@ pub enum SeqCmd {
     Shutdown,
 }
 
+/// Błąd nadania, które byłoby dłuższe niż limit: odrzucone przed
+/// podniesieniem PTT, żeby nie ucinać komunikatu na antenie.
+pub const TOO_LONG_ERROR: &str = "komunikat dłuższy niż limit nadawania";
+
 /// Najdłuższe odtwarzanie lokalne (R11): test audio nie może grać bez końca.
 pub const LOCAL_PLAY_LIMIT: Duration = Duration::from_secs(15);
 
@@ -264,6 +268,20 @@ fn transmit_one(
         Ok(pcm) => pcm,
         Err(err) => return Some((TxOutcome::Failed(err), Duration::ZERO)),
     };
+
+    // Długość znana przed nadaniem: ogon przed audio i całe audio
+    // (z identyfikacją) muszą się zmieścić w twardym limicie. Inaczej
+    // komunikat byłby ucięty w połowie — nie podnosimy PTT wcale.
+    let needed = config.tx_tail + full.duration();
+    if needed > config.tx_max_duration {
+        tracing::error!(
+            id = request.id,
+            needed_ms = needed.as_millis(),
+            limit_s = config.tx_max_duration.as_secs(),
+            "komunikat dłuższy niż limit nadawania, nie nadaję"
+        );
+        return Some((TxOutcome::Failed(TOO_LONG_ERROR.to_owned()), Duration::ZERO));
+    }
 
     // Ostatnie sprawdzenie tuż przed podniesieniem: zamknięcie albo
     // przerwanie, które przyszło po sprawdzeniu interlocków, nie może
@@ -481,6 +499,9 @@ mod tests {
         inner: FakeSink,
         marker: WatchdogMarker,
         fail: bool,
+        /// Ile razy dłużej gra niż trwa bufor (model wyjścia wolniejszego
+        /// niż zegar — jedyna droga do twardego limitu po sprawdzeniu długości).
+        stretch: std::sync::atomic::AtomicU32,
         keyed_while_playing: Mutex<Vec<bool>>,
     }
 
@@ -490,7 +511,12 @@ mod tests {
             if self.fail {
                 return Err(SinkError::Device("urządzenie zniknęło".to_owned()));
             }
-            self.inner.play(pcm, cancel)
+            let stretch = self.stretch.load(Ordering::SeqCst).max(1);
+            if stretch == 1 {
+                return self.inner.play(pcm, cancel);
+            }
+            let slow = Pcm::silence(pcm.sample_rate, pcm.duration() * stretch);
+            self.inner.play(&slow, cancel)
         }
     }
 
@@ -512,6 +538,7 @@ mod tests {
             inner: FakeSink::new(),
             marker: marker.clone(),
             fail,
+            stretch: std::sync::atomic::AtomicU32::new(1),
             keyed_while_playing: Mutex::new(Vec::new()),
         });
         let handle = Sequencer::spawn(
@@ -700,8 +727,10 @@ mod tests {
     #[tokio::test]
     async fn a_transmission_longer_than_the_limit_is_cut_and_reported_as_timeout() {
         let mut rig = guarded_rig(Duration::from_secs(1), false);
+        // Treść mieści się w limicie (0,9 s), ale wyjście gra ją 3× dłużej.
+        rig.sink.stretch.store(3, Ordering::SeqCst);
         let mut long = request(1, Priority::Normal);
-        long.body = Pcm::silence(48_000, Duration::from_secs(3));
+        long.body = Pcm::silence(48_000, Duration::from_millis(900));
         long.id_audio = None;
 
         let began = Instant::now();
@@ -836,7 +865,14 @@ mod tests {
             Some(marker.clone()),
         );
 
-        handle.transmit(request(1, Priority::Normal)).await.unwrap();
+        // Treść krótsza niż limit: do anteny dopuszcza ją sprawdzenie długości,
+        // a zawiesza dopiero wyjście.
+        let short = TransmitRequest {
+            body: Pcm::silence(48_000, Duration::from_millis(50)),
+            id_audio: None,
+            ..request(1, Priority::Normal)
+        };
+        handle.transmit(short).await.unwrap();
         tokio::time::sleep(Duration::from_millis(1000)).await;
         // Sekwencer wciąż wisi w sinku, a nadajnik już jest zdjęty z anteny.
         assert!(!ptt.is_keyed(), "watchdog musi opuścić PTT zawieszonego sekwencera");
@@ -861,6 +897,34 @@ mod tests {
         let keys_after = ptt.events().iter().filter(|e| **e == PttEvent::Key).count();
         assert_eq!(keys_before, keys_after, "po interwencji PTT nie może się podnieść");
         watchdog.stop();
+    }
+
+    #[tokio::test]
+    async fn a_message_longer_than_the_tx_limit_is_refused_before_keying() {
+        let mut rig = rig();
+        // Limit 10 s; treść 9,8 s + dwie identyfikacje i przerwy > 10 s.
+        let long = TransmitRequest {
+            body: Pcm::silence(48_000, Duration::from_millis(9_800)),
+            ..request(1, Priority::Normal)
+        };
+        rig.handle.transmit(long).await.unwrap();
+        let event = rig.handle.next_event().await.unwrap();
+        assert!(
+            matches!(&event, SeqEvent::Finished { id: 1, outcome: TxOutcome::Failed(err), played }
+                if err == TOO_LONG_ERROR && played.is_zero()),
+            "{event:?}"
+        );
+        assert!(!rig.ptt.events().contains(&PttEvent::Key), "{:?}", rig.ptt.events());
+
+        // Mieszczący się komunikat idzie normalnie.
+        let fits = TransmitRequest {
+            body: Pcm::silence(48_000, Duration::from_millis(9_000)),
+            id_audio: None,
+            ..request(2, Priority::Normal)
+        };
+        rig.handle.transmit(fits).await.unwrap();
+        assert!(matches!(rig.handle.next_event().await.unwrap(), SeqEvent::Started { id: 2 }));
+        assert!(rig.ptt.events().contains(&PttEvent::Key));
     }
 
     #[tokio::test]

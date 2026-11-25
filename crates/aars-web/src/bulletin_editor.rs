@@ -99,6 +99,10 @@ struct EditorPage {
     tx_max_s: u64,
     limit_s: u64,
     estimate_s: u64,
+    /// Budżet długości jak w kompozytorze (tempo mowy stacji).
+    budget: bl::Budget,
+    /// `chars_per_s` dla JS (kropka dziesiętna).
+    chars_per_s: String,
     next: String,
     /// Formularz pokazuje wpisany, niezapisany układ (np. po błędzie).
     dirty: bool,
@@ -182,11 +186,11 @@ fn block_views(layout: &Layout, callsign: &str, error: Option<&LayoutError>) -> 
         .collect()
 }
 
-/// Szacowany czas układu w sekundach (10 znaków ≈ 1 s, pauzy jak
-/// w kompozytorze: po poprzednim plus przed następnym, najwyżej 10 s).
+/// Szacowany czas układu w sekundach (znaki tempem budżetu jak
+/// w kompozytorze, pauzy jak w kompozytorze: po poprzednim plus przed następnym, najwyżej 10 s).
 /// Klocki z danymi liczone typową długością; „kiedy” pominięte (najdłuższy
 /// cykl). To samo liczy oś czasu w `bulletin-editor.js`.
-fn estimate_s(layout: &Layout, callsign: &str) -> u64 {
+fn estimate_s(layout: &Layout, callsign: &str, budget: &bl::Budget) -> u64 {
     let now = local_now();
     let mut chars = 0usize;
     let mut pause_ms = 0u64;
@@ -203,10 +207,10 @@ fn estimate_s(layout: &Layout, callsign: &str) -> u64 {
         chars += len + 1;
         prev_after = Some(b.pause_after_ms);
     }
-    (chars as u64 / 10) + pause_ms / 1000
+    (budget.seconds(chars) + pause_ms as f64 / 1000.0).round() as u64
 }
 
-fn preview_card(view: BulletinPreviewView, unsaved: bool) -> PreviewCard {
+fn preview_card(view: BulletinPreviewView, unsaved: bool, budget: &bl::Budget) -> PreviewCard {
     let parts = view
         .parts
         .iter()
@@ -242,7 +246,8 @@ fn preview_card(view: BulletinPreviewView, unsaved: bool) -> PreviewCard {
                 aars_core::pause::Segment::Text(_) => 0,
             })
             .sum();
-        aars_core::pause::strip_markers(t).chars().count() as u64 / 10 + pauses / 1000
+        let chars = aars_core::pause::strip_markers(t).chars().count();
+        (budget.seconds(chars) + pauses as f64 / 1000.0).round() as u64
     });
     PreviewCard {
         shown: view.display_text(),
@@ -271,7 +276,7 @@ async fn load(state: &AppState, current: &CurrentUser) -> Result<EditorPage, DbE
         "moduł wyłączony".to_owned()
     };
     let get = |k: &str| values.get(k).cloned().unwrap_or_default();
-    let limit_chars = bl::length_limit(station.tx_max_duration_s);
+    let budget = bl::Budget::new(station.tx_max_duration_s, station.speech_rate);
     Ok(EditorPage {
         chrome: Chrome::load(state, current).await,
         module_enabled,
@@ -293,10 +298,12 @@ async fn load(state: &AppState, current: &CurrentUser) -> Result<EditorPage, DbE
         default_json: Layout::default_layout().to_json(),
         catalog_json: catalog_json(),
         vars: bl::TEMPLATE_VARS,
-        estimate_s: estimate_s(&layout, &station.callsign),
+        estimate_s: estimate_s(&layout, &station.callsign, &budget),
         callsign: station.callsign,
         tx_max_s: station.tx_max_duration_s,
-        limit_s: (limit_chars / 10) as u64,
+        limit_s: budget.limit_s(),
+        chars_per_s: format!("{:.4}", budget.chars_per_s),
+        budget,
         next,
         dirty: false,
         preview: None,
@@ -467,7 +474,7 @@ async fn refused(
                 && entered.blocks.len() <= bl::MAX_BLOCKS
             {
                 view.blocks = block_views(&entered, &view.callsign, located.as_ref());
-                view.estimate_s = estimate_s(&entered, &view.callsign);
+                view.estimate_s = estimate_s(&entered, &view.callsign, &view.budget);
                 // Błąd przy klocku — u góry tylko, gdy dotyczy całego układu.
                 if located.as_ref().is_some_and(|e| e.block.is_some()) {
                     view.error_field = "block";
@@ -555,11 +562,18 @@ pub async fn preview(
         )
         .await);
     };
-    let unsaved = layout.is_some();
+    // JS wysyła układ zawsze; „niezapisany” tylko, gdy różni się od zapisanego.
+    let unsaved = match &layout {
+        Some(posted) => match bl::load(&state.pool).await {
+            Ok(saved) => *posted != saved,
+            Err(_) => true,
+        },
+        None => false,
+    };
     match compose(layout).await {
         Ok(view) => {
             let response = render_with(&state, &current, StatusCode::OK, |page| {
-                page.preview = Some(preview_card(view, unsaved));
+                page.preview = Some(preview_card(view, unsaved, &page.budget));
             })
             .await;
             Ok(if current.htmx {
@@ -586,12 +600,12 @@ async fn send_failed(
     current: &CurrentUser,
     status: StatusCode,
     message: String,
-    preview: Option<PreviewCard>,
+    preview: Option<BulletinPreviewView>,
 ) -> Response {
     let toast = message.clone();
     let response = render_with(state, current, status, |view| {
         view.send_error = Some(message);
-        view.preview = preview;
+        view.preview = preview.map(|p| preview_card(p, false, &view.budget));
     })
     .await;
     if current.htmx {
@@ -657,7 +671,7 @@ pub async fn send(
             &current,
             StatusCode::OK,
             format!("Nic do nadania: {reason}"),
-            Some(preview_card(view, false)),
+            Some(view),
         )
         .await);
     };
@@ -684,7 +698,7 @@ pub async fn send(
             .await;
             if current.htmx {
                 let response = render_with(&state, &current, StatusCode::OK, |page| {
-                    page.preview = Some(preview_card(view, false));
+                    page.preview = Some(preview_card(view, false, &page.budget));
                 })
                 .await;
                 return Ok(htmx::ok(response, "Biuletyn dodany do kolejki"));
@@ -1152,6 +1166,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_preview_of_the_saved_layout_posted_by_the_editor_is_not_called_unsaved() {
+        let (preview, _seen) = recording(sample_view());
+        let state = state().await.with_bulletin_preview(preview);
+        let (app, cookie, csrf, _state) = app_as(Role::Admin, state).await;
+        // Edytor zawsze wysyła układ; tu ten sam, co zapisany (domyślny).
+        let json = Layout::default_layout().to_json();
+        let reply = hx_post(
+            &app,
+            &cookie,
+            &csrf,
+            "/bulletin/preview",
+            &format!("layout={}", urlencode(&json)),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        assert!(reply.body.contains("z zapisanego układu"), "{}", reply.body);
+        assert!(!reply.body.contains("niezapisanego"), "{}", reply.body);
+    }
+
+    #[tokio::test]
     async fn the_preview_of_an_unsaved_layout_does_not_touch_the_database() {
         let (preview, seen) = recording(sample_view());
         let state = state().await.with_bulletin_preview(preview);
@@ -1432,8 +1466,13 @@ mod tests {
                 },
             ],
         };
-        // (99 + 1) + (70 + 1) znaków ≈ 17 s, pauza 1,5 + 0,5 = 2 s
-        assert_eq!(super::estimate_s(&layout, ""), 19);
+        // (99 + 1) + (70 + 1) = 171 znaków; przy 10 znakach/s ≈ 17,1 s,
+        // pauza 1,5 + 0,5 = 2 s.
+        let ten = aars_core::bulletin_layout::Budget { chars: 1500, chars_per_s: 10.0 };
+        assert_eq!(super::estimate_s(&layout, "", &ten), 19);
+        // Tempo 0,87 i normalizacja: 5,8 znaku/s → 29,5 s + 2 s.
+        let station = aars_core::bulletin_layout::Budget::new(180, 0.87);
+        assert_eq!(super::estimate_s(&layout, "", &station), 31);
         assert_eq!(super::seconds(700), "0,7 s");
     }
 }

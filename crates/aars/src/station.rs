@@ -758,6 +758,18 @@ async fn run_station(
         tracing::error!(%err, "czyszczenie wygasłych sesji zawiodło");
     }
 
+    // Aktualizacja ze stałych pór: tryb cykliczny jest domyślny, więc
+    // stacja bez zapisanego trybu nadaje teraz co 10 minut.
+    match aars_core::bulletin_layout::times_without_mode(pool).await {
+        Ok(true) => tracing::warn!(
+            "biuletyn działa teraz w trybie cyklicznym (domyślnie co {} min), choć zapisane są stałe pory; \
+             żeby wrócić do stałych pór, w panelu Biuletyn wybierz tryb „o stałych porach” i zapisz",
+            aars_core::bulletin_layout::DEFAULT_INTERVAL_MIN
+        ),
+        Ok(false) => {}
+        Err(err) => tracing::error!(%err, "odczyt trybu biuletynu zawiódł"),
+    }
+
     // Biuletyn i źródła `pogoda`, `imgw-wodowskazy` dzielą instancje (jedna
     // pamięć danych). Błąd budowy wyłącza biuletyn i oba źródła, reszta działa.
     let bulletin = match aars_sources::bulletin::build(&config, pool.clone()) {
@@ -1782,7 +1794,8 @@ mod tests {
         let pool = aars_core::db::test_pool().await;
         // Strażnik: 1 s + 0 ogona + 2 s zapasu; drenaż: to plus zapas testowy.
         put(&pool, "tx_max_duration_s", "1").await;
-        enqueue_one(&pool, "komunikat na zawieszoną kartę").await;
+        // Krótki tekst: nadanie dłuższe niż limit 1 s nie podniosłoby PTT.
+        enqueue_one(&pool, "kom").await;
         let hardware = Arc::new(FakeHardware::new(&[]));
         let ptt = hardware.ptt.clone();
         *hardware.sink.lock().unwrap() = Some(Arc::new(HangsLong));
@@ -2318,7 +2331,8 @@ mod tests {
         let pool = aars_core::db::test_pool().await;
         // Strażnik: 1 s + 0 ogona + 2 s zapasu.
         put(&pool, "tx_max_duration_s", "1").await;
-        enqueue_one(&pool, "komunikat, który zawiesi kartę").await;
+        // Krótki tekst: nadanie dłuższe niż limit 1 s nie podniosłoby PTT.
+        enqueue_one(&pool, "kom").await;
         let hardware = Arc::new(FakeHardware::new(&[]));
         let ptt = hardware.ptt.clone();
         *hardware.sink.lock().unwrap() = Some(Arc::new(HangsUntilWatchdog(ptt.clone())));

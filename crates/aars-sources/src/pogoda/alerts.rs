@@ -94,15 +94,21 @@ fn rain_clause(mm: i64) -> String {
     }
 }
 
+/// km/h progu → m/s w mowie (biuletyn i alerty mówią wiatr w m/s).
+fn spoken_ms(kmh: f64) -> i64 {
+    round_int(kmh / 3.6)
+}
+
 fn alerts_for(day: &Extremes, when: &str, (gust, frost, precip): (i64, i64, i64)) -> Vec<Alert> {
     let mut out = Vec::new();
     if let Some(g) = day.gust_max_kmh.filter(|g| *g >= gust as f64) {
-        let shown = round_int(g);
+        // Próg i odcisk w km/h (kubełek się nie zmienia), mowa w m/s.
+        let shown = spoken_ms(g);
         out.push(Alert {
             kind: "gust",
             fingerprint: format!("gust:{}", (g / 10.0).floor() as i64 * 10),
-            text: format!("{when} porywy wiatru do {shown} km/h."),
-            summary: format!("porywy wiatru do {shown} km/h, {}", day_month(day.date)),
+            text: format!("{when} porywy wiatru do {shown} m/s."),
+            summary: format!("porywy wiatru do {shown} m/s, {}", day_month(day.date)),
         });
     }
     if let Some(t_min) = day.t_min.filter(|t| *t <= frost as f64) {
@@ -145,10 +151,13 @@ fn held_alert(kind: &'static str, fingerprint: &str, date: NaiveDate) -> Option<
     let value = fingerprint.rsplit_once(':')?.1.parse::<i64>().ok()?;
     let when = "dziś";
     let (text, summary) = match kind {
-        "gust" => (
-            format!("{when} porywy wiatru do {value} km/h."),
-            format!("porywy wiatru do {value} km/h, {}", day_month(date)),
-        ),
+        "gust" => {
+            let ms = spoken_ms(value as f64);
+            (
+                format!("{when} porywy wiatru do {ms} m/s."),
+                format!("porywy wiatru do {ms} m/s, {}", day_month(date)),
+            )
+        }
         "frost" => (
             format!("{when} spadek temperatury do {value} °C."),
             format!("spadek temperatury do {value} °C, {}", day_month(date)),

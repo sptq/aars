@@ -95,7 +95,7 @@ Wszystkie są po instalacji wyłączone; włącza się je tak samo jak `imgw-met
 | `emsc` | EMSC, wstrząsy sejsmiczne w promieniu stacji | CC BY 4.0; „Dane: EMSC” |
 | `imgw-hydro` (etap 11c) | IMGW-PIB, ostrzeżenia hydrologiczne dla województw obszaru (stopnie 1–3; susza nie jest ogłaszana); obszar jak w `imgw-meteo`, powiat oznacza całe województwo | „Źródło: IMGW-PIB.” |
 | `imgw-wodowskazy` (etap 11c) | IMGW-PIB, stany wodowskazów w promieniu stacji (domyślnie 25 km) albo z listy `id_stacji`: komunikat po przekroczeniu stanu ostrzegawczego i alarmowego z danych IMGW; pomiar starszy niż 3 h jest pomijany, stan bez nowego pomiaru wygasa po dobie | „Źródło: IMGW-PIB.” |
-| `pogoda` (etap 11b) | Open-Meteo, prognoza dla pozycji stacji: komunikat po przekroczeniu progów (porywy od 75 km/h, mróz od −15 °C, dobowa suma opadów od 30 mm — progi w `/modules`) na dziś (z godzin od bieżącej do końca doby) lub jutro | CC BY 4.0; „Dane: Open-Meteo.” |
+| `pogoda` (etap 11b) | Open-Meteo, prognoza dla pozycji stacji: komunikat po przekroczeniu progów (porywy od 75 km/h, mróz od −15 °C, dobowa suma opadów od 30 mm — progi w `/modules`; na antenie porywy w m/s, jak w biuletynie) na dziś (z godzin od bieżącej do końca doby) lub jutro | CC BY 4.0; „Dane: Open-Meteo.” |
 
 Źródłem pochodzenia danych jest IMGW-PIB; dane zostały przetworzone
 (regulamin IMGW-PIB; dotyczy też `imgw-meteo` i mapy ostrzeżeń).
@@ -118,9 +118,17 @@ dyspozytor jak każdy inny element). Po instalacji jest wyłączony. Na
    interwału od północy czasu polskiego: …:00, :10, :20) albo „o stałych
    porach” — HH:MM w **czasie lokalnym** (Europe/Warsaw, nie UTC jak cron),
    po przecinku, najwyżej 8, domyślnie `07:00,19:00`;
-2. opcjonalnie zmienia **układ** (JSON, pusty = domyślny; wizualny edytor
-   w kolejnym kroku);
+2. opcjonalnie zmienia **układ** w menu **Biuletyn** (`/bulletin`): wizualny
+   edytor klocków z osią czasu, podglądem i odsłuchem (pod spodem ten sam
+   JSON, pusty = domyślny; bez JavaScriptu edytuje się go wprost);
 3. włącza moduł.
+
+**Po aktualizacji do etapu 13:** tryb „co określony czas” jest domyślny także
+dla stacji, które miały biuletyn o stałych porach — stacja bez zapisanego
+trybu nadaje od teraz co 10 minut, a przy starcie ostrzega o tym w logu
+(„biuletyn działa teraz w trybie cyklicznym…”). Żeby wrócić do stałych pór,
+w menu **Biuletyn** wybierz „o stałych porach” (pory zostały zachowane)
+i zapisz.
 
 Domyślny układ: wstęp („Tu automatyczna stacja informacyjna {znak}.
 {dzien}, {data}, godzina {godzina}.”, pauza 0,7 s), obowiązujące ostrzeżenia
@@ -186,13 +194,19 @@ nie zdąży albo zawiedzie, wypada, reszta wychodzi. Progi oceny w części
 - łączności dalekie (DX, pasma 80…10 m): najwyższe pasmo o dolnej krawędzi
   poniżej MUF(3000) × 0,85.
 
-Limit długości biuletynu to `min(1500, 10 × (limit nadawania w s − 10))`
-znaków (10 s zostaje na identyfikację i ogony):
-pauzy liczą się po 10 znaków na sekundę. Gdy złożony tekst się nie mieści,
+Limit długości biuletynu to `min(1500, (limit nadawania w s − 10) × 10 ×
+tempo mowy ÷ 1,5)` znaków (10 s zostaje na identyfikację i ogony; 1,5 to
+wydłużenie tekstu przez normalizator — liczby i jednostki czytane słownie;
+przy 180 s i tempie 87% to 986 znaków). Sekunda pauzy kosztuje tyle znaków,
+ile w niej da się powiedzieć; tak samo liczy oś czasu w edytorze. Gdy złożony tekst się nie mieści,
 wypadają całe klocki od końca — oprócz wstępu, ostrzeżeń i zakończenia.
 Ostrzeżenia dostają tyle miejsca, ile zostaje po wstępie i zakończeniu
 (najwyżej 1200 znaków), i skracają się całymi zdaniami („Oraz jeszcze…”),
 a gdy nie mieści się żadne zdanie — „Obowiązujące ostrzeżenia: N.”.
+Niezależnie od tego dyspozytor nie podnosi PTT dla żadnego komunikatu, którego
+nagranie (z identyfikacją i ogonem) jest dłuższe niż limit nadawania: element
+kolejki kończy się błędem „komunikat dłuższy niż limit nadawania” zamiast
+ucięcia na antenie.
 
 Podgląd — ta sama ścieżka co nadanie, bez zapisu i bez kolejki:
 `aars bulletin preview` drukuje tekst (albo „nic do nadania: powód”) i stan
@@ -394,6 +408,10 @@ potwierdzeniu:
    startach bez potwierdzenia albo gdy nowa wersja nie zbuduje stosu
    nadawczego, który stara budowała, strażnik wraca do poprzedniej wersji
    razem z kopią bazy.
+
+Aktualizacja zmienia program, nie głosy: katalog głosów (`/var/lib/aars/voices`)
+zostaje bez zmian, więc stacja mówi dotychczasowym głosem. Nowe głosy (np.
+Gosia, MC Speech) przychodzą z nowym obrazem karty.
 
 **Przy powrocie przepadają dane zapisane przez nową wersję w czasie próby**
 (najwyżej kilka minut: kolejka, dziennik nadań, zmiany ustawień). Wynik
