@@ -303,7 +303,16 @@ pub fn sun_text(forecast: &Forecast, now: DateTime<Utc>) -> Option<String> {
     sentence(" jutro", day.sunrise, day.sunset)
 }
 
-/// Tekst części; `None`, gdy żadne zdanie nie powstało.
+/// Zapowiedź pogody z atrybucją, przed pierwszą częścią pogodową biuletynu.
+pub fn heading(forecast: &Forecast) -> String {
+    format!(
+        "Pogoda dla okolic stacji według danych {}.",
+        forecast.provider.name()
+    )
+}
+
+/// Cała pogoda jednym tekstem (dawna część `pogoda`); `None`, gdy żadne
+/// zdanie nie powstało.
 pub fn bulletin(forecast: &Forecast, now: DateTime<Utc>) -> Option<String> {
     let parts: Vec<String> = [
         now_text(forecast, now),

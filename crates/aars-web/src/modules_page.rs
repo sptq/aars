@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use aars_core::error::DbError;
 use aars_core::geo::PositionRepo;
 use aars_core::module::{
-    BULLETIN, BULLETIN_PARTS, ModuleDescriptor, ModuleError, ModuleKind, ModuleRepo, SettingKind, Toggle,
+    BULLETIN, ModuleDescriptor, ModuleError, ModuleKind, ModuleRepo, SettingKind, Toggle,
 };
 use aars_core::priority::Priority;
 use aars_core::queue::EnqueueRequest;
@@ -89,6 +89,7 @@ fn kind_name(kind: SettingKind) -> &'static str {
         SettingKind::Decimal { .. } => "decimal",
         SettingKind::List(_) => "list",
         SettingKind::TimeList { .. } => "timelist",
+        SettingKind::BulletinLayout => "layout",
     }
 }
 
@@ -98,7 +99,9 @@ fn field_view(spec: &aars_core::module::SettingSpec, value: String) -> FieldView
         SettingKind::Integer { min, max } => (0, min, max, Vec::new()),
         SettingKind::Area => (0, 0, 0, Vec::new()),
         SettingKind::Choice(options) | SettingKind::List(options) => (0, 0, 0, options.to_vec()),
-        SettingKind::Decimal { .. } | SettingKind::TimeList { .. } => (0, 0, 0, Vec::new()),
+        SettingKind::Decimal { .. } | SettingKind::TimeList { .. } | SettingKind::BulletinLayout => {
+            (0, 0, 0, Vec::new())
+        }
     };
     let (min_text, max_text) = match spec.kind {
         SettingKind::Decimal { min, max } => (
@@ -108,10 +111,13 @@ fn field_view(spec: &aars_core::module::SettingSpec, value: String) -> FieldView
         _ => (String::new(), String::new()),
     };
     // Kanonicznie „3.0”; w formularzu po polsku „3,0” (walidacja przyjmuje oba).
-    let value = if matches!(spec.kind, SettingKind::Decimal { .. }) {
-        value.replace('.', ",")
-    } else {
-        value
+    // Pusty układ biuletynu to układ domyślny — pokazany, żeby było co edytować.
+    let value = match spec.kind {
+        SettingKind::Decimal { .. } => value.replace('.', ","),
+        SettingKind::BulletinLayout if value.trim().is_empty() => {
+            aars_core::bulletin_layout::Layout::default_layout().to_json()
+        }
+        _ => value,
     };
     let checks = if matches!(spec.kind, SettingKind::List(_)) {
         let chosen: Vec<&str> = value.split(',').map(str::trim).collect();
@@ -446,7 +452,7 @@ pub async fn preview_bulletin(
     match preview().await {
         Ok(view) => Ok(
             page_with(&state, &current, BULLETIN.id, StatusCode::OK, |card| {
-                card.bulletin_preview = Some(with_part_labels(view))
+                card.bulletin_preview = Some(view)
             })
             .await,
         ),
@@ -458,17 +464,6 @@ pub async fn preview_bulletin(
         )
         .await),
     }
-}
-
-/// Części biuletynu po polsku, jak w ustawieniach modułu (`pogoda` →
-/// „Pogoda dla pozycji stacji”); nieznany identyfikator zostaje bez zmian.
-fn with_part_labels(mut view: BulletinPreviewView) -> BulletinPreviewView {
-    for (part, _) in &mut view.parts {
-        if let Some((_, label)) = BULLETIN_PARTS.iter().find(|(id, _)| id == part) {
-            *part = (*label).to_owned();
-        }
-    }
-    view
 }
 
 /// Jak długo ręcznie zlecony biuletyn czeka w kolejce (jak pora z harmonogramu).
@@ -503,7 +498,7 @@ pub async fn send_bulletin(
         .await);
     };
     let view = match preview().await {
-        Ok(view) => with_part_labels(view),
+        Ok(view) => view,
         Err(e) => {
             return Ok(bulletin_message(
                 &state,
@@ -549,6 +544,7 @@ mod tests {
     use crate::router;
     use crate::state::{BulletinPreview, BulletinPreviewView};
     use crate::tests::{login, state};
+    use aars_core::settings::SettingsRepo;
     use aars_core::source_state::SourceStateRepo;
     use aars_core::user::{Role, UserRepo};
     use axum::Router;
@@ -841,6 +837,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_bulletin_layout_is_validated_and_stored_canonically() {
+        use aars_core::bulletin_layout::Layout;
+        let (app, cookie, csrf, state) = app_as(Role::Admin, state().await).await;
+        aars_core::module::ModuleRepo::new(state.pool.clone())
+            .register(&state.modules)
+            .await
+            .unwrap();
+        let (_, html) = get(&app, &cookie, "/modules").await;
+        assert!(html.contains("name=\"layout\""), "{html}");
+        assert!(html.contains("&#34;pogoda_teraz&#34;"), "{html}");
+        assert!(html.contains("Co określony czas"), "{html}");
+
+        let kv = SettingsRepo::new(state.pool.clone());
+        let json = r#"{"bloki":[{"rodzaj":"wody"}]}"#;
+        let body = format!("layout={}&mode=pory", urlencode(json));
+        let (status, _, _) = post(&app, &cookie, &csrf, "/modules/bulletin/settings", &body).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let stored = kv.kv_get("module:bulletin:layout").await.unwrap().unwrap();
+        assert_eq!(stored, Layout::parse(json).unwrap().to_json());
+        assert_eq!(kv.kv_get("module:bulletin:mode").await.unwrap().as_deref(), Some("pory"));
+
+        let bad = r#"{"bloki":[{"rodzaj":"wstep","tekst":"Tu {stacja}."}]}"#;
+        let body = format!("layout={}", urlencode(bad));
+        let (status, _, html) = post(&app, &cookie, &csrf, "/modules/bulletin/settings", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(html.contains("nieznana zmienna"), "{html}");
+        assert_eq!(kv.kv_get("module:bulletin:layout").await.unwrap().unwrap(), stored);
+    }
+
+    fn urlencode(s: &str) -> String {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => (b as char).to_string(),
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
     async fn a_missing_field_keeps_its_current_value() {
         let (app, cookie, csrf, state) = app_as(Role::Admin, state().await).await;
         post(
@@ -1100,7 +1135,7 @@ mod tests {
         BulletinPreviewView {
             text: Some("Biuletyn stacji SP9XYZ. 07:00. Koniec biuletynu.".to_owned()),
             parts: vec![(
-                "pogoda".to_owned(),
+                "Pogoda bieżąca".to_owned(),
                 "pominięta — brak pozycji stacji".to_owned(),
             )],
             skipped_reason: None,
@@ -1124,7 +1159,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{html}");
         for needle in [
             "Biuletyn stacji SP9XYZ. 07:00. Koniec biuletynu.",
-            "Pogoda dla pozycji stacji: pominięta — brak pozycji stacji",
+            "Pogoda bieżąca: pominięta — brak pozycji stacji",
             "Odsłuchaj",
         ] {
             assert!(html.contains(needle), "brak {needle}: {html}");
@@ -1135,7 +1170,7 @@ mod tests {
     async fn a_bulletin_with_nothing_to_say_shows_the_reason() {
         let view = BulletinPreviewView {
             text: None,
-            parts: vec![("propagacja".to_owned(), "błąd — x".to_owned())],
+            parts: vec![("Warunki propagacji KF".to_owned(), "błąd — x".to_owned())],
             skipped_reason: Some("brak danych".to_owned()),
         };
         let state = state().await.with_bulletin_preview(preview_of(view));

@@ -74,7 +74,7 @@ pub struct SourceItem {
     pub valid_until: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum SourceError {
     #[error("błąd połączenia: {0}")]
     Http(String),

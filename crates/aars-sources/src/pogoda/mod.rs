@@ -4,7 +4,7 @@
 pub mod alerts;
 pub mod speech;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aars_core::module::{ModuleDescriptor, ModuleKind, Needs, SettingKind, SettingSpec, Toggle};
@@ -16,6 +16,11 @@ use crate::http;
 use crate::source::{DataSource, FetchFuture, SourceCtx, SourceError};
 
 pub const ID: &str = "pogoda";
+/// Części biuletynu z jednej prognozy (klocki układu).
+pub const PART_NOW: &str = "pogoda_teraz";
+pub const PART_FORECAST: &str = "prognoza";
+pub const PART_SUN: &str = "slonce";
+const PARTS: [&str; 3] = [PART_NOW, PART_FORECAST, PART_SUN];
 const OPEN_METEO_MAX_BODY: usize = 256 * 1024;
 const MET_MAX_BODY: usize = 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -85,6 +90,16 @@ pub struct Pogoda {
     open_meteo_url: String,
     met_no_url: String,
     cache: Mutex<Option<Cached>>,
+    /// Jedno pobranie na złożenie: części pogodowe biuletynu czekają tu na
+    /// siebie, a porażka dla tej samej chwili i pozycji nie jest powtarzana.
+    gate: tokio::sync::Mutex<Option<Failure>>,
+}
+
+/// Nieudane pobranie dla chwili złożenia i pozycji.
+struct Failure {
+    at: DateTime<Utc>,
+    pos: (i64, i64),
+    error: SourceError,
 }
 
 impl Pogoda {
@@ -103,6 +118,7 @@ impl Pogoda {
             open_meteo_url: open_meteo.to_owned(),
             met_no_url: met_no.to_owned(),
             cache: Mutex::new(None),
+            gate: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -198,35 +214,107 @@ impl DataSource for Pogoda {
     }
 }
 
-impl BulletinPart for Pogoda {
+impl Pogoda {
+    /// Prognoza dla części biuletynu: świeża z pamięci albo jedno pobranie
+    /// (Open-Meteo, w zapasie MET Norway) wspólne dla wszystkich części
+    /// złożenia; `None` bez pozycji stacji.
+    pub(crate) async fn forecast_for(&self, ctx: &PartCtx) -> Result<Option<Forecast>, SourceError> {
+        let Some(pos) = ctx.position.as_ref() else {
+            return Ok(None);
+        };
+        let key = pos_key(pos.lat, pos.lon);
+        let mut failed = self.gate.lock().await;
+        if let Some(f) = self.recall(ctx.now, key) {
+            return Ok(Some(f));
+        }
+        if let Some(f) = failed.as_ref().filter(|f| f.at == ctx.now && f.pos == key) {
+            return Err(f.error.clone());
+        }
+        let fetched = match self.ask_open_meteo(pos.lat, pos.lon, ctx.now).await {
+            Ok(f) => Ok(f),
+            Err(_) => self.ask_met(pos.lat, pos.lon, ctx.now).await,
+        };
+        match fetched {
+            Ok(forecast) => {
+                self.remember(&forecast, ctx.now, key);
+                *failed = None;
+                Ok(Some(forecast))
+            }
+            Err(error) => {
+                *failed = Some(Failure {
+                    at: ctx.now,
+                    pos: key,
+                    error: error.clone(),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Trzy części biuletynu (`pogoda_teraz`, `prognoza`, `slonce`) na tej
+    /// samej instancji, więc z jedną prognozą.
+    pub fn parts(self: &Arc<Self>) -> Vec<Arc<dyn BulletinPart>> {
+        PARTS
+            .iter()
+            .map(|id| {
+                Arc::new(WeatherPart {
+                    id,
+                    pogoda: Arc::clone(self),
+                }) as Arc<dyn BulletinPart>
+            })
+            .collect()
+    }
+}
+
+/// Jedna z części pogodowych biuletynu.
+pub struct WeatherPart {
+    id: &'static str,
+    pogoda: Arc<Pogoda>,
+}
+
+impl WeatherPart {
+    fn text(&self, forecast: &Forecast, now: DateTime<Utc>) -> Option<String> {
+        match self.id {
+            PART_NOW => speech::now_text(forecast, now),
+            PART_FORECAST => speech::forecast_text(forecast, now),
+            _ => speech::sun_text(forecast, now),
+        }
+    }
+
+    fn empty_reason(&self) -> &'static str {
+        match self.id {
+            PART_NOW => "brak warunków bieżących",
+            PART_FORECAST => "brak prognozy",
+            _ => "brak godzin wschodu i zachodu",
+        }
+    }
+
+    /// Zapowiedź z atrybucją niesie pierwsza część pogodowa w układzie.
+    fn leads(&self, ctx: &PartCtx) -> bool {
+        ctx.planned.iter().find(|id| PARTS.contains(id)) == Some(&self.id)
+    }
+}
+
+impl BulletinPart for WeatherPart {
     fn id(&self) -> &'static str {
-        ID
+        self.id
     }
 
     fn max_chars(&self) -> usize {
-        900
+        500
     }
 
     fn compose<'a>(&'a self, ctx: &'a PartCtx) -> PartFuture<'a> {
         Box::pin(async move {
-            let Some(pos) = ctx.position.as_ref() else {
+            let Some(forecast) = self.pogoda.forecast_for(ctx).await? else {
                 return Ok(PartText::Empty("brak pozycji stacji"));
             };
-            let key = pos_key(pos.lat, pos.lon);
-            let forecast = match self.recall(ctx.now, key) {
-                Some(f) => f,
-                None => {
-                    let forecast = match self.ask_open_meteo(pos.lat, pos.lon, ctx.now).await {
-                        Ok(f) => f,
-                        Err(_) => self.ask_met(pos.lat, pos.lon, ctx.now).await?,
-                    };
-                    self.remember(&forecast, ctx.now, key);
-                    forecast
+            Ok(match self.text(&forecast, ctx.now) {
+                Some(text) if self.leads(ctx) => {
+                    PartText::Text(format!("{} {text}", speech::heading(&forecast)))
                 }
-            };
-            Ok(match speech::bulletin(&forecast, ctx.now) {
                 Some(text) => PartText::Text(text),
-                None => PartText::Empty("brak prognozy"),
+                None => PartText::Empty(self.empty_reason()),
             })
         })
     }
@@ -819,11 +907,19 @@ mod tests {
     }
 
     #[test]
-    fn the_bulletin_fits_the_part_limit() {
-        let src = Pogoda::with_urls("http://127.0.0.1:9/a", "http://127.0.0.1:9/b", Duration::from_secs(1)).unwrap();
-        assert_eq!(BulletinPart::max_chars(&src), 900);
-        let text = speech::bulletin(&station(), at(STATION_FETCHED)).unwrap();
-        assert!(text.chars().count() < 900, "{}", text.chars().count());
+    fn each_weather_part_fits_its_limit() {
+        let src = Arc::new(Pogoda::with_urls("http://127.0.0.1:9/a", "http://127.0.0.1:9/b", Duration::from_secs(1)).unwrap());
+        let parts = src.parts();
+        let ids: Vec<_> = parts.iter().map(|p| p.id()).collect();
+        assert_eq!(ids, ["pogoda_teraz", "prognoza", "slonce"]);
+        assert!(parts.iter().all(|p| p.max_chars() == 500));
+        let (f, now) = (station(), at(STATION_FETCHED));
+        let heading = speech::heading(&f);
+        assert_eq!(heading, "Pogoda dla okolic stacji według danych Open-Meteo.");
+        for text in [speech::now_text(&f, now), speech::forecast_text(&f, now), speech::sun_text(&f, now)] {
+            let n = format!("{heading} {}", text.unwrap()).chars().count();
+            assert!(n < 500, "{n}");
+        }
     }
 
     #[test]
@@ -924,6 +1020,14 @@ mod tests {
                 sources: BTreeMap::new(),
                 active_alerts: Vec::new(),
                 alert_sources: Default::default(),
+                planned: PARTS.to_vec(),
+            }
+        }
+
+        async fn text_of(part: &Arc<dyn BulletinPart>, ctx: &PartCtx) -> String {
+            match part.compose(ctx).await.unwrap() {
+                PartText::Text(t) => t,
+                PartText::Empty(why) => panic!("pusta część: {why}"),
             }
         }
 
@@ -948,11 +1052,12 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn the_part_falls_back_to_met_with_its_user_agent() {
+        async fn the_parts_fall_back_to_met_with_its_user_agent() {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/v1/forecast"))
                 .respond_with(ResponseTemplate::new(503))
+                .expect(1)
                 .mount(&server)
                 .await;
             Mock::given(method("GET"))
@@ -964,37 +1069,75 @@ mod tests {
                 .expect(1)
                 .mount(&server)
                 .await;
-            let src = source(&server);
-            let PartText::Text(text) = src
-                .compose(&part_ctx(
-                    "2026-11-22T19:00:00Z",
-                    Some(position(50.04, 21.99)),
-                ))
-                .await
-                .unwrap()
-            else {
-                panic!("pusta część");
-            };
-            assert!(text.ends_with("Dane: MET Norway."), "{text}");
-
-            server.reset().await;
-            Mock::given(method("GET"))
-                .respond_with(ResponseTemplate::new(503))
-                .mount(&server)
-                .await;
-            let fresh = source(&server);
-            let err = fresh
-                .compose(&part_ctx(
-                    "2026-11-22T19:00:00Z",
-                    Some(position(50.04, 21.99)),
-                ))
-                .await
-                .unwrap_err();
-            assert!(matches!(err, SourceError::Status(503)), "{err}");
+            let parts = Arc::new(source(&server)).parts();
+            let ctx = part_ctx("2026-11-22T19:00:00Z", Some(position(50.04, 21.99)));
+            let now = text_of(&parts[0], &ctx).await;
+            assert!(now.starts_with("Pogoda dla okolic stacji według danych MET Norway. "), "{now}");
+            // Zapowiedź tylko raz, przed pierwszą częścią pogodową.
+            let forecast = text_of(&parts[1], &ctx).await;
+            assert!(!forecast.contains("według danych"), "{forecast}");
+            server.verify().await;
         }
 
         #[tokio::test]
-        async fn the_part_reuses_a_fresh_forecast() {
+        async fn three_parts_of_one_bulletin_fetch_the_forecast_once() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/forecast"))
+                .respond_with(ok(OPEN_METEO).set_delay(Duration::from_millis(100)))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let parts = Arc::new(source(&server)).parts();
+            let ctx = part_ctx("2026-11-22T19:00:00Z", Some(position(50.04, 21.99)));
+            let (a, b, c) = tokio::join!(
+                parts[0].compose(&ctx),
+                parts[1].compose(&ctx),
+                parts[2].compose(&ctx)
+            );
+            // Stary zrzut nie ma godzin wschodu i zachodu: słońce puste, ale bez błędu.
+            assert!(matches!(a, Ok(PartText::Text(_))), "{a:?}");
+            assert!(matches!(b, Ok(PartText::Text(_))), "{b:?}");
+            assert!(c.is_ok(), "{c:?}");
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn a_failed_fetch_is_not_repeated_within_one_bulletin() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(2)
+                .mount(&server)
+                .await;
+            let parts = Arc::new(source(&server)).parts();
+            let ctx = part_ctx("2026-11-22T19:00:00Z", Some(position(50.04, 21.99)));
+            let (a, b, c) = tokio::join!(
+                parts[0].compose(&ctx),
+                parts[1].compose(&ctx),
+                parts[2].compose(&ctx)
+            );
+            for t in [a, b, c] {
+                assert!(matches!(t, Err(SourceError::Status(503))), "{t:?}");
+            }
+            // Jedno żądanie do Open-Meteo i jedno do MET Norway, nie po trzy.
+            server.verify().await;
+
+            // Następne złożenie (inna chwila) próbuje od nowa.
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/forecast"))
+                .respond_with(ok(OPEN_METEO))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let later = part_ctx("2026-11-22T19:10:00Z", Some(position(50.04, 21.99)));
+            assert!(matches!(parts[0].compose(&later).await, Ok(PartText::Text(_))));
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn the_parts_reuse_a_fresh_forecast() {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/v1/forecast"))
@@ -1002,18 +1145,20 @@ mod tests {
                 .expect(2)
                 .mount(&server)
                 .await;
-            let src = source(&server);
+            let src = Arc::new(source(&server));
             src.fetch(&ctx_at("2026-11-22T18:00:00Z", &[]))
                 .await
                 .unwrap();
+            let parts = src.parts();
             let p = Some(position(50.04, 21.99));
-            let t = src
+            let t = parts[1]
                 .compose(&part_ctx("2026-11-22T18:30:00Z", p.clone()))
                 .await
                 .unwrap();
             assert!(matches!(t, PartText::Text(_)));
             // 61 min po pobraniu: nowe żądanie (łącznie 2).
-            src.compose(&part_ctx("2026-11-22T19:01:00Z", p))
+            parts[1]
+                .compose(&part_ctx("2026-11-22T19:01:00Z", p))
                 .await
                 .unwrap();
             server.verify().await;
@@ -1029,13 +1174,13 @@ mod tests {
                 .expect(1)
                 .mount(&server)
                 .await;
-            let src = source(&server);
+            let src = Arc::new(source(&server));
             src.remember(
                 &open_meteo_forecast(),
                 at("2026-11-22T18:50:00Z"),
                 pos_key(50.04, 21.99),
             );
-            let t = src
+            let t = src.parts()[0]
                 .compose(&part_ctx(
                     "2026-11-22T19:00:00Z",
                     Some(position(50.06, 21.99)),
@@ -1047,18 +1192,20 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn without_a_position_the_part_is_empty() {
+        async fn without_a_position_the_parts_are_empty() {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .respond_with(ok(OPEN_METEO))
                 .expect(0)
                 .mount(&server)
                 .await;
-            let t = source(&server)
-                .compose(&part_ctx("2026-11-22T19:00:00Z", None))
-                .await
-                .unwrap();
-            assert_eq!(t, PartText::Empty("brak pozycji stacji"));
+            for part in Arc::new(source(&server)).parts() {
+                let t = part
+                    .compose(&part_ctx("2026-11-22T19:00:00Z", None))
+                    .await
+                    .unwrap();
+                assert_eq!(t, PartText::Empty("brak pozycji stacji"));
+            }
             server.verify().await;
         }
     }

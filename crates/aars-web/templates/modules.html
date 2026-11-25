@@ -84,6 +84,9 @@
       {% else if f.kind == "timelist" %}
       <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
       <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="text" inputmode="numeric" placeholder="07:00,19:00" value="{{ f.value }}" required>
+      {% else if f.kind == "layout" %}
+      <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
+      <textarea id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" rows="16" spellcheck="false" class="code">{{ f.value }}</textarea>
       {% else if f.kind == "list" %}
       <fieldset class="field-group"><legend>{{ f.label }}</legend>
         {% for (value, label, on) in f.checks %}<label class="check"><input type="checkbox" name="{{ f.key }}" value="{{ value }}" {% if *on %}checked{% endif %}> {{ label }}</label>{% endfor %}

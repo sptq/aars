@@ -1990,6 +1990,7 @@ mod tests {
         // to za 4–5 h, więc nigdy w oknie teraz ± 15 min, w każdej strefie hosta.
         let far = (chrono::Utc::now() + chrono::TimeDelta::hours(6)).format("%H:%M");
         put(&pool, "module:bulletin:enabled", "true").await;
+        put(&pool, "module:bulletin:mode", "pory").await;
         put(&pool, "module:bulletin:times", &far.to_string()).await;
         let locator = aars_core::geo::locator_from(50.04, 21.99, 6).unwrap();
         aars_core::geo::PositionRepo::new(pool.clone())

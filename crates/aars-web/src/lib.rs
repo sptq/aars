@@ -1923,8 +1923,21 @@ pub(crate) mod tests {
             .unwrap();
         let (_, html) = get_html(&app, &cookie, "/").await;
         let bulletin = tile(&html, "tile-bulletin");
-        assert!(bulletin.contains("07:00") || bulletin.contains("19:00"), "{bulletin}");
+        // Domyślnie cykl co 10 minut: najbliższa pełna dziesiątka minut.
+        let warsaw = chrono::Utc::now().with_timezone(&chrono_tz::Europe::Warsaw).time();
+        let soon = [warsaw, warsaw + chrono::TimeDelta::seconds(5)].map(|now| {
+            status::next_cycle(10, now).label()
+        });
+        assert!(soon.iter().any(|l| bulletin.contains(l.as_str())), "{soon:?}: {bulletin}");
         assert!(!bulletin.contains("wyłączony"), "{bulletin}");
+
+        aars_core::settings::SettingsRepo::new(state.pool.clone())
+            .kv_put("module:bulletin:mode", "pory")
+            .await
+            .unwrap();
+        let (_, html) = get_html(&app, &cookie, "/").await;
+        let bulletin = tile(&html, "tile-bulletin");
+        assert!(bulletin.contains("07:00") || bulletin.contains("19:00"), "{bulletin}");
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
-//! `BulletinRunner`: pory lokalne, spóźnienia, cisza nocna, idempotencja
-//! przez `bulletin_fires`. Tylko wstawia do kolejki — nigdy nie dotyka
-//! sekwencera ani PTT.
+//! `BulletinRunner`: cykl co N minut albo stałe pory lokalne, spóźnienia,
+//! cisza nocna, idempotencja przez `bulletin_fires`. Tylko wstawia do
+//! kolejki — nigdy nie dotyka sekwencera ani PTT.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,15 +13,20 @@ use aars_core::priority::Priority;
 use aars_core::queue::{EnqueueRequest, QueueRepo};
 use aars_core::settings::SettingsRepo;
 use aars_core::sink::CancelToken;
-use chrono::{DateTime, Local, NaiveTime, TimeDelta, Utc};
+use chrono::offset::LocalResult;
+use chrono::{DateTime, Local, NaiveTime, TimeDelta, TimeZone, Utc};
 use chrono_tz::Europe::Warsaw;
 
-use crate::bulletin::{Bulletin, module_settings};
+use crate::bulletin::{Bulletin, cycle_interval, module_settings};
 use crate::speech::warsaw_to_utc;
 
 const TICK: Duration = Duration::from_secs(10);
 /// Element kolejki żyje tyle po porze, więc większa tolerancja nie ma sensu (B3).
+/// W trybie cyklicznym krócej, gdy cykl jest krótszy: biuletyn nie zalega
+/// do następnego.
 const EXPIRY: TimeDelta = TimeDelta::minutes(15);
+/// Wpisy `bulletin_fires` starsze niż to są usuwane.
+const KEEP_FIRES: TimeDelta = TimeDelta::days(7);
 const MAX_GRACE_S: u64 = 900;
 /// Tik co 10 s i składanie trwają; mniejsza tolerancja zabiłaby każdą porę.
 const MIN_GRACE_S: u64 = 60;
@@ -51,6 +56,38 @@ pub fn due_fires(times: &[NaiveTime], now: DateTime<Utc>) -> Vec<DateTime<Utc>> 
         .filter_map(warsaw_to_utc)
         .filter(|at| *at <= now)
         .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Chwile cyklu: wielokrotności `interval_min` minut od północy czasu
+/// Warszawy (wczoraj i dziś), z ostatnich 24 h, tylko minione, rosnąco.
+/// Chwila nieistniejąca przy zmianie czasu wypada; godzina powtórzona
+/// jesienią daje obie chwile (cykl biegnie dalej co N minut).
+pub fn cycle_fires(interval_min: u32, now: DateTime<Utc>) -> Vec<DateTime<Utc>> {
+    let step = interval_min.clamp(1, 24 * 60);
+    let today = now.with_timezone(&Warsaw).date_naive();
+    let from = now - TimeDelta::hours(24);
+    let mut out = Vec::new();
+    for day in [today.pred_opt(), Some(today)].into_iter().flatten() {
+        let mut minute = 0;
+        while minute < 24 * 60 {
+            let Some(naive) = day.and_hms_opt(minute / 60, minute % 60, 0) else {
+                break;
+            };
+            match Warsaw.from_local_datetime(&naive) {
+                LocalResult::Single(d) => out.push(d.with_timezone(&Utc)),
+                LocalResult::Ambiguous(a, b) => {
+                    out.push(a.with_timezone(&Utc));
+                    out.push(b.with_timezone(&Utc));
+                }
+                LocalResult::None => {}
+            }
+            minute += step;
+        }
+    }
+    out.retain(|at| *at > from && *at <= now);
     out.sort_unstable();
     out.dedup();
     out
@@ -94,20 +131,35 @@ impl BulletinRunner {
             });
         }
         let settings = module_settings(&pool).await?;
-        let times = settings
-            .get("times")
-            .and_then(|t| parse_times(t))
-            .or_else(|| parse_times(DEFAULT_TIMES))
-            .unwrap_or_default();
+        let interval = cycle_interval(&settings);
+        let (due, expiry) = match interval {
+            Some(n) => (
+                cycle_fires(n, now),
+                EXPIRY.min(TimeDelta::minutes(i64::from(n))),
+            ),
+            None => {
+                let times = settings
+                    .get("times")
+                    .and_then(|t| parse_times(t))
+                    .or_else(|| parse_times(DEFAULT_TIMES))
+                    .unwrap_or_default();
+                (due_fires(&times, now), EXPIRY)
+            }
+        };
         let station = SettingsRepo::new(pool.clone()).load().await?;
         let grace_s = station.misfire_grace_s.clamp(MIN_GRACE_S, MAX_GRACE_S);
         let grace = TimeDelta::seconds(i64::try_from(grace_s).unwrap_or(0));
         let fires = BulletinFireRepo::new(pool);
 
         let mut tick = BulletinTick::default();
-        let due = due_fires(&times, now);
+        // Zajęte pory pomijamy bez zapisu: w trybie cyklicznym to do 144
+        // chwil na dobę, sprawdzanych co 10 s.
+        let claimed = match due.first() {
+            Some(&first) => fires.claimed_since(first).await?,
+            None => Vec::new(),
+        };
         let (late, fitting): (Vec<_>, Vec<_>) = due.into_iter().partition(|at| now - *at > grace);
-        for at in late {
+        for at in late.into_iter().filter(|at| !claimed.contains(at)) {
             if fires.claim(at, Some(LATE)).await? {
                 tick.skipped.push((at, LATE.to_owned()));
             }
@@ -115,7 +167,7 @@ impl BulletinRunner {
         let Some((&fire_at, older)) = fitting.split_last() else {
             return Ok(tick);
         };
-        for &at in older {
+        for &at in older.iter().filter(|at| !claimed.contains(at)) {
             if fires.claim(at, Some(SUPERSEDED)).await? {
                 tick.skipped.push((at, SUPERSEDED.to_owned()));
             }
@@ -159,7 +211,7 @@ impl BulletinRunner {
                 priority: Priority::Normal,
                 interrupting: false,
                 not_before: Some(now),
-                expires_at: Some(fire_at + EXPIRY),
+                expires_at: Some(fire_at + expiry),
                 repeat_count: 1,
                 repeat_interval: Duration::ZERO,
                 created_by: None,
@@ -179,6 +231,9 @@ impl BulletinRunner {
             return Ok(tick);
         };
         fires.set_queued(fire_at, id).await?;
+        if let Err(e) = fires.prune_before(now - KEEP_FIRES).await {
+            tracing::warn!(błąd = %e, "nie usunięto starych wpisów biuletynu");
+        }
         tick.queued = Some(id);
         tracing::info!(pora = %fire_at, element = id, "biuletyn w kolejce");
         Ok(tick)
@@ -266,10 +321,19 @@ mod tests {
     fn default_parts() -> Vec<Arc<dyn BulletinPart>> {
         vec![
             text("ostrzezenia", "Brak obowiązujących ostrzeżeń."),
-            text("pogoda", "Pogoda A."),
+            text("pogoda_teraz", "Pogoda A."),
             text("propagacja", "Propagacja B."),
         ]
     }
+
+    /// Wstęp domyślnego układu dla SP9XYZ o danej porze (23.11.2026 to poniedziałek).
+    fn intro(hm: &str) -> String {
+        format!(
+            "Tu automatyczna stacja informacyjna SP9XYZ. Poniedziałek, 23 listopada, godzina {hm}. [[pauza:700]] "
+        )
+    }
+
+    const END: &str = "Tu SP9XYZ. Koniec komunikatu.";
 
     /// Czas lokalny Warszawy → UTC.
     fn t(local: &str) -> DateTime<Utc> {
@@ -336,6 +400,7 @@ mod tests {
             pool,
         };
         s.put("callsign", "SP9XYZ").await;
+        s.put("module:bulletin:mode", "pory").await;
         s.put("module:bulletin:times", "07:00,19:00").await;
         s.put("misfire_grace_s", "600").await;
         s
@@ -379,12 +444,11 @@ mod tests {
         let item = &items[0];
         assert_eq!(item.id, id);
         assert!(
-            item.rendered_text
-                .starts_with("Biuletyn stacji SP9XYZ. 07:00. "),
+            item.rendered_text.starts_with(&intro("7:00")),
             "{}",
             item.rendered_text
         );
-        assert!(item.rendered_text.ends_with("Koniec biuletynu."));
+        assert!(item.rendered_text.ends_with(END), "{}", item.rendered_text);
         assert_eq!(item.priority, Priority::Normal);
         assert!(!item.interrupting);
         assert_eq!(item.expires_at, Some(utc("2026-11-23T06:15:00Z")));
@@ -544,7 +608,7 @@ mod tests {
         let items = s.queued().await;
         assert_eq!(items.len(), 1);
         assert!(
-            items[0].rendered_text.contains(" 07:05. "),
+            items[0].rendered_text.contains("godzina 7:05."),
             "{}",
             items[0].rendered_text
         );
@@ -606,7 +670,7 @@ mod tests {
     async fn an_empty_bulletin_is_not_aired() {
         let empty = |id| -> Arc<dyn BulletinPart> { Arc::new(Fixed(id, PartText::Empty("nic"))) };
         let s = station_with(
-            vec![empty("pogoda"), empty("propagacja"), empty("ostrzezenia")],
+            vec![empty("pogoda_teraz"), empty("propagacja"), empty("ostrzezenia")],
             None,
         )
         .await;
@@ -620,7 +684,7 @@ mod tests {
 
         let s = station_with(
             vec![
-                empty("pogoda"),
+                empty("pogoda_teraz"),
                 empty("propagacja"),
                 text("ostrzezenia", "Brak obowiązujących ostrzeżeń."),
             ],
@@ -635,7 +699,7 @@ mod tests {
     async fn a_failing_part_drops_out() {
         let s = station_with(
             vec![
-                Arc::new(Failing("pogoda")),
+                Arc::new(Failing("pogoda_teraz")),
                 text("propagacja", "Propagacja B."),
                 text("ostrzezenia", "Brak obowiązujących ostrzeżeń."),
             ],
@@ -643,15 +707,20 @@ mod tests {
         )
         .await;
         let c = s.bulletin.compose(t("2026-11-23 07:00")).await.unwrap();
-        assert_eq!(c.parts[0].0, "pogoda");
-        assert!(matches!(c.parts[0].1, PartOutcome::Failed(_)), "{c:?}");
-        assert!(matches!(c.parts[1].1, PartOutcome::Included(_)));
-        assert!(matches!(c.parts[2].1, PartOutcome::Included(_)));
+        let by_label = |l: &str| &c.parts.iter().find(|(x, _)| *x == l).unwrap().1;
+        assert!(matches!(by_label("Pogoda bieżąca"), PartOutcome::Failed(_)), "{c:?}");
+        assert!(matches!(by_label("Warunki propagacji KF"), PartOutcome::Included(_)));
+        assert!(matches!(by_label("Obowiązujące ostrzeżenia"), PartOutcome::Included(_)));
         assert_eq!(
-            c.text.as_deref(),
-            Some(
-                "Biuletyn stacji SP9XYZ. 07:00. Propagacja B. Brak obowiązujących ostrzeżeń. Koniec biuletynu."
-            )
+            by_label("Stany wód w okolicy"),
+            &PartOutcome::Failed("część niedostępna".to_owned())
+        );
+        assert_eq!(
+            c.text,
+            Some(format!(
+                "{}Brak obowiązujących ostrzeżeń. [[pauza:700]] Propagacja B. {END}",
+                intro("7:00")
+            ))
         );
     }
 
@@ -659,7 +728,7 @@ mod tests {
     async fn slow_parts_time_out_in_parallel() {
         let slow = |id| -> Arc<dyn BulletinPart> { Arc::new(Slow(id, Duration::from_secs(5))) };
         let s = station_with(
-            vec![slow("pogoda"), slow("propagacja"), slow("ostrzezenia")],
+            vec![slow("pogoda_teraz"), slow("propagacja"), slow("ostrzezenia")],
             Some(Duration::from_millis(200)),
         )
         .await;
@@ -670,11 +739,11 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
-        assert_eq!(c.parts.len(), 3);
-        for (id, o) in &c.parts {
+        for label in ["Pogoda bieżąca", "Warunki propagacji KF", "Obowiązujące ostrzeżenia"] {
+            let o = &c.parts.iter().find(|(l, _)| *l == label).unwrap().1;
             assert!(
                 matches!(o, PartOutcome::Failed(e) if e.starts_with("przekroczony czas")),
-                "{id}: {o:?}"
+                "{label}: {o:?}"
             );
         }
         assert_eq!(c.text, None);
@@ -690,41 +759,260 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert!(items.iter().any(|i| {
             i.rendered_text
-                .starts_with("Biuletyn stacji SP9ABC. 19:00. ")
+                .starts_with("Tu automatyczna stacja informacyjna SP9ABC. Poniedziałek, 23 listopada, godzina 19:00.")
         }));
 
-        s.put("module:bulletin:intro", "Tu SP9XYZ").await;
-        s.put("module:bulletin:parts", "ostrzezenia").await;
+        s.put(
+            "module:bulletin:layout",
+            r#"{"bloki":[{"rodzaj":"wstep","tekst":"Tu {znak}, {godzina}."},{"rodzaj":"ostrzezenia","pauza_przed_ms":400,"mow_gdy_brak":true}]}"#,
+        )
+        .await;
         let c = s.bulletin.compose(t("2026-11-23 19:00")).await.unwrap();
         assert_eq!(
             c.text.as_deref(),
-            Some("Tu SP9XYZ. 19:00. Brak obowiązujących ostrzeżeń. Koniec biuletynu.")
+            Some("Tu SP9ABC, 19:00. [[pauza:400]] Brak obowiązujących ostrzeżeń.")
         );
-        let ids: Vec<_> = c.parts.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, ["ostrzezenia"]);
+        let labels: Vec<_> = c.parts.iter().map(|(l, _)| *l).collect();
+        assert_eq!(labels, ["Wstęp", "Obowiązujące ostrzeżenia"]);
     }
 
     #[tokio::test]
-    async fn the_tx_limit_drops_parts_from_the_end() {
+    async fn old_parts_and_intro_are_migrated_on_first_compose() {
+        let s = station().await;
+        s.put("module:bulletin:parts", "ostrzezenia").await;
+        s.put("module:bulletin:intro", "Tu stacja klubowa").await;
+        let c = s.bulletin.compose(t("2026-11-23 19:00")).await.unwrap();
+        assert_eq!(
+            c.text,
+            Some(format!(
+                "Tu stacja klubowa. Godzina 19:00. [[pauza:700]] Brak obowiązujących ostrzeżeń. [[pauza:700]] {END}"
+            ))
+        );
+        let off = |l: &str| c.parts.iter().find(|(x, _)| *x == l).unwrap().1.clone();
+        assert_eq!(off("Pogoda bieżąca"), PartOutcome::Empty("klocek wyłączony".into()));
+        assert_eq!(off("Warunki propagacji KF"), PartOutcome::Empty("klocek wyłączony".into()));
+    }
+
+    #[tokio::test]
+    async fn without_a_callsign_the_intro_and_end_say_no_empty_tu() {
+        let s = station().await;
+        s.put("callsign", "").await;
+        let c = s.bulletin.compose(t("2026-11-24 07:00")).await.unwrap();
+        let text = c.text.unwrap();
+        assert!(
+            text.starts_with("Wtorek, 24 listopada, godzina 7:00. [[pauza:700]] "),
+            "{text}"
+        );
+        assert!(text.ends_with(" Koniec komunikatu."), "{text}");
+        assert!(!text.contains("Tu "), "{text}");
+    }
+
+    #[tokio::test]
+    async fn blocks_follow_the_cycle_number_and_hours() {
+        let s = station_with(
+            vec![
+                text("ostrzezenia", "Brak obowiązujących ostrzeżeń."),
+                text("propagacja", "Propagacja B."),
+            ],
+            None,
+        )
+        .await;
+        s.put("module:bulletin:mode", "cykl").await;
+        s.put(
+            "module:bulletin:layout",
+            r#"{"bloki":[
+                {"rodzaj":"ostrzezenia","mow_gdy_brak":true},
+                {"rodzaj":"propagacja","kiedy":{"typ":"co_n_cykli","n":3}},
+                {"rodzaj":"tekst","tekst":"Dobranoc.","kiedy":{"typ":"w_godzinach","od":"22:00","do":"06:00"}}
+            ]}"#,
+        )
+        .await;
+        let text_at = async |at: &str| s.bulletin.compose(t(at)).await.unwrap().text.unwrap();
+        // 0:30 → cykl 3: propagacja tak, noc tak.
+        assert_eq!(
+            text_at("2026-11-23 00:30").await,
+            "Brak obowiązujących ostrzeżeń. Propagacja B. Dobranoc."
+        );
+        // 0:40 → cykl 4: bez propagacji.
+        assert_eq!(text_at("2026-11-23 00:40").await, "Brak obowiązujących ostrzeżeń. Dobranoc.");
+        // 12:00 → cykl 72: propagacja, dzień — bez dobranocy.
+        let c = s.bulletin.compose(t("2026-11-23 12:00")).await.unwrap();
+        assert_eq!(c.text.as_deref(), Some("Brak obowiązujących ostrzeżeń. Propagacja B."));
+        assert_eq!(
+            c.parts[2].1,
+            PartOutcome::Empty("nadawany w godzinach 22:00–06:00".into())
+        );
+        assert_eq!(
+            s.bulletin.compose(t("2026-11-23 12:10")).await.unwrap().parts[1].1.describe(),
+            "pominięta — nadawany co 3. cykl"
+        );
+        // Tryb pór: „co N-ty cykl” zawsze pasuje.
+        s.put("module:bulletin:mode", "pory").await;
+        assert!(text_at("2026-11-23 00:40").await.contains("Propagacja B."));
+    }
+
+    #[tokio::test]
+    async fn warnings_without_say_when_empty_drop_out_when_nothing_is_active() {
+        let s = station().await;
+        s.put(
+            "module:bulletin:layout",
+            r#"{"bloki":[{"rodzaj":"ostrzezenia"},{"rodzaj":"pogoda_teraz"}]}"#,
+        )
+        .await;
+        let c = s.bulletin.compose(t("2026-11-23 07:00")).await.unwrap();
+        assert_eq!(c.text.as_deref(), Some("Pogoda A."));
+        assert_eq!(
+            c.parts[0].1,
+            PartOutcome::Empty("brak obowiązujących ostrzeżeń".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tx_limit_drops_blocks_from_the_end_but_keeps_warnings() {
         let long = |c: &str| format!("{}.", c.repeat(199));
         let s = station_with(
             vec![
                 text("ostrzezenia", &long("c")),
-                text("pogoda", &long("a")),
+                text("pogoda_teraz", &long("a")),
                 text("propagacja", &long("b")),
             ],
             None,
         )
         .await;
-        // (40 − 10) × 10 = 300 znaków: mieści się tylko pierwsza część.
-        s.put("tx_max_duration_s", "40").await;
+        // (70 − 10) × 10 = 600 znaków: wstęp, ostrzeżenia, zakończenie i jedna część.
+        s.put("tx_max_duration_s", "70").await;
         let c = s.bulletin.compose(t("2026-11-23 07:00")).await.unwrap();
-        let text = c.text.expect("tekst z pierwszą częścią");
+        let text = c.text.expect("tekst");
+        assert!(text.contains(&long("c")), "{text}");
         assert!(text.contains(&long("a")), "{text}");
         assert!(!text.contains(&long("b")));
-        assert_eq!(c.parts[0].0, "pogoda");
-        assert!(matches!(c.parts[0].1, PartOutcome::Included(_)));
-        assert_eq!(c.parts[1].1, PartOutcome::DroppedForLength);
-        assert_eq!(c.parts[2].1, PartOutcome::DroppedForLength);
+        assert!(text.ends_with(END));
+        let of = |l: &str| c.parts.iter().find(|(x, _)| *x == l).unwrap().1.clone();
+        assert_eq!(of("Warunki propagacji KF"), PartOutcome::DroppedForLength);
+        assert!(matches!(of("Pogoda bieżąca"), PartOutcome::Included(_)));
+
+        // Za mało nawet na jedną część: ostrzeżenia i tak idą.
+        s.put("tx_max_duration_s", "20").await;
+        let c = s.bulletin.compose(t("2026-11-23 07:00")).await.unwrap();
+        let text = c.text.expect("ostrzeżenia nie wypadają");
+        assert!(text.contains(&long("c")));
+        assert!(!text.contains(&long("a")));
+    }
+
+    // --- Tryb cykliczny ---
+
+    #[test]
+    fn cycle_fires_are_aligned_to_the_interval_from_midnight() {
+        let fires = cycle_fires(10, t("2026-11-23 07:03"));
+        assert_eq!(fires.last(), Some(&t("2026-11-23 07:00")));
+        assert_eq!(fires.first(), Some(&t("2026-11-22 07:10")));
+        assert_eq!(fires.len(), 144);
+        assert!(fires.windows(2).all(|w| w[1] - w[0] == TimeDelta::minutes(10)));
+
+        let fires = cycle_fires(15, t("2026-11-23 00:14:59"));
+        assert_eq!(fires.last(), Some(&t("2026-11-23 00:00")));
+        assert_eq!(cycle_fires(15, t("2026-11-23 00:15")).last(), Some(&t("2026-11-23 00:15")));
+        assert_eq!(fires.len(), 96);
+        // 7 min nie dzieli doby: cykl zaczyna się od nowa o północy.
+        let fires = cycle_fires(7, t("2026-11-23 00:01"));
+        assert!(fires.contains(&t("2026-11-22 23:55")));
+        assert!(fires.contains(&t("2026-11-23 00:00")));
+    }
+
+    #[test]
+    fn cycle_fires_across_the_autumn_and_spring_clock_change() {
+        // 25.10.2026: 3:00 CEST → 2:00 CET; 2:00–2:59 dwa razy.
+        let fires = cycle_fires(10, t("2026-10-25 04:00"));
+        let around: Vec<_> = fires
+            .iter()
+            .filter(|f| **f >= utc("2026-10-24T23:50:00Z") && **f <= utc("2026-10-25T02:10:00Z"))
+            .collect();
+        // Co 10 minut bez dziury i bez powtórki, także przez powtórzoną godzinę.
+        assert_eq!(around.len(), 15, "{around:?}");
+        assert!(around.windows(2).all(|w| *w[1] - *w[0] == TimeDelta::minutes(10)));
+        assert!(fires.contains(&utc("2026-10-25T00:30:00Z")));
+        assert!(fires.contains(&utc("2026-10-25T01:30:00Z")));
+        // 29.03.2026: 2:00 CET → 3:00 CEST; 2:xx nie istnieje.
+        let fires = cycle_fires(10, t("2026-03-29 03:30"));
+        let i = fires.iter().position(|f| *f == t("2026-03-29 01:50")).unwrap();
+        assert_eq!(fires[i + 1], t("2026-03-29 03:00"));
+    }
+
+    async fn cycle_station() -> Station {
+        let s = station().await;
+        s.put("module:bulletin:mode", "cykl").await;
+        s.put("module:bulletin:interval_min", "10").await;
+        s
+    }
+
+    #[tokio::test]
+    async fn the_cycle_fires_every_ten_minutes_once_even_after_a_restart() {
+        let s = cycle_station().await;
+        let first = s.runner().tick(t("2026-11-23 07:00:05")).await.unwrap();
+        assert!(first.queued.is_some());
+        // Wczorajsze i wcześniejsze chwile — spóźnione, bez nadania.
+        assert!(first.skipped.iter().all(|(_, r)| r == LATE), "{:?}", first.skipped);
+        assert_eq!(s.queued().await.len(), 1);
+        let item = &s.queued().await[0];
+        // Cykl 10 min: element wygasa po długości cyklu.
+        assert_eq!(item.expires_at, Some(t("2026-11-23 07:10")));
+        assert!(item.rendered_text.starts_with(&intro("7:00")), "{}", item.rendered_text);
+
+        // Ten sam cykl: drugi tik i restart nic nie dokładają.
+        assert_eq!(s.runner().tick(t("2026-11-23 07:00:15")).await.unwrap().queued, None);
+        let restarted = BulletinRunner::new(s.bulletin.clone(), s.queue.clone());
+        let again = restarted.tick(t("2026-11-23 07:05")).await.unwrap();
+        assert_eq!(again.queued, None);
+        assert!(again.skipped.is_empty(), "{:?}", again.skipped);
+        assert_eq!(s.queued().await.len(), 1);
+
+        // Następny cykl.
+        assert!(s.runner().tick(t("2026-11-23 07:10:05")).await.unwrap().queued.is_some());
+        let items = s.queued().await;
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|i| i.rendered_text.contains("godzina 7:10.")));
+    }
+
+    #[tokio::test]
+    async fn a_long_cycle_expires_after_fifteen_minutes() {
+        let s = cycle_station().await;
+        s.put("module:bulletin:interval_min", "30").await;
+        s.runner().tick(t("2026-11-23 07:30:05")).await.unwrap();
+        assert_eq!(s.queued().await[0].expires_at, Some(t("2026-11-23 07:45")));
+    }
+
+    #[tokio::test]
+    async fn after_downtime_the_cycle_resumes_without_an_avalanche() {
+        let s = cycle_station().await;
+        s.runner().tick(t("2026-11-23 07:00:05")).await.unwrap();
+        // 2 h przestoju: minione cykle spóźnione, nadany tylko bieżący.
+        let tick = s.runner().tick(t("2026-11-23 09:00:30")).await.unwrap();
+        assert!(tick.queued.is_some());
+        assert_eq!(tick.skipped.len(), 11, "{:?}", tick.skipped);
+        assert!(tick.skipped.iter().all(|(_, r)| r == LATE));
+        assert_eq!(s.queued().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn quiet_hours_skip_each_cycle() {
+        let now = t("2026-11-23 07:00:05");
+        let window = format!(
+            "{}-{}",
+            local_hhmm(now - TimeDelta::hours(1)),
+            local_hhmm(now + TimeDelta::hours(1))
+        );
+        let s = cycle_station().await;
+        s.put("quiet_hours", &window).await;
+        s.put("quiet_min_priority", &(Priority::High as i64).to_string())
+            .await;
+        let tick = s.runner().tick(now).await.unwrap();
+        assert_eq!(tick.queued, None);
+        assert_eq!(
+            tick.skipped.last(),
+            Some(&(t("2026-11-23 07:00"), QUIET.to_owned()))
+        );
+        let tick = s.runner().tick(t("2026-11-23 07:10:05")).await.unwrap();
+        assert_eq!(tick.skipped, [(t("2026-11-23 07:10"), QUIET.to_owned())]);
+        assert!(s.queued().await.is_empty());
     }
 }

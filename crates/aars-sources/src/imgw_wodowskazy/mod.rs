@@ -853,6 +853,7 @@ mod tests {
                 sources: map(sources),
                 active_alerts: Vec::new(),
                 alert_sources: Default::default(),
+                planned: Vec::new(),
             }
         }
 

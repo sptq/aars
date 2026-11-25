@@ -177,6 +177,7 @@ mod tests {
             sources: BTreeMap::new(),
             active_alerts: alerts,
             alert_sources,
+            planned: Vec::new(),
         }
     }
 

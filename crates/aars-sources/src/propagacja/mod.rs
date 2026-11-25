@@ -394,6 +394,7 @@ mod tests {
             sources: BTreeMap::new(),
             active_alerts: Vec::new(),
             alert_sources: Default::default(),
+            planned: Vec::new(),
         };
         part.compose(&ctx).await.unwrap()
     }

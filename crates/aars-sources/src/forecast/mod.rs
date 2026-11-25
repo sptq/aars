@@ -19,6 +19,14 @@ impl Provider {
             Provider::MetNorway => "Dane: MET Norway.",
         }
     }
+
+    /// Nazwa do zdania „według danych …”.
+    pub fn name(self) -> &'static str {
+        match self {
+            Provider::OpenMeteo => "Open-Meteo",
+            Provider::MetNorway => "MET Norway",
+        }
+    }
 }
 
 /// Opis pogody; kolejność wariantów = rosnąca dotkliwość.
