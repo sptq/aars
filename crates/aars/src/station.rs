@@ -351,6 +351,7 @@ pub async fn source_start_failed(state: &SourceStateRepo, id: &str, reason: &str
 struct SharedSources {
     pogoda: Option<Arc<aars_sources::pogoda::Pogoda>>,
     wodowskazy: Option<Arc<aars_sources::imgw_wodowskazy::ImgwWodowskazy>>,
+    powietrze: Option<Arc<aars_sources::powietrze::Powietrze>>,
     /// Instancja `imgw-meteo` dla runnera i mapy ostrzeżeń w panelu.
     meteo: Option<Arc<aars_sources::imgw_meteo::ImgwMeteo>>,
 }
@@ -360,6 +361,7 @@ impl SharedSources {
         Self {
             pogoda: built.map(|b| b.pogoda.clone()),
             wodowskazy: built.map(|b| b.wodowskazy.clone()),
+            powietrze: built.map(|b| b.powietrze.clone()),
             meteo: None,
         }
     }
@@ -397,7 +399,7 @@ pub fn warnings_snapshot(
     }
 }
 
-/// Źródło dla modułu. `pogoda`, `imgw-wodowskazy` i `imgw-meteo` to wspólne
+/// Źródło dla modułu. `pogoda`, `imgw-wodowskazy`, `powietrze` i `imgw-meteo` to wspólne
 /// instancje (biuletyn albo mapa), więc runner źródła i odbiorca dzielą
 /// pamięć; bez nich (błąd budowy, już zapisany) `None` — źródło nie startuje.
 fn source_for(
@@ -414,6 +416,10 @@ fn source_for(
             .wodowskazy
             .as_ref()
             .map(|w| Ok(w.clone() as Arc<dyn aars_sources::DataSource>)),
+        aars_sources::powietrze::ID => shared
+            .powietrze
+            .as_ref()
+            .map(|p| Ok(p.clone() as Arc<dyn aars_sources::DataSource>)),
         aars_sources::imgw_meteo::ID => shared
             .meteo
             .as_ref()
@@ -770,8 +776,9 @@ async fn run_station(
         Err(err) => tracing::error!(%err, "odczyt trybu biuletynu zawiódł"),
     }
 
-    // Biuletyn i źródła `pogoda`, `imgw-wodowskazy` dzielą instancje (jedna
-    // pamięć danych). Błąd budowy wyłącza biuletyn i oba źródła, reszta działa.
+    // Biuletyn i źródła `pogoda`, `imgw-wodowskazy`, `powietrze` dzielą
+    // instancje (jedna pamięć danych). Błąd budowy wyłącza biuletyn i te
+    // źródła, reszta działa.
     let bulletin = match aars_sources::bulletin::build(&config, pool.clone()) {
         Ok(built) => Some(built),
         Err(err) => {
@@ -780,7 +787,11 @@ async fn run_station(
                 %err,
                 "biuletyn nie wystartuje: {err}"
             );
-            for id in [aars_sources::pogoda::ID, aars_sources::imgw_wodowskazy::ID] {
+            for id in [
+                aars_sources::pogoda::ID,
+                aars_sources::imgw_wodowskazy::ID,
+                aars_sources::powietrze::ID,
+            ] {
                 source_start_failed(&SourceStateRepo::new(pool.clone()), id, &err.to_string())
                     .await;
             }
@@ -1872,9 +1883,16 @@ mod tests {
             Arc::as_ptr(&source),
             Arc::as_ptr(&built.wodowskazy)
         ));
+        let air = by_id(aars_sources::powietrze::ID);
+        let source = source_for(air, &config, &shared).unwrap().unwrap();
+        assert!(std::ptr::addr_eq(
+            Arc::as_ptr(&source),
+            Arc::as_ptr(&built.powietrze)
+        ));
         // Bez biuletynu (błąd budowy) współdzielone źródła nie startują osobno.
         assert!(source_for(module, &config, &none).is_none());
         assert!(source_for(gauges, &config, &none).is_none());
+        assert!(source_for(air, &config, &none).is_none());
         // Inne źródła budują się po staremu.
         assert_eq!(
             source_for(by_id("swpc"), &config, &none).unwrap().unwrap().id(),
@@ -2014,6 +2032,7 @@ mod tests {
         for url in [
             &mut config.sources.open_meteo_url,
             &mut config.sources.met_no_url,
+            &mut config.sources.open_meteo_aq_url,
             &mut config.sources.swpc_f107_url,
             &mut config.sources.swpc_kp_url,
             &mut config.sources.kc2g_url,

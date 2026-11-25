@@ -91,6 +91,9 @@ pub struct SourcesConfig {
     pub open_meteo_url: String,
     #[serde(default = "default_met_no_url")]
     pub met_no_url: String,
+    /// Open-Meteo Air Quality (CAMS) — część biuletynu „Jakość powietrza”.
+    #[serde(default = "default_open_meteo_aq_url")]
+    pub open_meteo_aq_url: String,
     #[serde(default = "default_swpc_f107_url")]
     pub swpc_f107_url: String,
     #[serde(default = "default_swpc_kp_url")]
@@ -135,6 +138,10 @@ fn default_met_no_url() -> String {
     "https://api.met.no/weatherapi/locationforecast/2.0/compact".to_owned()
 }
 
+fn default_open_meteo_aq_url() -> String {
+    "https://air-quality-api.open-meteo.com/v1/air-quality".to_owned()
+}
+
 fn default_swpc_f107_url() -> String {
     "https://services.swpc.noaa.gov/json/f107_cm_flux.json".to_owned()
 }
@@ -161,6 +168,7 @@ impl SourcesConfig {
             ("emsc_url", &self.emsc_url),
             ("open_meteo_url", &self.open_meteo_url),
             ("met_no_url", &self.met_no_url),
+            ("open_meteo_aq_url", &self.open_meteo_aq_url),
             ("swpc_f107_url", &self.swpc_f107_url),
             ("swpc_kp_url", &self.swpc_kp_url),
             ("kc2g_url", &self.kc2g_url),
@@ -193,6 +201,7 @@ impl Default for SourcesConfig {
             emsc_url: default_emsc_url(),
             open_meteo_url: default_open_meteo_url(),
             met_no_url: default_met_no_url(),
+            open_meteo_aq_url: default_open_meteo_aq_url(),
             swpc_f107_url: default_swpc_f107_url(),
             swpc_kp_url: default_swpc_kp_url(),
             kc2g_url: default_kc2g_url(),
@@ -482,6 +491,10 @@ mod tests {
                 cfg.sources.met_no_url,
                 "https://api.met.no/weatherapi/locationforecast/2.0/compact"
             );
+            assert_eq!(
+                cfg.sources.open_meteo_aq_url,
+                "https://air-quality-api.open-meteo.com/v1/air-quality"
+            );
             assert_eq!(cfg.sources.swpc_f107_url, "https://services.swpc.noaa.gov/json/f107_cm_flux.json");
             assert_eq!(
                 cfg.sources.swpc_kp_url,
@@ -494,7 +507,7 @@ mod tests {
 
     #[test]
     fn every_source_url_is_validated() {
-        for key in ["IMGW_METEO_URL", "IMGW_HYDRO_URL", "IMGW_HYDRO_STATIONS_URL", "RSO_URL", "SWPC_URL", "GIOS_URL", "EMSC_URL", "OPEN_METEO_URL", "MET_NO_URL", "SWPC_F107_URL", "SWPC_KP_URL", "KC2G_URL"] {
+        for key in ["IMGW_METEO_URL", "IMGW_HYDRO_URL", "IMGW_HYDRO_STATIONS_URL", "RSO_URL", "SWPC_URL", "GIOS_URL", "EMSC_URL", "OPEN_METEO_URL", "MET_NO_URL", "OPEN_METEO_AQ_URL", "SWPC_F107_URL", "SWPC_KP_URL", "KC2G_URL"] {
             figment::Jail::expect_with(|jail| {
                 jail.set_env(format!("AARS_SOURCES__{key}"), "ftp://x");
                 let err = Config::load(None).unwrap_err().to_string();

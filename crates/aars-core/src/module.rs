@@ -224,7 +224,7 @@ pub const BULLETIN_MODES: &[(&str, &str)] = &[
 pub const BULLETIN: ModuleDescriptor = ModuleDescriptor {
     id: "bulletin",
     name: "Biuletyn",
-    description: "Pełny komunikat informacyjny sklejany z klocków (ostrzeżenia, pogoda, prognoza, wody, propagacja) — cyklicznie albo o stałych porach.",
+    description: "Pełny komunikat informacyjny sklejany z klocków (ostrzeżenia, pogoda, prognoza, jakość powietrza, wody, propagacja) — cyklicznie albo o stałych porach.",
     kind: ModuleKind::Bulletin,
     toggle: Toggle::Switchable,
     default_enabled: false,

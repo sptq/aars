@@ -24,8 +24,8 @@ natychmiast, a operator może wpisać i nadać własny komunikat z panelu www.
   polski komunikat (sekcja „Źródła danych”),
 - biuletyn informacyjny co 10 minut (albo o stałych porach) sklejany
   z klocków: wstęp ze znakiem i godziną, obowiązujące ostrzeżenia, pogoda
-  bieżąca, prognoza, wschód/zachód słońca, stany wód z wodowskazów IMGW,
-  propagacja KF, zakończenie; z pauzami i podglądem w panelu i w CLI (sekcja
+  bieżąca, prognoza, wschód/zachód słońca, jakość powietrza i pyłki
+  (Open-Meteo, CAMS), stany wód z wodowskazów IMGW, propagacja KF, zakończenie; z pauzami i podglądem w panelu i w CLI (sekcja
   „Biuletyn (etap 11b, 13)”),
 - źródła hydrologiczne IMGW (ostrzeżenia, przekroczenia stanów na
   wodowskazach) i mapa ostrzeżeń meteo w panelu (sekcje „Źródła danych”
@@ -101,6 +101,7 @@ Wszystkie są po instalacji wyłączone; włącza się je tak samo jak `imgw-met
 | `emsc` | EMSC, wstrząsy sejsmiczne w promieniu stacji | CC BY 4.0; „Dane: EMSC” |
 | `imgw-hydro` (etap 11c) | IMGW-PIB, ostrzeżenia hydrologiczne dla województw obszaru (stopnie 1–3; susza nie jest ogłaszana); obszar jak w `imgw-meteo`, powiat oznacza całe województwo | „Źródło: IMGW-PIB.” |
 | `imgw-wodowskazy` (etap 11c) | IMGW-PIB, stany wodowskazów w promieniu stacji (domyślnie 25 km) albo z listy `id_stacji`: komunikat po przekroczeniu stanu ostrzegawczego i alarmowego z danych IMGW; pomiar starszy niż 3 h jest pomijany, stan bez nowego pomiaru wygasa po dobie | „Źródło: IMGW-PIB.” |
+| `powietrze` | Open-Meteo Air Quality (model CAMS), europejski indeks jakości powietrza, PM2,5, PM10 i pyłki dla pozycji stacji: samo nic nie ogłasza, dostarcza dane klockowi biuletynu „Jakość powietrza” (włączone odświeża je w tle co `interval_s`; biuletyn pobiera je też sam); ustawienie „Pyłki” (domyślnie tak) | CC BY 4.0; dane: Open-Meteo, CAMS — atrybucja tylko w panelu i tutaj, nie na antenie |
 | `pogoda` (etap 11b) | Open-Meteo, prognoza dla pozycji stacji: komunikat po przekroczeniu progów (porywy od 75 km/h, mróz od −15 °C, dobowa suma opadów od 30 mm — progi w `/modules`; na antenie porywy w m/s, jak w biuletynie) na dziś (z godzin od bieżącej do końca doby) lub jutro | CC BY 4.0; „Dane: Open-Meteo.” |
 
 Źródłem pochodzenia danych jest IMGW-PIB; dane zostały przetworzone
@@ -139,7 +140,8 @@ i zapisz.
 Domyślny układ: wstęp („Tu automatyczna stacja informacyjna {znak}.
 {dzien}, {data}, godzina {godzina}.”, pauza 0,7 s), obowiązujące ostrzeżenia
 (także „brak ostrzeżeń”, pauza 0,7 s), pogoda bieżąca, prognoza (pauza
-0,5 s), wschód i zachód słońca, stany wód, propagacja (co 3. cykl),
+0,5 s), wschód i zachód słońca, jakość powietrza, stany wód, propagacja
+(co 3. cykl),
 zakończenie („Tu {znak}. Koniec komunikatu.”). Każdy klocek ma przełącznik,
 pauzę przed i po (0–10 s; sąsiednie się sumują, najwyżej 10 s), warunek
 (`zawsze`, `co_n_cykli` 2–24 — numer cyklu to minuty od północy / interwał,
@@ -161,13 +163,16 @@ bez „mów, gdy brak” znikają, gdy nic nie obowiązuje. Format:
 ```
 
 Rodzaje: `wstep`, `ostrzezenia`, `pogoda_teraz`, `prognoza`, `slonce`,
-`wody`, `propagacja`, `tekst`, `zakonczenie`; pola pominięte mają wartości
+`powietrze`, `wody`, `propagacja`, `tekst`, `zakonczenie`; pola pominięte mają wartości
 domyślne (`wlaczony` tak, pauzy 0, `kiedy` zawsze). Stare ustawienia
 `parts` i `intro` (do etapu 12) są przy pierwszym odczycie przenoszone do
 układu i usuwane: lista części niezmieniona (dawny domyślny wybór) daje
 pełny nowy układ, lista zmieniona przez operatora — klocki niewybranych
 części wyłączone; wstęp → tekst wstępu z godziną. Układ równy domyślnemu
 zapisuje się jako pusty, więc ulepszenia domyślnego dochodzą do stacji.
+Zapisany własny układ nie dostaje nowych klocków sam (np. `powietrze`
+dodaje się w edytorze); przy przenoszeniu starej, zmienionej listy części
+`powietrze` jest wyłączone.
 
 W trybie cyklicznym element kolejki wygasa po długości cyklu (najwyżej
 15 min), więc biuletyn nie zalega do następnego; wpisy odpaleń starsze niż
@@ -185,6 +190,7 @@ już zrobionej. Gdy żadna część nie ma treści, nic nie idzie na antenę.
 | `pogoda_teraz`, `prognoza`, `slonce` | warunki bieżące; najbliższe godziny, noc, dziś/jutro; wschód i zachód słońca — dla pozycji stacji; pierwsza z nich w układzie zaczyna się od „Pogoda dla okolic stacji według danych Open-Meteo.”; bez pozycji wypadają | Open-Meteo (ta sama prognoza co źródło `pogoda`, świeża do 60 min, jedno pobranie na biuletyn), zapasowo MET Norway |
 | `propagacja` | strumień słoneczny (SFI), indeks K, skale NOAA, najbliższa jonosonda i ocena pasm KF | NOAA SWPC, GIRO przez KC2G |
 | `ostrzezenia` | obowiązujące ostrzeżenia ze źródeł włączonych i nieprzestarzałych, które poszły na antenę oraz czekające w kolejce (najwyżej 5, reszta — także bez opisu — jako „Pozostałych ostrzeżeń: n.”); brak = „Brak obowiązujących ostrzeżeń.”, a gdy część źródeł jest niedostępna — „Brak ostrzeżeń z dostępnych źródeł. Część źródeł ostrzeżeń jest niedostępna.”; bez żadnego włączonego źródła część wypada | `source_state` stacji |
+| `powietrze` | „Jakość powietrza {ocena}.” według europejskiego indeksu (EEA 2024: do 20 bardzo dobra, do 40 dobra, do 60 umiarkowana, do 80 dostateczna, do 100 zła, wyżej bardzo zła); stężenie pyłu (PM2,5 albo PM10, który gorszy) słownie w mikrogramach na metr sześcienny tylko od oceny „dostateczna”, i tylko gdy sam pył jest co najmniej dostateczny; najgorsza ocena z najbliższych 24 h, gdy gorsza niż teraz („Jutro rano dostateczna, pył zawieszony PM2,5 do 68 mikrogramów na metr sześcienny.”); pyłki olchy, brzozy, traw, bylicy, ambrozji i oliwki z najbliższych 12 h od stężenia średniego („Wysokie stężenie pyłków brzozy.”; progi w ziarnach/m³: olcha 30/100, brzoza i oliwka 20/75, trawy 20/50, bylica i ambrozja 10/30); bez pozycji albo bez bieżącej wartości wypada | Open-Meteo Air Quality, model CAMS (ta sama instancja co źródło `powietrze`, dane świeże do 60 min) |
 | `wody` (etap 11c) | do 3 najbliższych wodowskazów ze świeżym pomiarem (ustawienia źródła `imgw-wodowskazy`), z dopiskiem o stanie ostrzegawczym/alarmowym; susza hydrologiczna w 11c nie jest podawana (dopasowanie po województwie dawałoby ją prawie zawsze) | IMGW-PIB (ta sama instancja co źródło, dane świeże do 20 min) |
 
 Każda część ma 20 s na odpowiedź (części liczone równolegle); część, która
@@ -205,7 +211,10 @@ tempo mowy ÷ 1,5)` znaków (10 s zostaje na identyfikację i ogony; 1,5 to
 wydłużenie tekstu przez normalizator — liczby i jednostki czytane słownie;
 przy 180 s i tempie 87% to 1331 znaków). Sekunda pauzy kosztuje tyle znaków,
 ile w niej da się powiedzieć; tak samo liczy oś czasu w edytorze. Gdy złożony tekst się nie mieści,
-wypadają całe klocki od końca — oprócz wstępu, ostrzeżeń i zakończenia.
+wypadają całe klocki: najpierw propagacja, potem słońce, jakość powietrza,
+stany wód, a dalej pozostałe od końca układu — nigdy wstęp, ostrzeżenia
+i zakończenie (zapowiedź pogody z atrybucją przechodzi wtedy na następny
+klocek pogodowy).
 Ostrzeżenia dostają tyle miejsca, ile zostaje po wstępie i zakończeniu
 (najwyżej 1200 znaków), i skracają się całymi zdaniami („Oraz jeszcze…”),
 a gdy nie mieści się żadne zdanie — „Obowiązujące ostrzeżenia: N.”.
@@ -225,8 +234,11 @@ Licencje danych biuletynu (stacja jest niekomercyjna): Open-Meteo CC BY 4.0
 („…według danych Open-Meteo.”), MET Norway CC BY 4.0 / NLOD („…według
 danych MET Norway.”),
 NOAA SWPC domena publiczna, jonosondy GIRO przez KC2G CC BY-NC-SA („Dane:
-NOAA, GIRO przez KC2G.”, KC2G tylko gdy jonosonda użyta). Adresy
-(`open_meteo_url`, `met_no_url`, `swpc_f107_url`, `swpc_kp_url`, `kc2g_url`)
+NOAA, GIRO przez KC2G.”, KC2G tylko gdy jonosonda użyta), jakość powietrza
+Open-Meteo Air Quality CC BY 4.0, dane: Open-Meteo, CAMS (Copernicus
+Atmosphere Monitoring Service; atrybucja w panelu i tutaj, na antenie
+klocek jej nie podaje). Adresy (`open_meteo_url`, `met_no_url`,
+`open_meteo_aq_url`, `swpc_f107_url`, `swpc_kp_url`, `kc2g_url`)
 w `[sources]` w `aars.toml`.
 
 ### Mapa ostrzeżeń (etap 11c)

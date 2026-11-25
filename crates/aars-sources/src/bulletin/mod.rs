@@ -22,7 +22,7 @@ use sqlx::SqlitePool;
 
 use crate::source::SourceError;
 use crate::speech::truncate_sentence;
-use crate::{imgw_wodowskazy, pogoda, propagacja};
+use crate::{imgw_wodowskazy, pogoda, powietrze, propagacja};
 
 pub use ostrzezenia::Ostrzezenia;
 pub use runner::{BulletinRunner, BulletinTick, cycle_fires, due_fires};
@@ -170,9 +170,10 @@ fn cost(text: &str, pause_ms: u64, budget: &Budget) -> usize {
         .saturating_add(pause_chars)
 }
 
-/// Składa biuletyn z klocków. Dopóki tekst przekracza `limit`, ostatni
+/// Składa biuletyn z klocków. Dopóki tekst przekracza `limit`, jeden
 /// dołączony klocek, który może wypaść (nie wstęp, ostrzeżenia ani
-/// zakończenie), dostaje `DroppedForLength`. Gdy zostały same chronione,
+/// zakończenie), dostaje `DroppedForLength`: najpierw propagacja, słońce,
+/// jakość powietrza, wody (`BlockKind::drop_rank`), potem reszta od końca. Gdy zostały same chronione,
 /// tekst idzie mimo limitu — ostrzeżeń nie wolno zgubić (i same skracają się
 /// do swojego limitu). Bez żadnego klocka z treścią (poza wstępem
 /// i zakończeniem) biuletynu nie ma.
@@ -197,10 +198,13 @@ pub fn assemble(pieces: Vec<Piece>, budget: Budget) -> Composed {
         if cost(&text, pauses, &budget) <= limit {
             return composed(pieces, Some(text), None);
         }
+        // Najmniejsza ranga wypada pierwsza; przy równej — dalej w układzie
+        // (`min_by_key` bierze pierwszy z równych, więc idziemy od końca).
         let Some(last) = pieces
             .iter_mut()
             .rev()
-            .find(|p| matches!(p.outcome, PartOutcome::Included(_)) && !p.kind.is_protected())
+            .filter(|p| matches!(p.outcome, PartOutcome::Included(_)) && !p.kind.is_protected())
+            .min_by_key(|p| p.kind.drop_rank())
         else {
             tracing::warn!(
                 znaków = cost(&text, pauses, &budget),
@@ -209,8 +213,28 @@ pub fn assemble(pieces: Vec<Piece>, budget: Budget) -> Composed {
             );
             return composed(pieces, Some(text), None);
         };
-        last.outcome = PartOutcome::DroppedForLength;
+        let was = std::mem::replace(&mut last.outcome, PartOutcome::DroppedForLength);
+        if let PartOutcome::Included(text) = was {
+            pass_weather_heading(&mut pieces, &text);
+        }
         dropped = true;
+    }
+}
+
+/// Wypadł klocek pogodowy z zapowiedzią (atrybucją): przechodzi ona na
+/// następny dołączony klocek pogodowy. Słońce wypada przed pogodą bieżącą
+/// i prognozą, więc mogło stać w układzie przed nimi i nieść zapowiedź.
+fn pass_weather_heading(pieces: &mut [Piece], dropped: &str) {
+    let Some(rest) = pogoda::speech::strip_heading(dropped) else {
+        return;
+    };
+    let heading = dropped[..dropped.len() - rest.len()].trim_end();
+    let next = pieces.iter_mut().filter(|p| WEATHER.contains(&p.kind)).find_map(|p| match &mut p.outcome {
+        PartOutcome::Included(t) => Some(t),
+        _ => None,
+    });
+    if let Some(text) = next {
+        *text = format!("{heading} {text}");
     }
 }
 
@@ -495,19 +519,22 @@ pub struct BuiltBulletin {
     pub bulletin: Arc<Bulletin>,
     pub pogoda: Arc<pogoda::Pogoda>,
     pub wodowskazy: Arc<imgw_wodowskazy::ImgwWodowskazy>,
+    pub powietrze: Arc<powietrze::Powietrze>,
 }
 
-/// Biuletyn stacji: jedna `Pogoda` (trzy części z jednej prognozy) i jedna
-/// `ImgwWodowskazy` (te same instancje trafiają do runnera źródeł),
-/// `Propagacja`, `Ostrzezenia`.
+/// Biuletyn stacji: jedna `Pogoda` (trzy części z jednej prognozy), jedna
+/// `ImgwWodowskazy` i jedna `Powietrze` (te same instancje trafiają do
+/// runnera źródeł), `Propagacja`, `Ostrzezenia`.
 pub fn build(cfg: &Config, pool: SqlitePool) -> Result<BuiltBulletin, SourceError> {
     let pogoda = Arc::new(pogoda::Pogoda::new(&cfg.sources)?);
     let wodowskazy = Arc::new(imgw_wodowskazy::ImgwWodowskazy::new(
         &cfg.sources.imgw_hydro_stations_url,
     )?);
+    let powietrze = Arc::new(powietrze::Powietrze::new(&cfg.sources)?);
     let mut parts: Vec<Arc<dyn BulletinPart>> = pogoda.parts();
     parts.extend([
         wodowskazy.clone() as Arc<dyn BulletinPart>,
+        powietrze.clone() as Arc<dyn BulletinPart>,
         Arc::new(propagacja::Propagacja::new(&cfg.sources)?),
         Arc::new(Ostrzezenia),
     ]);
@@ -515,6 +542,7 @@ pub fn build(cfg: &Config, pool: SqlitePool) -> Result<BuiltBulletin, SourceErro
         bulletin: Arc::new(Bulletin::new(pool, parts)),
         pogoda,
         wodowskazy,
+        powietrze,
     })
 }
 
@@ -639,6 +667,35 @@ mod tests {
     }
 
     #[test]
+    fn over_the_limit_propagation_sun_air_and_water_drop_in_that_order() {
+        // Każdy klocek 49 znaków + odstęp; limit mieści wstęp, zakończenie i dwa klocki.
+        let pieces = || {
+            vec![
+                inc(Wstep, &long(49)),
+                inc(Propagacja, &long(49)),
+                inc(Wody, &long(49)),
+                inc(Powietrze, &long(49)),
+                inc(Slonce, &long(49)),
+                inc(Prognoza, &long(49)),
+                inc(Zakonczenie, &long(49)),
+            ]
+        };
+        let outcomes = |limit| {
+            assemble(pieces(), chars(limit))
+                .parts
+                .into_iter()
+                .map(|(_, o)| matches!(o, Included(_)))
+                .collect::<Vec<_>>()
+        };
+        // Bez propagacji (pierwsza w układzie, a i tak wypada pierwsza).
+        assert_eq!(outcomes(300), [true, false, true, true, true, true, true]);
+        // Potem słońce, potem powietrze, potem wody; prognoza zostaje najdłużej.
+        assert_eq!(outcomes(250), [true, false, true, true, false, true, true]);
+        assert_eq!(outcomes(200), [true, false, true, false, false, true, true]);
+        assert_eq!(outcomes(150), [true, false, false, false, false, true, true]);
+    }
+
+    #[test]
     fn pauses_count_towards_the_length_limit() {
         // 2 × 99 znaków + spacja = 199; pauza 10 s to 100 znaków → 299 ≤ 300.
         let pieces = |ms| vec![paused(WARN, &long(99), 0, ms), inc(Wody, &long(99))];
@@ -681,6 +738,19 @@ mod tests {
             c.text.as_deref(),
             Some("Stany wód. Pogoda dla okolic stacji według danych Open-Meteo. W nocy do 1 °C. Zachód słońca o 15:39.")
         );
+    }
+
+    #[test]
+    fn the_weather_attribution_survives_the_sun_dropping_first() {
+        let h = "Pogoda dla okolic stacji według danych Open-Meteo.";
+        let mut pieces = vec![
+            inc(Slonce, &format!("{h} Zachód słońca o 15:39.")),
+            inc(PogodaTeraz, &format!("{h} Obecnie bezchmurnie.")),
+        ];
+        attribute_weather_once(&mut pieces);
+        let c = assemble(pieces, chars(80));
+        assert_eq!(c.parts[0].1, DroppedForLength);
+        assert_eq!(c.text.as_deref(), Some(format!("{h} Obecnie bezchmurnie.").as_str()));
     }
 
     #[test]

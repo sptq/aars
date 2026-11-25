@@ -125,6 +125,8 @@ struct CatalogEntry {
     warn: bool,
     protected: bool,
     typical: usize,
+    /// Kolejność wypadania przy limicie (`BlockKind::drop_rank`).
+    drop_rank: u8,
 }
 
 fn catalog_json() -> String {
@@ -138,6 +140,7 @@ fn catalog_json() -> String {
             warn: k == BlockKind::Ostrzezenia,
             protected: k.is_protected(),
             typical: k.typical_chars(),
+            drop_rank: k.drop_rank(),
         })
         .collect();
     serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_owned())

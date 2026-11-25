@@ -589,8 +589,9 @@
   };
 
   // Odcinki jak w kompozytorze: włączone klocki, pauza między sąsiednimi
-  // (po poprzednim + przed następnym), za długie — klocki od końca wypadają
-  // (oprócz chronionych).
+  // (po poprzednim + przed następnym), za długie — klocki wypadają według
+  // rangi (propagacja, słońce, powietrze, wody, reszta), przy równej od
+  // końca (oprócz chronionych).
   Editor.prototype.segments = function () {
     var self = this, segs = [], prev = null;
     this.blocks.forEach(function (b, i) {
@@ -605,12 +606,18 @@
     });
     var total = segs.reduce(function (t, x) { return t + x.s; }, 0);
     if (this.limitS && total > this.limitS) {
-      for (var k = segs.length - 1; k >= 0 && total > this.limitS; k--) {
+      while (total > this.limitS) {
+        var k = -1;
+        for (var j = segs.length - 1; j >= 0; j--) {
+          var y = segs[j];
+          if (y.pause || y.dropped || y.info.protected) continue;
+          if (k < 0 || (y.info.drop_rank || 0) < (segs[k].info.drop_rank || 0)) k = j;
+        }
+        if (k < 0) break;
         var x = segs[k];
-        if (x.pause || x.info.protected) continue;
         x.dropped = true;
         total -= x.s;
-        if (segs[k - 1] && segs[k - 1].pause) { segs[k - 1].dropped = true; total -= segs[k - 1].s; }
+        if (segs[k - 1] && segs[k - 1].pause && !segs[k - 1].dropped) { segs[k - 1].dropped = true; total -= segs[k - 1].s; }
       }
     }
     return { segs: segs, total: total };

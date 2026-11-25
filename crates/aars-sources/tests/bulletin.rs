@@ -1,4 +1,5 @@
-//! Biuletyn z prawdziwych fiksów: pogoda (Open-Meteo), stany wód (IMGW),
+//! Biuletyn z prawdziwych fiksów: pogoda (Open-Meteo), jakość powietrza
+//! (Open-Meteo Air Quality), stany wód (IMGW),
 //! propagacja (NOAA, KC2G) i ostrzeżenia złożone domyślnym układem w jeden
 //! tekst z pauzami; runner wstawia go do kolejki.
 //! Tylko wiremock na 127.0.0.1; bez dyspozytora, PTT i audio, więc nic nie
@@ -21,7 +22,7 @@ use sqlx::SqlitePool;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const EXPECTED: &str = "Tu automatyczna stacja informacyjna SP9XYZ. Niedziela, 22 listopada, godzina 20:00. [[pauza:700]] Brak obowiązujących ostrzeżeń dla okolic stacji. [[pauza:700]] Pogoda dla okolic stacji według danych Open-Meteo. Obecnie bezchmurnie, temperatura 2 °C. Wiatr 3 m/s, w porywach 5 m/s. W najbliższych godzinach pochmurno, bez opadów. W nocy do 1 °C. Jutro śnieg, od 1 do 3 °C, opady do 2 mm, porywy wiatru do 13 m/s. [[pauza:500]] Stany wód. Rzeszów, Wisłok: 72 cm. Żarnowa, Wisłok: 164 cm. Godowa, Stobnica: 609 cm. Źródło: IMGW-PIB. Propagacja. Strumień słoneczny 98, umiarkowany. Indeks K 0,3, warunki spokojne. Pogoda kosmiczna bez zaburzeń. Jonosonda Warszawa: częstotliwość krytyczna 3,2 megaherca, MUF 10,6 megaherca. Łączności bliskie do pasma 160 metrów, dalekie do pasma 40 metrów. Dane: NOAA, GIRO przez KC2G. Tu SP9XYZ. Koniec komunikatu.";
+const EXPECTED: &str = "Tu automatyczna stacja informacyjna SP9XYZ. Niedziela, 22 listopada, godzina 20:00. [[pauza:700]] Brak obowiązujących ostrzeżeń dla okolic stacji. [[pauza:700]] Pogoda dla okolic stacji według danych Open-Meteo. Obecnie bezchmurnie, temperatura 2 °C. Wiatr 3 m/s, w porywach 5 m/s. W najbliższych godzinach pochmurno, bez opadów. W nocy do 1 °C. Jutro śnieg, od 1 do 3 °C, opady do 2 mm, porywy wiatru do 13 m/s. [[pauza:500]] Jakość powietrza umiarkowana. Jutro rano dostateczna, pył zawieszony PM2,5 do 68 mikrogramów na metr sześcienny. Stany wód. Rzeszów, Wisłok: 72 cm. Żarnowa, Wisłok: 164 cm. Godowa, Stobnica: 609 cm. Źródło: IMGW-PIB. Propagacja. Strumień słoneczny 98, umiarkowany. Indeks K 0,3, warunki spokojne. Pogoda kosmiczna bez zaburzeń. Jonosonda Warszawa: częstotliwość krytyczna 3,2 megaherca, MUF 10,6 megaherca. Łączności bliskie do pasma 160 metrów, dalekie do pasma 40 metrów. Dane: NOAA, GIRO przez KC2G. Tu SP9XYZ. Koniec komunikatu.";
 
 fn at(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
@@ -46,6 +47,8 @@ async fn server() -> MockServer {
         ("/scales", "swpc/noaa-scales-2026-11-22.json"),
         ("/stations", "propagacja/kc2g-stations-2026-11-22.json"),
         ("/hydro", "imgw/hydro-2026-11-22.json"),
+        // Prawdziwa odpowiedź z 25 listopada przesunięta na 22 listopada, 20:00.
+        ("/v1/air-quality", "powietrze/open-meteo-aq-rzeszow-przesuniety-2026-11-22.json"),
     ] {
         Mock::given(method("GET"))
             .and(path(route))
@@ -68,6 +71,7 @@ fn config(server: &MockServer) -> Config {
     cfg.sources.swpc_url = u("/scales");
     cfg.sources.kc2g_url = u("/stations");
     cfg.sources.imgw_hydro_stations_url = u("/hydro");
+    cfg.sources.open_meteo_aq_url = u("/v1/air-quality");
     cfg
 }
 

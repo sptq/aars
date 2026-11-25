@@ -292,7 +292,7 @@ impl aars_sources::bulletin::BulletinPart for DemoPart {
 }
 
 /// Zmyślone, ale typowe teksty części; ostrzeżenia są prawdziwe (z bazy demo).
-const DEMO_PARTS: [(&str, &str); 5] = [
+const DEMO_PARTS: [(&str, &str); 6] = [
     (
         "pogoda_teraz",
         "Pogoda dla okolic stacji według danych Open-Meteo. Obecnie umiarkowane zachmurzenie, temperatura 6 °C, odczuwalna 3 °C. Wilgotność 78 %. Ciśnienie 1014 hPa, spada. Wiatr południowo-zachodni 4 m/s, w porywach 9 m/s.",
@@ -302,6 +302,10 @@ const DEMO_PARTS: [(&str, &str); 5] = [
         "W najbliższych godzinach pochmurno, słaby deszcz, opady do 2 mm. W nocy do 2 °C. Jutro przelotne opady deszczu, od 2 do 8 °C, opady do 4 mm, wiatr zachodni do 6 m/s.",
     ),
     ("slonce", "Wschód słońca o 7:01, zachód o 15:42."),
+    (
+        "powietrze",
+        "Jakość powietrza umiarkowana. Dziś wieczorem dostateczna, pył zawieszony PM2,5 do 68 mikrogramów na metr sześcienny.",
+    ),
     (
         "wody",
         "Stany wód. Rzeszów, Wisłok: 212 cm, stan ostrzegawczy, rośnie. Źródło: IMGW-PIB.",

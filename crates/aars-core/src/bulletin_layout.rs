@@ -46,6 +46,7 @@ pub enum BlockKind {
     PogodaTeraz,
     Prognoza,
     Slonce,
+    Powietrze,
     Wody,
     Propagacja,
     Tekst,
@@ -53,12 +54,13 @@ pub enum BlockKind {
 }
 
 impl BlockKind {
-    pub const ALL: [BlockKind; 9] = [
+    pub const ALL: [BlockKind; 10] = [
         Self::Wstep,
         Self::Ostrzezenia,
         Self::PogodaTeraz,
         Self::Prognoza,
         Self::Slonce,
+        Self::Powietrze,
         Self::Wody,
         Self::Propagacja,
         Self::Tekst,
@@ -73,6 +75,7 @@ impl BlockKind {
             Self::PogodaTeraz => "Pogoda bieżąca",
             Self::Prognoza => "Prognoza pogody",
             Self::Slonce => "Wschód i zachód słońca",
+            Self::Powietrze => "Jakość powietrza",
             Self::Wody => "Stany wód w okolicy",
             Self::Propagacja => "Warunki propagacji KF",
             Self::Tekst => "Własny tekst",
@@ -87,6 +90,7 @@ impl BlockKind {
             Self::PogodaTeraz => Some("pogoda_teraz"),
             Self::Prognoza => Some("prognoza"),
             Self::Slonce => Some("slonce"),
+            Self::Powietrze => Some("powietrze"),
             Self::Wody => Some("wody"),
             Self::Propagacja => Some("propagacja"),
             Self::Wstep | Self::Tekst | Self::Zakonczenie => None,
@@ -103,6 +107,19 @@ impl BlockKind {
         matches!(self, Self::Wstep | Self::Ostrzezenia | Self::Zakonczenie)
     }
 
+    /// Kolejność wypadania przy limicie długości: najpierw najmniejsza
+    /// wartość (propagacja, słońce, powietrze, wody, potem reszta), przy
+    /// równej — klocek dalej w układzie. Chronione nie wypadają wcale.
+    pub fn drop_rank(self) -> u8 {
+        match self {
+            Self::Propagacja => 0,
+            Self::Slonce => 1,
+            Self::Powietrze => 2,
+            Self::Wody => 3,
+            _ => 4,
+        }
+    }
+
     /// Wartość `rodzaj` w JSON (jak serde).
     pub fn id(self) -> &'static str {
         match self {
@@ -111,6 +128,7 @@ impl BlockKind {
             Self::PogodaTeraz => "pogoda_teraz",
             Self::Prognoza => "prognoza",
             Self::Slonce => "slonce",
+            Self::Powietrze => "powietrze",
             Self::Wody => "wody",
             Self::Propagacja => "propagacja",
             Self::Tekst => "tekst",
@@ -126,6 +144,7 @@ impl BlockKind {
             Self::PogodaTeraz => "Temperatura, wilgotność, ciśnienie z tendencją, wiatr i zachmurzenie z pozycji stacji.",
             Self::Prognoza => "Najbliższe godziny, potem reszta dnia albo noc i jutro.",
             Self::Slonce => "Godzina wschodu i zachodu słońca dla pozycji stacji.",
+            Self::Powietrze => "Jakość powietrza dla pozycji stacji (indeks europejski, model CAMS) z prognozą pogorszenia na najbliższą dobę i stężeniem pyłków, gdy jest istotne.",
             Self::Wody => "Do trzech najbliższych wodowskazów ze świeżym pomiarem, z dopiskiem o stanie ostrzegawczym lub alarmowym.",
             Self::Propagacja => "Warunki propagacji na pasmach KF (indeksy słoneczne i geomagnetyczne).",
             Self::Tekst => "Twój stały tekst, np. zaproszenie na sieć albo informacja o przemienniku.",
@@ -141,6 +160,7 @@ impl BlockKind {
             Self::PogodaTeraz => 230,
             Self::Prognoza => 260,
             Self::Slonce => 70,
+            Self::Powietrze => 90,
             Self::Wody => 120,
             Self::Propagacja => 140,
             Self::Wstep | Self::Tekst | Self::Zakonczenie => 0,
@@ -350,6 +370,7 @@ impl Layout {
                 Block::new(BlockKind::PogodaTeraz),
                 Block::new(BlockKind::Prognoza).pause_after(500),
                 Block::new(BlockKind::Slonce),
+                Block::new(BlockKind::Powietrze),
                 Block::new(BlockKind::Wody),
                 propagation,
                 Block::new(BlockKind::Zakonczenie).with_text(DEFAULT_OUTRO),
@@ -413,8 +434,9 @@ impl Layout {
 
     /// Układ z ustawień sprzed etapu 13. Lista części nieustawiona albo równa
     /// staremu domyślnemu wyborowi (operator jej nie zmieniał) → pełny nowy
-    /// układ (także stany wód); lista zmieniona przez operatora → części
-    /// nieobecne na niej to klocki wyłączone. Wstęp operatora → tekst wstępu
+    /// układ (także stany wód i jakość powietrza); lista zmieniona przez
+    /// operatora → części nieobecne na niej to klocki wyłączone (jakość
+    /// powietrza nie miała starego odpowiednika, więc też wyłączona). Wstęp operatora → tekst wstępu
     /// (z godziną, jak dawniej).
     pub fn from_legacy(parts: Option<&str>, intro: Option<&str>) -> Layout {
         let mut layout = Self::default_layout();
@@ -425,6 +447,11 @@ impl Layout {
                     BlockKind::PogodaTeraz | BlockKind::Prognoza | BlockKind::Slonce => "pogoda",
                     BlockKind::Wody => "wody",
                     BlockKind::Propagacja => "propagacja",
+                    // Bez starego odpowiednika: operator z własną listą go nie wybrał.
+                    BlockKind::Powietrze => {
+                        block.enabled = false;
+                        continue;
+                    }
                     BlockKind::Ostrzezenia => "ostrzezenia",
                     BlockKind::Wstep | BlockKind::Tekst | BlockKind::Zakonczenie => continue,
                 };
@@ -845,6 +872,7 @@ mod tests {
                 PogodaTeraz,
                 Prognoza,
                 Slonce,
+                Powietrze,
                 Wody,
                 Propagacja,
                 Zakonczenie
@@ -857,8 +885,50 @@ mod tests {
         assert!(l.blocks[1].say_when_empty);
         assert_eq!(l.blocks[1].pause_after_ms, 700);
         assert_eq!(l.blocks[3].pause_after_ms, 500);
-        assert_eq!(l.blocks[6].when, When::CoNCykli { n: 3 });
-        assert_eq!(l.blocks[7].text, DEFAULT_OUTRO);
+        assert_eq!(l.blocks[5], Block::new(Powietrze));
+        assert_eq!(l.blocks[7].when, When::CoNCykli { n: 3 });
+        assert_eq!(l.blocks[8].text, DEFAULT_OUTRO);
+    }
+
+    #[test]
+    fn the_air_quality_block_has_its_own_id_and_label() {
+        let k = BlockKind::Powietrze;
+        assert_eq!((k.id(), k.label(), k.part_id()), ("powietrze", "Jakość powietrza", Some("powietrze")));
+        assert_eq!(serde_json::to_string(&k).unwrap(), "\"powietrze\"");
+        assert!(!k.is_text() && !k.is_protected() && k.typical_chars() > 0);
+        let l = Layout::parse(r#"{"bloki":[{"rodzaj":"powietrze","pauza_po_ms":300}]}"#).unwrap();
+        assert_eq!(Layout::parse(&l.to_json()).unwrap(), l);
+        assert_eq!(l.blocks[0].kind, k);
+    }
+
+    #[test]
+    fn a_saved_layout_without_air_quality_loads_without_it() {
+        // Układ zapisany przed dodaniem klocka: nic się nie dokłada samo.
+        let json = r#"{"bloki":[
+            {"rodzaj":"wstep","tekst":"Tu {znak}."},
+            {"rodzaj":"pogoda_teraz"},
+            {"rodzaj":"wody"},
+            {"rodzaj":"zakonczenie","tekst":"Koniec."}
+        ]}"#;
+        let l = resolve(json);
+        assert_eq!(
+            kinds(&l),
+            [BlockKind::Wstep, BlockKind::PogodaTeraz, BlockKind::Wody, BlockKind::Zakonczenie]
+        );
+        assert_ne!(l.stored(), "");
+        // Pusty zapis (układ domyślny) dostaje nowy klocek z domyślnym układem.
+        assert!(kinds(&resolve("")).contains(&BlockKind::Powietrze));
+    }
+
+    #[test]
+    fn blocks_drop_propagation_first_then_sun_air_and_water() {
+        use BlockKind::*;
+        let mut order: Vec<BlockKind> = BlockKind::ALL
+            .into_iter()
+            .filter(|k| !k.is_protected())
+            .collect();
+        order.sort_by_key(|k| k.drop_rank());
+        assert_eq!(&order[..4], [Propagacja, Slonce, Powietrze, Wody]);
     }
 
     #[test]
@@ -1109,13 +1179,19 @@ mod tests {
         assert_eq!(l.blocks[0].text, "Tu SP9. Godzina {godzina}.");
         // Lista zmieniona przez operatora: niewybrane części wyłączone.
         let l = Layout::from_legacy(Some("pogoda,propagacja,ostrzezenia,wody"), None);
-        assert!(l.blocks.iter().all(|b| b.enabled));
+        assert!(
+            l.blocks
+                .iter()
+                .all(|b| b.enabled == (b.kind != BlockKind::Powietrze))
+        );
 
         let l = Layout::from_legacy(Some("pogoda,ostrzezenia"), Some("Tu stacja klubowa"));
         let on = |k| l.blocks.iter().find(|b| b.kind == k).unwrap().enabled;
         assert!(on(BlockKind::PogodaTeraz) && on(BlockKind::Prognoza) && on(BlockKind::Slonce));
         assert!(on(BlockKind::Ostrzezenia));
         assert!(!on(BlockKind::Wody) && !on(BlockKind::Propagacja));
+        // Jakość powietrza nie miała starego odpowiednika: przy własnej liście wyłączona.
+        assert!(!on(BlockKind::Powietrze));
         assert!(on(BlockKind::Wstep) && on(BlockKind::Zakonczenie));
         assert_eq!(l.blocks[0].text, "Tu stacja klubowa. Godzina {godzina}.");
         assert!(l.validate().is_ok());
