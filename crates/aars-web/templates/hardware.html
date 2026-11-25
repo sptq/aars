@@ -32,15 +32,15 @@
       <label class="check"><input type="checkbox" name="{{ f.name }}" value="1" {% if f.value == "1" %}checked{% endif %}> {{ f.label }}</label>
       {% else if f.kind == "select" %}
       <label for="{{ f.name }}">{{ f.label }}</label>
-      <select id="{{ f.name }}" name="{{ f.name }}"{% if f.error.is_some() %} aria-invalid="true"{% endif %}>
+      <select id="{{ f.name }}" name="{{ f.name }}"{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ f.name }}-error"{% endif %}>
         {% for (v, l) in f.options %}<option value="{{ v }}" {% if v.as_str() == f.value.as_str() %}selected{% endif %}>{{ l }}</option>{% endfor %}
       </select>
       {% else %}
       <label for="{{ f.name }}">{{ f.label }}</label>
-      <input id="{{ f.name }}" name="{{ f.name }}" type="{{ f.kind }}" value="{{ f.value }}"{% if f.error.is_some() %} aria-invalid="true"{% endif %}>
+      <input id="{{ f.name }}" name="{{ f.name }}" type="{{ f.kind }}" value="{{ f.value }}"{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ f.name }}-error"{% endif %}>
       {% endif %}
       <small class="help">{{ f.hint }}{% if let Some(n) = f.note %}<span> · {{ n }}</span>{% endif %}</small>
-      {% if let Some(e) = f.error %}<div class="error">{{ e }}</div>{% endif %}
+      {% if let Some(e) = f.error %}<div class="error" id="{{ f.name }}-error">{{ e }}</div>{% endif %}
     </div>
     {% endfor %}
     <button type="submit">Zapisz</button>
@@ -51,7 +51,7 @@
   <h2>Testy</h2>
   {% if let Some((css, text)) = result %}<p class="{{ css }}">{{ text }}</p>{% endif %}
   {% if vox %}<p class="error">{{ vox_note }} <a href="/compose">/compose</a>, bo tam nadanie idzie z identyfikacją.</p>{% endif %}
-  <form method="post" action="/settings/hardware/test-ptt" hx-post="/settings/hardware/test-ptt" hx-target="closest .card" hx-select="#testy" hx-swap="outerHTML">
+  <form method="post" action="/settings/hardware/test-ptt" hx-post="/settings/hardware/test-ptt" hx-request='{"timeout": 60000}' hx-target="closest .card" hx-select="#testy" hx-swap="outerHTML">
     <fieldset {% if !tests_available %}disabled{% endif %} class="field-group test-group">
       <h3>Test PTT</h3>
       <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
@@ -65,7 +65,7 @@
       <button type="submit" class="danger">Uruchom test PTT</button>
     </fieldset>
   </form>
-  <form method="post" action="/settings/hardware/test-audio" hx-post="/settings/hardware/test-audio" hx-target="closest .card" hx-select="#testy" hx-swap="outerHTML">
+  <form method="post" action="/settings/hardware/test-audio" hx-post="/settings/hardware/test-audio" hx-request='{"timeout": 60000}' hx-target="closest .card" hx-select="#testy" hx-swap="outerHTML">
     <fieldset {% if !tests_available %}disabled{% endif %} class="field-group">
       <h3>Test audio</h3>
       <input type="hidden" name="csrf" value="{{ chrome.csrf }}">

@@ -623,6 +623,7 @@ pub fn router(state: AppState) -> Router {
         .route("/modules/bulletin/send", post(modules_page::send_bulletin))
         .route("/healthz", get(healthz))
         .route("/assets/{*path}", get(assets::serve))
+        .layer(axum::middleware::from_fn(htmx_auth_redirect))
         .layer(axum::middleware::from_fn_with_state(state.clone(), host_check))
         // Zewnętrzna warstwa: adres klienta przed `Host` i przed trasami.
         .layer(axum::middleware::from_fn_with_state(state.clone(), client_check))
@@ -676,6 +677,27 @@ async fn client_check(
             )
                 .into_response()
         }
+    }
+}
+
+/// Żądanie htmx odesłane na logowanie albo zmianę hasła (wygasła sesja,
+/// hasło tymczasowe): zamiast 303, które XHR po cichu wykonałby i wstawił
+/// stronę logowania w kartę (albo kartę usunął), `HX-Redirect` — htmx
+/// przechodzi wtedy na ten adres całą stroną.
+async fn htmx_auth_redirect(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let htmx = request
+        .headers()
+        .get("HX-Request")
+        .is_some_and(|v| v.as_bytes() == b"true");
+    let response = next.run(request).await;
+    if !htmx || !response.status().is_redirection() {
+        return response;
+    }
+    match response.headers().get(header::LOCATION) {
+        Some(to) if matches!(to.as_bytes(), b"/login" | b"/account/password") => {
+            (StatusCode::OK, [("HX-Redirect", to.clone())]).into_response()
+        }
+        _ => response,
     }
 }
 

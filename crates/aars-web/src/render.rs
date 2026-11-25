@@ -87,10 +87,20 @@ pub mod htmx {
         response
     }
 
-    /// Udany zapis: karta i „Zapisano” (albo inny tekst).
+    /// Udany zapis: karta i „Zapisano” (albo inny tekst). Gdy samo
+    /// odświeżenie strony po zapisie zawiodło (np. 500 z bazy), powiadomienie
+    /// mówi o tym zamiast udawać, że wszystko jest w porządku.
     pub fn ok(response: Response, text: &str) -> Response {
-        toast(response, Kind::Ok, text)
+        if response.status().is_success() {
+            toast(response, Kind::Ok, text)
+        } else {
+            toast(response, Kind::Error, NOT_REFRESHED)
+        }
     }
+
+    /// Akcja wykonana, ale widok po niej się nie złożył.
+    pub const NOT_REFRESHED: &str =
+        "Wykonano, ale nie udało się odświeżyć widoku — przeładuj stronę.";
 
     /// Odrzucony formularz: karta z błędem i wpisanymi wartościami. Strona
     /// z błędem walidacji (400) idzie jako 422, który htmx wstawia w kartę;
@@ -124,6 +134,15 @@ pub mod htmx {
             );
             let parsed: serde_json::Value = serde_json::from_str(value).unwrap();
             assert_eq!(parsed["toast"]["text"], "zła \"wartość\"\n");
+        }
+
+        #[test]
+        fn a_failed_refresh_after_a_save_is_not_reported_as_saved() {
+            let failed = super::super::db_error("test", &"x");
+            let response = ok(failed, "Zapisano");
+            let value = response.headers().get("HX-Trigger").unwrap().to_str().unwrap();
+            assert!(value.contains("\"kind\":\"error\""), "{value}");
+            assert!(!value.contains("Zapisano"), "{value}");
         }
 
         #[test]

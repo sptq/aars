@@ -48,6 +48,8 @@ pub(crate) struct FieldView {
     pub(crate) checks: Vec<(&'static str, &'static str, bool)>,
     /// (wartość, etykieta)
     pub(crate) options: Vec<(&'static str, &'static str)>,
+    /// Błąd walidacji tego pola (pokazany przy nim, pole z `aria-invalid`).
+    pub(crate) error: Option<String>,
 }
 
 pub(crate) struct ModuleView {
@@ -138,6 +140,7 @@ fn field_view(spec: &aars_core::module::SettingSpec, value: String) -> FieldView
         max_text,
         checks,
         options,
+        error: None,
     }
 }
 
@@ -234,15 +237,17 @@ async fn page_with(
 }
 
 /// Strona z błędem w karcie modułu `id`; `entered` zastępuje wartości pól.
-/// Formularz htmx dostaje kartę z kodem 422 i powiadomienie `toast`.
+/// Błąd pola `field` stoi przy nim, inny — u góry karty. Formularz htmx
+/// dostaje kartę z kodem 422 i powiadomienie z treścią błędu.
 async fn page_with_error(
     state: &AppState,
     current: &CurrentUser,
     id: &str,
     message: String,
     entered: Option<&BTreeMap<String, String>>,
-    toast: &str,
+    field: Option<&str>,
 ) -> Response {
+    let toast = message.clone();
     let response = page_with(state, current, id, StatusCode::BAD_REQUEST, |view| {
         if let Some(entered) = entered {
             for field in &mut view.fields {
@@ -251,11 +256,14 @@ async fn page_with_error(
                 }
             }
         }
-        view.error = Some(message);
+        match view.fields.iter_mut().find(|f| Some(f.key) == field) {
+            Some(f) => f.error = Some(message),
+            None => view.error = Some(message),
+        }
     })
     .await;
     if current.htmx {
-        htmx::refused(response, toast)
+        htmx::refused(response, &toast)
     } else {
         response
     }
@@ -327,8 +335,7 @@ pub async fn set_enabled(
     {
         Ok(()) => {}
         Err(err @ (ModuleError::AlwaysOn(_) | ModuleError::Planned(_))) => {
-            let message = err.to_string();
-            return Ok(page_with_error(&state, &current, m.id, message.clone(), None, &message).await);
+            return Ok(page_with_error(&state, &current, m.id, err.to_string(), None, None).await);
         }
         Err(ModuleError::Db(err)) => return Ok(db_error("zmiana stanu modułu zawiodła", &err)),
     }
@@ -394,11 +401,12 @@ pub async fn save_settings(
             input.insert(spec.key.to_owned(), value.clone());
         }
     }
-    let values = match m.validate(&input) {
+    let values = match m.validate_fields(&input) {
         Ok(values) => values,
-        Err(message) => {
-            let toast = message.clone();
-            return Ok(page_with_error(&state, &current, m.id, message, Some(&input), &toast).await);
+        Err((key, message)) => {
+            return Ok(
+                page_with_error(&state, &current, m.id, message, Some(&input), Some(key)).await,
+            );
         }
     };
     let changed: Vec<&str> = m

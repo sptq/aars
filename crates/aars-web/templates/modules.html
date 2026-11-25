@@ -20,12 +20,12 @@
     {% if let Some((text, href)) = m.see_also %}{% if m.is_source %} · {% endif %}<a href="{{ href }}">{{ text }}</a>{% endif %}
   </p>
   {% if m.id == "bulletin" %}
-  <form method="post" action="/modules/bulletin/preview" id="bulletin-preview-form" class="module-form" hx-post="/modules/bulletin/preview" hx-target="closest .card" hx-select="#{{ m.id }}" hx-swap="outerHTML">
+  <form method="post" action="/modules/bulletin/preview" id="bulletin-preview-form" class="module-form" hx-post="/modules/bulletin/preview" hx-request='{"timeout": 60000}' hx-target="closest .card" hx-select="#{{ m.id }}" hx-swap="outerHTML">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     <button type="submit" class="ghost">Podgląd biuletynu</button>
     <small class="muted">Składa biuletyn na teraz, bez nadawania; pyta źródła o dane.</small>
   </form>
-  <form method="post" action="/modules/bulletin/send" class="module-form" hx-post="/modules/bulletin/send" hx-target="closest .card" hx-select="#{{ m.id }}" hx-swap="outerHTML">
+  <form method="post" action="/modules/bulletin/send" class="module-form" hx-post="/modules/bulletin/send" hx-request='{"timeout": 60000}' hx-target="closest .card" hx-select="#{{ m.id }}" hx-swap="outerHTML">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     <button type="submit">Nadaj biuletyn teraz</button>
     <small class="muted">Składa biuletyn ze świeżych danych i dodaje go do kolejki; wyjdzie na antenę, gdy nadawanie jest włączone.</small>
@@ -64,7 +64,7 @@
     <div class="module-form">
       {% if f.kind == "integer" %}
       <label for="{{ m.id }}-{{ f.key }}">{{ f.label }} ({{ f.min }}–{{ f.max }})</label>
-      <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="number" min="{{ f.min }}" max="{{ f.max }}" value="{{ f.value }}" required>
+      <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="number" min="{{ f.min }}" max="{{ f.max }}" value="{{ f.value }}" required{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>
       {% else if f.kind == "area" %}
       {% if let Some(note) = m.auto_area_note %}
       <p class="auto-area">{{ note }}</p>
@@ -72,29 +72,30 @@
       {% else %}
       <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
       {% endif %}
-      <textarea id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" rows="5" placeholder="1061 Łódź&#10;10">{{ f.value }}</textarea>
+      <textarea id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" rows="5" placeholder="1061 Łódź&#10;10"{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>{{ f.value }}</textarea>
       {% else if f.kind == "choice" %}
       <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
-      <select id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}">
+      <select id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}"{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>
         {% for (value, label) in f.options %}<option value="{{ value }}" {% if f.value == *value %}selected{% endif %}>{{ label }}</option>{% endfor %}
       </select>
       {% else if f.kind == "decimal" %}
       <label for="{{ m.id }}-{{ f.key }}">{{ f.label }} ({{ f.min_text }}–{{ f.max_text }})</label>
-      <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="text" inputmode="decimal" value="{{ f.value }}" required>
+      <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="text" inputmode="decimal" value="{{ f.value }}" required{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>
       {% else if f.kind == "timelist" %}
       <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
-      <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="text" inputmode="numeric" placeholder="07:00,19:00" value="{{ f.value }}" required>
+      <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="text" inputmode="numeric" placeholder="07:00,19:00" value="{{ f.value }}" required{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>
       {% else if f.kind == "layout" %}
       <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
-      <textarea id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" rows="16" spellcheck="false" class="code">{{ f.value }}</textarea>
+      <textarea id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" rows="16" spellcheck="false" class="code"{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>{{ f.value }}</textarea>
       {% else if f.kind == "list" %}
       <fieldset class="field-group"><legend>{{ f.label }}</legend>
-        {% for (value, label, on) in f.checks %}<label class="check"><input type="checkbox" name="{{ f.key }}" value="{{ value }}" {% if *on %}checked{% endif %}> {{ label }}</label>{% endfor %}
+        {% for (value, label, on) in f.checks %}<label class="check"><input type="checkbox" name="{{ f.key }}" value="{{ value }}" {% if *on %}checked{% endif %}{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}> {{ label }}</label>{% endfor %}
       </fieldset>
       {% else %}
       <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
-      <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" value="{{ f.value }}" maxlength="{{ f.max_len }}">
+      <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" value="{{ f.value }}" maxlength="{{ f.max_len }}"{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>
       {% endif %}
+      {% if let Some(e) = f.error %}<p class="error" id="{{ m.id }}-{{ f.key }}-error">{{ e }}</p>{% endif %}
       {% if !f.help.is_empty() %}<small class="help">{{ f.help }}</small>{% endif %}
     </div>
     {% endfor %}

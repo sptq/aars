@@ -703,12 +703,14 @@ mod tests {
                 .body(Body::from(format!("csrf={csrf}&enabled=0&back=%2F")))
                 .unwrap();
             let (status, headers, _) = send(&app, request).await;
-            assert_eq!(status, StatusCode::SEE_OTHER, "htmx={htmx}");
-            assert_eq!(
-                headers.get(header::LOCATION).unwrap(),
-                "/account/password",
-                "htmx={htmx}"
-            );
+            // htmx dostaje HX-Redirect (cała strona przechodzi na zmianę hasła).
+            let (want, target) = if htmx {
+                (StatusCode::OK, headers.get("HX-Redirect"))
+            } else {
+                (StatusCode::SEE_OTHER, headers.get(header::LOCATION))
+            };
+            assert_eq!(status, want, "htmx={htmx}");
+            assert_eq!(target.unwrap(), "/account/password", "htmx={htmx}");
             assert!(state.interlocks.snapshot().tx_enabled, "htmx={htmx}");
         }
     }

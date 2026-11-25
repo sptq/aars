@@ -494,3 +494,233 @@ async fn the_frame_keeps_safety_forms_out_of_htmx() {
     }
     assert!(html.contains("action=\"/tx-enabled\""));
 }
+
+#[tokio::test]
+async fn station_and_module_errors_mark_the_field() {
+    let (app, cookie, csrf, _) = admin().await;
+    let bad = STATION.replace("callsign=SP0ABC", "callsign=%21%21");
+    let reply = hx_post(&app, &cookie, &csrf, "/settings", &bad).await;
+    reply.assert_refused("stacja");
+    assert!(
+        reply.body.contains(
+            "value=\"!!\" maxlength=\"10\" aria-invalid=\"true\" aria-describedby=\"callsign-error\""
+        ),
+        "{}",
+        reply.body
+    );
+    assert!(
+        reply
+            .body
+            .contains("<p class=\"error\" id=\"callsign-error\">znak wywoławczy")
+    );
+    assert_eq!(reply.body.matches("aria-invalid").count(), 1);
+
+    let reply = hx_post(
+        &app,
+        &cookie,
+        &csrf,
+        "/modules/imgw-meteo/settings",
+        "interval_s=5",
+    )
+    .await;
+    reply.assert_refused("imgw-meteo");
+    assert!(
+        reply.body.contains(
+            "value=\"5\" required aria-invalid=\"true\" aria-describedby=\"imgw-meteo-interval_s-error\""
+        ),
+        "{}",
+        reply.body
+    );
+    assert!(reply.body.contains("id=\"imgw-meteo-interval_s-error\""));
+}
+
+#[tokio::test]
+async fn an_htmx_post_without_a_session_redirects_the_whole_page() {
+    let (app, _, _, state) = admin().await;
+    let reply = send(
+        &app,
+        "aars_session=nieznana",
+        Some(Hx::Form),
+        "POST",
+        "/modules/scheduler/enabled",
+        "csrf=x&enabled=0".to_owned(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.headers.get("HX-Redirect").unwrap(), "/login");
+    assert!(
+        reply.body.is_empty(),
+        "nie strona logowania do wstawienia w kartę"
+    );
+    // boost też (przejście linkiem po wygaśnięciu sesji)
+    let reply = send(
+        &app,
+        "aars_session=nieznana",
+        Some(Hx::Boosted),
+        "GET",
+        "/modules",
+        String::new(),
+    )
+    .await;
+    assert_eq!(reply.headers.get("HX-Redirect").unwrap(), "/login");
+    // bez htmx — zwykłe 303
+    let reply = send(
+        &app,
+        "aars_session=nieznana",
+        None,
+        "GET",
+        "/modules",
+        String::new(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+
+    // hasło tymczasowe: na zmianę hasła
+    UserRepo::new(state.pool.clone())
+        .create("tymczas", "haslo", Role::Admin)
+        .await
+        .unwrap();
+    let (cookie, csrf) = crate::tests::login(&app, "tymczas", "haslo").await;
+    sqlx::query("UPDATE users SET must_change_password = 1 WHERE username = 'tymczas'")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let reply = hx_post(
+        &app,
+        &cookie,
+        &csrf,
+        "/modules/scheduler/enabled",
+        "enabled=0",
+    )
+    .await;
+    assert_eq!(
+        reply.headers.get("HX-Redirect").unwrap(),
+        "/account/password"
+    );
+}
+
+#[tokio::test]
+async fn queue_series_cancel_carries_a_toast() {
+    let (app, cookie, csrf, state) = logged_in(Role::Operator).await;
+    let ids = state
+        .queue
+        .enqueue(EnqueueRequest {
+            message_id: None,
+            rendered_text: "seria".to_owned(),
+            priority: Priority::Normal,
+            interrupting: false,
+            not_before: None,
+            expires_at: None,
+            repeat_count: 3,
+            repeat_interval: Duration::from_secs(60),
+            created_by: None,
+        })
+        .await
+        .unwrap();
+    let group = state.queue.pending(10).await.unwrap()[0]
+        .repeat_group
+        .clone()
+        .unwrap();
+    assert_eq!(ids.len(), 3);
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/queue/group/{group}/cancel"))
+        .header(header::COOKIE, &cookie)
+        .header("HX-Request", "true")
+        .header("x-csrf-token", &csrf)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let trigger = response
+        .headers()
+        .get("HX-Trigger")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        trigger.contains("\"kind\":\"ok\"") && trigger.contains("serii: 3"),
+        "{trigger}"
+    );
+}
+
+#[tokio::test]
+async fn every_user_action_says_what_it_did() {
+    let (app, cookie, csrf, state) = admin().await;
+    let id = UserRepo::new(state.pool.clone())
+        .create("inny", "haslo", Role::Operator)
+        .await
+        .unwrap();
+    let reply = hx_post(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("/users/{id}/role"),
+        "role=viewer",
+    )
+    .await;
+    reply.assert_card("uzytkownicy", "Zmieniono rolę");
+    let reply = hx_post(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("/users/{id}/disabled"),
+        "disabled=1",
+    )
+    .await;
+    reply.assert_card("uzytkownicy", "Zapisano");
+    assert!(reply.body.contains("wyłączony"));
+    let reply = hx_post(&app, &cookie, &csrf, &format!("/users/{id}/reset"), "").await;
+    reply.assert_card("uzytkownicy", "Hasło tymczasowe gotowe");
+    assert!(reply.body.contains("id=\"new-password\""));
+    let reply = hx_post(&app, &cookie, &csrf, &format!("/users/{id}/delete"), "").await;
+    reply.assert_card("uzytkownicy", "Usunięto konto");
+    assert!(!reply.body.contains("inny"));
+}
+
+fn bulletin_state(state: AppState, text: Option<&str>) -> AppState {
+    let view = crate::state::BulletinPreviewView {
+        text: text.map(str::to_owned),
+        parts: vec![("Pogoda".to_owned(), "pominięta".to_owned())],
+        skipped_reason: text.is_none().then(|| "brak danych do nadania".to_owned()),
+    };
+    state.with_bulletin_preview(Arc::new(move || {
+        let view = view.clone();
+        Box::pin(async move { Ok(view) })
+    }))
+}
+
+#[tokio::test]
+async fn bulletin_preview_and_send_answer_with_the_bulletin_card() {
+    let state = bulletin_state(state().await, Some("Biuletyn próbny."));
+    UserRepo::new(state.pool.clone())
+        .create("u", "haslo", Role::Operator)
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let (cookie, csrf) = crate::tests::login(&app, "u", "haslo").await;
+    let reply = hx_post(&app, &cookie, &csrf, "/modules/bulletin/preview", "").await;
+    reply.assert_card("bulletin", "Podgląd gotowy");
+    assert!(reply.body.contains("Biuletyn próbny."));
+    let reply = hx_post(&app, &cookie, &csrf, "/modules/bulletin/send", "").await;
+    reply.assert_card("bulletin", "Biuletyn dodany do kolejki");
+    assert_eq!(state.queue.pending(10).await.unwrap().len(), 1);
+
+    let state = bulletin_state(crate::tests::state().await, None);
+    UserRepo::new(state.pool.clone())
+        .create("u", "haslo", Role::Operator)
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let (cookie, csrf) = crate::tests::login(&app, "u", "haslo").await;
+    let reply = hx_post(&app, &cookie, &csrf, "/modules/bulletin/send", "").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.toast()["kind"], "error");
+    assert!(
+        reply.toast()["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Nic do nadania")
+    );
+    assert!(state.queue.pending(10).await.unwrap().is_empty());
+}

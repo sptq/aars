@@ -32,6 +32,8 @@ struct SettingsPage {
     pending: Vec<String>,
     has_station: bool,
     error: Option<String>,
+    /// Pole formularza, którego dotyczy `error` (`""` — błąd całej karty).
+    error_field: &'static str,
     saved: bool,
     no_callsign: bool,
     position: PositionCard,
@@ -148,6 +150,7 @@ async fn view(
         pending: crate::hardware_page::pending_for(state, s).await,
         has_station: state.station.is_some(),
         error,
+        error_field: "",
         saved,
         no_callsign: s.callsign.is_empty(),
         position: PositionCard::from_saved(saved_position(state).await.as_ref()),
@@ -188,42 +191,51 @@ pub async fn page_view(
     }
 }
 
-fn parse_form(form: &SettingsForm, stored: &StationSettings) -> Result<StationSettings, String> {
-    let number = |text: &str, name: &str| {
+/// Formularz → ustawienia; błąd niesie nazwę pola formularza i komunikat.
+fn parse_form(
+    form: &SettingsForm,
+    stored: &StationSettings,
+) -> Result<StationSettings, (&'static str, String)> {
+    let number = |text: &str, key: &'static str, name: &str| {
         text.trim()
             .parse::<u64>()
-            .map_err(|_| format!("{name}: podaj liczbę całkowitą"))
+            .map_err(|_| (key, format!("{name}: podaj liczbę całkowitą")))
     };
     let id_mode = match form.id_mode.as_str() {
         "cw" => aars_core::ident::IdMode::Cw,
         "voice" => aars_core::ident::IdMode::Voice,
-        _ => return Err("tryb identyfikacji: cw albo voice".to_owned()),
+        _ => return Err(("id_mode", "tryb identyfikacji: cw albo voice".to_owned())),
     };
     let quiet_hours = match form.quiet_hours.trim() {
         "" => None,
-        text => Some(QuietHours::parse(text)?),
+        text => Some(QuietHours::parse(text).map_err(|e| ("quiet_hours", e))?),
     };
     let speech_rate = match form.speech_rate_pct.trim() {
         "" => stored.speech_rate,
         text => {
-            let pct = text
-                .parse::<u32>()
-                .map_err(|_| "tempo mowy: podaj liczbę całkowitą procent".to_owned())?;
+            let pct = text.parse::<u32>().map_err(|_| {
+                ("speech_rate_pct", "tempo mowy: podaj liczbę całkowitą procent".to_owned())
+            })?;
             pct as f32 / 100.0
         }
     };
     let mut parsed = StationSettings {
         callsign: form.callsign.clone(),
         id_mode,
-        id_interval_s: number(&form.id_interval_s, "odstęp identyfikacji")?,
-        tx_max_duration_s: number(&form.tx_max_duration_s, "limit czasu nadawania")?,
-        misfire_grace_s: number(&form.misfire_grace_s, "tolerancja spóźnień")?,
+        id_interval_s: number(&form.id_interval_s, "id_interval_s", "odstęp identyfikacji")?,
+        tx_max_duration_s: number(&form.tx_max_duration_s, "tx_max_duration_s", "limit czasu nadawania")?,
+        misfire_grace_s: number(&form.misfire_grace_s, "misfire_grace_s", "tolerancja spóźnień")?,
         quiet_hours,
-        quiet_min_priority: parse_priority(&form.quiet_min_priority)
-            .ok_or_else(|| "nieznany priorytet progu ciszy".to_owned())?,
+        quiet_min_priority: parse_priority(&form.quiet_min_priority).ok_or_else(|| {
+            ("quiet_min_priority", "nieznany priorytet progu ciszy".to_owned())
+        })?,
         speech_rate,
     };
-    parsed.validate()?;
+    // Pola struktury nazywają się jak pola formularza, poza tempem mowy.
+    parsed.validate_fields().map_err(|(key, message)| match key {
+        "speech_rate" => ("speech_rate_pct", message),
+        key => (key, message),
+    })?;
     Ok(parsed)
 }
 
@@ -274,10 +286,11 @@ pub async fn submit(
 
     let new = match parse_form(&form, &stored) {
         Ok(new) => new,
-        Err(message) => {
-            // Błąd dotyczy jednego pola i nazywa je, więc idzie też do powiadomienia.
+        Err((field, message)) => {
+            // Błąd stoi przy polu i idzie też do powiadomienia.
             let toast = message.clone();
             let mut shown = view(&state, &current, &stored, Some(message), false).await;
+            shown.error_field = field;
             // Wpisane wartości zostają w polach (do poprawienia, nie od nowa).
             shown.callsign = form.callsign.clone();
             shown.id_mode = form.id_mode.clone();

@@ -80,6 +80,12 @@ impl StationSettings {
 
     /// Zamienia znak na wielkie litery i sprawdza zakresy.
     pub fn validate(&mut self) -> Result<(), String> {
+        self.validate_fields().map_err(|(_, message)| message)
+    }
+
+    /// Jak `validate`, ale błąd niesie też nazwę pola struktury, którego
+    /// dotyczy (panel zaznacza to pole w formularzu).
+    pub fn validate_fields(&mut self) -> Result<(), (&'static str, String)> {
         self.callsign = self.callsign.trim().to_uppercase();
         let len = self.callsign.chars().count();
         let chars_ok = self
@@ -87,19 +93,19 @@ impl StationSettings {
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '/');
         if !self.callsign.is_empty() && (!(3..=10).contains(&len) || !chars_ok) {
-            return Err("znak wywoławczy: 3–10 znaków A–Z, 0–9 lub /".to_owned());
+            return Err(("callsign", "znak wywoławczy: 3–10 znaków A–Z, 0–9 lub /".to_owned()));
         }
         if !(60..=3600).contains(&self.id_interval_s) {
-            return Err("odstęp identyfikacji: 60–3600 s".to_owned());
+            return Err(("id_interval_s", "odstęp identyfikacji: 60–3600 s".to_owned()));
         }
         if !(10..=600).contains(&self.tx_max_duration_s) {
-            return Err("limit czasu nadawania: 10–600 s".to_owned());
+            return Err(("tx_max_duration_s", "limit czasu nadawania: 10–600 s".to_owned()));
         }
         if self.misfire_grace_s > 86_400 {
-            return Err("tolerancja spóźnień: 0–86400 s".to_owned());
+            return Err(("misfire_grace_s", "tolerancja spóźnień: 0–86400 s".to_owned()));
         }
         if !SPEECH_RATE_RANGE.contains(&self.speech_rate) {
-            return Err("tempo mowy: 70–120%".to_owned());
+            return Err(("speech_rate", "tempo mowy: 70–120%".to_owned()));
         }
         // Dwa miejsca po przecinku, jak w formularzu (87%, nie 87,0000001%).
         self.speech_rate = (self.speech_rate * 100.0).round() / 100.0;
@@ -399,7 +405,7 @@ mod tests {
         for bad in ["ab", "SP7 TQ", "TOOLONGCALLSIGN", "SP7TQ!", "SP7TQ-1"] {
             let mut s = sample();
             s.callsign = bad.into();
-            assert!(s.validate().is_err(), "{bad}");
+            assert_eq!(s.validate_fields().unwrap_err().0, "callsign", "{bad}");
         }
         let mut s = sample();
         s.callsign.clear();

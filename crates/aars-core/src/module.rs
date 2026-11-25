@@ -102,88 +102,101 @@ impl ModuleDescriptor {
     /// Sprawdza i sprowadza do postaci kanonicznej wszystkie ustawienia
     /// z opisu; obce klucze wejścia są pomijane.
     pub fn validate(&self, input: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>, String> {
+        self.validate_fields(input).map_err(|(_, message)| message)
+    }
+
+    /// Jak `validate`, ale błąd niesie też klucz pola, którego dotyczy
+    /// (panel zaznacza to pole w formularzu).
+    pub fn validate_fields(
+        &self,
+        input: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>, (&'static str, String)> {
         let mut out = BTreeMap::new();
         for spec in self.settings {
-            let raw = input
-                .get(spec.key)
-                .ok_or_else(|| format!("{}: brak wartości", spec.label))?;
-            let value = match spec.kind {
-                SettingKind::Text { max_len } => {
-                    let v = raw.trim();
-                    if v.chars().count() > max_len {
-                        return Err(format!("{}: najwyżej {max_len} znaków", spec.label));
-                    }
-                    v.to_owned()
-                }
-                SettingKind::Integer { min, max } => match raw.trim().parse::<i64>() {
-                    Ok(n) if (min..=max).contains(&n) => n.to_string(),
-                    _ => return Err(format!("{}: {min}–{max}", spec.label)),
-                },
-                SettingKind::Area => area_text(&parse_area(raw)?),
-                SettingKind::Choice(options) => {
-                    let v = raw.trim();
-                    if !options.iter().any(|(value, _)| *value == v) {
-                        return Err(format!("{}: nieznana wartość", spec.label));
-                    }
-                    v.to_owned()
-                }
-                SettingKind::Decimal { min, max } => {
-                    let range = || format!("{}–{}", comma(min), comma(max));
-                    match raw.trim().replace(',', ".").parse::<f64>() {
-                        Ok(n) if n.is_finite() && n >= min && n <= max => format!("{n:.1}"),
-                        _ => return Err(format!("{}: {}", spec.label, range())),
-                    }
-                }
-                SettingKind::List(options) => {
-                    let wanted: Vec<&str> =
-                        raw.split(',').map(str::trim).filter(|v| !v.is_empty()).collect();
-                    if wanted.is_empty() {
-                        return Err(format!("{}: wybierz co najmniej jedną", spec.label));
-                    }
-                    if wanted.iter().any(|w| !options.iter().any(|(v, _)| v == w)) {
-                        return Err(format!("{}: nieznana wartość", spec.label));
-                    }
-                    options
-                        .iter()
-                        .filter(|(v, _)| wanted.contains(v))
-                        .map(|(v, _)| *v)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                }
-                SettingKind::TimeList { max } => {
-                    let mut times = Vec::new();
-                    for part in raw.split(',').map(str::trim).filter(|v| !v.is_empty()) {
-                        let time = parse_clock(part).ok_or_else(|| {
-                            format!("{}: pora „{part}” ma mieć postać HH:MM", spec.label)
-                        })?;
-                        times.push(time);
-                    }
-                    times.sort_unstable();
-                    times.dedup();
-                    if times.is_empty() {
-                        return Err(format!("{}: podaj co najmniej jedną porę", spec.label));
-                    }
-                    if times.len() > max {
-                        return Err(format!("{}: najwyżej {max} pór", spec.label));
-                    }
-                    times
-                        .iter()
-                        .map(|t| t.format("%H:%M").to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                }
-                SettingKind::BulletinLayout => {
-                    if raw.trim().is_empty() {
-                        String::new()
-                    } else {
-                        crate::bulletin_layout::Layout::parse(raw)?.stored()
-                    }
-                }
-            };
+            let value = canonical(spec, input.get(spec.key)).map_err(|message| (spec.key, message))?;
             out.insert(spec.key.to_owned(), value);
         }
         Ok(out)
     }
+}
+
+/// Wartość jednego ustawienia w postaci kanonicznej albo komunikat błędu.
+fn canonical(spec: &SettingSpec, raw: Option<&String>) -> Result<String, String> {
+    let raw = raw.ok_or_else(|| format!("{}: brak wartości", spec.label))?;
+    let value = match spec.kind {
+        SettingKind::Text { max_len } => {
+            let v = raw.trim();
+            if v.chars().count() > max_len {
+                return Err(format!("{}: najwyżej {max_len} znaków", spec.label));
+            }
+            v.to_owned()
+        }
+        SettingKind::Integer { min, max } => match raw.trim().parse::<i64>() {
+            Ok(n) if (min..=max).contains(&n) => n.to_string(),
+            _ => return Err(format!("{}: {min}–{max}", spec.label)),
+        },
+        SettingKind::Area => area_text(&parse_area(raw)?),
+        SettingKind::Choice(options) => {
+            let v = raw.trim();
+            if !options.iter().any(|(value, _)| *value == v) {
+                return Err(format!("{}: nieznana wartość", spec.label));
+            }
+            v.to_owned()
+        }
+        SettingKind::Decimal { min, max } => {
+            let range = || format!("{}–{}", comma(min), comma(max));
+            match raw.trim().replace(',', ".").parse::<f64>() {
+                Ok(n) if n.is_finite() && n >= min && n <= max => format!("{n:.1}"),
+                _ => return Err(format!("{}: {}", spec.label, range())),
+            }
+        }
+        SettingKind::List(options) => {
+            let wanted: Vec<&str> =
+                raw.split(',').map(str::trim).filter(|v| !v.is_empty()).collect();
+            if wanted.is_empty() {
+                return Err(format!("{}: wybierz co najmniej jedną", spec.label));
+            }
+            if wanted.iter().any(|w| !options.iter().any(|(v, _)| v == w)) {
+                return Err(format!("{}: nieznana wartość", spec.label));
+            }
+            options
+                .iter()
+                .filter(|(v, _)| wanted.contains(v))
+                .map(|(v, _)| *v)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        SettingKind::TimeList { max } => {
+            let mut times = Vec::new();
+            for part in raw.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                let time = parse_clock(part).ok_or_else(|| {
+                    format!("{}: pora „{part}” ma mieć postać HH:MM", spec.label)
+                })?;
+                times.push(time);
+            }
+            times.sort_unstable();
+            times.dedup();
+            if times.is_empty() {
+                return Err(format!("{}: podaj co najmniej jedną porę", spec.label));
+            }
+            if times.len() > max {
+                return Err(format!("{}: najwyżej {max} pór", spec.label));
+            }
+            times
+                .iter()
+                .map(|t| t.format("%H:%M").to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        SettingKind::BulletinLayout => {
+            if raw.trim().is_empty() {
+                String::new()
+            } else {
+                crate::bulletin_layout::Layout::parse(raw)?.stored()
+            }
+        }
+    };
+    Ok(value)
 }
 
 /// `HH:MM` albo `H:MM`; nic więcej.
@@ -655,6 +668,7 @@ mod tests {
         let mut input = defaults.clone();
         input.insert("interval_min".into(), "4".into());
         assert_eq!(m.validate(&input).unwrap_err(), "Co ile minut: 5–60");
+        assert_eq!(m.validate_fields(&input).unwrap_err().0, "interval_min");
         input.insert("interval_min".into(), "60".into());
         input.insert("mode".into(), "pory".into());
         input.insert("layout".into(), r#"{"bloki":[{"rodzaj":"wody"}]}"#.into());
