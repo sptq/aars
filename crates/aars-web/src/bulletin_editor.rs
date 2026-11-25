@@ -105,6 +105,11 @@ struct EditorPage {
     preview: Option<PreviewCard>,
     preview_error: Option<String>,
     send_error: Option<String>,
+    /// Bez JS: pytanie „przywrócić układ domyślny?” przed zapisem.
+    confirm_reset: bool,
+    /// Teraz w Warszawie (`YYYY-MM-DDTHH:MM:SS`) — JS liczy „Usłyszysz”
+    /// i pory cyklu w czasie stacji, nie przeglądarki.
+    now_warsaw: String,
 }
 
 #[derive(Serialize)]
@@ -297,6 +302,8 @@ async fn load(state: &AppState, current: &CurrentUser) -> Result<EditorPage, DbE
         preview: None,
         preview_error: None,
         send_error: None,
+        confirm_reset: false,
+        now_warsaw: local_now().format("%Y-%m-%dT%H:%M:%S").to_string(),
     })
 }
 
@@ -335,9 +342,23 @@ fn fields(pairs: Vec<(String, String)>) -> BTreeMap<String, String> {
 
 const FORM_KEYS: [&str; 4] = ["mode", "interval_min", "times", "layout"];
 
+/// Górna granica pola `layout` przed odczytem JSON. Najdłuższy poprawny
+/// układ (24 klocki po 500 znaków, z wcięciami) to około 20 KiB.
+pub const MAX_LAYOUT_BYTES: usize = 32 * 1024;
+
+fn too_long() -> String {
+    format!(
+        "układ biuletynu: najwyżej {} KiB zapisu",
+        MAX_LAYOUT_BYTES / 1024
+    )
+}
+
 /// `POST /bulletin/layout` (admin): tryb, interwał, pory i układ (JSON)
 /// razem, przez walidację opisu modułu. Błąd układu stoi przy klocku,
-/// którego dotyczy; wpisane wartości zostają. `reset=1` — układ domyślny.
+/// którego dotyczy; wpisane wartości zostają. Bez JS „Przywróć domyślny”
+/// ma dwa kroki: `reset=1` pokazuje pytanie (nic nie zapisuje),
+/// `reset=confirm` zapisuje układ domyślny (z JS edytor wczytuje domyślny
+/// u siebie i zapisuje się zwykłym „Zapisz”).
 pub async fn save(
     State(state): State<AppState>,
     current: CurrentUser,
@@ -346,8 +367,35 @@ pub async fn save(
     require_role(&current.user, Role::Admin)?;
     let mut form = fields(pairs);
     require_csrf(&current.csrf_token, form.get("csrf").map(String::as_str))?;
-    if form.get("reset").is_some_and(|v| v == "1") {
-        form.insert("layout".to_owned(), String::new());
+    match form.get("reset").map(String::as_str) {
+        Some("1") => {
+            return Ok(render_with(&state, &current, StatusCode::OK, |view| {
+                view.confirm_reset = true;
+            })
+            .await);
+        }
+        Some("confirm") => {
+            form.insert("layout".to_owned(), String::new());
+        }
+        _ => {}
+    }
+    if form
+        .get("layout")
+        .is_some_and(|l| l.len() > MAX_LAYOUT_BYTES)
+    {
+        let message = too_long();
+        let toast = message.clone();
+        // Bez odsyłania wpisanego tekstu i bez rysowania jego klocków.
+        let response = render_with(&state, &current, StatusCode::BAD_REQUEST, |view| {
+            view.error_field = "layout";
+            view.error = Some(message);
+        })
+        .await;
+        return Ok(if current.htmx {
+            htmx::refused(response, &toast)
+        } else {
+            response
+        });
     }
     let repo = ModuleRepo::new(state.pool.clone());
     let stored = match repo.settings(&BULLETIN).await {
@@ -415,7 +463,9 @@ async fn refused(
         if key == "layout" && !raw.trim().is_empty() {
             view.layout_json = raw.clone();
             let located = Layout::parse_located(&raw).err();
-            if let Ok(entered) = Layout::parse_unchecked(&raw) {
+            if let Ok(entered) = Layout::parse_unchecked(&raw)
+                && entered.blocks.len() <= bl::MAX_BLOCKS
+            {
                 view.blocks = block_views(&entered, &view.callsign, located.as_ref());
                 view.estimate_s = estimate_s(&entered, &view.callsign);
                 // Błąd przy klocku — u góry tylko, gdy dotyczy całego układu.
@@ -439,6 +489,11 @@ async fn refused(
 fn preview_layout(form: &BTreeMap<String, String>) -> Result<Option<Layout>, LayoutError> {
     match form.get("layout") {
         None => Ok(None),
+        Some(raw) if raw.len() > MAX_LAYOUT_BYTES => Err(LayoutError {
+            block: None,
+            message: too_long(),
+            detail: too_long(),
+        }),
         Some(raw) if raw.trim().is_empty() => Ok(Some(Layout::default_layout())),
         Some(raw) => Layout::parse_located(raw).map(Some),
     }
@@ -1012,8 +1067,88 @@ mod tests {
             &format!("layout={json}&reset=1"),
         )
         .await;
+        // Bez JS pierwszy krok tylko pyta i nic nie zapisuje.
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        assert!(
+            reply.body.contains("Przywrócić układ domyślny?"),
+            "{}",
+            reply.body
+        );
+        assert!(
+            reply.body.contains("name=\"reset\" value=\"confirm\""),
+            "{}",
+            reply.body
+        );
+        assert!(stored_layout(&state).await.is_some_and(|v| !v.is_empty()));
+        let reply = post(&app, &cookie, &csrf, "/bulletin/layout", "reset=confirm").await;
         assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
         assert_eq!(stored_layout(&state).await.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_layout_is_refused_before_parsing() {
+        let (preview, seen) = recording(sample_view());
+        let state = state().await.with_bulletin_preview(preview);
+        let (app, cookie, csrf, state) = app_as(Role::Admin, state).await;
+        // poprawny JSON z bardzo wieloma klockami
+        let many = format!(
+            "{{\"bloki\":[{}]}}",
+            vec![r#"{"rodzaj":"tekst","tekst":"x"}"#; 2000].join(",")
+        );
+        assert!(many.len() > super::MAX_LAYOUT_BYTES);
+        let fields = format!("layout={}", urlencode(&many));
+        let reply = post(&app, &cookie, &csrf, "/bulletin/layout", &fields).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert!(
+            reply.body.contains("najwyżej 32 KiB"),
+            "{}",
+            &reply.body[..2000.min(reply.body.len())]
+        );
+        assert!(reply.body.len() < 200_000, "bez rysowania 2000 klocków");
+        assert_eq!(stored_layout(&state).await, None);
+        let reply = post(&app, &cookie, &csrf, "/bulletin/preview", &fields).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert!(seen.lock().unwrap().is_empty());
+        // ponad 24 klocki, ale w limicie bajtów: błąd bez rysowania wpisanych klocków
+        let thirty = format!(
+            "{{\"bloki\":[{}]}}",
+            vec![r#"{"rodzaj":"tekst","tekst":"x"}"#; 30].join(",")
+        );
+        let reply = post(
+            &app,
+            &cookie,
+            &csrf,
+            "/bulletin/layout",
+            &format!("layout={}", urlencode(&thirty)),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert!(reply.body.contains("najwyżej 24 klocków"), "{}", reply.body);
+        assert!(reply.body.matches("class=\"blk blk-static").count() <= 24);
+    }
+
+    #[tokio::test]
+    async fn an_htmx_save_also_refreshes_the_next_airing() {
+        let (app, cookie, csrf, _) = app_as(Role::Admin, state().await).await;
+        let (_, html) = get(&app, &cookie, "/bulletin").await;
+        assert!(
+            html.contains("hx-select-oob=\"#bulletin-status\""),
+            "{html}"
+        );
+        let reply = hx_post(
+            &app,
+            &cookie,
+            &csrf,
+            "/bulletin/layout",
+            "mode=pory&times=08%3A00",
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert!(
+            reply.body.contains("id=\"bulletin-status\""),
+            "{}",
+            reply.body
+        );
     }
 
     #[tokio::test]

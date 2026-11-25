@@ -486,7 +486,7 @@ pub(crate) mod tests {
         let (_, html) = get(&app, &cookie, "/sources").await;
         assert!(html.contains("1061 Łódź"), "{html}");
         assert!(html.contains("600 s"), "{html}");
-        assert!(html.contains("href=\"/modules#imgw-meteo\""), "{html}");
+        assert!(html.contains("href=\"/modules?m=imgw-meteo\""), "{html}");
         assert!(html.contains("Zmień w Moduły"), "{html}");
         assert!(!html.contains("name=\"area\""), "{html}");
         assert!(!html.contains("/sources/imgw-meteo/settings"), "{html}");
@@ -533,7 +533,7 @@ pub(crate) mod tests {
         let swpc = html.split("Pogoda kosmiczna NOAA").nth(1).unwrap();
         let swpc = swpc.split("Aktywne ostrzeżenia").next().unwrap();
         assert!(swpc.contains("Ustawienia źródła zmienia administrator"), "{swpc}");
-        assert!(swpc.contains("href=\"/modules#swpc\""), "{swpc}");
+        assert!(swpc.contains("href=\"/modules?m=swpc\""), "{swpc}");
         assert!(!swpc.contains("Obszar i interwał"), "{swpc}");
         let imgw = html.split("Ostrzeżenia meteorologiczne IMGW").nth(1).unwrap();
         let imgw = imgw.split("Aktywne ostrzeżenia").next().unwrap();

@@ -18,6 +18,18 @@
     'września', 'października', 'listopada', 'grudnia'];
   var slice = Array.prototype.slice;
   var ed = null;   // bieżący edytor (strona ma najwyżej jeden)
+  // Czas stacji (Warszawa) zamiast strefy przeglądarki: serwer podaje
+  // „teraz” w Warszawie, a my przesuwamy zegar o różnicę. Wynik czytamy
+  // getHours()/getDate() jako czas warszawski.
+  var clockShift = 0;
+  function stationNow() { return new Date(Date.now() + clockShift); }
+  function setClock(text) {
+    var m = /^(\d+)-(\d+)-(\d+)T(\d+):(\d+):(\d+)$/.exec(text || '');
+    if (m) clockShift = new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime() - Date.now();
+  }
+  // Układ, z którego pochodzi karta podglądu (JSON), i klocki w chwili żądania:
+  // długości z podglądu przypisujemy po tożsamości klocka, nie po pozycji.
+  var previewFor = null;
 
   function all(root, sel) { return slice.call(root.querySelectorAll(sel)); }
   function pad(n) { return (n < 10 ? '0' : '') + n; }
@@ -53,7 +65,7 @@
   // Szablon na teraz, jak `render_template` na serwerze: bez znaku stacji
   // zdania z {znak} wypadają, zdanie od zmiennej dostaje wielką literę.
   function renderTemplate(text, callsign) {
-    var now = new Date();
+    var now = stationNow();
     var values = {
       znak: callsign, dzien: DAYS[now.getDay()], data: now.getDate() + ' ' + MONTHS[now.getMonth()],
       godzina: now.getHours() + ':' + pad(now.getMinutes())
@@ -111,6 +123,7 @@
     this.history = [];
     this.previewChars = {};    // uid → znaki z ostatniego podglądu
     this.previewUids = null;
+    setClock(form.dataset.now);
     this.blocks = parseLayout(this.editable ? this.field.value : form.dataset.layout);
     all(document, '#bulletin-editor [data-js-show]').forEach(function (el) { el.hidden = false; });
     if (this.editable) this.startEditing();
@@ -128,7 +141,10 @@
     });
     this.blocks.forEach(function (b, i) { if (serverErrors[i] != null) b.serverError = serverErrors[i]; });
     all(form, '[data-nojs]').forEach(function (el) { el.hidden = true; });
+    var hint = document.querySelector('[data-out=preview-hint]');
+    if (hint) hint.textContent = 'Składa biuletyn na teraz z układu, który widzisz (także niezapisanego); nic nie nadaje i nic nie zapisuje.';
     this.initial = this.snapshot();
+    this.serverJson = this.json();
     this.dirtyFromServer = form.dataset.dirty === '1';
     this.render();
     this.modeUi();
@@ -154,6 +170,7 @@
     return [mode ? mode.value : '', f.interval_min ? f.interval_min.value : '', f.times ? f.times.value : ''].join('|');
   };
   Editor.prototype.snapshot = function () { return this.json() + '\n' + this.modeValues(); };
+  Editor.prototype.isDirtyLayout = function () { return !!this.dirtyFromServer || (this.initial != null && this.snapshot() !== this.initial); };
   Editor.prototype.isDirty = function () { return this.dirtyFromServer || this.snapshot() !== this.initial; };
 
   Editor.prototype.remember = function () {
@@ -288,7 +305,7 @@
     all(this.form, '[data-mode]').forEach(function (el) { el.hidden = el.dataset.mode !== value; });
     var hint = this.form.querySelector('[data-out=cycle-hint]'), m = this.cycleMinutes();
     if (hint && m) {
-      var now = new Date(), minutes = now.getHours() * 60 + now.getMinutes(), next = [];
+      var now = stationNow(), minutes = now.getHours() * 60 + now.getMinutes(), next = [];
       for (var t = 0; t < 1440 && next.length < 4; t += m) if (t > minutes) next.push(pad(Math.floor(t / 60)) + ':' + pad(t % 60));
       hint.textContent = 'Wyrównane do północy. Najbliższe: ' + (next.length ? next.join(', ') + '…' : 'jutro 00:00') +
         (1440 % m ? ' (doba nie dzieli się równo — o północy cykl zaczyna się od nowa).' : '');
@@ -319,7 +336,19 @@
 
   // Pole `layout`, pasek zapisu, przycisk nadania, oś czasu.
   Editor.prototype.sync = function () {
-    this.field.value = this.json();
+    var json = this.json(), self = this;
+    // Błąd z serwera dotyczył wysłanego układu: po każdej zmianie układu
+    // zostają tylko błędy liczone tutaj (te same reguły co na serwerze).
+    if (this.serverJson != null && json !== this.serverJson) {
+      this.serverJson = null;
+      this.blocks.forEach(function (b, i) {
+        if (b.serverError == null) return;
+        delete b.serverError;
+        var li = self.list.querySelector('[data-uid="' + b.uid + '"]');
+        if (li) self.refreshCard(li, b, i);
+      });
+    }
+    this.field.value = json;
     var dirty = this.isDirty(), bar = document.getElementById('bulletin-savebar');
     if (bar) {
       bar.classList.toggle('is-dirty', dirty);
@@ -466,6 +495,7 @@
         self.announce('Wczytano układ domyślny. Zapisz, żeby go użyć.');
       } else if (act === 'discard') {
         self.dirtyFromServer = false;
+        self.previewChars = {};
         self.initial = self.snapshot();   // bez pytania przy podmianie
         htmx.ajax('GET', '/bulletin', { target: '#bulletin-form', select: '#bulletin-form', swap: 'outerHTML' });
       }
@@ -488,10 +518,15 @@
   Editor.prototype.bindDrag = function () {
     var self = this, list = this.list, dragged = null, target = null, after = false;
     function clear() { all(list, '.drop-before, .drop-after').forEach(function (el) { el.classList.remove('drop-before', 'drop-after'); }); }
+    var armed = null;   // karta „uzbrojona” wciśnięciem uchwytu
     list.addEventListener('pointerdown', function (e) {
       var grip = e.target.closest('[data-act=grip]');
-      if (grip) grip.closest('.blk-edit').draggable = true;
+      if (grip) { armed = grip.closest('.blk-edit'); armed.draggable = true; }
     });
+    // Wciśnięcie bez przeciągania: karta znów zwykła (zaznaczanie tekstu w polach).
+    function disarm() { if (armed && armed !== dragged) armed.draggable = false; armed = null; }
+    document.addEventListener('pointerup', disarm);
+    document.addEventListener('pointercancel', disarm);
     list.addEventListener('dragstart', function (e) {
       var li = e.target.closest && e.target.closest('.blk-edit');
       if (!li || !li.draggable) { e.preventDefault(); return; }
@@ -662,12 +697,19 @@
   // Długości klocków z ostatniego podglądu (karta #bulletin-preview).
   Editor.prototype.readPreview = function () {
     var box = document.querySelector('#bulletin-preview .preview-result');
+    this.previewChars = {};
     if (!box) return;
     var chars;
     try { chars = JSON.parse(box.dataset.chars || '[]'); } catch (e) { return; }
-    var uids = this.previewUids || this.blocks.map(function (b) { return b.uid; });
+    var uids = this.previewUids;
+    if (!uids) {
+      // Karta podglądu sprzed tego edytora (wczytanie strony, zapis, „Odrzuć”):
+      // pasuje po kolei tylko do tego samego układu.
+      var same = previewFor ? previewFor === this.json() : !this.isDirtyLayout();
+      if (!same) return;
+      uids = this.blocks.map(function (b) { return b.uid; });
+    }
     var self = this;
-    this.previewChars = {};
     // null: klocek w tym cyklu nie wszedł (np. „co 3. cykl”) — zostaje typowa długość.
     chars.forEach(function (n, i) { if (uids[i] != null && n != null) self.previewChars[uids[i]] = n; });
   };
@@ -695,6 +737,7 @@
   document.addEventListener('htmx:configRequest', function (e) {
     if (!ed || !ed.editable || e.detail.elt.id !== 'bulletin-preview-form') return;
     e.detail.parameters.layout = ed.json();
+    previewFor = e.detail.parameters.layout;
     ed.previewUids = ed.blocks.map(function (b) { return b.uid; });
   });
   // Odwołane żądanie nie dostaje htmx:afterRequest — przyciski zablokowane

@@ -680,7 +680,7 @@ label.add-block-label { display: flex; flex-direction: column; gap: 0.2rem; marg
   margin-top: var(--space-4); padding: var(--space-3) var(--space-4); background: var(--surface);
   border: 1px solid var(--line); border-radius: var(--radius); box-shadow: 0 6px 20px var(--shadow);
 }
-.savebar-state { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; order: -1; margin: 0; color: var(--muted); font-weight: 600; }
+.savebar-state { flex: 1 1 auto; min-width: 6.5rem; line-height: 1.25; order: -1; margin: 0; color: var(--muted); font-weight: 600; }
 .savebar > button { flex: none; }
 @media (max-width: 699px) {
   .savebar { flex-wrap: wrap; padding: var(--space-2) var(--space-3); gap: var(--space-1) var(--space-2); bottom: var(--space-2); }
@@ -740,4 +740,11 @@ button.ghost:disabled { background: transparent; border-color: var(--line); }
   .blk-body, .blk-chips, .blk-hear, .blk-template, .blk .error { margin-left: 0; }
   .blk-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .module-card { padding: var(--space-3); }
+}
+.confirm-card { border-color: var(--danger); border-left: 4px solid var(--danger); }
+.confirm-card .form-actions { align-items: center; }
+.bed-card-head { margin-bottom: var(--space-3); }
+.bed-card-head h2 { margin: 0; }
+@media (max-width: 599px) {
+  .bed-card-head { flex-direction: column; align-items: flex-start; gap: 0.1rem; }
 }

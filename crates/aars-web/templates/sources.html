@@ -17,7 +17,7 @@
       <tr><th>Interwał</th><td>{{ s.interval_s }} s</td></tr>
     </tbody>
   </table></div>
-  {% if chrome.is_admin %}<p class="muted"><small>{% if s.shows_area %}Obszar i interwał ustawia administrator{% else %}Ustawienia źródła zmienia administrator na stronie Moduły{% endif %}: <a href="/modules#{{ s.id }}">Zmień w Moduły</a></small></p>{% endif %}
+  {% if chrome.is_admin %}<p class="muted"><small>{% if s.shows_area %}Obszar i interwał ustawia administrator{% else %}Ustawienia źródła zmienia administrator na stronie Moduły{% endif %}: <a href="/modules?m={{ s.id }}">Zmień w Moduły</a></small></p>{% endif %}
   <div class="row-actions source-actions">
     <form method="post" action="/sources/{{ s.id }}/enabled" class="inline" hx-post="/sources/{{ s.id }}/enabled" hx-target="closest .card" hx-select="#{{ s.id }}" hx-swap="outerHTML">
       <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
