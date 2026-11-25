@@ -1,5 +1,6 @@
 //! Dziennik nadań i dziennik audytu.
 
+use aars_core::source_log::SourceLogRepo;
 use aars_core::txlog::{TxLogRepo, TxLogRow};
 use askama::Template;
 use axum::extract::State;
@@ -9,6 +10,7 @@ use chrono::{DateTime, Utc};
 use crate::auth::{AuthRejection, CurrentUser};
 use crate::chrome::{Chrome, audit_action_label, both_times_now};
 use crate::render::{db_error, page};
+use crate::sources_page::{LogRow, log_row};
 use crate::state::AppState;
 
 #[derive(Template)]
@@ -16,6 +18,7 @@ use crate::state::AppState;
 struct LogsPage {
     chrome: Chrome,
     transmissions: Vec<TxRow>,
+    source_log: Vec<LogRow>,
     audit: Vec<AuditRow>,
 }
 
@@ -105,6 +108,10 @@ pub async fn page_view(
         Ok(rows) => rows,
         Err(response) => return Ok(response),
     };
+    let source_log = match SourceLogRepo::new(state.pool.clone()).recent(LIMIT).await {
+        Ok(rows) => rows.into_iter().map(log_row).collect(),
+        Err(err) => return Ok(db_error("odczyt dziennika źródeł zawiódł", &err)),
+    };
     let audit = match audit_rows(&state).await {
         Ok(rows) => rows,
         Err(response) => return Ok(response),
@@ -112,6 +119,7 @@ pub async fn page_view(
     Ok(page(&LogsPage {
         chrome: Chrome::load(&state, &current).await,
         transmissions,
+        source_log,
         audit,
     }))
 }

@@ -20,6 +20,7 @@ pub mod queue;
 pub mod scheduler;
 pub mod settings;
 pub mod sequencer;
+pub mod source_log;
 pub mod source_state;
 pub mod sink;
 pub mod synth;

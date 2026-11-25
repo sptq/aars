@@ -45,6 +45,20 @@
   </table></div>
   {% endif %}
 
+  <h3 class="section-title">Dziennik źródła</h3>
+  {% if s.log.is_empty() %}
+  <p class="empty">Bez błędów i przerw.</p>
+  {% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Kiedy</th><th>Zdarzenie</th><th>Szczegóły</th></tr></thead>
+    <tbody>
+      {% for e in s.log %}
+      <tr><td>{{ e.when }}</td><td><span class="badge {{ e.css }}">{{ e.kind }}</span></td><td>{{ e.message }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  <p class="muted"><small>Pełny dziennik wszystkich źródeł: <a href="/logs#zrodla">Dzienniki</a>.</small></p>
+  {% endif %}
 </div>
 {% endfor %}
 {% endblock %}

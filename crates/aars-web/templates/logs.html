@@ -17,6 +17,22 @@
   </table></div>
   {% endif %}
 </div>
+<div class="card" id="zrodla">
+  <h2>Źródła danych</h2>
+  <p class="muted"><small>Dlaczego źródło nie działało i kiedy wróciło. Powtarzający się błąd to jeden wiersz z licznikiem.</small></p>
+  {% if source_log.is_empty() %}
+  <p class="empty">Wszystkie źródła działały bez błędów.</p>
+  {% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Kiedy</th><th>Źródło</th><th>Zdarzenie</th><th>Szczegóły</th></tr></thead>
+    <tbody>
+      {% for e in source_log %}
+      <tr><td>{{ e.when }}</td><td>{{ e.source }}</td><td><span class="badge {{ e.css }}">{{ e.kind }}</span></td><td>{{ e.message }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+</div>
 <div class="card">
   <h2>Dziennik audytu</h2>
   {% if audit.is_empty() %}

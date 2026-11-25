@@ -6,6 +6,7 @@
 use aars_core::error::DbError;
 use aars_core::geo::PositionRepo;
 use aars_core::module::Needs;
+use aars_core::source_log::{LogEntry, LogKind, SourceLogRepo};
 use aars_core::source_state::{SourceConfig, SourceStateRepo, SourceStatus};
 use aars_core::user::Role;
 use askama::Template;
@@ -78,6 +79,45 @@ pub(crate) struct SourceView {
     pub(crate) auto_area_note: Option<String>,
     pub(crate) interval_s: u64,
     pub(crate) warnings: Vec<WarningRow>,
+    /// Ostatnie wpisy dziennika źródła: dlaczego nie działało, kiedy wróciło.
+    pub(crate) log: Vec<LogRow>,
+}
+
+/// Wiersz dziennika źródła w panelu.
+pub(crate) struct LogRow {
+    pub(crate) source: String,
+    /// „12:05” albo „12:05 – 14:30 (31 razy)”.
+    pub(crate) when: String,
+    pub(crate) kind: &'static str,
+    pub(crate) css: &'static str,
+    pub(crate) message: String,
+}
+
+/// Ile wpisów dziennika pokazuje karta źródła.
+const CARD_LOG_LIMIT: i64 = 5;
+
+pub(crate) fn log_row(entry: LogEntry) -> LogRow {
+    let when = if entry.count > 1 {
+        format!(
+            "{} – {} ({} razy)",
+            both_times_now(entry.first_at),
+            both_times_now(entry.last_at),
+            entry.count
+        )
+    } else {
+        both_times_now(entry.first_at)
+    };
+    LogRow {
+        source: source_label(&entry.source_id).to_owned(),
+        when,
+        kind: entry.kind.label(),
+        css: match entry.kind {
+            LogKind::Error => "err",
+            LogKind::Skipped => "warn",
+            LogKind::Recovered => "on",
+        },
+        message: entry.message,
+    }
 }
 
 fn time_or_never(at: Option<DateTime<Utc>>) -> String {
@@ -137,6 +177,12 @@ pub(crate) async fn load_views(state: &AppState) -> Result<Vec<SourceView>, DbEr
             }),
             interval_s: cfg.interval_s,
             warnings,
+            log: SourceLogRepo::new(state.pool.clone())
+                .for_source(&status.source_id, CARD_LOG_LIMIT)
+                .await?
+                .into_iter()
+                .map(log_row)
+                .collect(),
         });
     }
     Ok(views)
@@ -385,6 +431,34 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_source_log_shows_on_the_source_card_and_in_the_logs_page() {
+        use aars_core::source_log::{LogKind, SourceLogRepo};
+        let (app, cookie, _csrf, state) = app_as(Role::Operator, state().await).await;
+        let (_, html) = get(&app, &cookie, "/sources").await;
+        assert!(html.contains("Bez błędów i przerw."), "{html}");
+
+        let log = SourceLogRepo::new(state.pool.clone());
+        let t = |m| Utc.with_ymd_and_hms(2026, 11, 25, 10, m, 0).unwrap();
+        let message = "nie można połączyć się z serwerem (danepubliczne.imgw.pl): <dns>";
+        log.problem("imgw-meteo", LogKind::Error, message, t(0)).await.unwrap();
+        log.problem("imgw-meteo", LogKind::Error, message, t(5)).await.unwrap();
+        log.success("imgw-meteo", t(10)).await.unwrap();
+
+        let (_, html) = get(&app, &cookie, "/sources").await;
+        assert!(html.contains("Dziennik źródła"), "{html}");
+        assert!(html.contains("(2 razy)"), "{html}");
+        // Treść z sieci jest escapowana.
+        assert!(html.contains("danepubliczne.imgw.pl): &#60;dns&#62;"), "{html}");
+        assert!(html.contains("działa ponownie"), "{html}");
+
+        let (status, html) = get(&app, &cookie, "/logs").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("id=\"zrodla\""), "{html}");
+        assert!(html.contains("Ostrzeżenia meteorologiczne IMGW"), "{html}");
+        assert!(html.contains("badge err"), "{html}");
     }
 
     #[tokio::test]

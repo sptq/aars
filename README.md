@@ -76,7 +76,13 @@ Po instalacji źródło jest wyłączone. W panelu, w tej kolejności:
    operator może też kliknąć „Odśwież teraz” na `/sources`.
 
 Stan źródła (działa, błąd, przestarzałe, wyłączone, brak obszaru) widać też na
-pulpicie. Podgląd bez zapisu i bez kolejki: `cargo run -p aars -- source preview [id]`
+pulpicie. **Dziennik źródła** (karta na `/sources`, wszystkie źródła razem na
+`/logs`) mówi, dlaczego źródło nie działało: błąd sieci po polsku z nazwą serwera
+(np. „serwer nie odpowiedział w wyznaczonym czasie”, z podpowiedzią przy DNS
+i certyfikacie), kod HTTP, nieczytelna odpowiedź albo pominięcie z podpowiedzią
+(„brak pozycji stacji — ustaw położenie stacji w Ustawieniach”), oraz kiedy
+wróciło. Powtarzający się błąd to jeden wpis z licznikiem; zostaje 50 ostatnich
+wpisów na źródło. Podgląd bez zapisu i bez kolejki: `cargo run -p aars -- source preview [id]`
 (domyślnie `imgw-meteo`) pobiera dane dla zapisanego obszaru albo pozycji
 stacji i wypisuje tekst, priorytet oraz postać znormalizowaną do syntezy.
 

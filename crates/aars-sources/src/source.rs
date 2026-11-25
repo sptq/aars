@@ -80,7 +80,8 @@ pub struct SourceItem {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SourceError {
-    #[error("błąd połączenia: {0}")]
+    /// Pełny opis po polsku (`http::describe`).
+    #[error("{0}")]
     Http(String),
     #[error("serwer odpowiedział kodem {0}")]
     Status(u16),

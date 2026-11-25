@@ -9,11 +9,28 @@ use aars_core::settings::SettingsRepo;
 use aars_core::priority::Priority;
 use aars_core::queue::{EnqueueRequest, QueueRepo, QueueState};
 use aars_core::sink::CancelToken;
+use aars_core::source_log::{LogKind, SourceLogRepo};
 use aars_core::source_state::{NewTracked, SourceStateRepo, TrackedItem, TrackedState};
 use chrono::{DateTime, Utc};
 use tokio::sync::Notify;
 
 use crate::source::{DataSource, SourceCtx, SourceItem};
+
+/// Powód pominięcia z podpowiedzią, co zrobić, do dziennika w panelu.
+fn skip_explained(reason: &str) -> String {
+    let hint = match reason {
+        "brak pozycji stacji" => "ustaw położenie stacji w Ustawieniach",
+        "brak obszaru" => "ustaw obszar źródła na stronie Moduły",
+        "pozycja poza obszarem Polski" => {
+            "obszar z położenia działa tylko w Polsce; ustaw go ręcznie na stronie Moduły"
+        }
+        _ => return reason.to_owned(),
+    };
+    format!("{reason} — {hint}")
+}
+
+/// Powód pominięcia wyłączonego źródła (nie trafia do dziennika).
+pub const SKIPPED_DISABLED: &str = "wyłączone";
 
 /// Tyle kolejnych udanych odpytań bez pozycji odwołuje ją (R5).
 const MISSES_TO_CANCEL: i64 = 2;
@@ -73,9 +90,29 @@ impl SourceRunner {
         let mut report = CycleReport::default();
         if let Err(error) = self.run_cycle(now, &mut report).await {
             tracing::error!(source = self.source.id(), %error, "cykl źródła przerwany błędem bazy");
-            report.error = Some(error.to_string());
+            report.error = Some(format!("błąd bazy danych stacji: {error}"));
         }
+        self.log(&report, now).await;
         report
+    }
+
+    /// Dziennik źródła w panelu: błąd, pominięcie (włączone, ale bez pozycji
+    /// albo obszaru) i powrót do pracy. Wyłączone źródło niczego nie zapisuje.
+    async fn log(&self, report: &CycleReport, now: DateTime<Utc>) {
+        let id = self.source.id();
+        let log = SourceLogRepo::new(self.state.pool().clone());
+        let result = if let Some(error) = &report.error {
+            log.problem(id, LogKind::Error, error, now).await
+        } else if let Some(reason) = report.skipped.filter(|r| *r != SKIPPED_DISABLED) {
+            log.problem(id, LogKind::Skipped, &skip_explained(reason), now).await
+        } else if report.fetched {
+            log.success(id, now).await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            tracing::warn!(source = id, %error, "nie można zapisać dziennika źródła");
+        }
     }
 
     pub async fn run(self, shutdown: CancelToken) {
@@ -154,11 +191,11 @@ impl SourceRunner {
     async fn run_cycle(&self, now: DateTime<Utc>, report: &mut CycleReport) -> Result<(), DbError> {
         let id = self.source.id();
         let Some(mut cfg) = self.state.config(id).await? else {
-            report.skipped = Some("wyłączone");
+            report.skipped = Some(SKIPPED_DISABLED);
             return Ok(());
         };
         if !cfg.enabled {
-            report.skipped = Some("wyłączone");
+            report.skipped = Some(SKIPPED_DISABLED);
             return Ok(());
         }
         let needs = self.source.needs();
@@ -966,6 +1003,42 @@ mod tests {
         r.state.save_config("imgw-meteo", "", 300).await.unwrap();
         assert_eq!(r.runner.cycle(now()).await.skipped, Some("brak obszaru"));
         assert_eq!(r.source.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_source_log_says_why_a_source_failed_and_when_it_came_back() {
+        use aars_core::source_log::{LogKind, SourceLogRepo};
+        let r = rig(vec![
+            Err(SourceError::Status(503)),
+            Err(SourceError::Status(503)),
+            ok(vec![]),
+            ok(vec![]),
+        ])
+        .await;
+        let log = SourceLogRepo::new(r.state.pool().clone());
+        for _ in 0..4 {
+            r.runner.cycle(now()).await;
+        }
+        let rows = log.for_source("imgw-meteo", 10).await.unwrap();
+        let got: Vec<_> = rows.iter().map(|e| (e.kind, e.message.as_str(), e.count)).collect();
+        assert_eq!(
+            got,
+            [
+                (LogKind::Recovered, aars_core::source_log::RECOVERED_MESSAGE, 1),
+                (LogKind::Error, "serwer odpowiedział kodem 503", 2),
+            ]
+        );
+
+        // Wyłączone: nic; włączone bez obszaru: pominięcie z podpowiedzią.
+        r.state.set_enabled("imgw-meteo", false).await.unwrap();
+        r.runner.cycle(now()).await;
+        assert_eq!(log.for_source("imgw-meteo", 10).await.unwrap().len(), 2);
+        r.state.set_enabled("imgw-meteo", true).await.unwrap();
+        r.state.save_config("imgw-meteo", "", 300).await.unwrap();
+        r.runner.cycle(now()).await;
+        let latest = log.latest("imgw-meteo").await.unwrap().unwrap();
+        assert_eq!(latest.kind, LogKind::Skipped);
+        assert_eq!(latest.message, "brak obszaru — ustaw obszar źródła na stronie Moduły");
     }
 
     #[test]
