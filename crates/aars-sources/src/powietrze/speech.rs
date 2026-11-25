@@ -50,8 +50,9 @@ impl Level {
     }
 }
 
-/// Od tej klasy mówimy stężenie pyłu (niżej sama ocena słowna).
-const PM_FROM: Level = Level::Dostateczna;
+/// Od tej klasy mówimy stężenie pyłu (niżej sama ocena słowna). Właściciel
+/// chce liczb już przy umiarkowanej: długość komunikatu nie jest problemem.
+const PM_FROM: Level = Level::Umiarkowana;
 
 /// Klasa pyłu według progów godzinowych EAQI (µg/m³: górne granice klas
 /// od „bardzo dobra” do „zła”).
@@ -335,7 +336,7 @@ mod tests {
                 },
                 night,
                 true,
-                Some("Jakość powietrza dobra. Jutro rano umiarkowana."),
+                Some("Jakość powietrza dobra. Jutro rano umiarkowana, pył zawieszony PM2,5 do 30 mikrogramów na metr sześcienny."),
             ),
             (
                 "pogorszenie do dostatecznej z pyłem",
@@ -434,7 +435,7 @@ mod tests {
         let t = text(&aq, at("2026-11-25T08:24:00Z"), true).unwrap();
         assert_eq!(
             t,
-            "Jakość powietrza umiarkowana. Dziś wieczorem dostateczna, pył zawieszony PM2,5 do 68 mikrogramów na metr sześcienny."
+            "Jakość powietrza umiarkowana, pył zawieszony PM2,5: 19 mikrogramów na metr sześcienny. Dziś wieczorem dostateczna, pył zawieszony PM2,5 do 68 mikrogramów na metr sześcienny."
         );
         assert_speakable(&[&t]);
         let spoken = aars_audio::text::normalize(&t);

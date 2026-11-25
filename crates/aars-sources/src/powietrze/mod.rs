@@ -285,7 +285,7 @@ mod tests {
             Duration::from_secs(5),
         )
         .unwrap();
-        let want = "Jakość powietrza umiarkowana. Dziś wieczorem dostateczna, pył zawieszony PM2,5 do 68 mikrogramów na metr sześcienny.";
+        let want = "Jakość powietrza umiarkowana, pył zawieszony PM2,5: 19 mikrogramów na metr sześcienny. Dziś wieczorem dostateczna, pył zawieszony PM2,5 do 68 mikrogramów na metr sześcienny.";
         for now in ["2026-11-25T08:24:00Z", "2026-11-25T08:50:00Z"] {
             let got = p.compose(&part_ctx(now, true, &[])).await.unwrap();
             assert_eq!(got, PartText::Text(want.to_owned()), "{now}");
