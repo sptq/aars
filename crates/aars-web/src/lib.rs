@@ -10,6 +10,7 @@ pub mod hardware_page;
 pub mod logs;
 mod map_page;
 pub mod messages;
+pub mod bulletin_editor;
 pub mod modules_page;
 pub mod preview;
 pub mod queue_page;
@@ -616,11 +617,10 @@ pub fn router(state: AppState) -> Router {
         .route("/modules", get(modules_page::page_view))
         .route("/modules/{id}/enabled", post(modules_page::set_enabled))
         .route("/modules/{id}/settings", post(modules_page::save_settings))
-        .route(
-            "/modules/bulletin/preview",
-            post(modules_page::preview_bulletin),
-        )
-        .route("/modules/bulletin/send", post(modules_page::send_bulletin))
+        .route("/bulletin", get(bulletin_editor::page_view))
+        .route("/bulletin/layout", post(bulletin_editor::save))
+        .route("/bulletin/preview", post(bulletin_editor::preview))
+        .route("/bulletin/send", post(bulletin_editor::send))
         .route("/healthz", get(healthz))
         .route("/assets/{*path}", get(assets::serve))
         .layer(axum::middleware::from_fn(htmx_auth_redirect))
@@ -869,7 +869,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let html = String::from_utf8_lossy(&body);
-        let theme = html.find(r#"<script src="/assets/theme.js"></script>"#);
+        let theme = html.find(r#"<script src="/assets/theme.js?v="#);
         let css = html.find("/assets/app.css");
         assert!(theme.is_some() && theme < css, "{html}");
         assert!(html.contains("AARS — stacja ostrzegawcza"), "{html}");
@@ -2171,7 +2171,7 @@ pub(crate) mod tests {
         let (app, cookie, _csrf, _state) = logged_in(Role::Viewer).await;
         let (_, html) = get_html(&app, &cookie, "/").await;
         let script = html
-            .find("<script src=\"/assets/theme.js\"></script>")
+            .find("<script src=\"/assets/theme.js?v=")
             .expect("skrypt motywu");
         let css = html.find("/assets/app.css").expect("arkusz stylów");
         assert!(script < css, "{html}");

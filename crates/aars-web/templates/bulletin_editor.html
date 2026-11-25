@@ -1,0 +1,236 @@
+{% extends "base.html" %}
+{% block title %}AARS — biuletyn{% endblock %}
+{% block heading %}Biuletyn{% endblock %}
+{% block main_class %}wide{% endblock %}
+{% block content %}
+{#- Edytor biuletynu (etap 13, 4a). Bez JS: układ do odczytu i formularz
+    z polem JSON. Z JS (assets/bulletin-editor.js): karty klocków budowane
+    z <template id="blk-template">, stan w tym samym polu `layout`.
+    #bulletin-form podmienia się po zapisie, #bulletin-preview po podglądzie,
+    #bulletin-send po nadaniu; oś czasu rysuje JS. -#}
+<div class="bed" id="bulletin-editor">
+  <div class="bed-status">
+    <span class="badge {% if module_enabled %}on{% else %}off{% endif %}">{% if module_enabled %}moduł włączony{% else %}moduł wyłączony{% endif %}</span>
+    <span>Najbliższe nadanie: <strong>{{ next }}</strong></span>
+    <span class="muted">Limit nadawania {{ tx_max_s }} s — na treść około {{ limit_s }} s</span>
+    {% if !module_enabled %}<a href="/modules?m=bulletin">Włącz w Modułach</a>{% endif %}
+  </div>
+
+  {% if can_edit %}
+  <form method="post" action="/bulletin/layout" id="bulletin-form" class="bed-main"
+        hx-post="/bulletin/layout" hx-target="#bulletin-form" hx-select="#bulletin-form" hx-swap="outerHTML"
+        data-editable="1"{% if dirty %} data-dirty="1"{% endif %}
+        data-catalog="{{ catalog_json }}" data-default="{{ default_json }}" data-callsign="{{ callsign }}"
+        data-limit-s="{{ limit_s }}" data-error-block="{% for b in blocks %}{% if b.error.is_some() %}{{ b.n }}{% endif %}{% endfor %}">
+    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+  {% else %}
+  <div id="bulletin-form" class="bed-main" data-catalog="{{ catalog_json }}" data-callsign="{{ callsign }}" data-limit-s="{{ limit_s }}" data-layout="{{ layout_json }}">
+  {% endif %}
+
+    <section class="card bed-card" id="bulletin-schedule" aria-labelledby="bed-schedule-title">
+      <h2 id="bed-schedule-title">Kiedy nadawać</h2>
+      {% if can_edit %}
+      <fieldset class="seg"{% if error_field == "mode" %} aria-invalid="true" aria-describedby="bulletin-mode-error"{% endif %}>
+        <legend class="sr-only">Tryb nadawania</legend>
+        {% for (value, label) in modes %}
+        <label class="seg-opt"><input type="radio" name="mode" value="{{ value }}"{% if mode == *value %} checked{% endif %}><span>{{ label }}</span></label>
+        {% endfor %}
+      </fieldset>
+      {% if error_field == "mode" %}{% if let Some(e) = error %}<p class="error" id="bulletin-mode-error">{{ e }}</p>{% endif %}{% endif %}
+      <div class="bed-when">
+        <div class="field" data-mode="cykl">
+          <label for="bulletin-interval">Co ile minut ({{ min_interval }}–{{ max_interval }})</label>
+          <input id="bulletin-interval" name="interval_min" type="number" min="{{ min_interval }}" max="{{ max_interval }}" value="{{ interval_min }}" required{% if error_field == "interval_min" %} aria-invalid="true" aria-describedby="bulletin-interval-error"{% endif %}>
+          {% if error_field == "interval_min" %}{% if let Some(e) = error %}<p class="error" id="bulletin-interval-error">{{ e }}</p>{% endif %}{% endif %}
+          <small class="help" data-out="cycle-hint">Wyrównane do pełnych minut od północy, np. …:00, :10, :20. Tylko w trybie „co określony czas”.</small>
+        </div>
+        <div class="field" data-mode="pory">
+          <label for="bulletin-times">Pory nadania</label>
+          <input id="bulletin-times" name="times" type="text" inputmode="numeric" placeholder="07:00,19:00" value="{{ times }}" required{% if error_field == "times" %} aria-invalid="true" aria-describedby="bulletin-times-error"{% endif %}>
+          {% if error_field == "times" %}{% if let Some(e) = error %}<p class="error" id="bulletin-times-error">{{ e }}</p>{% endif %}{% endif %}
+          <small class="help">Czas lokalny, HH:MM po przecinku. Tylko w trybie „o stałych porach”; pora w ciszy nocnej jest pomijana.</small>
+        </div>
+      </div>
+      {% else %}
+      <dl class="facts">
+        <div><dt>Tryb</dt><dd>{% for (value, label) in modes %}{% if mode == *value %}{{ label }}{% endif %}{% endfor %}</dd></div>
+        {% if mode == "cykl" %}<div><dt>Co ile minut</dt><dd>{{ interval_min }}</dd></div>{% else %}<div><dt>Pory nadania</dt><dd>{{ times }}</dd></div>{% endif %}
+      </dl>
+      {% endif %}
+    </section>
+
+    <section class="card bed-card" id="bulletin-blocks-card" aria-labelledby="bed-blocks-title">
+      <div class="bed-card-head">
+        <h2 id="bed-blocks-title">Klocki w kolejności nadawania</h2>
+        <span class="muted bed-count" data-out="count">{{ blocks.len() }} klocków</span>
+      </div>
+      {% if can_edit %}<p class="help bed-hint" data-js-show hidden>Przeciągnij klocek za uchwyt <svg class="icon" aria-hidden="true"><use href="/assets/icons.svg?v={{ crate::assets::stamp() }}#i-grip"></use></svg> albo użyj strzałek. Pauzy w sekundach (co 0,1 s); między klockami liczy się pauza po poprzednim plus przed następnym.</p>{% endif %}
+      {% if error_field == "layout" %}{% if let Some(e) = error %}<p class="error" id="bulletin-layout-error">{{ e }}</p>{% endif %}{% endif %}
+      <ol class="blocks" id="bulletin-blocks" aria-describedby="bed-blocks-title">
+        {% for b in blocks %}
+        <li class="blk blk-static k-{{ b.kind }}{% if !b.enabled %} is-off{% endif %}{% if b.error.is_some() %} is-invalid{% endif %}" id="blk-{{ b.n }}" data-kind="{{ b.kind }}">
+          <div class="blk-head">
+            <span class="blk-num" aria-hidden="true">{{ b.n }}</span>
+            <div class="blk-title">
+              <h3 class="blk-name">{{ b.label }}</h3>
+              <p class="blk-desc">{{ b.description }}</p>
+            </div>
+            <span class="badge {% if b.enabled %}on{% else %}off{% endif %}">{% if b.enabled %}nadawany{% else %}wyłączony{% endif %}</span>
+          </div>
+          <ul class="blk-chips">
+            <li>pauza przed {{ b.before }}</li>
+            <li>pauza po {{ b.after }}</li>
+            <li{% if !b.always %} class="chip-when"{% endif %}>{{ b.when }}</li>
+            {% if b.is_warnings && b.say_when_empty %}<li>mówi „brak ostrzeżeń”</li>{% endif %}
+          </ul>
+          {% if !b.text.is_empty() %}
+          <p class="blk-hear"><span class="muted">Usłyszysz:</span> {{ b.rendered }}</p>
+          <p class="blk-template"><span class="muted">Szablon:</span> <code>{{ b.text }}</code></p>
+          {% endif %}
+          {% if let Some(e) = b.error %}<p class="error" id="blk-{{ b.n }}-error">{{ e }}</p>{% endif %}
+        </li>
+        {% endfor %}
+      </ol>
+      {% if can_edit %}
+      <div class="add-block" data-js-show hidden>
+        <label class="add-block-label">Dodaj klocek
+          <select data-f="add-kind"></select>
+        </label>
+        <button type="button" class="ghost" data-act="add"><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg?v={{ crate::assets::stamp() }}#i-plus"></use></svg> Dodaj</button>
+        <button type="button" class="ghost" data-act="add-text"><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg?v={{ crate::assets::stamp() }}#i-plus"></use></svg> Dodaj własny tekst</button>
+      </div>
+      <div class="json-field" data-nojs>
+        <label for="bulletin-layout">Układ jako JSON (bez JavaScriptu edytuje się go tutaj)</label>
+        <textarea id="bulletin-layout" name="layout" rows="14" spellcheck="false" class="code"{% if error_field == "layout" || error_field == "block" %} aria-invalid="true" aria-describedby="bulletin-layout-error"{% endif %}>{{ layout_json }}</textarea>
+        <small class="help">Klocki w kolejności nadawania. Zmienne w tekstach: {% for v in vars %}{{ "{" }}{{ v }}{{ "}" }}{% if !loop.last %}, {% endif %}{% endfor %}. Pauzy w milisekundach (najwyżej 10000).</small>
+      </div>
+      {% if error_field == "block" %}{% if let Some(e) = error %}<p class="error sr-only" id="bulletin-layout-error">{{ e }}</p>{% endif %}{% endif %}
+      {% endif %}
+    </section>
+
+    {% if can_edit %}
+    <div class="savebar" id="bulletin-savebar">
+      <button type="submit" class="savebar-save">Zapisz</button>
+      <p class="savebar-state" data-out="state" aria-live="polite">{% if dirty %}Niezapisane zmiany{% else %}Zapisane{% endif %}</p>
+      <button type="button" class="ghost" data-act="undo" data-js-show hidden disabled><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg?v={{ crate::assets::stamp() }}#i-undo"></use></svg> Cofnij</button>
+      <button type="button" class="ghost" data-act="discard" data-js-show hidden disabled>Odrzuć</button>
+      <button type="submit" class="ghost" name="reset" value="1" data-act="reset" formnovalidate>Przywróć domyślny</button>
+    </div>
+  </form>
+    {% else %}
+    <p class="muted">Układ zmienia administrator. Możesz zrobić podgląd, odsłuchać i nadać biuletyn teraz.</p>
+  </div>
+    {% endif %}
+
+  <aside class="bed-side" aria-label="Oś czasu, podgląd i nadanie">
+    <section class="card bed-card" id="bulletin-timeline-card" aria-labelledby="bed-tl-title">
+      <h2 id="bed-tl-title">Oś czasu</h2>
+      <div class="timeline" id="bulletin-timeline" data-js-show hidden></div>
+      <p class="tl-total" data-out="total">Szacunkowo około <strong>{{ estimate_s }} s</strong> z {{ limit_s }} s na treść.</p>
+      <p class="help">Szacunek: 10 znaków ≈ 1 s; klocki z danymi typową długością, dopóki podgląd nie poda prawdziwej. Za długi biuletyn traci klocki od końca (wstęp, ostrzeżenia i zakończenie zostają).</p>
+    </section>
+
+    <section class="card bed-card" id="bulletin-preview" aria-labelledby="bed-preview-title">
+      <h2 id="bed-preview-title">Podgląd i odsłuch</h2>
+      <form method="post" action="/bulletin/preview" id="bulletin-preview-form" hx-post="/bulletin/preview" hx-request='{"timeout": 60000}' hx-target="#bulletin-preview" hx-select="#bulletin-preview" hx-swap="outerHTML">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <button type="submit" class="ghost" id="bulletin-preview-btn"><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg?v={{ crate::assets::stamp() }}#i-eye"></use></svg> Podgląd</button>
+        <small class="help" data-out="preview-hint">Składa biuletyn na teraz{% if can_edit %} z układu, który widzisz (także niezapisanego){% endif %}; nic nie nadaje i nic nie zapisuje.</small>
+      </form>
+      {% if let Some(e) = preview_error %}<p class="error">{{ e }}</p>{% endif %}
+      {% if let Some(p) = preview %}
+      <div class="preview-result" data-chars="{{ p.chars_json }}">
+        <p class="preview-meta">
+          {% if p.text.is_some() %}<span class="badge on">≈ {{ p.seconds }} s</span>{% else %}<span class="badge off">nic do nadania</span>{% endif %}
+          <span class="muted">{% if p.unsaved %}z układu w edytorze (niezapisanego){% else %}z zapisanego układu{% endif %}</span>
+        </p>
+        {% if let Some(text) = p.text %}
+        <blockquote class="preview-text">{% if let Some(shown) = p.shown %}{{ shown }}{% endif %}</blockquote>
+        <input type="hidden" id="bulletin-text" value="{{ text }}">
+        <div class="preview">
+          <button type="button" id="preview-btn" data-preview data-preview-text="bulletin-text"><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg?v={{ crate::assets::stamp() }}#i-play"></use></svg> Odsłuchaj</button>
+          <span id="preview-note" class="preview-note"></span>
+          <audio id="preview-audio" controls></audio>
+        </div>
+        {% else %}
+        <p>Nic do nadania: {% if let Some(reason) = p.skipped %}{{ reason }}{% else %}brak danych{% endif %}</p>
+        {% endif %}
+        <ol class="parts">
+          {% for part in p.parts %}<li><span class="dot {{ part.css }}" aria-hidden="true"></span><span class="part-name">{{ part.label }}</span><span class="part-outcome">{{ part.outcome }}</span></li>{% endfor %}
+        </ol>
+      </div>
+      {% endif %}
+    </section>
+
+    <section class="card bed-card" id="bulletin-send" aria-labelledby="bed-send-title">
+      <h2 id="bed-send-title">Nadaj teraz</h2>
+      <form method="post" action="/bulletin/send" id="bulletin-send-form" hx-post="/bulletin/send" hx-request='{"timeout": 60000}' hx-target="#bulletin-send" hx-select="#bulletin-send" hx-swap="outerHTML">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <button type="submit" id="bulletin-send-btn"><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg?v={{ crate::assets::stamp() }}#i-send"></use></svg> Nadaj teraz</button>
+      </form>
+      <p class="help" data-out="send-hint">Składa biuletyn z zapisanego układu i świeżych danych i dodaje go do kolejki; pójdzie na antenę, gdy nadawanie jest włączone.</p>
+      {% if let Some(e) = send_error %}<p class="error">{{ e }}</p>{% endif %}
+    </section>
+  </aside>
+</div>
+
+{% if can_edit %}
+<template id="blk-template">
+  <li class="blk blk-edit">
+    <div class="blk-head">
+      <button type="button" class="icon-btn blk-grip" data-act="grip" aria-label="Przenieś klocek: strzałki w górę i w dół"><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg?v={{ crate::assets::stamp() }}#i-grip"></use></svg></button>
+      <span class="blk-num" aria-hidden="true"></span>
+      <div class="blk-title">
+        <h3 class="blk-name"></h3>
+        <p class="blk-desc"></p>
+      </div>
+      <label class="toggle"><input type="checkbox" data-f="enabled"><span class="toggle-track" aria-hidden="true"></span><span class="toggle-text">Nadawany</span></label>
+      <div class="blk-order">
+        <button type="button" class="icon-btn" data-act="up" aria-label="W górę"><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg?v={{ crate::assets::stamp() }}#i-up"></use></svg></button>
+        <button type="button" class="icon-btn" data-act="down" aria-label="W dół"><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg?v={{ crate::assets::stamp() }}#i-down"></use></svg></button>
+      </div>
+    </div>
+    <div class="blk-body">
+      <div class="blk-textbox" data-part="text">
+        <label class="blk-label">Treść
+          <textarea data-f="text" rows="2" maxlength="500" spellcheck="true"></textarea>
+        </label>
+        <div class="blk-vars"><span class="muted">Wstaw zmienną:</span>{% for v in vars %} <button type="button" class="chip" data-var="{{ v }}">{{ "{" }}{{ v }}{{ "}" }}</button>{% endfor %}</div>
+        <p class="blk-hear"><span class="muted">Usłyszysz:</span> <span data-out="hear"></span></p>
+      </div>
+      <label class="check blk-check" data-part="warn"><input type="checkbox" data-f="say_when_empty"> Gdy nic nie obowiązuje, powiedz „Brak obowiązujących ostrzeżeń”</label>
+      <div class="blk-grid">
+        <label class="blk-label">Pauza przed
+          <span class="unit"><input type="number" min="0" max="10" step="0.1" inputmode="decimal" data-f="before"><span aria-hidden="true">s</span></span>
+        </label>
+        <label class="blk-label">Pauza po
+          <span class="unit"><input type="number" min="0" max="10" step="0.1" inputmode="decimal" data-f="after"><span aria-hidden="true">s</span></span>
+        </label>
+        <label class="blk-label">Kiedy
+          <select data-f="when">
+            <option value="zawsze">Zawsze</option>
+            <option value="co_n_cykli">Co N-ty cykl</option>
+            <option value="w_godzinach">W godzinach</option>
+          </select>
+        </label>
+        <label class="blk-label" data-part="n">Co który cykl
+          <input type="number" min="2" max="24" step="1" data-f="n">
+        </label>
+        <label class="blk-label" data-part="hours">Od
+          <input type="time" data-f="od">
+        </label>
+        <label class="blk-label" data-part="hours">Do
+          <input type="time" data-f="do">
+        </label>
+      </div>
+      <p class="blk-hint" data-out="when"></p>
+      <p class="error blk-error" data-out="error" hidden></p>
+      <div class="blk-foot" data-part="remove">
+        <button type="button" class="ghost danger-ghost" data-act="remove"><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg?v={{ crate::assets::stamp() }}#i-trash"></use></svg> Usuń klocek</button>
+      </div>
+    </div>
+  </li>
+</template>
+<p class="sr-only" id="bulletin-announce" aria-live="polite"></p>
+{% endif %}
+{% endblock %}

@@ -2,108 +2,132 @@
 {% block title %}AARS — moduły{% endblock %}
 {% block heading %}Moduły stacji{% endblock %}
 {% block content %}
-<div class="card">
-  <h2>Moduły stacji</h2>
-  <p class="muted">Włączenie lub wyłączenie modułu działa od razu: źródło od następnego cyklu, harmonogram od następnego tiku. Wyłączenie nie kasuje kolejki — to, co już czeka, anulujesz w <a href="/queue">Kolejce</a>.{% if !chrome.is_admin %} Zmiany wprowadza administrator.{% endif %}</p>
-</div>
-{% for m in modules %}
-<div class="card" id="{{ m.id }}">
-  <h2>{{ m.name }} <span class="badge {{ m.css }}">{{ m.state }}</span>{% if let Some((css, text)) = m.health %} <span class="badge {{ css }}">{{ text }}</span>{% endif %}</h2>
-  <p class="muted">{{ m.kind }}</p>
-  <p>{{ m.description }}</p>
-  {% if let Some(message) = m.error %}<p class="error">{{ message }}</p>{% endif %}
-  {% if let Some(callsign) = m.ident %}
-  {% if callsign.is_empty() %}<p class="error">Uwaga: bez znaku wywoławczego stacja nadaje bez identyfikacji.</p>{% else %}<p>Znak stacji: <strong>{{ callsign }}</strong></p>{% endif %}
-  {% endif %}
-  <p>
-    {% if m.is_source %}<a href="/sources">Stan źródła i aktywne ostrzeżenia</a>{% endif %}
-    {% if let Some((text, href)) = m.see_also %}{% if m.is_source %} · {% endif %}<a href="{{ href }}">{{ text }}</a>{% endif %}
-  </p>
-  {% if m.id == "bulletin" %}
-  <form method="post" action="/modules/bulletin/preview" id="bulletin-preview-form" class="module-form" hx-post="/modules/bulletin/preview" hx-request='{"timeout": 60000}' hx-target="closest .card" hx-select="#{{ m.id }}" hx-swap="outerHTML">
-    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-    <button type="submit" class="ghost">Podgląd biuletynu</button>
-    <small class="muted">Składa biuletyn na teraz, bez nadawania; pyta źródła o dane.</small>
-  </form>
-  <form method="post" action="/modules/bulletin/send" class="module-form" hx-post="/modules/bulletin/send" hx-request='{"timeout": 60000}' hx-target="closest .card" hx-select="#{{ m.id }}" hx-swap="outerHTML">
-    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-    <button type="submit">Nadaj biuletyn teraz</button>
-    <small class="muted">Składa biuletyn ze świeżych danych i dodaje go do kolejki; wyjdzie na antenę, gdy nadawanie jest włączone.</small>
-  </form>
-  {% if let Some(p) = m.bulletin_preview %}
-  <h3 class="section-title">Podgląd</h3>
-  {% if let Some(text) = p.text %}
-  <p>{% if let Some(shown) = p.display_text() %}{{ shown }}{% endif %}</p>
-  <input type="hidden" id="bulletin-text" value="{{ text }}">
-  <div class="preview">
-    <button type="button" class="ghost" id="preview-btn" data-preview data-preview-text="bulletin-text">Odsłuchaj</button>
-    <span id="preview-note" class="preview-note"></span>
-    <audio id="preview-audio" controls></audio>
-  </div>
-  {% else %}
-  <p>Nic do nadania: {% if let Some(reason) = p.skipped_reason %}{{ reason }}{% else %}brak danych{% endif %}</p>
-  {% endif %}
-  <ul>
-    {% for (part, outcome) in p.parts %}<li>{{ part }}: {{ outcome }}</li>{% endfor %}
-  </ul>
-  {% endif %}
-  {% endif %}
-  {% if chrome.is_admin %}
-  {% if m.switchable %}
-  <form method="post" action="/modules/{{ m.id }}/enabled" class="module-form" hx-post="/modules/{{ m.id }}/enabled" hx-target="closest .card" hx-select="#{{ m.id }}" hx-swap="outerHTML">
-    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-    <input type="hidden" name="enabled" value="{% if m.enabled %}0{% else %}1{% endif %}">
-    <button type="submit" class="{% if m.enabled %}danger{% endif %}">{% if m.enabled %}Wyłącz{% else %}Włącz{% endif %}</button>
-  </form>
-  {% endif %}
-  {% if !m.fields.is_empty() %}
-  <h3 class="section-title">Ustawienia</h3>
-  <form method="post" action="/modules/{{ m.id }}/settings" hx-post="/modules/{{ m.id }}/settings" hx-target="closest .card" hx-select="#{{ m.id }}" hx-swap="outerHTML">
-    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-    {% for f in m.fields %}
-    <div class="module-form">
-      {% if f.kind == "integer" %}
-      <label for="{{ m.id }}-{{ f.key }}">{{ f.label }} ({{ f.min }}–{{ f.max }})</label>
-      <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="number" min="{{ f.min }}" max="{{ f.max }}" value="{{ f.value }}" required{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>
-      {% else if f.kind == "area" %}
-      {% if let Some(note) = m.auto_area_note %}
-      <p class="auto-area">{{ note }}</p>
-      <label for="{{ m.id }}-{{ f.key }}">Nadpisz obszar (zostaw puste, żeby liczyć z pozycji)</label>
-      {% else %}
-      <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
-      {% endif %}
-      <textarea id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" rows="5" placeholder="1061 Łódź&#10;10"{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>{{ f.value }}</textarea>
-      {% else if f.kind == "choice" %}
-      <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
-      <select id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}"{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>
-        {% for (value, label) in f.options %}<option value="{{ value }}" {% if f.value == *value %}selected{% endif %}>{{ label }}</option>{% endfor %}
-      </select>
-      {% else if f.kind == "decimal" %}
-      <label for="{{ m.id }}-{{ f.key }}">{{ f.label }} ({{ f.min_text }}–{{ f.max_text }})</label>
-      <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="text" inputmode="decimal" value="{{ f.value }}" required{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>
-      {% else if f.kind == "timelist" %}
-      <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
-      <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="text" inputmode="numeric" placeholder="07:00,19:00" value="{{ f.value }}" required{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>
-      {% else if f.kind == "layout" %}
-      <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
-      <textarea id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" rows="16" spellcheck="false" class="code"{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>{{ f.value }}</textarea>
-      {% else if f.kind == "list" %}
-      <fieldset class="field-group"><legend>{{ f.label }}</legend>
-        {% for (value, label, on) in f.checks %}<label class="check"><input type="checkbox" name="{{ f.key }}" value="{{ value }}" {% if *on %}checked{% endif %}{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}> {{ label }}</label>{% endfor %}
-      </fieldset>
-      {% else %}
-      <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
-      <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" value="{{ f.value }}" maxlength="{{ f.max_len }}"{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>
-      {% endif %}
-      {% if let Some(e) = f.error %}<p class="error" id="{{ m.id }}-{{ f.key }}-error">{{ e }}</p>{% endif %}
-      {% if !f.help.is_empty() %}<small class="help">{{ f.help }}</small>{% endif %}
-    </div>
+{#- Dwie kolumny: lista modułów (stan, przełącznik) i szczegóły wybranego.
+    Link na liście i każdy formularz podmieniają cały #modules (lista
+    i szczegóły razem, bo stan na liście zależy od zapisu); bez JS to zwykłe
+    przejście na /modules?m=<id>. Na wąskim ekranie lista stoi nad
+    szczegółami, a panel.js przewija do szczegółów po wyborze. -#}
+<div class="modules" id="modules" data-scroll-mobile="#module-detail">
+  <nav class="module-list" id="module-list" aria-label="Lista modułów">
+    {% for g in groups %}
+    <h2 class="module-group">{{ g.title }}</h2>
+    <ul>
+      {% for item in g.items %}
+      <li class="module-item{% if item.id == selected %} is-current{% endif %}">
+        <a id="module-link-{{ item.id }}" href="/modules?m={{ item.id }}" hx-get="/modules?m={{ item.id }}" hx-target="#modules" hx-select="#modules" hx-swap="outerHTML" hx-push-url="true" title="{{ item.state }}"{% if item.id == selected %} aria-current="page"{% endif %}>
+          <span class="dot {% if let Some((css, _)) = item.health %}{{ css }}{% else %}{{ item.css }}{% endif %}" aria-hidden="true"></span>
+          <span class="module-item-text">
+            <span class="module-item-name">{{ item.name }}</span>
+            <span class="module-item-state">{{ item.short_state }}{% if let Some((_, text)) = item.health %} · {{ text }}{% endif %}</span>
+          </span>
+        </a>
+        {% if chrome.is_admin && item.switchable %}
+        <form method="post" action="/modules/{{ item.id }}/enabled" class="module-switch" hx-post="/modules/{{ item.id }}/enabled" hx-target="#modules" hx-select="#modules" hx-swap="outerHTML">
+          <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+          <input type="hidden" name="enabled" value="{% if item.enabled %}0{% else %}1{% endif %}">
+          <input type="hidden" name="m" value="{{ selected }}">
+          <button type="submit" id="module-toggle-{{ item.id }}" class="switch" role="switch" aria-checked="{% if item.enabled %}true{% else %}false{% endif %}" aria-label="{{ item.name }}: {% if item.enabled %}wyłącz{% else %}włącz{% endif %}" title="{% if item.enabled %}Wyłącz{% else %}Włącz{% endif %}"><span class="switch-knob"></span><span class="switch-label">{% if item.enabled %}Wyłącz{% else %}Włącz{% endif %}</span></button>
+        </form>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ul>
     {% endfor %}
-    <button type="submit">Zapisz</button>
-  </form>
-  {% endif %}
-  {% endif %}
-</div>
-{% endfor %}
+    <p class="module-list-note">Przełącznik działa od razu: źródło od następnego cyklu, harmonogram od następnego tiku. Wyłączenie nie kasuje kolejki — to, co czeka, anulujesz w <a href="/queue">Kolejce</a>.{% if !chrome.is_admin %} Zmiany wprowadza administrator.{% endif %}</p>
+  </nav>
 
+  {% let m = detail %}
+  <section class="module-detail" id="module-detail" aria-labelledby="module-title">
+  <div class="card module-card" id="{{ m.id }}">
+    <header class="module-head">
+      <div>
+        <p class="module-kind">{{ m.kind }}</p>
+        <h2 class="module-title" id="module-title">{{ m.name }}</h2>
+      </div>
+      <div class="module-badges">
+        <span class="badge {{ m.css }}">{{ m.state }}</span>
+        {% if let Some((css, text)) = m.health %}<span class="badge {{ css }}">{{ text }}</span>{% endif %}
+      </div>
+    </header>
+    <p class="module-desc">{{ m.description }}</p>
+    {% if let Some(message) = m.error %}<p class="error">{{ message }}</p>{% endif %}
+    {% if let Some(callsign) = m.ident %}
+    {% if callsign.is_empty() %}<p class="error">Uwaga: bez znaku wywoławczego stacja nadaje bez identyfikacji.</p>{% else %}<p>Znak stacji: <strong>{{ callsign }}</strong></p>{% endif %}
+    {% endif %}
+
+    {% if let Some(b) = m.bulletin %}
+    <dl class="facts">
+      <div><dt>Kiedy</dt><dd>{{ b.when }}</dd></div>
+      <div><dt>Najbliższe nadanie</dt><dd>{{ b.next }}</dd></div>
+      <div><dt>Klocki</dt><dd>{{ b.blocks_on }} włączonych z {{ b.blocks_all }}</dd></div>
+    </dl>
+    <p><a class="button" href="/bulletin">Otwórz edytor biuletynu</a></p>
+    <p class="muted">Kolejność klocków, pauzy, pory i własne teksty ustawia się w edytorze; tam też podgląd, odsłuch i nadanie na żądanie.</p>
+    {% endif %}
+
+    {% if m.is_source || m.see_also.is_some() %}
+    <p class="module-links">
+      {% if m.is_source %}<a href="/sources">Stan źródła i aktywne ostrzeżenia</a>{% endif %}
+      {% if let Some((text, href)) = m.see_also %}{% if m.is_source %} · {% endif %}<a href="{{ href }}">{{ text }}</a>{% endif %}
+    </p>
+    {% endif %}
+
+    {% if !m.fields.is_empty() %}
+    <h3 class="section-title">Ustawienia</h3>
+    {% if chrome.is_admin %}
+    <form method="post" action="/modules/{{ m.id }}/settings" class="module-settings" hx-post="/modules/{{ m.id }}/settings" hx-target="#modules" hx-select="#modules" hx-swap="outerHTML">
+      <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+      {% for f in m.fields %}
+      <div class="module-form">
+        {% if f.kind == "integer" %}
+        <label for="{{ m.id }}-{{ f.key }}">{{ f.label }} ({{ f.min }}–{{ f.max }})</label>
+        <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="number" min="{{ f.min }}" max="{{ f.max }}" value="{{ f.value }}" required{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>
+        {% else if f.kind == "area" %}
+        {% if let Some(note) = m.auto_area_note %}
+        <p class="auto-area">{{ note }}</p>
+        <label for="{{ m.id }}-{{ f.key }}">Nadpisz obszar (zostaw puste, żeby liczyć z pozycji)</label>
+        {% else %}
+        <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
+        {% endif %}
+        <textarea id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" rows="4" placeholder="1061 Łódź&#10;10"{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>{{ f.value }}</textarea>
+        {% else if f.kind == "choice" %}
+        <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
+        <select id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}"{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>
+          {% for (value, label) in f.options %}<option value="{{ value }}" {% if f.value == *value %}selected{% endif %}>{{ label }}</option>{% endfor %}
+        </select>
+        {% else if f.kind == "decimal" %}
+        <label for="{{ m.id }}-{{ f.key }}">{{ f.label }} ({{ f.min_text }}–{{ f.max_text }})</label>
+        <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="text" inputmode="decimal" value="{{ f.value }}" required{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>
+        {% else if f.kind == "timelist" %}
+        <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
+        <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" type="text" inputmode="numeric" placeholder="07:00,19:00" value="{{ f.value }}" required{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>
+        {% else if f.kind == "layout" %}
+        <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
+        <textarea id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" rows="16" spellcheck="false" class="code"{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>{{ f.value }}</textarea>
+        {% else if f.kind == "list" %}
+        <fieldset class="field-group"><legend>{{ f.label }}</legend>
+          {% for (value, label, on) in f.checks %}<label class="check"><input type="checkbox" name="{{ f.key }}" value="{{ value }}" {% if *on %}checked{% endif %}{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}> {{ label }}</label>{% endfor %}
+        </fieldset>
+        {% else %}
+        <label for="{{ m.id }}-{{ f.key }}">{{ f.label }}</label>
+        <input id="{{ m.id }}-{{ f.key }}" name="{{ f.key }}" value="{{ f.value }}" maxlength="{{ f.max_len }}"{% if f.error.is_some() %} aria-invalid="true" aria-describedby="{{ m.id }}-{{ f.key }}-error"{% endif %}>
+        {% endif %}
+        {% if let Some(e) = f.error %}<p class="error" id="{{ m.id }}-{{ f.key }}-error">{{ e }}</p>{% endif %}
+        {% if !f.help.is_empty() %}<small class="help">{{ f.help }}</small>{% endif %}
+      </div>
+      {% endfor %}
+      <div class="form-actions"><button type="submit">Zapisz ustawienia</button></div>
+    </form>
+    {% else %}
+    {% if let Some(note) = m.auto_area_note %}<p class="auto-area">{{ note }}</p>{% endif %}
+    <dl class="facts">
+      {% for f in m.fields %}
+      <div><dt>{{ f.label }}</dt><dd>{{ f.display }}</dd>{% if !f.help.is_empty() %}<dd class="help">{{ f.help }}</dd>{% endif %}</div>
+      {% endfor %}
+    </dl>
+    {% endif %}
+    {% endif %}
+  </div>
+  </section>
+</div>
 {% endblock %}

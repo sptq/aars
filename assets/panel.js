@@ -73,7 +73,8 @@
       window.location.assign(xhr.responseURL || d.pathInfo.finalRequestPath);
     }
     var at = submitter && t.contains(submitter) ? submitter : document.activeElement;
-    restore = d.shouldSwap && t.id && !d.boosted ? { id: t.id, error: xhr.status >= 400, at: locate(t, at) } : null;
+    var link = d.requestConfig && d.requestConfig.elt && d.requestConfig.elt.tagName === 'A';
+    restore = d.shouldSwap && t.id && !d.boosted ? { id: t.id, error: xhr.status >= 400, at: locate(t, at), link: link } : null;
   });
   on('htmx:afterSettle', function () {   // fokus: pierwsze błędne pole albo ten sam element
     var r = restore, card = r && document.getElementById(r.id), el;
@@ -83,6 +84,9 @@
     if (el && !el.matches(FOCUSABLE)) el.setAttribute('tabindex', '-1');
     el = el || find(card, r.at);
     if (el) el.focus({ preventScroll: true });
+    // Lista nad szczegółami (wąski ekran, Moduły): po wyborze z listy pokaż szczegóły.
+    var show = r.link && card.dataset.scrollMobile && document.querySelector(card.dataset.scrollMobile);
+    if (show && window.matchMedia('(max-width: 899px)').matches) show.scrollIntoView({ block: 'start' });
   });
   on('htmx:historyCacheMissLoad', function (e) {
     if (needsFullLoad(e.detail.xhr.responseText)) window.location.reload();

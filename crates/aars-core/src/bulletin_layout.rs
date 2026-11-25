@@ -102,6 +102,54 @@ impl BlockKind {
     pub fn is_protected(self) -> bool {
         matches!(self, Self::Wstep | Self::Ostrzezenia | Self::Zakonczenie)
     }
+
+    /// Wartość `rodzaj` w JSON (jak serde).
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Wstep => "wstep",
+            Self::Ostrzezenia => "ostrzezenia",
+            Self::PogodaTeraz => "pogoda_teraz",
+            Self::Prognoza => "prognoza",
+            Self::Slonce => "slonce",
+            Self::Wody => "wody",
+            Self::Propagacja => "propagacja",
+            Self::Tekst => "tekst",
+            Self::Zakonczenie => "zakonczenie",
+        }
+    }
+
+    /// Jedno zdanie po polsku: co klocek mówi (edytor w panelu).
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Wstep => "Przedstawienie stacji, dzień, data i godzina. Zawsze na początku komunikatu.",
+            Self::Ostrzezenia => "Pełna treść wszystkich obowiązujących ostrzeżeń (IMGW, RSO, GIOŚ, EMSC, NOAA). Nigdy nie wypada przy limicie.",
+            Self::PogodaTeraz => "Temperatura, wilgotność, ciśnienie z tendencją, wiatr i zachmurzenie z pozycji stacji.",
+            Self::Prognoza => "Najbliższe godziny, potem reszta dnia albo noc i jutro.",
+            Self::Slonce => "Godzina wschodu i zachodu słońca dla pozycji stacji.",
+            Self::Wody => "Stany wód na wodomierzach w okolicy stacji, gdy są ostrzegawcze lub alarmowe.",
+            Self::Propagacja => "Warunki propagacji na pasmach KF (indeksy słoneczne i geomagnetyczne).",
+            Self::Tekst => "Twój stały tekst, np. zaproszenie na sieć albo informacja o przemienniku.",
+            Self::Zakonczenie => "Pożegnanie ze znakiem stacji. Zawsze na końcu komunikatu.",
+        }
+    }
+
+    /// Typowa długość klocka z danymi w znakach — do szacunku czasu
+    /// w edytorze, zanim podgląd poda prawdziwą.
+    pub fn typical_chars(self) -> usize {
+        match self {
+            Self::Ostrzezenia => 160,
+            Self::PogodaTeraz => 230,
+            Self::Prognoza => 260,
+            Self::Slonce => 70,
+            Self::Wody => 120,
+            Self::Propagacja => 140,
+            Self::Wstep | Self::Tekst | Self::Zakonczenie => 0,
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<BlockKind> {
+        Self::ALL.into_iter().find(|k| k.id() == id)
+    }
 }
 
 /// Kiedy klocek jest nadawany.
@@ -214,6 +262,68 @@ impl Block {
     }
 }
 
+impl Block {
+    /// Reguły jednego klocka (`before` — klocki przed nim). Błąd bez przedrostka „klocek N”.
+    fn check(&self, before: &[Block]) -> Result<(), String> {
+        if self.kind != BlockKind::Tekst && before.iter().any(|b| b.kind == self.kind) {
+            return Err("ten klocek już jest w układzie".to_owned());
+        }
+        for ms in [self.pause_before_ms, self.pause_after_ms] {
+            if ms > MAX_PAUSE_MS {
+                return Err(format!("pauza najwyżej {MAX_PAUSE_MS} ms"));
+            }
+        }
+        match self.when {
+            When::CoNCykli { n } if !(MIN_EVERY_N..=MAX_EVERY_N).contains(&n) => {
+                return Err(format!("co N-ty cykl, N od {MIN_EVERY_N} do {MAX_EVERY_N}"));
+            }
+            When::WGodzinach { od, do_ } if od == do_ => {
+                return Err("początek i koniec godzin muszą się różnić".to_owned());
+            }
+            _ => {}
+        }
+        if self.kind.is_text() {
+            let text = self.text.trim();
+            if text.is_empty() {
+                return Err("wpisz tekst".to_owned());
+            }
+            if text.chars().count() > MAX_TEXT_CHARS {
+                return Err(format!("tekst najwyżej {MAX_TEXT_CHARS} znaków"));
+            }
+            if crate::pause::has_marker(text) {
+                return Err("pauzy ustawia się polami pauzy przed i po klocku".to_owned());
+            }
+            template_vars(text)?;
+        } else if !self.text.trim().is_empty() {
+            return Err("ten klocek nie ma własnego tekstu".to_owned());
+        }
+        if self.say_when_empty && self.kind != BlockKind::Ostrzezenia {
+            return Err("„mów, gdy brak” dotyczy tylko ostrzeżeń".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Błąd układu: którego klocka dotyczy (`None` — całego układu albo zapisu
+/// JSON), pełny komunikat (`message`, z „klocek N (nazwa): …”) i sam opis
+/// (`detail`, do pokazania przy klocku).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutError {
+    pub block: Option<usize>,
+    pub message: String,
+    pub detail: String,
+}
+
+impl LayoutError {
+    fn whole(message: String) -> Self {
+        Self {
+            block: None,
+            detail: message.clone(),
+            message,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Layout {
@@ -248,10 +358,21 @@ impl Layout {
     }
 
     pub fn parse(json: &str) -> Result<Layout, String> {
-        let layout: Layout = serde_json::from_str(json)
-            .map_err(|e| format!("układ biuletynu: niepoprawny zapis ({e})"))?;
-        layout.validate()?;
+        Self::parse_located(json).map_err(|e| e.message)
+    }
+
+    /// Jak `parse`, ale błąd mówi też, którego klocka dotyczy (panel
+    /// zaznacza ten klocek); błąd zapisu JSON nie ma klocka.
+    pub fn parse_located(json: &str) -> Result<Layout, LayoutError> {
+        let layout = Self::parse_unchecked(json).map_err(LayoutError::whole)?;
+        layout.validate_located()?;
         Ok(layout)
+    }
+
+    /// Sam odczyt JSON, bez reguł układu (panel pokazuje wpisany układ
+    /// razem z błędem przy klocku).
+    pub fn parse_unchecked(json: &str) -> Result<Layout, String> {
+        serde_json::from_str(json).map_err(|e| format!("układ biuletynu: niepoprawny zapis ({e})"))
     }
 
     /// Postać kanoniczna (z wcięciami — operator może ją edytować ręcznie).
@@ -270,55 +391,22 @@ impl Layout {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_located().map_err(|e| e.message)
+    }
+
+    pub fn validate_located(&self) -> Result<(), LayoutError> {
         if self.blocks.is_empty() {
-            return Err("układ biuletynu: dodaj co najmniej jeden klocek".to_owned());
+            return Err(LayoutError::whole("układ biuletynu: dodaj co najmniej jeden klocek".to_owned()));
         }
         if self.blocks.len() > MAX_BLOCKS {
-            return Err(format!("układ biuletynu: najwyżej {MAX_BLOCKS} klocków"));
+            return Err(LayoutError::whole(format!("układ biuletynu: najwyżej {MAX_BLOCKS} klocków")));
         }
         for (i, block) in self.blocks.iter().enumerate() {
-            let at = format!("klocek {} ({})", i + 1, block.kind.label());
-            if block.kind != BlockKind::Tekst
-                && self.blocks[..i].iter().any(|b| b.kind == block.kind)
-            {
-                return Err(format!("{at}: ten klocek już jest w układzie"));
-            }
-            for ms in [block.pause_before_ms, block.pause_after_ms] {
-                if ms > MAX_PAUSE_MS {
-                    return Err(format!("{at}: pauza najwyżej {MAX_PAUSE_MS} ms"));
-                }
-            }
-            match block.when {
-                When::CoNCykli { n } if !(MIN_EVERY_N..=MAX_EVERY_N).contains(&n) => {
-                    return Err(format!(
-                        "{at}: co N-ty cykl, N od {MIN_EVERY_N} do {MAX_EVERY_N}"
-                    ));
-                }
-                When::WGodzinach { od, do_ } if od == do_ => {
-                    return Err(format!("{at}: początek i koniec godzin muszą się różnić"));
-                }
-                _ => {}
-            }
-            if block.kind.is_text() {
-                let text = block.text.trim();
-                if text.is_empty() {
-                    return Err(format!("{at}: wpisz tekst"));
-                }
-                if text.chars().count() > MAX_TEXT_CHARS {
-                    return Err(format!("{at}: tekst najwyżej {MAX_TEXT_CHARS} znaków"));
-                }
-                if crate::pause::has_marker(text) {
-                    return Err(format!(
-                        "{at}: pauzy ustawia się polami pauzy przed i po klocku"
-                    ));
-                }
-                template_vars(text).map_err(|e| format!("{at}: {e}"))?;
-            } else if !block.text.trim().is_empty() {
-                return Err(format!("{at}: ten klocek nie ma własnego tekstu"));
-            }
-            if block.say_when_empty && block.kind != BlockKind::Ostrzezenia {
-                return Err(format!("{at}: „mów, gdy brak” dotyczy tylko ostrzeżeń"));
-            }
+            block.check(&self.blocks[..i]).map_err(|detail| LayoutError {
+                block: Some(i),
+                message: format!("klocek {} ({}): {detail}", i + 1, block.kind.label()),
+                detail,
+            })?;
         }
         Ok(())
     }
@@ -554,6 +642,15 @@ pub fn resolve(raw: &str) -> Layout {
     })
 }
 
+/// Limit długości tekstu biuletynu: 10 s limitu nadawania na identyfikację
+/// i ogony, reszta po około 10 znaków na sekundę, nie więcej niż 1500.
+/// Kompozytor i edytor w panelu liczą tak samo.
+pub fn length_limit(tx_max_duration_s: u64) -> usize {
+    usize::try_from(tx_max_duration_s.saturating_sub(10).saturating_mul(10))
+        .unwrap_or(usize::MAX)
+        .min(1500)
+}
+
 /// Tryb biuletynu „co określony czas” (wartość ustawienia `mode`).
 pub const MODE_CYCLE: &str = "cykl";
 /// Tryb biuletynu „o stałych porach”.
@@ -676,6 +773,33 @@ mod tests {
             assert!(json.contains(needle), "{needle} w {json}");
         }
         assert_eq!(Layout::parse(&json).unwrap(), l);
+    }
+
+    #[test]
+    fn an_error_names_the_block_it_is_about() {
+        let e = Layout::parse_located(
+            r#"{"bloki":[{"rodzaj":"wody"},{"rodzaj":"tekst","tekst":"Tu {stacja}."}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(e.block, Some(1));
+        assert!(e.detail.starts_with("nieznana zmienna"), "{e:?}");
+        assert!(e.message.starts_with("klocek 2 (Własny tekst): nieznana zmienna"), "{e:?}");
+        let e = Layout::parse_located("nie json").unwrap_err();
+        assert_eq!(e.block, None);
+        let e = Layout::parse_located(r#"{"bloki":[]}"#).unwrap_err();
+        assert_eq!(e.block, None);
+        // Sam odczyt przepuszcza układ łamiący reguły (panel pokazuje go z błędem).
+        assert!(Layout::parse_unchecked(r#"{"bloki":[]}"#).is_ok());
+    }
+
+    #[test]
+    fn block_ids_match_the_json_names() {
+        for kind in BlockKind::ALL {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, format!("\"{}\"", kind.id()));
+            assert_eq!(BlockKind::from_id(kind.id()), Some(kind));
+            assert!(!kind.description().is_empty());
+        }
     }
 
     #[test]

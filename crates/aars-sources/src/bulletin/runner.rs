@@ -191,7 +191,7 @@ impl BulletinRunner {
             return Ok(tick);
         }
 
-        let composed = match self.bulletin.compose_at(now, fire_at).await {
+        let composed = match self.bulletin.compose_at(now, fire_at, None).await {
             Ok(c) => c,
             Err(e) => {
                 // Pora jest już zajęta; zostawiamy ślad, dlaczego nic nie poszło.

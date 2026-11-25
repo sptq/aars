@@ -434,6 +434,14 @@ pub fn bulletin_preview_view(
             .map(|(id, outcome)| ((*id).to_owned(), outcome.describe()))
             .collect(),
         skipped_reason: composed.skipped_reason.map(str::to_owned),
+        part_chars: composed
+            .parts
+            .iter()
+            .map(|(_, outcome)| match outcome {
+                aars_sources::bulletin::PartOutcome::Included(text) => Some(text.chars().count()),
+                _ => None,
+            })
+            .collect(),
     }
 }
 
@@ -941,11 +949,11 @@ async fn run_station(
     }
     if let Some(built) = &bulletin {
         let bulletin = built.bulletin.clone();
-        state = state.with_bulletin_preview(Arc::new(move || {
+        state = state.with_bulletin_preview(Arc::new(move |layout| {
             let bulletin = bulletin.clone();
             Box::pin(async move {
                 bulletin
-                    .compose(chrono::Utc::now())
+                    .compose_with(chrono::Utc::now(), layout)
                     .await
                     .map(bulletin_preview_view)
                     .map_err(|e| e.to_string())

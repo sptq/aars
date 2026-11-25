@@ -15,6 +15,7 @@ croner.workspace = true
 mime_guess.workspace = true
 rust-embed.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -28,6 +29,9 @@ test = true
 
 [dev-dependencies]
 aars-audio = { path = "../aars-audio" }
+# Tylko panel_demo: prawdziwe opisy źródeł i kompozytor biuletynu na
+# zmyślonych danych. Biblioteka panelu nie zależy od źródeł.
+aars-sources = { path = "../aars-sources" }
 anyhow.workspace = true
 aars-core = { path = "../aars-core", features = ["testing"] }
 tokio = { workspace = true, features = ["rt", "macros"] }

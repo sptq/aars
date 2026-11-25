@@ -298,3 +298,19 @@ fn the_audio_preview_has_a_single_rule() {
         }
     }
 }
+
+#[test]
+fn every_asset_address_in_the_templates_carries_the_stamp() {
+    // Bez odcisku przeglądarka trzymałaby stary plik do godziny po aktualizacji.
+    for (name, text) in templates() {
+        for (at, _) in text.match_indices("/assets/") {
+            let rest = &text[at..];
+            let end = rest.find(['"', '\'']).unwrap_or(rest.len());
+            let url = &rest[..end];
+            assert!(
+                url.contains("?v={{ crate::assets::stamp() }}"),
+                "{name}: adres bez odcisku: {url}"
+            );
+        }
+    }
+}

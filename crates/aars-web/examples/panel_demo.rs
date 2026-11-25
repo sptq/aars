@@ -16,9 +16,8 @@ use aars_core::geo::{PositionRepo, StationPosition};
 use aars_core::ident::IdMode;
 use aars_core::interlock::InMemoryInterlocks;
 use aars_core::message::{MessageRepo, NewMessage, ScheduleKind};
-use aars_core::module::{
-    BULLETIN, ModuleDescriptor, ModuleRegistry, ModuleRepo, builtin, sample_source,
-};
+use aars_core::bulletin_layout::{Block, BlockKind, Layout, When};
+use aars_core::module::{BULLETIN, ModuleRegistry, ModuleRepo, builtin};
 use aars_core::priority::Priority;
 use aars_core::queue::{EnqueueRequest, QueueRepo};
 use aars_core::settings::{QuietHours, SettingsRepo, StationSettings};
@@ -55,47 +54,9 @@ fn request(text: &str, not_before: chrono::Duration, repeat_count: u32) -> Enque
 /// Zasiewa bazę danymi przykładowymi i składa stan panelu bez stacji,
 /// sondy sprzętu i aktualizacji.
 async fn demo_state(pool: SqlitePool) -> AppState {
+    // Prawdziwe opisy źródeł (nazwy, opisy, ustawienia) z `aars-sources`.
     let mut all = builtin();
-    // Prawdziwe nazwy i opisy modułów z `aars-sources` (tu tylko tekst,
-    // bez zależności od tego crate'a).
-    for (id, name, description) in [
-        (
-            "imgw-meteo",
-            "Ostrzeżenia meteorologiczne IMGW",
-            "Ostrzeżenia meteorologiczne IMGW dla obszaru stacji, ogłaszane po zmianie.",
-        ),
-        (
-            "rso",
-            "Regionalny System Ostrzegania (RSO)",
-            "Komunikaty RSO: Alert RCB, komunikaty wojewódzkie i sanepidu, próby syren, alarmy z powietrza.",
-        ),
-        (
-            "swpc",
-            "Pogoda kosmiczna NOAA",
-            "Burze geomagnetyczne (G), radiacyjne (S) i zaniki łączności KF (R) według skal NOAA SWPC.",
-        ),
-        (
-            "gios-smog",
-            "Alerty smogowe GIOŚ",
-            "Alerty o przekroczeniu poziomu informowania i alarmowego dla pyłów w pobliżu stacji według GIOŚ.",
-        ),
-        (
-            "emsc",
-            "Wstrząsy sejsmiczne (EMSC)",
-            "Wstrząsy ziemi w promieniu od stacji według Europejsko-Śródziemnomorskiego Centrum Sejsmologicznego (EMSC).",
-        ),
-        (
-            "pogoda",
-            "Pogoda (Open-Meteo)",
-            "Komunikat, gdy prognoza dla pozycji stacji przekroczy progi: porywy, mróz, opady. Biuletyn korzysta z tej samej prognozy.",
-        ),
-    ] {
-        all.push(ModuleDescriptor {
-            name,
-            description,
-            ..sample_source(id)
-        });
-    }
+    all.extend(aars_sources::modules().into_iter().map(|m| m.descriptor));
     let registry = Arc::new(ModuleRegistry::new(all));
     ModuleRepo::new(pool.clone())
         .register(&registry)
@@ -136,7 +97,7 @@ async fn demo_state(pool: SqlitePool) -> AppState {
     let now = Utc::now();
     let sources = SourceStateRepo::new(pool.clone());
     sources
-        .save_config("imgw-meteo", "18 podkarpackie", 300)
+        .save_config("imgw-meteo", "", 300)
         .await
         .expect("obszar");
     sources
@@ -247,6 +208,11 @@ async fn demo_state(pool: SqlitePool) -> AppState {
         .set_enabled(&BULLETIN, true)
         .await
         .expect("biuletyn");
+    SettingsRepo::new(pool.clone())
+        .kv_put(aars_core::bulletin_layout::LAYOUT_KEY, &demo_layout().to_json())
+        .await
+        .expect("układ biuletynu");
+    let bulletin = demo_bulletin(pool.clone());
 
     let warnings_at = now;
     AppState::new(pool, queue, Arc::new(InMemoryInterlocks::permissive()), false)
@@ -265,15 +231,108 @@ async fn demo_state(pool: SqlitePool) -> AppState {
                 warnings: vec![warning("1863", 2, "Burze z gradem"), warning("1816", 1, "Burze z gradem")],
             })
         }))
-        .with_bulletin_preview(Arc::new(|| {
-            Box::pin(async {
-                Ok(BulletinPreviewView {
-                    text: Some("Biuletyn stacji SP0DEMO. Pogoda: pogodnie, 18 stopni. Obowiązuje ostrzeżenie o burzach z gradem.".to_owned()),
-                    parts: vec![("pogoda".to_owned(), "pogodnie, 18 stopni".to_owned())],
-                    skipped_reason: None,
-                })
+        .with_bulletin_preview(Arc::new(move |layout| {
+            let bulletin = bulletin.clone();
+            Box::pin(async move {
+                bulletin
+                    .compose_with(Utc::now(), layout)
+                    .await
+                    .map(preview_view)
+                    .map_err(|e| e.to_string())
             })
         }))
+}
+
+/// Część biuletynu z gotowym tekstem (demo bez sieci).
+struct DemoPart {
+    id: &'static str,
+    text: &'static str,
+}
+
+impl aars_sources::bulletin::BulletinPart for DemoPart {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn max_chars(&self) -> usize {
+        600
+    }
+
+    fn compose<'a>(
+        &'a self,
+        _ctx: &'a aars_sources::bulletin::PartCtx,
+    ) -> aars_sources::bulletin::PartFuture<'a> {
+        Box::pin(async move { Ok(aars_sources::bulletin::PartText::Text(self.text.to_owned())) })
+    }
+}
+
+/// Zmyślone, ale typowe teksty części; ostrzeżenia są prawdziwe (z bazy demo).
+const DEMO_PARTS: [(&str, &str); 5] = [
+    (
+        "pogoda_teraz",
+        "Pogoda w Rzeszowie o godzinie 14. Zachmurzenie umiarkowane, temperatura 6 stopni, odczuwalna 3 stopnie. Wilgotność 78 procent. Ciśnienie 1014 hektopaskali, spada. Wiatr południowo-zachodni, 4 metry na sekundę, w porywach do 9.",
+    ),
+    (
+        "prognoza",
+        "Prognoza na najbliższe godziny: zachmurzenie duże, od godziny 18 słaby deszcz. W nocy od 2 do 4 stopni, wiatr słaby. Jutro przelotne opady, do 8 stopni.",
+    ),
+    ("slonce", "Wschód słońca o 7:01, zachód o 15:42."),
+    (
+        "wody",
+        "Stany wód w okolicy: Wisłok w Rzeszowie, 212 centymetrów, stan ostrzegawczy, tendencja rosnąca.",
+    ),
+    (
+        "propagacja",
+        "Warunki propagacji na falach krótkich: strumień słoneczny 152, wskaźnik K równy 2. Pasma 20 i 15 metrów otwarte w dzień, 40 i 80 metrów w nocy.",
+    ),
+];
+
+/// Kompozytor biuletynu ze stacji na zmyślonych częściach.
+fn demo_bulletin(pool: SqlitePool) -> Arc<aars_sources::bulletin::Bulletin> {
+    let mut parts: Vec<Arc<dyn aars_sources::bulletin::BulletinPart>> =
+        vec![Arc::new(aars_sources::bulletin::Ostrzezenia)];
+    for (id, text) in DEMO_PARTS {
+        parts.push(Arc::new(DemoPart { id, text }));
+    }
+    Arc::new(aars_sources::bulletin::Bulletin::new(pool, parts))
+}
+
+/// Jak `station::bulletin_preview_view` w binarce.
+fn preview_view(composed: aars_sources::bulletin::Composed) -> BulletinPreviewView {
+    use aars_sources::bulletin::PartOutcome;
+    BulletinPreviewView {
+        text: composed.text,
+        part_chars: composed
+            .parts
+            .iter()
+            .map(|(_, o)| match o {
+                PartOutcome::Included(t) => Some(t.chars().count()),
+                _ => None,
+            })
+            .collect(),
+        parts: composed
+            .parts
+            .iter()
+            .map(|(id, outcome)| ((*id).to_owned(), outcome.describe()))
+            .collect(),
+        skipped_reason: composed.skipped_reason.map(str::to_owned),
+    }
+}
+
+/// Układ demo: domyślny plus własny tekst co szósty cykl.
+fn demo_layout() -> Layout {
+    let mut layout = Layout::default_layout();
+    let at = layout.blocks.len() - 1;
+    layout.blocks.insert(
+        at,
+        Block {
+            when: When::CoNCykli { n: 6 },
+            pause_before_ms: 400,
+            text: "Zapraszamy na niedzielną sieć o 20:00 na przemienniku SR8R.".to_owned(),
+            ..Block::new(BlockKind::Tekst)
+        },
+    );
+    layout
 }
 
 /// Odsłuch w demo: lokalny Piper przez ten sam cache co stacja.
@@ -420,6 +479,24 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["state"], "ok", "{body}");
         assert!(!v["warnings"].as_array().unwrap().is_empty(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_demo_has_real_modules_and_a_composed_bulletin() {
+        let (state, _dir) = demo().await;
+        let (status, body) = get(state.clone(), "admin", "/modules?m=imgw-meteo").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("Stany wodowskazów IMGW"), "{body}");
+        assert!(body.contains("Automatycznie:"), "{body}");
+        let compose = state.bulletin_preview.clone().unwrap();
+        let view = compose(None).await.unwrap();
+        let text = view.text.unwrap();
+        assert!(text.contains("SP0DEMO") && text.contains("burze z gradem"), "{text}");
+        assert!(text.contains("[[pauza:"), "{text}");
+        // niezapisany układ: same wody
+        let only = Layout::parse(r#"{"bloki":[{"rodzaj":"wody"}]}"#).unwrap();
+        let view = compose(Some(only)).await.unwrap();
+        assert!(view.text.unwrap().starts_with("Stany wód"));
     }
 
     #[tokio::test]

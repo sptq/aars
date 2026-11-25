@@ -223,13 +223,7 @@ fn composed(pieces: Vec<Piece>, text: Option<String>, skipped_reason: Option<&'s
     }
 }
 
-/// Limit długości tekstu: 10 s limitu nadawania na identyfikację i ogony,
-/// reszta po około 10 znaków na sekundę, nie więcej niż 1500.
-pub fn length_limit(tx_max_duration_s: u64) -> usize {
-    usize::try_from(tx_max_duration_s.saturating_sub(10).saturating_mul(10))
-        .unwrap_or(usize::MAX)
-        .min(1500)
-}
+pub use bulletin_layout::length_limit;
 
 const SETTINGS_PREFIX: &str = "module:bulletin:";
 const DEFAULT_PART_TIMEOUT: Duration = Duration::from_secs(20);
@@ -287,7 +281,17 @@ impl Bulletin {
 
     /// Składa biuletyn na chwilę `now` bez zapisu do kolejki (podgląd).
     pub async fn compose(&self, now: DateTime<Utc>) -> Result<Composed, DbError> {
-        self.compose_at(now, now).await
+        self.compose_at(now, now, None).await
+    }
+
+    /// Podgląd z podanym układem zamiast zapisanego (edytor w panelu,
+    /// niezapisane zmiany); baza zostaje bez zmian.
+    pub async fn compose_with(
+        &self,
+        now: DateTime<Utc>,
+        layout: Option<bulletin_layout::Layout>,
+    ) -> Result<Composed, DbError> {
+        self.compose_at(now, now, layout).await
     }
 
     /// `now` — chwila danych; `spoken` — pora wypowiadana we wstępie,
@@ -296,10 +300,14 @@ impl Bulletin {
         &self,
         now: DateTime<Utc>,
         spoken: DateTime<Utc>,
+        layout: Option<bulletin_layout::Layout>,
     ) -> Result<Composed, DbError> {
         let station = SettingsRepo::new(self.pool.clone()).load().await?;
         let settings = module_settings(&self.pool).await?;
-        let layout = bulletin_layout::load(&self.pool).await?;
+        let layout = match layout {
+            Some(layout) => layout,
+            None => bulletin_layout::load(&self.pool).await?,
+        };
         let local = spoken.with_timezone(&Warsaw).naive_local();
         let cycle = bulletin_layout::cycle_interval(&settings)
             .map(|n| bulletin_layout::cycle_index(local.time(), n));

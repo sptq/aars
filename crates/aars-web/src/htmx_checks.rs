@@ -683,15 +683,16 @@ fn bulletin_state(state: AppState, text: Option<&str>) -> AppState {
         text: text.map(str::to_owned),
         parts: vec![("Pogoda".to_owned(), "pominięta".to_owned())],
         skipped_reason: text.is_none().then(|| "brak danych do nadania".to_owned()),
+        part_chars: vec![None],
     };
-    state.with_bulletin_preview(Arc::new(move || {
+    state.with_bulletin_preview(Arc::new(move |_| {
         let view = view.clone();
         Box::pin(async move { Ok(view) })
     }))
 }
 
 #[tokio::test]
-async fn bulletin_preview_and_send_answer_with_the_bulletin_card() {
+async fn bulletin_preview_and_send_answer_with_their_cards() {
     let state = bulletin_state(state().await, Some("Biuletyn próbny."));
     UserRepo::new(state.pool.clone())
         .create("u", "haslo", Role::Operator)
@@ -699,11 +700,11 @@ async fn bulletin_preview_and_send_answer_with_the_bulletin_card() {
         .unwrap();
     let app = router(state.clone());
     let (cookie, csrf) = crate::tests::login(&app, "u", "haslo").await;
-    let reply = hx_post(&app, &cookie, &csrf, "/modules/bulletin/preview", "").await;
-    reply.assert_card("bulletin", "Podgląd gotowy");
+    let reply = hx_post(&app, &cookie, &csrf, "/bulletin/preview", "").await;
+    reply.assert_card("bulletin-preview", "Podgląd gotowy");
     assert!(reply.body.contains("Biuletyn próbny."));
-    let reply = hx_post(&app, &cookie, &csrf, "/modules/bulletin/send", "").await;
-    reply.assert_card("bulletin", "Biuletyn dodany do kolejki");
+    let reply = hx_post(&app, &cookie, &csrf, "/bulletin/send", "").await;
+    reply.assert_card("bulletin-send", "Biuletyn dodany do kolejki");
     assert_eq!(state.queue.pending(10).await.unwrap().len(), 1);
 
     let state = bulletin_state(crate::tests::state().await, None);
@@ -713,8 +714,9 @@ async fn bulletin_preview_and_send_answer_with_the_bulletin_card() {
         .unwrap();
     let app = router(state.clone());
     let (cookie, csrf) = crate::tests::login(&app, "u", "haslo").await;
-    let reply = hx_post(&app, &cookie, &csrf, "/modules/bulletin/send", "").await;
+    let reply = hx_post(&app, &cookie, &csrf, "/bulletin/send", "").await;
     assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("id=\"bulletin-send\""));
     assert_eq!(reply.toast()["kind"], "error");
     assert!(
         reply.toast()["text"]

@@ -668,6 +668,7 @@ mod tests {
                 "pominięta — brak pozycji stacji".to_owned(),
             )],
             skipped_reason: None,
+            ..Default::default()
         };
         assert_eq!(
             super::bulletin_preview_lines(&view),
@@ -680,6 +681,7 @@ mod tests {
             text: None,
             parts: Vec::new(),
             skipped_reason: Some("brak danych".to_owned()),
+            ..Default::default()
         };
         assert_eq!(
             super::bulletin_preview_lines(&view),

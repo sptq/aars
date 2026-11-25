@@ -8,11 +8,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}AARS{% endblock %}</title>
-  <script src="/assets/theme.js"></script>
-  <link rel="stylesheet" href="/assets/app.css">
-  <script src="/assets/vendor/htmx.min.js" defer></script>
-  <script src="/assets/panel.js" defer></script>
-  <script src="/assets/preview.js" defer></script>
+  <script src="/assets/theme.js?v={{ crate::assets::stamp() }}"></script>
+  <link rel="stylesheet" href="/assets/app.css?v={{ crate::assets::stamp() }}">
+  <script src="/assets/vendor/htmx.min.js?v={{ crate::assets::stamp() }}" defer></script>
+  <script src="/assets/panel.js?v={{ crate::assets::stamp() }}" defer></script>
+  <script src="/assets/preview.js?v={{ crate::assets::stamp() }}" defer></script>
+  <script src="/assets/bulletin-editor.js?v={{ crate::assets::stamp() }}" defer></script>
   {% block head %}{% endblock %}
 </head>
 {#- hx-boost: linki i formularze bez własnego hx-* idą przez htmx i
@@ -36,7 +37,7 @@
 {% include "status_bar.html" %}
 <div class="layout">
   <input type="checkbox" id="menu-toggle" class="menu-toggle">
-  <label for="menu-toggle" class="menu-button"><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg#i-menu"></use></svg> Menu</label>
+  <label for="menu-toggle" class="menu-button"><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg?v={{ crate::assets::stamp() }}#i-menu"></use></svg> Menu</label>
   <aside class="sidebar">
     <p class="brand">AARS — stacja ostrzegawcza</p>
     <nav aria-label="Menu główne">
@@ -47,6 +48,7 @@
         {%- call m::nav_item("/compose", "compose", "i-send", "Nadaj", chrome.section) %}{% endcall %}
         {%- call m::nav_item("/messages", "messages", "i-messages", "Komunikaty", chrome.section) %}{% endcall %}
         {%- call m::nav_item("/queue", "queue", "i-queue", "Kolejka", chrome.section) %}{% endcall %}
+        {%- call m::nav_item("/bulletin", "bulletin", "i-bulletin", "Biuletyn", chrome.section) %}{% endcall %}
         {%- endif %}
       </ul>
       <h2>Dane</h2>

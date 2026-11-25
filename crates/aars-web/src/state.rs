@@ -129,6 +129,9 @@ pub struct BulletinPreviewView {
     pub text: Option<String>,
     pub parts: Vec<(String, String)>,
     pub skipped_reason: Option<String>,
+    /// Długość tekstu każdego klocka w biuletynie (w kolejności `parts`;
+    /// `None` — klocek nie wszedł). Edytor liczy z niej oś czasu.
+    pub part_chars: Vec<Option<usize>>,
 }
 
 impl BulletinPreviewView {
@@ -143,7 +146,11 @@ pub type BulletinPreviewFuture =
     Pin<Box<dyn Future<Output = Result<BulletinPreviewView, String>> + Send>>;
 
 /// Składa biuletyn na teraz bez zapisu do kolejki; ustawia go binarka.
-pub type BulletinPreview = Arc<dyn Fn() -> BulletinPreviewFuture + Send + Sync>;
+/// `Some(układ)` — podgląd niezapisanego układu z edytora (baza bez zmian),
+/// `None` — zapisany układ (nadanie, podgląd zapisanego).
+pub type BulletinPreview = Arc<
+    dyn Fn(Option<aars_core::bulletin_layout::Layout>) -> BulletinPreviewFuture + Send + Sync,
+>;
 
 /// „Odśwież teraz” dla źródła: `true`, gdy źródło o tym id istnieje i zostało
 /// obudzone, `false` dla nieznanego id. Panel nie zna crate'a źródeł (spec §3).

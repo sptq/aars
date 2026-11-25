@@ -18,5 +18,5 @@
 {#- Pozycja menu bocznego: ikona ze sprite'a i tekst; bieżąca dostaje
     aria-current="page". -#}
 {% macro nav_item(href, key, icon, label, current) %}
-<li><a href="{{ href }}"{% if key == current %} aria-current="page"{% endif %}><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg#{{ icon }}"></use></svg><span>{{ label }}</span></a></li>
+<li><a href="{{ href }}"{% if key == current %} aria-current="page"{% endif %}><svg class="icon" aria-hidden="true"><use href="/assets/icons.svg?v={{ crate::assets::stamp() }}#{{ icon }}"></use></svg><span>{{ label }}</span></a></li>
 {%- endmacro %}

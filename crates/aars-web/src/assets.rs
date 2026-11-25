@@ -8,14 +8,56 @@ use rust_embed::Embed;
 #[folder = "../../assets/"]
 pub struct Assets;
 
-pub async fn serve(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+/// Odcisk wszystkich assetów (z sum SHA-256 wkompilowanych plików), liczony
+/// raz. Szablony dokładają go do adresów (`/assets/app.css?v=…`), więc po
+/// aktualizacji stacji przeglądarka pobiera nowe pliki od razu, zamiast
+/// trzymać stare z cache.
+pub fn stamp() -> &'static str {
+    static STAMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    STAMP.get_or_init(|| {
+        let mut names: Vec<_> = Assets::iter().collect();
+        names.sort();
+        // FNV-1a po nazwach i sumach: stabilny między uruchomieniami.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |bytes: &[u8]| {
+            for b in bytes {
+                hash ^= u64::from(*b);
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        for name in names {
+            eat(name.as_bytes());
+            if let Some(file) = Assets::get(&name) {
+                eat(&file.metadata.sha256_hash());
+            }
+        }
+        format!("{hash:016x}")[..10].to_owned()
+    })
+}
+
+#[derive(serde::Deserialize)]
+pub struct Version {
+    v: Option<String>,
+}
+
+pub async fn serve(
+    axum::extract::Path(path): axum::extract::Path<String>,
+    axum::extract::Query(version): axum::extract::Query<Version>,
+) -> Response {
     match Assets::get(&path) {
         None => (StatusCode::NOT_FOUND, "nie ma takiego pliku").into_response(),
         Some(file) => {
             let mime = mime_guess::from_path(&path).first_or_octet_stream();
-            // Assety są wersjonowane razem z binarką, więc mogą leżeć w cache
-            // przeglądarki; granice powiatów (743 KB) zmieniają się rzadko.
-            let cache = if path == "powiaty.geojson" { "public, max-age=86400" } else { "public, max-age=3600" };
+            // Adres z bieżącym odciskiem (`?v=`) nigdy nie zmieni treści — może
+            // leżeć w cache rok. Bez odcisku (albo ze starym) jak dawniej:
+            // godzina, granice powiatów (743 KB) dzień.
+            let cache = if version.v.as_deref() == Some(stamp()) {
+                "public, max-age=31536000, immutable"
+            } else if path == "powiaty.geojson" {
+                "public, max-age=86400"
+            } else {
+                "public, max-age=3600"
+            };
             (
                 [
                     (header::CONTENT_TYPE, mime.as_ref().to_owned()),
@@ -59,6 +101,34 @@ mod tests {
         let mime = header_text(header::CONTENT_TYPE);
         let cache = header_text(header::CACHE_CONTROL);
         (response.status(), mime, cache)
+    }
+
+    #[tokio::test]
+    async fn a_versioned_address_is_cached_for_good_and_an_old_one_is_not() {
+        let stamp = super::stamp();
+        assert_eq!(stamp.len(), 10);
+        assert_eq!(stamp, super::stamp(), "odcisk liczony raz, stały");
+        let (status, mime, cache) = fetch(&format!("/assets/app.css?v={stamp}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(mime.starts_with("text/css"), "{mime}");
+        assert_eq!(cache, "public, max-age=31536000, immutable");
+        // stary odcisk (po aktualizacji) — zwykła godzina, nie rok
+        let (_, _, cache) = fetch("/assets/app.css?v=0000000000").await;
+        assert_eq!(cache, "public, max-age=3600");
+    }
+
+    #[tokio::test]
+    async fn pages_link_assets_with_the_current_stamp() {
+        let app = router(AppState::for_tests(aars_core::db::test_pool().await));
+        let response = app
+            .oneshot(Request::builder().uri("/login").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let html = String::from_utf8_lossy(&body);
+        let stamp = super::stamp();
+        assert!(html.contains(&format!("href=\"/assets/app.css?v={stamp}\"")), "{html}");
+        assert!(html.contains(&format!("src=\"/assets/theme.js?v={stamp}\"")), "{html}");
     }
 
     #[tokio::test]

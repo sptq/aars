@@ -3,9 +3,9 @@
 {% block heading %}Ustawienia{% endblock %}
 {% block body_attrs %} data-full-load{% endblock %}
 {% block head %}
-  <link rel="stylesheet" href="/assets/vendor/leaflet/leaflet.css">
-  <script src="/assets/vendor/leaflet/leaflet.js" defer></script>
-  <script src="/assets/station-map.js" defer></script>
+  <link rel="stylesheet" href="/assets/vendor/leaflet/leaflet.css?v={{ crate::assets::stamp() }}">
+  <script src="/assets/vendor/leaflet/leaflet.js?v={{ crate::assets::stamp() }}" defer></script>
+  <script src="/assets/station-map.js?v={{ crate::assets::stamp() }}" defer></script>
 {% endblock %}
 {% block content %}
 <div class="card" id="stacja">
