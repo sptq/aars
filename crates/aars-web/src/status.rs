@@ -6,7 +6,7 @@ use aars_core::hardware::ConfigOrigin;
 use aars_core::interlock::{InterlockState, Interlocks};
 use aars_core::module::{BULLETIN, ModuleRepo};
 use aars_core::settings::SettingsRepo;
-use chrono::{NaiveTime, Timelike};
+use chrono::NaiveTime;
 
 use crate::auth::{AuthRejection, CurrentUser};
 use crate::chrome::Chrome;
@@ -168,19 +168,14 @@ pub fn next_bulletin(enabled: bool, times: &str, now: NaiveTime) -> NextBulletin
     }
 }
 
-/// Najbliższa chwila cyklu po `now` (czas Warszawy): wielokrotność
-/// `interval_min` minut od północy, jak w runnerze biuletynu.
+/// Najbliższa chwila cyklu po `now` (czas Warszawy) — ta sama arytmetyka
+/// co w runnerze (`aars_core::bulletin_layout`).
 pub fn next_cycle(interval_min: u32, now: NaiveTime) -> NextBulletin {
-    let step = interval_min.clamp(1, 24 * 60);
-    let next = ((now.hour() * 60 + now.minute()) / step + 1) * step;
-    match NaiveTime::from_hms_opt(next / 60, next % 60, 0) {
-        Some(t) if next < 24 * 60 => NextBulletin::Today(t),
-        _ => NextBulletin::Tomorrow(NaiveTime::MIN),
+    match aars_core::bulletin_layout::next_cycle_after(interval_min, now) {
+        Some(t) => NextBulletin::Today(t),
+        None => NextBulletin::Tomorrow(NaiveTime::MIN),
     }
 }
-
-/// Interwał trybu cyklicznego jak w runnerze: poza 5–60 → 10 min.
-const DEFAULT_INTERVAL_MIN: u32 = 10;
 
 pub async fn load_next_bulletin(state: &AppState, now: NaiveTime) -> Result<NextBulletin, DbError> {
     let repo = ModuleRepo::new(state.pool.clone());
@@ -188,12 +183,7 @@ pub async fn load_next_bulletin(state: &AppState, now: NaiveTime) -> Result<Next
         return Ok(NextBulletin::Off);
     }
     let settings = repo.settings(&BULLETIN).await?;
-    if settings.get("mode").map(|m| m.trim()) != Some("pory") {
-        let interval = settings
-            .get("interval_min")
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .filter(|n| (5..=60).contains(n))
-            .unwrap_or(DEFAULT_INTERVAL_MIN);
+    if let Some(interval) = aars_core::bulletin_layout::cycle_interval(&settings) {
         return Ok(next_cycle(interval, now));
     }
     let times = settings

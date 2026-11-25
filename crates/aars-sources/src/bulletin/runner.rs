@@ -17,7 +17,9 @@ use chrono::offset::LocalResult;
 use chrono::{DateTime, Local, NaiveTime, TimeDelta, TimeZone, Utc};
 use chrono_tz::Europe::Warsaw;
 
-use crate::bulletin::{Bulletin, cycle_interval, module_settings};
+use aars_core::bulletin_layout::{cycle_interval, cycle_minutes};
+
+use crate::bulletin::{Bulletin, module_settings};
 use crate::speech::warsaw_to_utc;
 
 const TICK: Duration = Duration::from_secs(10);
@@ -66,13 +68,11 @@ pub fn due_fires(times: &[NaiveTime], now: DateTime<Utc>) -> Vec<DateTime<Utc>> 
 /// Chwila nieistniejąca przy zmianie czasu wypada; godzina powtórzona
 /// jesienią daje obie chwile (cykl biegnie dalej co N minut).
 pub fn cycle_fires(interval_min: u32, now: DateTime<Utc>) -> Vec<DateTime<Utc>> {
-    let step = interval_min.clamp(1, 24 * 60);
     let today = now.with_timezone(&Warsaw).date_naive();
     let from = now - TimeDelta::hours(24);
     let mut out = Vec::new();
     for day in [today.pred_opt(), Some(today)].into_iter().flatten() {
-        let mut minute = 0;
-        while minute < 24 * 60 {
+        for minute in cycle_minutes(interval_min) {
             let Some(naive) = day.and_hms_opt(minute / 60, minute % 60, 0) else {
                 break;
             };
@@ -84,7 +84,6 @@ pub fn cycle_fires(interval_min: u32, now: DateTime<Utc>) -> Vec<DateTime<Utc>> 
                 }
                 LocalResult::None => {}
             }
-            minute += step;
         }
     }
     out.retain(|at| *at > from && *at <= now);
@@ -175,6 +174,10 @@ impl BulletinRunner {
         if !fires.claim(fire_at, None).await? {
             return Ok(tick);
         }
+        // Raz na nową porę, nadaną czy pominiętą (cisza całą dobę też ma granicę).
+        if let Err(e) = fires.prune_before(now - KEEP_FIRES).await {
+            tracing::warn!(błąd = %e, "nie usunięto starych wpisów biuletynu");
+        }
 
         let local = now.with_timezone(&Local).time();
         if quiet_refuses(
@@ -231,9 +234,6 @@ impl BulletinRunner {
             return Ok(tick);
         };
         fires.set_queued(fire_at, id).await?;
-        if let Err(e) = fires.prune_before(now - KEEP_FIRES).await {
-            tracing::warn!(błąd = %e, "nie usunięto starych wpisów biuletynu");
-        }
         tick.queued = Some(id);
         tracing::info!(pora = %fire_at, element = id, "biuletyn w kolejce");
         Ok(tick)
@@ -1014,5 +1014,10 @@ mod tests {
         let tick = s.runner().tick(t("2026-11-23 07:10:05")).await.unwrap();
         assert_eq!(tick.skipped, [(t("2026-11-23 07:10"), QUIET.to_owned())]);
         assert!(s.queued().await.is_empty());
+        // Stare wpisy znikają także wtedy, gdy nic nie idzie na antenę.
+        let old = t("2026-11-10 07:00");
+        BulletinFireRepo::new(s.pool.clone()).claim(old, Some(QUIET)).await.unwrap();
+        s.runner().tick(t("2026-11-23 07:20:05")).await.unwrap();
+        assert!(BulletinFireRepo::new(s.pool.clone()).get(old).await.unwrap().is_none());
     }
 }

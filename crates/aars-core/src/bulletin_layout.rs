@@ -259,6 +259,16 @@ impl Layout {
         serde_json::to_string_pretty(self).unwrap_or_default()
     }
 
+    /// Wartość do zapisania w ustawieniu: pusta, gdy układ jest domyślnym
+    /// (zmiany domyślnego w nowych wersjach dochodzą wtedy do stacji), inaczej JSON.
+    pub fn stored(&self) -> String {
+        if *self == Self::default_layout() {
+            String::new()
+        } else {
+            self.to_json()
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.blocks.is_empty() {
             return Err("układ biuletynu: dodaj co najmniej jeden klocek".to_owned());
@@ -313,11 +323,14 @@ impl Layout {
         Ok(())
     }
 
-    /// Układ z ustawień sprzed etapu 13: części nieobecne na liście → klocki
-    /// wyłączone; wstęp operatora → tekst wstępu (z godziną, jak dawniej).
+    /// Układ z ustawień sprzed etapu 13. Lista części nieustawiona albo równa
+    /// staremu domyślnemu wyborowi (operator jej nie zmieniał) → pełny nowy
+    /// układ (także stany wód); lista zmieniona przez operatora → części
+    /// nieobecne na niej to klocki wyłączone. Wstęp operatora → tekst wstępu
+    /// (z godziną, jak dawniej).
     pub fn from_legacy(parts: Option<&str>, intro: Option<&str>) -> Layout {
         let mut layout = Self::default_layout();
-        if let Some(parts) = parts {
+        if let Some(parts) = parts.filter(|p| !is_legacy_default(p)) {
             let chosen: Vec<&str> = parts.split(',').map(str::trim).collect();
             for block in &mut layout.blocks {
                 let legacy = match block.kind {
@@ -349,6 +362,20 @@ impl Layout {
         }
         layout
     }
+}
+
+/// Domyślny wybór części sprzed etapu 13 (w dowolnej kolejności).
+const LEGACY_DEFAULT_PARTS: [&str; 3] = ["ostrzezenia", "pogoda", "propagacja"];
+
+fn is_legacy_default(parts: &str) -> bool {
+    let mut chosen: Vec<&str> = parts
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    chosen.sort_unstable();
+    chosen.dedup();
+    chosen == LEGACY_DEFAULT_PARTS
 }
 
 /// Nazwy zmiennych `{…}` w szablonie; nieznana zmienna albo niedomknięty
@@ -494,7 +521,7 @@ pub async fn migrate_legacy(pool: &SqlitePool) -> Result<(), DbError> {
              updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
         )
         .bind(LAYOUT_KEY)
-        .bind(layout.to_json())
+        .bind(layout.stored())
         .execute(&mut *tx)
         .await?;
         tracing::info!("układ biuletynu przeniesiony ze starych ustawień (części, wstęp)");
@@ -525,6 +552,53 @@ pub fn resolve(raw: &str) -> Layout {
         tracing::warn!(błąd = %e, "zapisany układ biuletynu nieczytelny, używam domyślnego");
         Layout::default_layout()
     })
+}
+
+/// Tryb biuletynu „co określony czas” (wartość ustawienia `mode`).
+pub const MODE_CYCLE: &str = "cykl";
+/// Tryb biuletynu „o stałych porach”.
+pub const MODE_TIMES: &str = "pory";
+pub const DEFAULT_INTERVAL_MIN: u32 = 10;
+pub const MIN_INTERVAL_MIN: u32 = 5;
+pub const MAX_INTERVAL_MIN: u32 = 60;
+const DAY_MIN: u32 = 24 * 60;
+
+/// Tryb z ustawień modułu (`mode`, `interval_min`, bez prefiksu):
+/// `Some(interwał w minutach)` w trybie cyklicznym (także gdy tryb nie jest
+/// ustawiony), `None` w trybie stałych pór. Interwał spoza 5–60 → 10.
+/// Jedno źródło prawdy dla runnera i panelu.
+pub fn cycle_interval(settings: &std::collections::BTreeMap<String, String>) -> Option<u32> {
+    if settings.get("mode").map(|m| m.trim()) == Some(MODE_TIMES) {
+        return None;
+    }
+    Some(
+        settings
+            .get("interval_min")
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|n| (MIN_INTERVAL_MIN..=MAX_INTERVAL_MIN).contains(n))
+            .unwrap_or(DEFAULT_INTERVAL_MIN),
+    )
+}
+
+/// Numer cyklu: minuty od północy (czas Warszawy) / interwał.
+pub fn cycle_index(local: NaiveTime, interval_min: u32) -> u32 {
+    (local.hour() * 60 + local.minute()) / interval_min.max(1)
+}
+
+/// Chwile cyklu w dobie jako minuty od północy: 0, N, 2N, … poniżej 24 h
+/// (gdy N nie dzieli doby, cykl zaczyna się od nowa o północy).
+pub fn cycle_minutes(interval_min: u32) -> impl Iterator<Item = u32> {
+    let step = interval_min.clamp(1, DAY_MIN);
+    (0..DAY_MIN).step_by(step as usize)
+}
+
+/// Najbliższa chwila cyklu po `local` (czas Warszawy) tego samego dnia;
+/// `None` — następna jest jutro o północy.
+pub fn next_cycle_after(interval_min: u32, local: NaiveTime) -> Option<NaiveTime> {
+    let now = local.hour() * 60 + local.minute();
+    cycle_minutes(interval_min)
+        .find(|m| *m > now)
+        .and_then(|m| NaiveTime::from_hms_opt(m / 60, m % 60, 0))
 }
 
 #[cfg(test)]
@@ -711,6 +785,44 @@ mod tests {
     }
 
     #[test]
+    fn the_cycle_schedule_is_shared() {
+        let s = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        assert_eq!(cycle_interval(&s(&[])), Some(10));
+        assert_eq!(
+            cycle_interval(&s(&[("mode", "cykl"), ("interval_min", "15")])),
+            Some(15)
+        );
+        assert_eq!(
+            cycle_interval(&s(&[("mode", "cykl"), ("interval_min", "3")])),
+            Some(10)
+        );
+        assert_eq!(
+            cycle_interval(&s(&[("mode", "cykl"), ("interval_min", "61")])),
+            Some(10)
+        );
+        assert_eq!(
+            cycle_interval(&s(&[("mode", "pory"), ("interval_min", "15")])),
+            None
+        );
+        assert_eq!(cycle_index(hm("00:00"), 10), 0);
+        assert_eq!(cycle_index(hm("00:09"), 10), 0);
+        assert_eq!(cycle_index(hm("00:30"), 10), 3);
+        assert_eq!(cycle_index(hm("23:50"), 10), 143);
+        assert_eq!(cycle_index(hm("01:00"), 15), 4);
+        assert_eq!(cycle_minutes(10).count(), 144);
+        assert_eq!(cycle_minutes(7).last(), Some(23 * 60 + 55));
+        assert_eq!(next_cycle_after(10, hm("07:00")), Some(hm("07:10")));
+        assert_eq!(next_cycle_after(7, hm("23:50")), Some(hm("23:55")));
+        assert_eq!(next_cycle_after(7, hm("23:55")), None);
+        assert_eq!(next_cycle_after(10, hm("23:50")), None);
+    }
+
+    #[test]
     fn templates_fill_polish_dates_and_times() {
         // 24 listopada 2026 to wtorek.
         let at = local(2026, 11, 24, 7, 5);
@@ -745,6 +857,22 @@ mod tests {
 
     #[test]
     fn legacy_parts_and_intro_become_the_layout() {
+        // Stary domyślny wybór (w dowolnej kolejności) albo brak listy → pełny nowy układ.
+        for parts in [
+            None,
+            Some("pogoda,propagacja,ostrzezenia"),
+            Some(" ostrzezenia, pogoda,propagacja "),
+        ] {
+            let l = Layout::from_legacy(parts, None);
+            assert_eq!(l, Layout::default_layout(), "{parts:?}");
+        }
+        let l = Layout::from_legacy(Some("pogoda,propagacja,ostrzezenia"), Some("Tu SP9"));
+        assert!(l.blocks.iter().all(|b| b.enabled));
+        assert_eq!(l.blocks[0].text, "Tu SP9. Godzina {godzina}.");
+        // Lista zmieniona przez operatora: niewybrane części wyłączone.
+        let l = Layout::from_legacy(Some("pogoda,propagacja,ostrzezenia,wody"), None);
+        assert!(l.blocks.iter().all(|b| b.enabled));
+
         let l = Layout::from_legacy(Some("pogoda,ostrzezenia"), Some("Tu stacja klubowa"));
         let on = |k| l.blocks.iter().find(|b| b.kind == k).unwrap().enabled;
         assert!(on(BlockKind::PogodaTeraz) && on(BlockKind::Prognoza) && on(BlockKind::Slonce));
@@ -782,11 +910,28 @@ mod tests {
         assert_eq!(kv.kv_get(LEGACY_PARTS_KEY).await.unwrap(), None);
         assert_eq!(kv.kv_get(LEGACY_INTRO_KEY).await.unwrap(), None);
         assert_eq!(kv.kv_get(LAYOUT_KEY).await.unwrap(), Some(l.to_json()));
+        assert_ne!(l, Layout::default_layout());
 
         // Stary klucz, który wróci (np. stara wersja), nie nadpisuje układu.
         kv.kv_put(LEGACY_PARTS_KEY, "wody").await.unwrap();
         assert_eq!(load(&pool).await.unwrap(), l);
         assert_eq!(kv.kv_get(LEGACY_PARTS_KEY).await.unwrap(), None);
+
+        // Stacja, która nie ruszała części: pełny układ, stany wód włączone.
+        kv.kv_put(LAYOUT_KEY, "").await.unwrap();
+        kv.kv_put(LEGACY_PARTS_KEY, "pogoda,propagacja,ostrzezenia")
+            .await
+            .unwrap();
+        let l = load(&pool).await.unwrap();
+        assert!(
+            l.blocks
+                .iter()
+                .find(|b| b.kind == BlockKind::Wody)
+                .unwrap()
+                .enabled
+        );
+        assert_eq!(l, Layout::default_layout());
+        assert_eq!(kv.kv_get(LAYOUT_KEY).await.unwrap().as_deref(), Some(""));
 
         // Zepsuty zapis → układ domyślny, bez błędu.
         kv.kv_put(LAYOUT_KEY, "{zepsute").await.unwrap();

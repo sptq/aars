@@ -305,10 +305,16 @@ pub fn sun_text(forecast: &Forecast, now: DateTime<Utc>) -> Option<String> {
 
 /// Zapowiedź pogody z atrybucją, przed pierwszą częścią pogodową biuletynu.
 pub fn heading(forecast: &Forecast) -> String {
-    format!(
-        "Pogoda dla okolic stacji według danych {}.",
-        forecast.provider.name()
-    )
+    format!("{HEADING_START}{}.", forecast.provider.name())
+}
+
+const HEADING_START: &str = "Pogoda dla okolic stacji według danych ";
+
+/// Tekst bez zapowiedzi z `heading`; `None`, gdy jej nie ma.
+pub fn strip_heading(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix(HEADING_START)?;
+    let end = rest.find(". ")?;
+    Some(&rest[end + 2..])
 }
 
 /// Cała pogoda jednym tekstem (dawna część `pogoda`); `None`, gdy żadne

@@ -74,8 +74,14 @@ impl BulletinFireRepo {
             .await?;
         Ok(rows
             .iter()
-            .filter_map(|r| chrono::NaiveDateTime::parse_from_str(r, "%Y-%m-%dT%H:%M:%SZ").ok())
-            .map(|n| n.and_utc())
+            .filter_map(|r| match chrono::NaiveDateTime::parse_from_str(r, "%Y-%m-%dT%H:%M:%SZ") {
+                Ok(n) => Some(n.and_utc()),
+                Err(e) => {
+                    // Nieszkodliwe (claim i tak pilnuje INSERT OR IGNORE), ale widoczne.
+                    tracing::debug!(wiersz = %r, błąd = %e, "nieczytelna pora w bulletin_fires");
+                    None
+                }
+            })
             .collect())
     }
 

@@ -176,7 +176,7 @@ impl ModuleDescriptor {
                     if raw.trim().is_empty() {
                         String::new()
                     } else {
-                        crate::bulletin_layout::Layout::parse(raw)?.to_json()
+                        crate::bulletin_layout::Layout::parse(raw)?.stored()
                     }
                 }
             };
@@ -204,8 +204,8 @@ fn comma(n: f64) -> String {
 
 /// Tryby nadawania biuletynu (wartość, etykieta).
 pub const BULLETIN_MODES: &[(&str, &str)] = &[
-    ("cykl", "Co określony czas"),
-    ("pory", "O stałych porach"),
+    (crate::bulletin_layout::MODE_CYCLE, "Co określony czas"),
+    (crate::bulletin_layout::MODE_TIMES, "O stałych porach"),
 ];
 
 pub const BULLETIN: ModuleDescriptor = ModuleDescriptor {
@@ -229,7 +229,10 @@ pub const BULLETIN: ModuleDescriptor = ModuleDescriptor {
             key: "interval_min",
             label: "Co ile minut",
             help: "Tylko w trybie „co określony czas”.",
-            kind: SettingKind::Integer { min: 5, max: 60 },
+            kind: SettingKind::Integer {
+                min: crate::bulletin_layout::MIN_INTERVAL_MIN as i64,
+                max: crate::bulletin_layout::MAX_INTERVAL_MIN as i64,
+            },
             default: "10",
         },
         SettingSpec {
@@ -656,6 +659,10 @@ mod tests {
         input.insert("mode".into(), "pory".into());
         input.insert("layout".into(), r#"{"bloki":[{"rodzaj":"wody"}]}"#.into());
         let ok = m.validate(&input).unwrap();
+        // Układ równy domyślnemu zapisuje się jako pusty: późniejsze ulepszenia domyślnego dochodzą.
+        let mut same = input.clone();
+        same.insert("layout".into(), crate::bulletin_layout::Layout::default_layout().to_json());
+        assert_eq!(m.validate(&same).unwrap()["layout"], "");
         assert_eq!(ok["layout"], crate::bulletin_layout::Layout::parse(&input["layout"]).unwrap().to_json());
         input.insert("layout".into(), r#"{"bloki":[{"rodzaj":"wstep","tekst":"{stacja}"}]}"#.into());
         assert!(m.validate(&input).unwrap_err().contains("nieznana zmienna"));

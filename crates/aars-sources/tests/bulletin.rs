@@ -208,6 +208,48 @@ async fn the_bulletin_reads_the_fixtures_into_one_text() {
     assert!(!text.contains("Brak obowiązujących ostrzeżeń"), "{text}");
     assert_speakable(&text);
 
+    // Krótki limit nadawania: wstęp, ostrzeżenia i zakończenie muszą się
+    // zmieścić razem, a ostrzeżenia ucinają się na granicy zdania z ogonem.
+    let kv = SettingsRepo::new(pool.clone());
+    for (tx, expected) in [
+        ("35", "Obowiązujące ostrzeżenia. Uwaga, burza geomagnetyczna G3, silna. Oraz jeszcze jedno ostrzeżenie."),
+        ("28", "Obowiązujące ostrzeżenia: 2."),
+    ] {
+        kv.kv_put("tx_max_duration_s", tx).await.unwrap();
+        let limit = aars_sources::bulletin::length_limit(tx.parse().unwrap());
+        let short = bulletin.compose(now).await.unwrap().text.unwrap();
+        let spoken = aars_core::pause::strip_markers(&short);
+        let pauses: u64 = aars_core::pause::split(&short)
+            .iter()
+            .map(|s| match s {
+                aars_core::pause::Segment::Pause(d) => d.as_millis() as u64,
+                aars_core::pause::Segment::Text(_) => 0,
+            })
+            .sum();
+        let cost = spoken.chars().count() + (pauses / 100) as usize;
+        assert!(cost <= limit, "{cost} > {limit}: {short}");
+        assert!(short.contains(&format!("[[pauza:700]] {expected} [[pauza:700]] Tu SP9XYZ. Koniec komunikatu.")), "{short}");
+        assert!(!short.contains("Pogoda dla okolic"), "{short}");
+        assert_speakable(&short);
+    }
+    kv.kv_put("tx_max_duration_s", "180").await.unwrap();
+
+    // Atrybucja pogody jest w pierwszym dołączonym klocku pogodowym, także
+    // gdy pogoda bieżąca jest wyłączona.
+    kv.kv_put(
+        "module:bulletin:layout",
+        r#"{"bloki":[{"rodzaj":"pogoda_teraz","wlaczony":false},{"rodzaj":"wody"},{"rodzaj":"prognoza"},{"rodzaj":"slonce"}]}"#,
+    )
+    .await
+    .unwrap();
+    let text = bulletin.compose(now).await.unwrap().text.unwrap();
+    assert!(
+        text.starts_with("Stany wód. ") && text.contains(" Źródło: IMGW-PIB. Pogoda dla okolic stacji według danych Open-Meteo. W najbliższych godzinach"),
+        "{text}"
+    );
+    assert_eq!(text.matches("według danych").count(), 1, "{text}");
+    kv.kv_put("module:bulletin:layout", "").await.unwrap();
+
     // Runner w cyklu 19:00 lokalnie wstawia dokładnie jeden element.
     let queue = Arc::new(QueueRepo::new(pool.clone()));
     let runner = BulletinRunner::new(bulletin.clone(), queue.clone());

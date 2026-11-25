@@ -6,7 +6,8 @@ use aars_core::source_state::TrackedItem;
 use crate::bulletin::{BulletinPart, PartCtx, PartFuture, PartText};
 use crate::speech::truncate_sentence;
 
-const MAX_CHARS: usize = 1200;
+/// Górna granica długości części; kompozytor może dać mniej (`PartCtx::warnings_max_chars`).
+pub const MAX_CHARS: usize = 1200;
 
 pub struct Ostrzezenia;
 
@@ -91,6 +92,11 @@ fn compose_alerts(ctx: &PartCtx) -> PartText {
     // Ogon („Oraz jeszcze…”, „Część źródeł…”) nie może wypaść przy cięciu
     // długości: najpierw ubywa pełnych treści, a gdy zostaje jedna — tnie
     // się ją samą.
+    let max_chars = ctx.warnings_max_chars.unwrap_or(MAX_CHARS).min(MAX_CHARS);
+    // Gdy kompozytor ściska część (krótki limit nadawania), żadna treść nie
+    // może urwać się w pół zdania — zostaje wtedy sama liczba.
+    let squeezed = max_chars < MAX_CHARS;
+    let count_only = format!("Obowiązujące ostrzeżenia: {total}.{down_tail}");
     let mut listed_n = texts.len();
     loop {
         let rest = total - listed_n;
@@ -101,7 +107,7 @@ fn compose_alerts(ctx: &PartCtx) -> PartText {
         tail.push_str(&down_tail);
         let body = texts[..listed_n].join(" ");
         let head = format!("{HEADER} {body}");
-        if head.chars().count() + tail.chars().count() <= MAX_CHARS {
+        if head.chars().count() + tail.chars().count() <= max_chars {
             return PartText::Text(format!("{head}{tail}"));
         }
         if listed_n > 1 {
@@ -110,10 +116,14 @@ fn compose_alerts(ctx: &PartCtx) -> PartText {
         }
         // Nagłówek ma własną kropkę, więc tnie się samą treść.
         let budget =
-            MAX_CHARS.saturating_sub(HEADER.chars().count() + 1 + tail.chars().count() + 1);
+            max_chars.saturating_sub(HEADER.chars().count() + 1 + tail.chars().count() + 1);
         let (cut, _) = truncate_sentence(&texts[0], budget);
+        let whole_sentences = cut.ends_with(['.', '!', '?']);
         let cut =
             cut.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '.' | ';' | ',' | ':'));
+        if cut.is_empty() || (squeezed && !whole_sentences) {
+            return PartText::Text(count_only);
+        }
         return PartText::Text(format!("{HEADER} {cut}.{tail}"));
     }
 }
@@ -177,7 +187,7 @@ mod tests {
             sources: BTreeMap::new(),
             active_alerts: alerts,
             alert_sources,
-            planned: Vec::new(),
+            warnings_max_chars: None,
         }
     }
 
@@ -356,6 +366,37 @@ mod tests {
             "{t}"
         );
         assert!(t.starts_with("Obowiązujące ostrzeżenia. słowo"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn a_squeezed_part_never_ends_mid_sentence() {
+        let two = || {
+            vec![
+                full("", "Uwaga, burza geomagnetyczna G3, silna. Możliwe zakłócenia łączności."),
+                full("", &format!("Zaniki łączności {}.", "na falach krótkich ".repeat(5))),
+            ]
+        };
+        let squeezed = |n: usize| {
+            let mut c = ctx(two(), FRESH);
+            c.warnings_max_chars = Some(n);
+            c
+        };
+        let run_at = async |n: usize| text(Ostrzezenia.compose(&squeezed(n)).await.unwrap());
+        // Mieści się pierwsze, drugie idzie w ogon.
+        let t = run_at(130).await;
+        assert_eq!(
+            t,
+            "Obowiązujące ostrzeżenia. Uwaga, burza geomagnetyczna G3, silna. Możliwe zakłócenia łączności. Oraz jeszcze jedno ostrzeżenie."
+        );
+        // Mniej miejsca: ucięte na granicy zdania.
+        let t = run_at(100).await;
+        assert_eq!(
+            t,
+            "Obowiązujące ostrzeżenia. Uwaga, burza geomagnetyczna G3, silna. Oraz jeszcze jedno ostrzeżenie."
+        );
+        // Nawet jedno zdanie się nie mieści: sama liczba, bez urwanych słów.
+        assert_eq!(run_at(40).await, "Obowiązujące ostrzeżenia: 2.");
+        assert_eq!(run_at(0).await, "Obowiązujące ostrzeżenia: 2.");
     }
 
     #[test]

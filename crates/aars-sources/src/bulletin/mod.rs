@@ -16,7 +16,7 @@ use aars_core::bulletin_layout::{self, Block, BlockKind, MAX_PAUSE_MS};
 use aars_core::module::BULLETIN;
 use aars_core::settings::SettingsRepo;
 use aars_core::source_state::{AlertSourceHealth, SourceStateRepo, TrackedItem};
-use chrono::{DateTime, NaiveTime, Timelike, Utc};
+use chrono::{DateTime, Utc};
 use chrono_tz::Europe::Warsaw;
 use sqlx::SqlitePool;
 
@@ -38,8 +38,10 @@ pub struct PartCtx {
     pub sources: BTreeMap<String, String>,
     pub active_alerts: Vec<TrackedItem>,
     pub alert_sources: AlertSourceHealth,
-    /// Identyfikatory części składanych w tym biuletynie, w kolejności układu.
-    pub planned: Vec<&'static str>,
+    /// Miejsce dla części `ostrzezenia`, gdy limit nadawania jest krótki
+    /// (`None` — jej własny limit). Kompozytor liczy je tak, żeby wstęp,
+    /// ostrzeżenia i zakończenie zmieściły się razem.
+    pub warnings_max_chars: Option<usize>,
 }
 
 impl PartCtx {
@@ -231,7 +233,6 @@ pub fn length_limit(tx_max_duration_s: u64) -> usize {
 
 const SETTINGS_PREFIX: &str = "module:bulletin:";
 const DEFAULT_PART_TIMEOUT: Duration = Duration::from_secs(20);
-pub(crate) const DEFAULT_INTERVAL_MIN: u32 = 10;
 
 /// Ustawienia `module:bulletin:*` (bez prefiksu); brakujące klucze z opisu modułu.
 pub(crate) async fn module_settings(
@@ -248,26 +249,6 @@ pub(crate) async fn module_settings(
             .await?,
     );
     Ok(out)
-}
-
-/// Tryb nadawania z ustawień: `Some(interwał w minutach)` w trybie
-/// cyklicznym, `None` w trybie stałych pór.
-pub(crate) fn cycle_interval(settings: &BTreeMap<String, String>) -> Option<u32> {
-    if settings.get("mode").map(|m| m.trim()) == Some("pory") {
-        return None;
-    }
-    Some(
-        settings
-            .get("interval_min")
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .filter(|n| (5..=60).contains(n))
-            .unwrap_or(DEFAULT_INTERVAL_MIN),
-    )
-}
-
-/// Numer cyklu: minuty od północy (czas Warszawy) / interwał.
-pub fn cycle_index(local: NaiveTime, interval_min: u32) -> u32 {
-    (local.hour() * 60 + local.minute()) / interval_min.max(1)
 }
 
 /// Kompozytor: wspólna ścieżka nadania i podglądu. Wszystko, co zależy od
@@ -320,7 +301,8 @@ impl Bulletin {
         let settings = module_settings(&self.pool).await?;
         let layout = bulletin_layout::load(&self.pool).await?;
         let local = spoken.with_timezone(&Warsaw).naive_local();
-        let cycle = cycle_interval(&settings).map(|n| cycle_index(local.time(), n));
+        let cycle = bulletin_layout::cycle_interval(&settings)
+            .map(|n| bulletin_layout::cycle_index(local.time(), n));
 
         let wants_alerts = layout.blocks.iter().any(|b| {
             b.kind == BlockKind::Ostrzezenia && b.enabled && b.when.matches(cycle, local.time())
@@ -371,6 +353,7 @@ impl Bulletin {
             })
             .collect();
 
+        let limit = length_limit(station.tx_max_duration_s);
         let position = PositionRepo::new(self.pool.clone()).load().await?;
         let sources = SettingsRepo::new(self.pool.clone())
             .kv_prefix("source:")
@@ -382,13 +365,7 @@ impl Bulletin {
             sources,
             active_alerts,
             alert_sources,
-            planned: plans
-                .iter()
-                .filter_map(|p| match p {
-                    Plan::Part(part) => Some(part.id()),
-                    Plan::Done(_) => None,
-                })
-                .collect(),
+            warnings_max_chars: warnings_room(&layout.blocks, &plans, limit),
         });
 
         let timeout = self.part_timeout;
@@ -423,7 +400,63 @@ impl Bulletin {
             };
             pieces.push(Piece::from_block(block, outcome));
         }
-        Ok(assemble(pieces, length_limit(station.tx_max_duration_s)))
+        attribute_weather_once(&mut pieces);
+        Ok(assemble(pieces, limit))
+    }
+}
+
+/// Miejsce na ostrzeżenia, gdy chronione klocki (wstęp, ostrzeżenia,
+/// zakończenie) razem przekroczyłyby limit: limit minus wstęp, zakończenie,
+/// odstępy i pauzy wokół ostrzeżeń (liczone z zapasem, jakby między nimi nic
+/// nie zostało). `None`, gdy ostrzeżeń nie ma w tym złożeniu albo mieszczą się
+/// w swoim własnym limicie.
+fn warnings_room(blocks: &[Block], plans: &[Plan], limit: usize) -> Option<usize> {
+    let warn = blocks
+        .iter()
+        .zip(plans)
+        .position(|(b, p)| b.kind == BlockKind::Ostrzezenia && matches!(p, Plan::Part(_)))?;
+    let text_of = |kind: BlockKind| {
+        blocks.iter().zip(plans).find_map(|(b, p)| match p {
+            Plan::Done(PartOutcome::Included(t)) if b.kind == kind => Some((b, t)),
+            _ => None,
+        })
+    };
+    let w = &blocks[warn];
+    let mut used = 0usize;
+    let mut pause_ms = 0u64;
+    if let Some((intro, t)) = text_of(BlockKind::Wstep) {
+        // Tekst, kropka i odstęp (przy pauzie dwa).
+        used += t.chars().count() + 3;
+        pause_ms += u64::from((intro.pause_after_ms + w.pause_before_ms).min(MAX_PAUSE_MS));
+    }
+    if let Some((outro, t)) = text_of(BlockKind::Zakonczenie) {
+        used += t.chars().count() + 3;
+        pause_ms += u64::from((w.pause_after_ms + outro.pause_before_ms).min(MAX_PAUSE_MS));
+    }
+    let room = limit.saturating_sub(used + usize::try_from(pause_ms / 100).unwrap_or(usize::MAX));
+    (room < ostrzezenia::MAX_CHARS).then_some(room)
+}
+
+/// Kody klocków pogodowych: wspólna zapowiedź z atrybucją danych.
+const WEATHER: [BlockKind; 3] = [BlockKind::PogodaTeraz, BlockKind::Prognoza, BlockKind::Slonce];
+
+/// Każda część pogodowa zaczyna się od zapowiedzi „Pogoda dla okolic stacji
+/// według danych …” (atrybucja CC BY); zostaje tylko w pierwszej dołączonej,
+/// w następnych jest zdejmowana. Klocki wypadają przy limicie od końca, więc
+/// pierwsza pogodowa wypada ostatnia z pogodowych — atrybucja nie ginie.
+fn attribute_weather_once(pieces: &mut [Piece]) {
+    let mut seen = false;
+    for piece in pieces.iter_mut().filter(|p| WEATHER.contains(&p.kind)) {
+        let PartOutcome::Included(text) = &mut piece.outcome else {
+            continue;
+        };
+        if !seen {
+            seen = true;
+            continue;
+        }
+        if let Some(rest) = pogoda::speech::strip_heading(text) {
+            *text = rest.to_owned();
+        }
     }
 }
 
@@ -619,20 +652,20 @@ mod tests {
     }
 
     #[test]
-    fn cycle_numbers_count_from_midnight() {
-        let t = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
-        assert_eq!(cycle_index(t(0, 0), 10), 0);
-        assert_eq!(cycle_index(t(0, 9), 10), 0);
-        assert_eq!(cycle_index(t(0, 30), 10), 3);
-        assert_eq!(cycle_index(t(23, 50), 10), 143);
-        assert_eq!(cycle_index(t(1, 0), 15), 4);
-        let s = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
-            pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
-        };
-        assert_eq!(cycle_interval(&s(&[])), Some(10));
-        assert_eq!(cycle_interval(&s(&[("mode", "cykl"), ("interval_min", "15")])), Some(15));
-        assert_eq!(cycle_interval(&s(&[("mode", "cykl"), ("interval_min", "3")])), Some(10));
-        assert_eq!(cycle_interval(&s(&[("mode", "pory"), ("interval_min", "15")])), None);
+    fn the_weather_attribution_stays_on_the_first_included_weather_block() {
+        let h = "Pogoda dla okolic stacji według danych Open-Meteo.";
+        let mut pieces = vec![
+            Piece::new(PogodaTeraz, Empty("brak warunków bieżących".into())),
+            inc(Wody, "Stany wód."),
+            inc(Prognoza, &format!("{h} W nocy do 1 °C.")),
+            inc(Slonce, &format!("{h} Zachód słońca o 15:39.")),
+        ];
+        attribute_weather_once(&mut pieces);
+        let c = assemble(pieces, 1500);
+        assert_eq!(
+            c.text.as_deref(),
+            Some("Stany wód. Pogoda dla okolic stacji według danych Open-Meteo. W nocy do 1 °C. Zachód słońca o 15:39.")
+        );
     }
 
     #[test]
@@ -662,7 +695,7 @@ mod tests {
             .collect(),
             active_alerts: Vec::new(),
             alert_sources: AlertSourceHealth::default(),
-            planned: Vec::new(),
+            warnings_max_chars: None,
         };
         let s = ctx.source_settings("imgw-wodowskazy");
         assert_eq!(s.len(), 2);

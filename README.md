@@ -150,8 +150,10 @@ Rodzaje: `wstep`, `ostrzezenia`, `pogoda_teraz`, `prognoza`, `slonce`,
 `wody`, `propagacja`, `tekst`, `zakonczenie`; pola pominięte mają wartości
 domyślne (`wlaczony` tak, pauzy 0, `kiedy` zawsze). Stare ustawienia
 `parts` i `intro` (do etapu 12) są przy pierwszym odczycie przenoszone do
-układu (części niewybrane → klocki wyłączone, wstęp → tekst wstępu
-z godziną) i usuwane.
+układu i usuwane: lista części niezmieniona (dawny domyślny wybór) daje
+pełny nowy układ, lista zmieniona przez operatora — klocki niewybranych
+części wyłączone; wstęp → tekst wstępu z godziną. Układ równy domyślnemu
+zapisuje się jako pusty, więc ulepszenia domyślnego dochodzą do stacji.
 
 W trybie cyklicznym element kolejki wygasa po długości cyklu (najwyżej
 15 min), więc biuletyn nie zalega do następnego; wpisy odpaleń starsze niż
@@ -187,9 +189,10 @@ nie zdąży albo zawiedzie, wypada, reszta wychodzi. Progi oceny w części
 Limit długości biuletynu to `min(1500, 10 × (limit nadawania w s − 10))`
 znaków (10 s zostaje na identyfikację i ogony):
 pauzy liczą się po 10 znaków na sekundę. Gdy złożony tekst się nie mieści,
-wypadają całe klocki od końca — oprócz wstępu, ostrzeżeń i zakończenia; gdy
-zostały same te, biuletyn idzie mimo limitu (ostrzeżenia same skracają się
-do 1200 znaków).
+wypadają całe klocki od końca — oprócz wstępu, ostrzeżeń i zakończenia.
+Ostrzeżenia dostają tyle miejsca, ile zostaje po wstępie i zakończeniu
+(najwyżej 1200 znaków), i skracają się całymi zdaniami („Oraz jeszcze…”),
+a gdy nie mieści się żadne zdanie — „Obowiązujące ostrzeżenia: N.”.
 
 Podgląd — ta sama ścieżka co nadanie, bez zapisu i bez kolejki:
 `aars bulletin preview` drukuje tekst (albo „nic do nadania: powód”) i stan

@@ -288,11 +288,6 @@ impl WeatherPart {
             _ => "brak godzin wschodu i zachodu",
         }
     }
-
-    /// Zapowiedź z atrybucją niesie pierwsza część pogodowa w układzie.
-    fn leads(&self, ctx: &PartCtx) -> bool {
-        ctx.planned.iter().find(|id| PARTS.contains(id)) == Some(&self.id)
-    }
 }
 
 impl BulletinPart for WeatherPart {
@@ -309,11 +304,10 @@ impl BulletinPart for WeatherPart {
             let Some(forecast) = self.pogoda.forecast_for(ctx).await? else {
                 return Ok(PartText::Empty("brak pozycji stacji"));
             };
+            // Każda część niesie zapowiedź z atrybucją; kompozytor zostawia ją
+            // tylko w pierwszej dołączonej części pogodowej.
             Ok(match self.text(&forecast, ctx.now) {
-                Some(text) if self.leads(ctx) => {
-                    PartText::Text(format!("{} {text}", speech::heading(&forecast)))
-                }
-                Some(text) => PartText::Text(text),
+                Some(text) => PartText::Text(format!("{} {text}", speech::heading(&forecast))),
                 None => PartText::Empty(self.empty_reason()),
             })
         })
@@ -1020,7 +1014,7 @@ mod tests {
                 sources: BTreeMap::new(),
                 active_alerts: Vec::new(),
                 alert_sources: Default::default(),
-                planned: PARTS.to_vec(),
+                warnings_max_chars: None,
             }
         }
 
@@ -1073,9 +1067,10 @@ mod tests {
             let ctx = part_ctx("2026-11-22T19:00:00Z", Some(position(50.04, 21.99)));
             let now = text_of(&parts[0], &ctx).await;
             assert!(now.starts_with("Pogoda dla okolic stacji według danych MET Norway. "), "{now}");
-            // Zapowiedź tylko raz, przed pierwszą częścią pogodową.
+            // Każda część niesie zapowiedź; kompozytor zostawia ją raz.
             let forecast = text_of(&parts[1], &ctx).await;
-            assert!(!forecast.contains("według danych"), "{forecast}");
+            let rest = speech::strip_heading(&forecast).unwrap();
+            assert!(!rest.is_empty() && !rest.contains("według danych"), "{rest}");
             server.verify().await;
         }
 
