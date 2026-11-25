@@ -1,5 +1,9 @@
 # Głosy Pipera w obrazie (R3): nazwa url sha256 rozmiar.
 # rhasspy/piper-voices przypięte do rewizji: repozytorium jest przetrenowywane.
-# pl_PL-darkman-medium: zbiór danych CC0. Sprawdzone 2026-11-21.
-pl_PL-darkman-medium.onnx https://huggingface.co/rhasspy/piper-voices/resolve/e9c8a39444359388adaa94255becb37a5a2b8e51/pl/pl_PL/darkman/medium/pl_PL-darkman-medium.onnx cf757ee307e3a7c23d5d8f69934deab51683d01c1c6be376d3e13146020f1530 63221984
-pl_PL-darkman-medium.onnx.json https://huggingface.co/rhasspy/piper-voices/resolve/e9c8a39444359388adaa94255becb37a5a2b8e51/pl/pl_PL/darkman/medium/pl_PL-darkman-medium.onnx.json 1208a7d257daba8d0a421e9f55ec8210db009d785cd4f7e0b0c9936b3168f1a0 6133
+# pl_PL-gosia-medium: zbiór danych OHF-Voice/voice-datasets, CC0 (MODEL_CARD). Sprawdzone 2026-11-25.
+# pl_PL-mc_speech-medium: zbiór danych The MC Speech Dataset (Kaggle), CC0 (MODEL_CARD). Sprawdzone 2026-11-25.
+# Gosia wymaga Pipera 1.5 lub nowszego; obraz ma 1.8.0.
+pl_PL-gosia-medium.onnx https://huggingface.co/rhasspy/piper-voices/resolve/e9c8a39444359388adaa94255becb37a5a2b8e51/pl/pl_PL/gosia/medium/pl_PL-gosia-medium.onnx d322ded1f1daffeab41bbacd43d6f62ac83a4a5d4d63a297aa39f345f506b358 63221984
+pl_PL-gosia-medium.onnx.json https://huggingface.co/rhasspy/piper-voices/resolve/e9c8a39444359388adaa94255becb37a5a2b8e51/pl/pl_PL/gosia/medium/pl_PL-gosia-medium.onnx.json f0cc2f4f53d60274a79bf6ec9d8d17c02e188ae3c7cc170f6d308a97526c351b 6131
+pl_PL-mc_speech-medium.onnx https://huggingface.co/rhasspy/piper-voices/resolve/e9c8a39444359388adaa94255becb37a5a2b8e51/pl/pl_PL/mc_speech/medium/pl_PL-mc_speech-medium.onnx a6b043358bc81e6c111a5140606a21959ce7f34969b8b7207f62869787cc3907 63201294
+pl_PL-mc_speech-medium.onnx.json https://huggingface.co/rhasspy/piper-voices/resolve/e9c8a39444359388adaa94255becb37a5a2b8e51/pl/pl_PL/mc_speech/medium/pl_PL-mc_speech-medium.onnx.json b8bb11228e15c505219846a88fdc129e93f57e774ed7f9bac263156d1aa3d324 4961

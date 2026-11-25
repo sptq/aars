@@ -233,7 +233,7 @@ log "Test dymny w chroocie"
 got="$(in_root /opt/aars/current/aars --version)"
 [ "$got" = "aars $VERSION" ] || die "aars --version w obrazie: \"$got\", oczekiwane \"aars $VERSION\""
 echo "Test głosu." | in_root /opt/aars/piper/bin/piper \
-  --model /var/lib/aars/voices/pl_PL-darkman-medium.onnx --output_file /tmp/aars-smoke.wav
+  --model /var/lib/aars/voices/pl_PL-gosia-medium.onnx --output_file /tmp/aars-smoke.wav
 [ -s "$ROOT/tmp/aars-smoke.wav" ] || die "Piper nie zapisał pliku WAV"
 rm -f "$ROOT/tmp/aars-smoke.wav"
 

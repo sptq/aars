@@ -14,7 +14,7 @@ use aars_core::config::{AudioConfig, Config, FirstAdmin, PttBackendKind, PttConf
 use aars_core::dispatcher::{
     Dispatcher, DispatcherConfig, DispatcherControl, StationTest, TestOutcome,
 };
-use aars_core::hardware::probe::HardwareProbe;
+use aars_core::hardware::probe::{HardwareProbe, resolve_model};
 use aars_core::hardware::{ApplyStatus, ConfigOrigin, HW_KEYS, HardwareRepo, HardwareSettings};
 use aars_core::module::{ModuleRegistry, ModuleRepo};
 use aars_core::ptt::PttBackend;
@@ -55,9 +55,19 @@ impl HardwareFactory for RealHardware {
     }
 
     fn synth(&self, config: &Config) -> Arc<dyn Synthesizer> {
+        // Po aktualizacji ustawiony model mógł zniknąć z katalogu głosów
+        // (np. darkman): wtedy Gosia, żeby stacja nie zamilkła.
+        let model = resolve_model(&config.tts.model, &config.tts.voices_dir);
+        if let Some(missing) = &model.replaced {
+            tracing::warn!(
+                brak = %missing,
+                uzyty = %model.path,
+                "model głosu nie istnieje — używam Gosi; wybierz głos na stronie Sprzęt"
+            );
+        }
         Arc::new(aars_audio::piper::PiperSynth::new(
             &config.tts.piper_bin,
-            &config.tts.model,
+            &model.path,
             config.audio.sample_rate,
         ))
     }
@@ -705,6 +715,7 @@ async fn run_station(
         cache.clone(),
         synth.clone(),
         config.audio.gain_db,
+        SettingsRepo::new(pool.clone()),
     ));
     let queue = Arc::new(QueueRepo::new(pool.clone()));
 
@@ -819,6 +830,8 @@ async fn run_station(
             station.id_mode,
             config.audio.sample_rate,
             config.audio.gain_db,
+            SettingsRepo::new(pool.clone()),
+            station.speech_rate,
         ));
         let mut dispatcher = Dispatcher::new(
             queue.clone(),

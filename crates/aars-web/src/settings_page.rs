@@ -27,6 +27,7 @@ struct SettingsPage {
     misfire_grace_s: String,
     quiet_hours: String,
     quiet_min_priority: String,
+    speech_rate_pct: String,
     quiet_hint: String,
     pending: Vec<String>,
     has_station: bool,
@@ -94,6 +95,9 @@ pub struct SettingsForm {
     #[serde(default)]
     quiet_hours: String,
     quiet_min_priority: String,
+    /// Tempo mowy w procentach tempa głosu; brak pola zostawia zapisane.
+    #[serde(default)]
+    speech_rate_pct: String,
 }
 
 /// `22:00–06:00 lokalnie = 21:00–05:00 UTC` dla podanego przesunięcia strefy.
@@ -139,6 +143,7 @@ async fn view(
         misfire_grace_s: s.misfire_grace_s.to_string(),
         quiet_hours: s.quiet_hours.map(|q| q.as_text()).unwrap_or_default(),
         quiet_min_priority: priority_value(s.quiet_min_priority).to_owned(),
+        speech_rate_pct: format!("{:.0}", s.speech_rate * 100.0),
         quiet_hint: quiet_hint(s.quiet_hours),
         pending: crate::hardware_page::pending_for(state, s).await,
         has_station: state.station.is_some(),
@@ -183,7 +188,7 @@ pub async fn page_view(
     }
 }
 
-fn parse_form(form: &SettingsForm) -> Result<StationSettings, String> {
+fn parse_form(form: &SettingsForm, stored: &StationSettings) -> Result<StationSettings, String> {
     let number = |text: &str, name: &str| {
         text.trim()
             .parse::<u64>()
@@ -198,6 +203,15 @@ fn parse_form(form: &SettingsForm) -> Result<StationSettings, String> {
         "" => None,
         text => Some(QuietHours::parse(text)?),
     };
+    let speech_rate = match form.speech_rate_pct.trim() {
+        "" => stored.speech_rate,
+        text => {
+            let pct = text
+                .parse::<u32>()
+                .map_err(|_| "tempo mowy: podaj liczbę całkowitą procent".to_owned())?;
+            pct as f32 / 100.0
+        }
+    };
     let mut parsed = StationSettings {
         callsign: form.callsign.clone(),
         id_mode,
@@ -207,6 +221,7 @@ fn parse_form(form: &SettingsForm) -> Result<StationSettings, String> {
         quiet_hours,
         quiet_min_priority: parse_priority(&form.quiet_min_priority)
             .ok_or_else(|| "nieznany priorytet progu ciszy".to_owned())?,
+        speech_rate,
     };
     parsed.validate()?;
     Ok(parsed)
@@ -236,6 +251,7 @@ fn changed_keys(old: &StationSettings, new: &StationSettings) -> Vec<&'static st
         old.quiet_min_priority != new.quiet_min_priority,
         "quiet_min_priority",
     );
+    note(old.speech_rate != new.speech_rate, "speech_rate");
     keys
 }
 
@@ -256,7 +272,7 @@ pub async fn submit(
         }
     };
 
-    let new = match parse_form(&form) {
+    let new = match parse_form(&form, &stored) {
         Ok(new) => new,
         Err(message) => {
             return Ok((
@@ -405,6 +421,7 @@ mod tests {
             ("misfire_grace_s", "600"),
             ("quiet_hours", ""),
             ("quiet_min_priority", "emergency"),
+            ("speech_rate_pct", "87"),
         ];
         for (key, value) in overrides {
             fields.iter_mut().find(|(k, _)| k == key).unwrap().1 = value;
@@ -464,6 +481,66 @@ mod tests {
             audit.contains("callsign") && audit.contains("quiet_hours"),
             "{audit}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_speech_rate_is_saved_as_a_multiplier_and_shown_as_a_percentage() {
+        let (app, cookie, csrf, state) = logged_in(Role::Admin).await;
+        let (_, html) = get(&app, "/settings", &cookie).await;
+        assert!(html.contains("Tempo mowy"), "{html}");
+        assert!(html.contains("name=\"speech_rate_pct\"") && html.contains("value=\"87\""), "{html}");
+
+        let status = post_settings(&app, &cookie, &csrf, &[("speech_rate_pct", "100")]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stored(&state, "speech_rate").await, "1.00");
+        let (_, html) = get(&app, "/settings", &cookie).await;
+        assert!(html.contains("value=\"100\""), "{html}");
+
+        // Pole pominięte (stary formularz) zostawia zapisane tempo.
+        let before = stored(&state, "speech_rate").await;
+        post_settings_without(&app, &cookie, &csrf).await;
+        assert_eq!(stored(&state, "speech_rate").await, before);
+    }
+
+    async fn post_settings_without(app: &Router, cookie: &str, csrf: &str) {
+        let body = format!(
+            "csrf={csrf}&callsign=SP7TQ&id_mode=voice&id_interval_s=600&tx_max_duration_s=180\
+             &misfire_grace_s=600&quiet_hours=&quiet_min_priority=emergency"
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/settings")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_speech_rate_outside_70_to_120_percent_is_refused() {
+        let (app, cookie, csrf, state) = logged_in(Role::Admin).await;
+        for bad in ["69", "121", "0", "abc", "-5", "87,5"] {
+            assert_eq!(
+                post_settings(&app, &cookie, &csrf, &[("speech_rate_pct", bad)]).await,
+                StatusCode::BAD_REQUEST,
+                "{bad}"
+            );
+        }
+        assert_eq!(stored(&state, "speech_rate").await, "0.87");
+        for ok in ["70", "120"] {
+            assert_eq!(
+                post_settings(&app, &cookie, &csrf, &[("speech_rate_pct", ok)]).await,
+                StatusCode::OK,
+                "{ok}"
+            );
+        }
     }
 
     #[tokio::test]

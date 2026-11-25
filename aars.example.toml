@@ -14,7 +14,7 @@ piper_bin = "piper"
 # Katalog z głosami: panel pokazuje pliki *.onnx, które mają obok *.onnx.json.
 voices_dir = "/var/lib/aars/voices"
 # Ustawiane w panelu (Ustawienia → Sprzęt). Wartości tutaj są tylko startowe; panel ma pierwszeństwo.
-# model = "/var/lib/aars/voices/pl_PL-darkman-medium.onnx"
+# model = "/var/lib/aars/voices/pl_PL-gosia-medium.onnx"
 
 [sources]
 # Adres API ostrzeżeń meteo IMGW. Włączanie źródła, obszar i interwał ustawia

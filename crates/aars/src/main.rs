@@ -77,18 +77,26 @@ async fn main() -> Result<()> {
             let pool = db::connect(&config.storage.db_path).await.context("otwieranie bazy")?;
             db::migrate(&pool).await.context("nakładanie migracji")?;
 
+            let model = aars_core::hardware::probe::resolve_model(
+                &config.tts.model,
+                &config.tts.voices_dir,
+            );
+            if let Some(missing) = &model.replaced {
+                eprintln!("model głosu {missing} nie istnieje — używam {}", model.path);
+            }
             let synth = aars_audio::piper::PiperSynth::new(
                 &config.tts.piper_bin,
-                &config.tts.model,
+                &model.path,
                 config.audio.sample_rate,
             );
+            let rate = aars_core::settings::SettingsRepo::new(pool.clone()).speech_rate().await;
             let cache = aars_audio::cache::AudioCache::new(
                 pool,
                 config.storage.cache_dir.clone(),
                 config.storage.cache_max_bytes,
             );
 
-            let voice = aars_core::synth::VoiceParams::default();
+            let voice = aars_core::synth::VoiceParams { rate, ..Default::default() };
             let (path, pcm) =
                 cache.render(&synth, &text, &voice).await.context("synteza komunikatu")?;
 
@@ -120,9 +128,16 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
+            let model = aars_core::hardware::probe::resolve_model(
+                &config.tts.model,
+                &config.tts.voices_dir,
+            );
+            if let Some(missing) = &model.replaced {
+                eprintln!("model głosu {missing} nie istnieje — używam {}", model.path);
+            }
             let synth = aars_audio::piper::PiperSynth::new(
                 &config.tts.piper_bin,
-                &config.tts.model,
+                &model.path,
                 config.audio.sample_rate,
             );
             let cache = aars_audio::cache::AudioCache::new(
@@ -130,7 +145,10 @@ async fn main() -> Result<()> {
                 config.storage.cache_dir.clone(),
                 config.storage.cache_max_bytes,
             );
-            let voice = aars_core::synth::VoiceParams::default();
+            let voice = aars_core::synth::VoiceParams {
+                rate: aars_core::settings::SettingsRepo::new(pool.clone()).speech_rate().await,
+                ..Default::default()
+            };
             let (_, body) = cache.render(&synth, &text, &voice).await.context("synteza treści")?;
 
             let callsign: String =

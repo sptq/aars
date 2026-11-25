@@ -5,7 +5,7 @@
 //! z procesem; nic nie dotyka karty dźwiękowej ani nadajnika.
 //!
 //! „Odsłuchaj” działa, gdy jest lokalny Piper i głos: domyślnie
-//! `target/piper/bin/piper` i `target/voices/pl_PL-darkman-medium.onnx`
+//! `target/piper/bin/piper` i `target/voices/pl_PL-gosia-medium.onnx`
 //! (inne ścieżki: `AARS_DEMO_PIPER`, `AARS_DEMO_VOICE`). Synteza składa
 //! tylko plik WAV dla przeglądarki; bez Pipera podgląd jest niedostępny.
 
@@ -120,6 +120,7 @@ async fn demo_state(pool: SqlitePool) -> AppState {
             misfire_grace_s: 600,
             quiet_hours: QuietHours::parse("22:00-06:00").ok(),
             quiet_min_priority: Priority::High,
+            speech_rate: 0.87,
         })
         .await
         .expect("ustawienia stacji");
@@ -280,6 +281,7 @@ struct DemoPiper {
     cache: aars_audio::cache::AudioCache,
     synth: Arc<aars_audio::piper::PiperSynth>,
     permit: Arc<tokio::sync::Semaphore>,
+    settings: aars_core::settings::SettingsRepo,
 }
 
 impl PreviewRenderer for DemoPiper {
@@ -289,13 +291,14 @@ impl PreviewRenderer for DemoPiper {
             let cache = self.cache.clone();
             let synth = self.synth.clone();
             let owned = text.to_owned();
+            // Tempo z ustawień stacji, tak jak w prawdziwym odsłuchu.
+            let voice = aars_core::synth::VoiceParams {
+                rate: self.settings.speech_rate().await,
+                ..Default::default()
+            };
             let handle = tokio::runtime::Handle::current();
             let (_, pcm) = tokio::task::spawn_blocking(move || {
-                handle.block_on(cache.render(
-                    synth.as_ref(),
-                    &owned,
-                    &aars_core::synth::VoiceParams::default(),
-                ))
+                handle.block_on(cache.render(synth.as_ref(), &owned, &voice))
             })
             .await
             .map_err(|e| format!("wątek syntezy: {e}"))?
@@ -311,11 +314,12 @@ fn demo_piper(pool: SqlitePool, cache_dir: std::path::PathBuf) -> Option<DemoPip
     let bin =
         std::env::var("AARS_DEMO_PIPER").unwrap_or_else(|_| format!("{root}/piper/bin/piper"));
     let voice = std::env::var("AARS_DEMO_VOICE")
-        .unwrap_or_else(|_| format!("{root}/voices/pl_PL-darkman-medium.onnx"));
+        .unwrap_or_else(|_| format!("{root}/voices/pl_PL-gosia-medium.onnx"));
     if !std::path::Path::new(&bin).is_file() || !std::path::Path::new(&voice).is_file() {
         return None;
     }
     Some(DemoPiper {
+        settings: aars_core::settings::SettingsRepo::new(pool.clone()),
         cache: aars_audio::cache::AudioCache::new(pool, cache_dir, 64 << 20),
         synth: Arc::new(aars_audio::piper::PiperSynth::new(bin, voice, 48_000)),
         permit: Arc::new(tokio::sync::Semaphore::new(1)),

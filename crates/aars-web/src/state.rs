@@ -339,6 +339,7 @@ pub mod testing {
                     misfire_grace_s: 600,
                     quiet_hours: None,
                     quiet_min_priority: aars_core::priority::Priority::Emergency,
+                    speech_rate: 0.87,
                 },
                 restarts: AtomicUsize::new(0),
                 outcome: Mutex::new(TestOutcome::Done {

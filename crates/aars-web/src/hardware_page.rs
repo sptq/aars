@@ -3,7 +3,7 @@
 
 use aars_core::config::{PttBackendKind, SerialPttLine};
 use aars_core::dispatcher::{StationTest, TEST_PTT_RANGE, TestOutcome};
-use aars_core::hardware::probe::{HostLists, check_against_host, host_lists};
+use aars_core::hardware::probe::{HostLists, check_against_host, friendly_voice_name, host_lists, resolve_model};
 use aars_core::hardware::{FieldError, HardwareRepo, HardwareSettings, SAMPLE_RATES};
 use aars_core::interlock::RefusalReason;
 use aars_core::settings::{SettingsRepo, StationSettings};
@@ -451,7 +451,7 @@ fn build_fields(
             &input.voice_model,
         ),
         Some(l) => {
-            let o = l.voices.iter().map(|v| (v.path.clone(), v.name.clone())).collect();
+            let o = l.voices.iter().map(|v| (v.path.clone(), friendly_voice_name(&v.name))).collect();
             choice(o, None, "", &input.voice_model)
         }
         None => choice(Vec::new(), None, "Brak listy głosów — wpisz ścieżkę modelu .onnx ręcznie.", &input.voice_model),
@@ -492,6 +492,14 @@ async fn show(state: &AppState, current: &CurrentUser, status: StatusCode, ctx: 
                 .into_iter()
                 .map(|e| format!("zapisane ustawienie nie pasuje do tego komputera: {}", e.message)),
         );
+    }
+    // Zapisany model zniknął (np. darkman po aktualizacji): stacja gra Gosią.
+    let resolved = resolve_model(&stored.voice_model, &state.base_config.tts.voices_dir);
+    if let Some(missing) = resolved.replaced {
+        warnings.push(format!(
+            "model głosu {missing} nie istnieje — stacja używa głosu Gosia ({}); wybierz głos i zapisz",
+            resolved.path
+        ));
     }
     let form_failed = !ctx.errors.is_empty();
     let input = ctx.input.unwrap_or_else(|| FormInput::from_settings(&stored));
@@ -951,6 +959,41 @@ mod tests {
         for needle in ["hw:1,0", "/dev/ttyUSB0", "gpiochip0", "pl_PL-test", "w pliku:"] {
             assert!(html.contains(needle), "brak {needle}: {html}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_voice_list_uses_friendly_names_for_the_bundled_voices() {
+        let env = env(Role::Admin).await;
+        for f in [
+            "pl_PL-gosia-medium.onnx",
+            "pl_PL-gosia-medium.onnx.json",
+            "pl_PL-mc_speech-medium.onnx",
+            "pl_PL-mc_speech-medium.onnx.json",
+        ] {
+            std::fs::write(env._voices.path().join(f), "x").unwrap();
+        }
+        let (_, html) = get(&env, "/settings/hardware").await;
+        assert!(html.contains("Gosia (kobiecy)"), "{html}");
+        assert!(html.contains("MC Speech (męski)"), "{html}");
+        assert!(html.contains("pl_PL-test"), "nieznany głos zostaje pod nazwą pliku");
+        assert!(!html.contains("stacja używa głosu Gosia"), "model istnieje, bez ostrzeżenia");
+    }
+
+    #[tokio::test]
+    async fn a_vanished_model_is_reported_as_replaced_by_gosia() {
+        let env = env(Role::Admin).await;
+        for f in ["pl_PL-gosia-medium.onnx", "pl_PL-gosia-medium.onnx.json"] {
+            std::fs::write(env._voices.path().join(f), "x").unwrap();
+        }
+        let darkman = env._voices.path().join("pl_PL-darkman-medium.onnx");
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('hw:tts.model', ?)")
+            .bind(darkman.to_string_lossy().as_ref())
+            .execute(&env.state.pool)
+            .await
+            .unwrap();
+        let (_, html) = get(&env, "/settings/hardware").await;
+        assert!(html.contains("pl_PL-darkman-medium.onnx nie istnieje"), "{html}");
+        assert!(html.contains("stacja używa głosu Gosia"), "{html}");
     }
 
     #[tokio::test]

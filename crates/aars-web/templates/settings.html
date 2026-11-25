@@ -39,6 +39,11 @@
       <input id="misfire_grace_s" name="misfire_grace_s" type="number" min="0" max="86400" value="{{ misfire_grace_s }}" required>
     </div>
     <div class="field">
+      <label for="speech_rate_pct">Tempo mowy (%, 70–120)</label>
+      <input id="speech_rate_pct" name="speech_rate_pct" type="number" min="70" max="120" step="1" value="{{ speech_rate_pct }}" required>
+      <small class="help">100% = tempo głosu; mniej = wolniej, więcej = szybciej (domyślnie 87%). Działa od następnego nadania i podglądu, bez restartu.</small>
+    </div>
+    <div class="field">
       <label for="quiet_hours">Okno ciszy, czas lokalny (HH:MM-HH:MM; puste = brak)</label>
       <input id="quiet_hours" name="quiet_hours" value="{{ quiet_hours }}" placeholder="22:00-06:00">
       {% if !quiet_hint.is_empty() %}<small class="help">{{ quiet_hint }}</small>{% endif %}

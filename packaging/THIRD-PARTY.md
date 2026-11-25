@@ -14,7 +14,8 @@ pakietów Debiana leżą w `/usr/share/doc/*/copyright`), następujące składni
 | flatbuffers | 25.12.19 | Apache-2.0 | https://github.com/google/flatbuffers |
 | packaging | 26.3 | Apache-2.0 lub BSD-2-Clause | https://github.com/pypa/packaging |
 | pathvalidate | 3.3.1 | MIT | https://github.com/thombashi/pathvalidate |
-| Głos `pl_PL-darkman-medium` | rewizja `e9c8a39444359388adaa94255becb37a5a2b8e51` | zbiór danych CC0 | https://huggingface.co/rhasspy/piper-voices |
+| Głos `pl_PL-gosia-medium` | rewizja `e9c8a39444359388adaa94255becb37a5a2b8e51` | zbiór danych OHF-Voice/voice-datasets, CC0 (dotrenowany z Hi-Fi TTS, głos 92) | https://huggingface.co/rhasspy/piper-voices |
+| Głos `pl_PL-mc_speech-medium` | rewizja `e9c8a39444359388adaa94255becb37a5a2b8e51` | zbiór danych The MC Speech Dataset (Kaggle, czyzi0), CC0 (dotrenowany z głosu lessac) | https://huggingface.co/rhasspy/piper-voices |
 
 Piper działa w osobnym venv (`/opt/aars/piper`) i AARS uruchamia go jako
 osobny proces, więc licencja GPL obejmuje Pipera, a nie kod AARS.

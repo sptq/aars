@@ -343,7 +343,7 @@ impl Default for Config {
             },
             tts: TtsConfig {
                 piper_bin: "piper".to_owned(),
-                model: "/var/lib/aars/voices/pl_PL-darkman-medium.onnx".to_owned(),
+                model: "/var/lib/aars/voices/pl_PL-gosia-medium.onnx".to_owned(),
                 voices_dir: default_voices_dir(),
             },
             storage: StorageConfig {
