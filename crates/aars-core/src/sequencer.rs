@@ -272,8 +272,10 @@ fn transmit_one(
     // Długość znana przed nadaniem: ogon przed audio i całe audio
     // (z identyfikacją) muszą się zmieścić w twardym limicie. Inaczej
     // komunikat byłby ucięty w połowie — nie podnosimy PTT wcale.
+    // Wyjątek: komunikat Alarmowy (Alert RCB, atak z powietrza) idzie mimo
+    // to — lepiej usłyszeć jego początek uciętego twardym limitem niż nic.
     let needed = config.tx_tail + full.duration();
-    if needed > config.tx_max_duration {
+    if needed > config.tx_max_duration && request.priority != Priority::Emergency {
         tracing::error!(
             id = request.id,
             needed_ms = needed.as_millis(),
@@ -897,6 +899,20 @@ mod tests {
         let keys_after = ptt.events().iter().filter(|e| **e == PttEvent::Key).count();
         assert_eq!(keys_before, keys_after, "po interwencji PTT nie może się podnieść");
         watchdog.stop();
+    }
+
+    #[tokio::test]
+    async fn an_emergency_longer_than_the_tx_limit_still_goes_on_air() {
+        let mut rig = rig();
+        // Alert RCB dłuższy niż limit: lepiej jego początek niż nic.
+        let long = TransmitRequest {
+            body: Pcm::silence(48_000, Duration::from_millis(9_800)),
+            ..request(1, Priority::Emergency)
+        };
+        rig.handle.transmit(long).await.unwrap();
+        let event = rig.handle.next_event().await.unwrap();
+        assert!(matches!(event, SeqEvent::Started { id: 1 }), "{event:?}");
+        assert!(rig.ptt.events().contains(&PttEvent::Key), "{:?}", rig.ptt.events());
     }
 
     #[tokio::test]

@@ -206,7 +206,8 @@ a gdy nie mieści się żadne zdanie — „Obowiązujące ostrzeżenia: N.”.
 Niezależnie od tego dyspozytor nie podnosi PTT dla żadnego komunikatu, którego
 nagranie (z identyfikacją i ogonem) jest dłuższe niż limit nadawania: element
 kolejki kończy się błędem „komunikat dłuższy niż limit nadawania” zamiast
-ucięcia na antenie.
+ucięcia na antenie. Wyjątek: komunikat Alarmowy (Alert RCB, atak z powietrza)
+idzie mimo to — lepiej jego początek uciętego twardym limitem niż nic.
 
 Podgląd — ta sama ścieżka co nadanie, bez zapisu i bez kolejki:
 `aars bulletin preview` drukuje tekst (albo „nic do nadania: powód”) i stan
