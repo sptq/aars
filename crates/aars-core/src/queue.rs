@@ -398,6 +398,21 @@ impl QueueRepo {
         self.cancel_where(CancelTarget::Id(id)).await
     }
 
+    /// Stany wszystkich elementów serii, do której należy `id` (sam `id`,
+    /// gdy nie jest w serii). Pusta lista, gdy elementu nie ma.
+    pub async fn series_states(&self, id: i64) -> Result<Vec<QueueState>, DbError> {
+        let states: Vec<String> = sqlx::query_scalar(
+            "SELECT state FROM queue_items
+              WHERE id = ?1
+                 OR (repeat_group IS NOT NULL
+                     AND repeat_group = (SELECT repeat_group FROM queue_items WHERE id = ?1))",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(states.iter().filter_map(|s| QueueState::parse(s)).collect())
+    }
+
     /// Grupa powtórzeń elementu (`None` dla pojedynczego albo nieistniejącego).
     pub async fn group_of(&self, id: i64) -> Result<Option<String>, DbError> {
         let group: Option<Option<String>> =

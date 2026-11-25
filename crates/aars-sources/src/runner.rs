@@ -400,15 +400,19 @@ impl SourceRunner {
         self.enqueue(text.to_owned(), item.priority, item.interrupting, item.valid_until, repeat).await
     }
 
-    /// Co wiadomo o nadaniu pozycji z jej elementów kolejki: `done`
-    /// któregokolwiek to nadanie; wzięty albo czekający jeszcze się waży.
+    /// Co wiadomo o nadaniu pozycji z jej elementów kolejki, z całymi seriami
+    /// (śledzony jest tylko pierwszy element serii, a pierwszy mógł odpaść
+    /// przy interlocku, gdy powtórka poszła): `done` któregokolwiek członka to
+    /// nadanie; wzięty albo czekający jeszcze się waży.
     async fn fate(&self, ids: impl Iterator<Item = i64>) -> Result<Fate, DbError> {
         let mut fate = Fate::NotAired;
         for queue_item_id in ids {
-            match self.queue.state_of(queue_item_id).await? {
-                Some(QueueState::Done) => return Ok(Fate::Aired),
-                Some(QueueState::Transmitting | QueueState::Pending) => fate = Fate::Unresolved,
-                _ => {}
+            for state in self.queue.series_states(queue_item_id).await? {
+                match state {
+                    QueueState::Done => return Ok(Fate::Aired),
+                    QueueState::Transmitting | QueueState::Pending => fate = Fate::Unresolved,
+                    _ => {}
+                }
             }
         }
         Ok(fate)
@@ -423,10 +427,13 @@ impl SourceRunner {
         let mut aired = old.aired;
         if let Some(queue_item_id) = old.queue_item_id {
             self.cancel_waiting(Some(queue_item_id)).await;
-            match self.queue.state_of(queue_item_id).await? {
-                Some(QueueState::Done) => aired = true,
-                Some(QueueState::Transmitting) => superseded.push(queue_item_id),
-                _ => {}
+            let states = self.queue.series_states(queue_item_id).await?;
+            if states.contains(&QueueState::Done) {
+                aired = true;
+            }
+            // Wzięty członek serii może jeszcze skończyć jako `done`.
+            if states.contains(&QueueState::Transmitting) {
+                superseded.push(queue_item_id);
             }
         }
         Ok((aired, superseded))
@@ -456,29 +463,21 @@ impl SourceRunner {
         Ok(())
     }
 
-    /// R7: anuluje element kolejki, który jeszcze czeka. `true`, gdy czekał.
-    async fn cancel_waiting(&self, queue_item_id: Option<i64>) -> bool {
+    /// R7: anuluje element kolejki, który jeszcze czeka, a dla serii cały jej
+    /// niewysłany ogon.
+    async fn cancel_waiting(&self, queue_item_id: Option<i64>) {
         let Some(queue_item_id) = queue_item_id else {
-            return false;
+            return;
         };
-        let waited = match self.queue.cancel(queue_item_id).await {
-            Ok(rows) => rows == 1,
-            Err(error) => {
-                tracing::warn!(%error, queue_item_id, "nie udało się anulować elementu kolejki");
-                false
-            }
+        // Pozycja z serii (Alert RCB): wycofujemy cały niewysłany ogon serii.
+        let result = match self.queue.group_of(queue_item_id).await {
+            Ok(Some(group)) => self.queue.cancel_group(&group).await,
+            Ok(None) => self.queue.cancel(queue_item_id).await,
+            Err(error) => Err(error),
         };
-        // Pozycja z serii (Alert RCB): wycofujemy też niewysłane powtórki.
-        match self.queue.group_of(queue_item_id).await {
-            Ok(Some(group)) => {
-                if let Err(error) = self.queue.cancel_group(&group).await {
-                    tracing::warn!(%error, queue_item_id, "nie udało się anulować serii w kolejce");
-                }
-            }
-            Ok(None) => {}
-            Err(error) => tracing::warn!(%error, queue_item_id, "nie udało się odczytać serii elementu"),
+        if let Err(error) = result {
+            tracing::warn!(%error, queue_item_id, "nie udało się anulować elementu kolejki");
         }
-        waited
     }
 
     /// R16: wywoływane po `enqueue`; gdy zapis zawiedzie, następny cykl
@@ -724,6 +723,47 @@ mod tests {
         let report = r.runner.cycle(now()).await;
         assert_eq!(report.cancelled, 1);
         // Zostaje tylko odwołanie; powtórki serii wycofane.
+        assert_eq!(texts(&r.queue).await, vec!["odwołanie a"]);
+    }
+
+    fn quick_series(key: &str) -> SourceItem {
+        SourceItem { repeat: Some((3, Duration::from_millis(1))), ..series_item(key, "f1") }
+    }
+
+    #[tokio::test]
+    async fn a_repeat_that_aired_after_the_first_was_dropped_still_gets_a_cancellation() {
+        let r = rig(vec![ok(vec![quick_series("a")]), ok(vec![]), ok(vec![])]).await;
+        r.runner.cycle(now()).await;
+        let mut pending = r.queue.pending(10).await.unwrap();
+        pending.sort_by_key(|i| i.repeat_index);
+        // Pierwsze nadanie odpadło (np. interlock), druga powtórka poszła.
+        r.queue.cancel(pending[0].id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second = r.queue.claim_next().await.unwrap().unwrap();
+        assert_eq!(second.id, pending[1].id);
+        r.queue.mark_done(second.id).await.unwrap();
+        r.runner.cycle(now()).await;
+        let report = r.runner.cycle(now()).await;
+        assert_eq!(report.cancelled, 1);
+        assert_eq!(texts(&r.queue).await, vec!["odwołanie a"]);
+    }
+
+    #[tokio::test]
+    async fn withdrawing_while_a_repeat_transmits_cancels_the_rest_and_announces_after_it_airs() {
+        let r = rig(vec![ok(vec![quick_series("a")]), ok(vec![]), ok(vec![]), ok(vec![])]).await;
+        r.runner.cycle(now()).await;
+        let mut pending = r.queue.pending(10).await.unwrap();
+        pending.sort_by_key(|i| i.repeat_index);
+        r.queue.cancel(pending[0].id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second = r.queue.claim_next().await.unwrap().unwrap();
+        assert_eq!(second.id, pending[1].id);
+        r.runner.cycle(now()).await;
+        r.runner.cycle(now()).await;
+        // Trwająca powtórka kończy nadanie, reszta serii wycofana, odwołania jeszcze nie ma.
+        assert!(texts(&r.queue).await.is_empty());
+        r.queue.mark_done(second.id).await.unwrap();
+        r.runner.cycle(now()).await;
         assert_eq!(texts(&r.queue).await, vec!["odwołanie a"]);
     }
 

@@ -178,16 +178,16 @@ fn max_age(ctx: &SourceCtx) -> TimeDelta {
 }
 
 fn rcb_series(ctx: &SourceCtx) -> Option<(u32, Duration)> {
-    let read = |key: &str, min: u64, max: u64, default: u64| {
+    let read = |key: &str, min: u32, max: u32, default: u32| {
         ctx.settings
             .get(key)
-            .and_then(|v| v.trim().parse::<u64>().ok())
+            .and_then(|v| v.trim().parse::<u32>().ok())
             .filter(|n| (min..=max).contains(n))
             .unwrap_or(default)
     };
     let count = read("rcb_repeats", 1, 10, 3);
     let interval = read("rcb_interval_s", 30, 600, 60);
-    (count > 1).then(|| (u32::try_from(count).unwrap_or(3), Duration::from_secs(interval)))
+    (count > 1).then(|| (count, Duration::from_secs(u64::from(interval))))
 }
 
 pub struct Rso {
