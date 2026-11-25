@@ -279,20 +279,20 @@ impl aars_sources::bulletin::BulletinPart for DemoPart {
 const DEMO_PARTS: [(&str, &str); 5] = [
     (
         "pogoda_teraz",
-        "Pogoda w Rzeszowie o godzinie 14. Zachmurzenie umiarkowane, temperatura 6 stopni, odczuwalna 3 stopnie. Wilgotność 78 procent. Ciśnienie 1014 hektopaskali, spada. Wiatr południowo-zachodni, 4 metry na sekundę, w porywach do 9.",
+        "Pogoda dla okolic stacji według danych Open-Meteo. Obecnie umiarkowane zachmurzenie, temperatura 6 °C, odczuwalna 3 °C. Wilgotność 78 %. Ciśnienie 1014 hPa, spada. Wiatr południowo-zachodni 4 m/s, w porywach 9 m/s.",
     ),
     (
         "prognoza",
-        "Prognoza na najbliższe godziny: zachmurzenie duże, od godziny 18 słaby deszcz. W nocy od 2 do 4 stopni, wiatr słaby. Jutro przelotne opady, do 8 stopni.",
+        "W najbliższych godzinach pochmurno, słaby deszcz, opady do 2 mm. W nocy do 2 °C. Jutro przelotne opady deszczu, od 2 do 8 °C, opady do 4 mm, wiatr zachodni do 6 m/s.",
     ),
     ("slonce", "Wschód słońca o 7:01, zachód o 15:42."),
     (
         "wody",
-        "Stany wód w okolicy: Wisłok w Rzeszowie, 212 centymetrów, stan ostrzegawczy, tendencja rosnąca.",
+        "Stany wód. Rzeszów, Wisłok: 212 cm, stan ostrzegawczy, rośnie. Źródło: IMGW-PIB.",
     ),
     (
         "propagacja",
-        "Warunki propagacji na falach krótkich: strumień słoneczny 152, wskaźnik K równy 2. Pasma 20 i 15 metrów otwarte w dzień, 40 i 80 metrów w nocy.",
+        "Propagacja. Strumień słoneczny 152, wysoki. Indeks K 2, warunki spokojne. Pogoda kosmiczna bez zaburzeń. Łączności bliskie do pasma 40 metrów, dalekie do pasma 15 metrów. Dane: NOAA, GIRO przez KC2G.",
     ),
 ];
 
